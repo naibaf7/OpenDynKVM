@@ -42,7 +42,7 @@ PCB = os.path.join(HERE, 'kvm.kicad_pcb')
 
 TPD = 6.7                     # ps/mm: FR4 over the In1.Cu GND reference (this stack-up's microstrip/stripline mix)
 COUPLED_MM = 0.45             # lane separation at or below which the two lines still couple (design pitch 0.30)
-PITCH_MM = 0.30               # the design's own pair pitch (design.md §11: ~88 ohm differential over L2)
+PITCH_MM = 0.30               # the design's own pair pitch (README: ~88 ohm differential over L2)
 SPLIT_MM = 0.80               # separation beyond which the pair is two single lines
 SHORT_OK = 10.0               # mm: a split this short is a lumped discontinuity - harmless at USB2 HS
 SPLIT_WARN = 15.0             # mm: beyond this a split wants a reason

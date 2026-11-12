@@ -82,21 +82,10 @@ def ref(prefix):
     return f'{prefix}{_block[0] * 100 + _counters[key]}'
 
 
-# Assembly variants (0.16.0): a part with fit='BT' is fitted only on the Bluetooth variant.  Its symbol and footprint
-# carry the field Fit = BT, and tools/make_fab.py writes the BOM / CPL with it (jlcpcb_*.csv) and without it
-# (jlcpcb_*_nobt.csv).  The board works either way: the firmware finds the module or its absence at run time.
-_fit = [None]
-
-
-def fit(variant):
-    """Parts made from here on (until fit(None)) are fitted only on that assembly variant."""
-    _fit[0] = variant
-
-
 def part(prefix, lib_id, value, fp, pins, rot=0, unit=1, lcsc='', mpn='', in_bom=True, refdes=None):
     r = refdes or ref(prefix)
     PARTS.append(dict(ref=r, lib_id=lib_id, value=value, fp=fp, rot=rot, unit=unit, pins=pins,
-                      lcsc=lcsc, mpn=mpn, in_bom=in_bom, block=_block[0], fit=_fit[0]))
+                      lcsc=lcsc, mpn=mpn, in_bom=in_bom, block=_block[0]))
     return r
 
 
@@ -134,9 +123,8 @@ def usblc6(dm, dp, vbus, swap=False):
     # the connector's D+ pad is west of its D- pad and the service switch's D+ pin is east of its D- pin, so one of the
     # two pairs on this part must cross.  Swapping the ESD's channels only moves the crossover from the switch's pair to
     # the connector's, and the connector's pair has nowhere to put it (its fan-out is 0.5 mm wide, measured "lines only
-    # -0.090 mm apart at (160.38,109.06)").  So the crossing is in the switch's pair: rev 8 to 0.13 avoided it by
-    # putting SVC_DP on the switch's USB2- pin (block 6), and since 0.14.0 it is a twist inside that pair's run
-    # (route.py twist_in_run).
+    # -0.090 mm apart at (160.38,109.06)").  The switch's pair does have room - at its own fan-out, on the west channel
+    # (gen_schematic.py block 6 and tools/route.py pair_links).
     a, b = (dm, dp) if swap else (dp, dm)
     return part('U', 'Power_Protection:USBLC6-2SC6', 'USBLC6-2SC6', SOT236,
                 {'1': b, '6': b, '3': a, '4': a, '5': vbus, '2': 'GND'}, lcsc='C7519', mpn='USBLC6-2SC6')
@@ -262,14 +250,6 @@ GPIO = {
     15: 'LED_DATA', 11: 'KEY', 0: 'SVC_SEL', 1: 'PWR_ST',
     40: 'VSNS_PWR', 41: 'RP_CC1', 42: 'RP_CC2',
     36: 'DBG_TX',                                              # UART1 TX -> spare pin of the SWD pads
-    # Bluetooth LE coprocessor (0.16.0, block 16): UART0 on GPIO28/29 (UART0 TX/RX in the RP2350's function table),
-    # two of the four free pins on the south side, the one facing the module.  Two wires, not four: the module's
-    # BOOT strap (IO9) shares the RP2354B's TX line, and its EN has only its RC (block 16).  The planned via fan-out
-    # of pins 38/39 (GPIO30/31) sits on Hub-0's Mouse pair's corner under the RP2354B, and without vias their lines
-    # cut the crystal's off (first full runs of 0.16.0: "PAIR FAIL H0_MS ... blocked by ['ESP_EN']", then RP_XIN
-    # unrouted).  Boards 0.12-0.15 leave GPIO28/29 unconnected, and a 0.16.0 board can go without the module: the
-    # firmware reads GPIO29 with its pull-down on, and only the module's TXD0, idling high, lifts it (software.md 4.13)
-    28: 'ESP_RXD', 29: 'ESP_TXD',
 }
 rp = {'81': 'GND'}
 rp_pins = {  # QFN-80 pin -> GPIO number
@@ -308,12 +288,8 @@ part('J', 'Connector:Conn_ARM_SWD_TagConnect_TC2030-NL', 'SWD RP2354B',
 for net in ('AT1_BOOT0', 'AT2_BOOT0'):                         # AT32 boots from flash unless the RP2354B says so
     R('10k', net, 'GND')
 R('100k', 'HUB0_VBUS', 'GND')
-R('10k', 'SVC_SEL', '+3V3')                                   # blank RP2354B: USB goes to the service port (SEL = 01 =
+R('100k', 'SVC_SEL', '+3V3')                                  # blank RP2354B: USB goes to the service port (SEL = 01 =
 #                                                             USB2, which carries the service connector since rev 8)
-# ERRATA E2 (hardware/errata.md), fixed in 0.17.0: rev 8 - 0.16.0 had 100k here.  The RP2350 holds its own pad
-# pull-down on GPIO0 at reset and in the boot ROM (36-113k at 3.3 V, datasheet §14.9.4 Table 1683), so 100k left SEL0 at
-# 0.87-1.75 V against the switch's 1.3 V V_IH: the service port stayed on Hub-0.  10k gives SEL0 >= 2.58 V with the
-# strongest pull-down, and the firmware still drives it low with 0.33 mA (Hub-0 for normalized and mirrored ports).
 R('10k', 'CC1_PWR', 'RP_CC1')                                  # CC can see 5 V (bent contact, bad cable)
 R('10k', 'CC2_PWR', 'RP_CC2')
 
@@ -327,26 +303,23 @@ block(6)
 # Channel assignment (rev 8, third pass - measured, see tools/route.py pair_links): the service connector on USB2, Hub-0's
 # full-speed upstream on USB1, **MHL left unused** (on purpose: only it is specified at 1.5-3.3 V
 # signal levels, and a hub upstream does not belong there while a proper USB channel is free).
-# ERRATA E1 (hardware/errata.md), fixed in 0.14.0: boards 0.8-0.12 crossed D+/D- between the RP2354B and Hub-0 here.
-# The switch is passive, but its common D+ (11) switches to the *plus* pin of every channel and D- (10) to the minus
-# pins (datasheet Table 6-1).  Rev 8 put RP_DM on the common D+ pin and SVC_DM on USB2+, so that neither pair had to
-# cross over on its way to the switch, and left USB1 straight - which crossed Hub-0's pair.  0.13.0 (designed, never
-# ordered) swapped USB1 as well, which left every pair pin of the part carrying the other line's name.
-# Since 0.14.0 (2026-11-06) every pin carries its own line, as the datasheet names it: D+ 11 = RP_DP,
-# USB1+ 3 = H0_UP_DP, USB2+ 5 = SVC_DP.  The crossings that rev 8 avoided are in copper instead, one twist in each pair:
-# - the RP pair: the RP2354B's own D+ pin 67 is west of its D- pin 66, so the pair arrives with D+ on the wrong side;
-# - the service pair: the service ESD U301 has D+ on the pad west of D-, the same.
-# A twist at one end of the link does not fit at either: measured in rev 8, the service pair's A-end via lands in the
-# USB1 terminal's reserved corridor 0.8 mm away ("no pair path ... (0,380,1200)", then "lines only -0.190 mm apart"),
-# and the RP pair's ends are the 27R resistors and a point 1.6 mm west of the port's escape.  0.14.0 was therefore
-# routed from 0.12.0 (route.py --seed, seed_twist); since 0.15.0 both links put the twist inside their own run
-# (route.py pair_links: twist_at='run'), so the board routes from scratch.  check_netlist.py checks every switch
-# channel.
+# Both of those USB channels are in use, so the pair *polarity* inside the service channel is what makes the link
+# routable - and that is free to choose, because this switch is a passive pass-through: D+ and D- are interchangeable on
+# its pins.  The service pair needs the two lines to keep their side all the way (its far end, the service ESD U301, has
+# D+ on the pad west of D-).  With D+ on pin 5 - the eastern pin, like every other channel of this part - the pair would
+# have to cross over, and there is nowhere for that: the neighbouring USB1 terminal's reserved corridor is 0.8 mm away
+# and a crossover via needs 0.65 mm beside the pair, so the checked zone is refused and the unchecked fallback comes out
+# crossed (measured: "no pair path ... (0,380,1200)", then "lines only -0.190 mm apart").  With D+ on pin 6 instead the
+# two ends agree, no crossover is needed, and both channel pairs route.
 part('U', 'KVM:TS3USB3031', 'TS3USB3031', 'Package_DFN_QFN:Texas_RMG0012A_WQFN-12_1.8x1.8mm_P0.4mm',
      {'12': '+3V3', '9': 'GND', '1': 'SVC_SEL', '2': 'SVC_SEL1',
-      '11': 'RP_DP', '10': 'RP_DM',                    # common port: the RP2354B, behind its 27R series resistors
+      '11': 'RP_DM', '10': 'RP_DP',                    # common port: the RP2354B, behind its 27R series resistors.
+      # RP_DP on pin 10 rather than 11 for the same reason as the service channel's D+: the switch is passive, so the
+      # two lines of the pair are interchangeable on its pins, and this way the pair keeps its side all the way from the
+      # RP2354B (whose own D+ pin 67 is west of its D- pin 66) to the switch - no crossover, which is what the router
+      # could not place here (its A end is the 27R resistors, its B end is 1.6 mm west of the port's escape).
       '3': 'H0_UP_DP', '4': 'H0_UP_DM',                # USB1: Hub-0's upstream port (full speed)
-      '5': 'SVC_DP', '6': 'SVC_DM',                    # USB2: the service connector
+      '5': 'SVC_DM', '6': 'SVC_DP',                    # USB2: the service connector, D+ on pin 6 - see below
       '7': None, '8': None},                           # MHL: unused (it carries no HS channel, so it stays free)
      lcsc='C2652459', mpn='TS3USB3031RMGR')
 R('100k', 'SVC_SEL1', 'GND')                           # SEL1 low: SEL0 alone picks USB1 (00) or USB2 (01)
@@ -475,39 +448,6 @@ for k, name in enumerate(['PC1', 'KB', 'MS', 'OT', 'PC2']):
 for k in range(4):
     part('H', 'Mechanical:MountingHole', 'M3', 'MountingHole:MountingHole_3.2mm_M3', {}, in_bom=False)
 
-# ══ 16. Bluetooth LE coprocessor: ESP32-C3-MINI-1 (0.16.0, fitted on the BT variant only) ══════════════════
-block(16)
-fit('BT')
-# Bluetooth LE keyboard and mouse towards extra PCs, tablets and phones (design.md 13).  The RP2354B talks to it over
-# UART0 (ESP_RXD = the RP's TX into the module's RXD0, ESP_TXD the other way, both on the module's UART0 pins, which
-# are also its ROM bootloader's) and reprograms it from its own image, as it does the AT32F405s.
-# Strapping (datasheet section 4): IO2 and IO8 high (pull-ups here, both float otherwise); IO9 low at reset = UART
-# download, high = boot from flash.  IO9 is on ESP_RXD: the line idles high (the UART's idle level, and R1604 before
-# the RP2354B drives it), so the module boots its firmware; the RP2354B holds the line low (a UART break) across a
-# reset to get the ROM bootloader - a blank module resets over and over by itself, a programmed one restarts into its
-# ROM on a link command (software.md 4.13).  After reset IO9 is only an input the firmware never drives.
-# EN: Espressif's 10 k / 1 uF delay (datasheet section 9), power-on reset only.
-# Power: 3.3 V from the TLV62569; Bluetooth LE TX at the +9 dBm the firmware allows peaks at 190 mA (table 6-5), so the
-# module gets its 10 uF + 100 nF right at its 3V3 pad (budget: design.md 6.1).
-esp = {'3': '+3V3', '8': 'ESP_EN', '30': 'ESP_RXD', '31': 'ESP_TXD', '5': 'ESP_IO2', '22': 'ESP_IO8', '23': 'ESP_RXD',
-       '6': 'ESP_LOG'}
-for n in (1, 2, 11, 14, *range(36, 54)):
-    esp[str(n)] = 'GND'
-for n in (12, 13, 16, 18, 19, 20, 21, 26, 27, 4, 7, 9, 10, 15, 17, 24, 25, 28, 29, 32, 33, 34, 35):
-    esp[str(n)] = None
-part('U', 'KVM:ESP32-C3-MINI-1', 'ESP32-C3-MINI-1', 'CustomFootprints:ESP32-C3-MINI-1', esp,
-     lcsc='C41349510', mpn='ESP32-C3-MINI-1-H4X')
-C('10uF', '+3V3')
-C('100nF', '+3V3')
-R('10k', '+3V3', 'ESP_EN')
-C('1uF', 'ESP_EN')
-R('10k', '+3V3', 'ESP_IO2')
-R('10k', '+3V3', 'ESP_IO8')
-R('10k', '+3V3', 'ESP_RXD')                           # IO9 high (boot from flash) whatever the RP2354B's pad does
-fit(None)
-# the module's own log (its UART1 TX on IO3) on a test pad beside it, for bring-up without the RP2354B's help
-part('TP', 'Connector:TestPoint', 'ESP LOG', 'TestPoint:TestPoint_Pad_D1.0mm', {'1': 'ESP_LOG'}, in_bom=False)
-
 # power flags: rails fed through passives (inductor, resistor) or from connectors
 FLAGS = ['GND', '+3V3', 'RP_VREG', 'VBUS_PC1', 'VBUS_PC2', 'VBUS_PWR']
 
@@ -520,14 +460,13 @@ BLOCK_TITLES = {
     10: '10. AT32F405 #1 (HS device to PC1)', 11: '11. AT32F405 #2 (HS device to PC2)',
     12: '12. Front port: Keyboard', 13: '13. Front port: Mouse', 14: '14. Front port: Other',
     15: '15. MX key + under-key LED (hand-assembled), status LEDs, mounting holes',
-    16: '16. Bluetooth LE coprocessor ESP32-C3-MINI-1 (fitted on the BT variant only, Fit = BT)',
 }
 # block -> (column x, top y) on the A0 sheet; blocks flow downward within a column
 LAYOUT = {1: (20, 30), 2: (20, 120), 3: (20, 210), 4: (20, 300),
           5: (250, 30), 6: (250, 300),
           7: (480, 30), 8: (480, 190), 9: (480, 350),
           10: (710, 30), 11: (710, 230),
-          12: (940, 30), 13: (940, 190), 14: (940, 350), 15: (710, 440), 16: (250, 440)}
+          12: (940, 30), 13: (940, 190), 14: (940, 350), 15: (710, 440)}
 COLUMN_W = 230
 NOTES = [
     'Generated by tools/gen_schematic.py from the netlist in that file - edit the generator, not this sheet.',
@@ -767,8 +706,6 @@ def main():
             props.append(sym_prop('LCSC', p['lcsc'], p['pos'], hide=True))
         if p['mpn']:                                  # also hand-fitted parts (no LCSC)
             props.append(sym_prop('MPN', p['mpn'], p['pos'], hide=True))
-        if p['fit']:                                  # assembly variant (fit())
-            props.append(sym_prop('Fit', p['fit'], p['pos'], hide=True))
         items.append(instance(p['ref'], p['unit'], p['lib_id'], p['value'], p['pos'], p['rot'],
                               props, list(pins), in_bom=p['in_bom']))
 

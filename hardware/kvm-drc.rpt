@@ -1,12 +1,619 @@
 ** Drc report for kvm.kicad_pcb **
-** Created on 2026-11-07T08:09:24 **
+** Created on 2026-10-24T21:10:32 **
 ** Report includes: Errors, Warnings **
 
 ** Found 0 DRC violations **
 
-** Found 0 unconnected pads **
+** Found 1 unconnected pads **
+[unconnected_items]: Missing connection between items
+    Local override; error
+    @(158.9500 mm, 130.8500 mm): Via [+3V3] on F.Cu - B.Cu
+    @(159.0500 mm, 132.1200 mm): Pad 1 [+3V3] of C501 on F.Cu
 
-** Found 0 Footprint errors **
+** Found 201 Footprint errors **
+[net_conflict]: Pad net (VBUS_PC1) doesn't match net given by schematic (/VBUS_PC1)
+    Local override; warning
+    @(111.8500 mm, 112.3300 mm): Pad 1 [VBUS_PC1] of C101 on F.Cu
+[net_conflict]: Pad net (VBUS_PC2) doesn't match net given by schematic (/VBUS_PC2)
+    Local override; warning
+    @(201.8500 mm, 112.3300 mm): Pad 1 [VBUS_PC2] of C201 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(156.8500 mm, 112.3300 mm): Pad 1 [VBUS_PWR] of C301 on F.Cu
+[net_conflict]: Pad net (VBUS_PCS) doesn't match net given by schematic (/VBUS_PCS)
+    Local override; warning
+    @(172.7500 mm, 114.7700 mm): Pad 1 [VBUS_PCS] of C401 on F.Cu
+[net_conflict]: Pad net (SS) doesn't match net given by schematic (/SS)
+    Local override; warning
+    @(172.3500 mm, 107.7700 mm): Pad 1 [SS] of C402 on F.Cu
+[net_conflict]: Pad net (RP_VREG) doesn't match net given by schematic (/RP_VREG)
+    Local override; warning
+    @(159.0700 mm, 138.2000 mm): Pad 1 [RP_VREG] of C516 on F.Cu
+[net_conflict]: Pad net (RP_XIN) doesn't match net given by schematic (/RP_XIN)
+    Local override; warning
+    @(160.4000 mm, 143.9200 mm): Pad 1 [RP_XIN] of C517 on F.Cu
+[net_conflict]: Pad net (RP_XO_R) doesn't match net given by schematic (/RP_XO_R)
+    Local override; warning
+    @(165.2800 mm, 140.6500 mm): Pad 1 [RP_XO_R] of C518 on F.Cu
+[net_conflict]: Pad net (RP_RUN) doesn't match net given by schematic (/RP_RUN)
+    Local override; warning
+    @(170.1200 mm, 144.3000 mm): Pad 1 [RP_RUN] of C519 on F.Cu
+[net_conflict]: Pad net (H0_CRFILT) doesn't match net given by schematic (/H0_CRFILT)
+    Local override; warning
+    @(167.2700 mm, 122.0000 mm): Pad 1 [H0_CRFILT] of C708 on F.Cu
+[net_conflict]: Pad net (H0_PLLFILT) doesn't match net given by schematic (/H0_PLLFILT)
+    Local override; warning
+    @(156.9800 mm, 124.2000 mm): Pad 1 [H0_PLLFILT] of C709 on F.Cu
+[net_conflict]: Pad net (H0_XI) doesn't match net given by schematic (/H0_XI)
+    Local override; warning
+    @(147.6300 mm, 122.4500 mm): Pad 1 [H0_XI] of C710 on F.Cu
+[net_conflict]: Pad net (H0_XO) doesn't match net given by schematic (/H0_XO)
+    Local override; warning
+    @(151.6000 mm, 119.0800 mm): Pad 1 [H0_XO] of C711 on F.Cu
+[net_conflict]: Pad net (HUB0_RST) doesn't match net given by schematic (/HUB0_RST)
+    Local override; warning
+    @(162.7700 mm, 113.4500 mm): Pad 1 [HUB0_RST] of C712 on F.Cu
+[net_conflict]: Pad net (H1_CRFILT) doesn't match net given by schematic (/H1_CRFILT)
+    Local override; warning
+    @(122.2700 mm, 122.0000 mm): Pad 1 [H1_CRFILT] of C808 on F.Cu
+[net_conflict]: Pad net (H1_PLLFILT) doesn't match net given by schematic (/H1_PLLFILT)
+    Local override; warning
+    @(111.9800 mm, 124.2000 mm): Pad 1 [H1_PLLFILT] of C809 on F.Cu
+[net_conflict]: Pad net (H1_XI) doesn't match net given by schematic (/H1_XI)
+    Local override; warning
+    @(102.6300 mm, 122.4500 mm): Pad 1 [H1_XI] of C810 on F.Cu
+[net_conflict]: Pad net (H1_XO) doesn't match net given by schematic (/H1_XO)
+    Local override; warning
+    @(106.6000 mm, 119.0800 mm): Pad 1 [H1_XO] of C811 on F.Cu
+[net_conflict]: Pad net (HUB1_RST) doesn't match net given by schematic (/HUB1_RST)
+    Local override; warning
+    @(117.7700 mm, 113.4500 mm): Pad 1 [HUB1_RST] of C812 on F.Cu
+[net_conflict]: Pad net (H2_CRFILT) doesn't match net given by schematic (/H2_CRFILT)
+    Local override; warning
+    @(212.2700 mm, 122.0000 mm): Pad 1 [H2_CRFILT] of C908 on F.Cu
+[net_conflict]: Pad net (H2_PLLFILT) doesn't match net given by schematic (/H2_PLLFILT)
+    Local override; warning
+    @(201.9800 mm, 124.2000 mm): Pad 1 [H2_PLLFILT] of C909 on F.Cu
+[net_conflict]: Pad net (H2_XI) doesn't match net given by schematic (/H2_XI)
+    Local override; warning
+    @(192.6300 mm, 122.4500 mm): Pad 1 [H2_XI] of C910 on F.Cu
+[net_conflict]: Pad net (H2_XO) doesn't match net given by schematic (/H2_XO)
+    Local override; warning
+    @(196.6000 mm, 119.0800 mm): Pad 1 [H2_XO] of C911 on F.Cu
+[net_conflict]: Pad net (HUB2_RST) doesn't match net given by schematic (/HUB2_RST)
+    Local override; warning
+    @(207.7700 mm, 113.4500 mm): Pad 1 [HUB2_RST] of C912 on F.Cu
+[net_conflict]: Pad net (AT1_XI) doesn't match net given by schematic (/AT1_XI)
+    Local override; warning
+    @(110.1800 mm, 148.6500 mm): Pad 1 [AT1_XI] of C1007 on F.Cu
+[net_conflict]: Pad net (AT1_XO) doesn't match net given by schematic (/AT1_XO)
+    Local override; warning
+    @(116.3700 mm, 146.9500 mm): Pad 1 [AT1_XO] of C1008 on F.Cu
+[net_conflict]: Pad net (AT1_NRST) doesn't match net given by schematic (/AT1_NRST)
+    Local override; warning
+    @(122.1200 mm, 147.5500 mm): Pad 1 [AT1_NRST] of C1009 on F.Cu
+[net_conflict]: Pad net (AT2_XI) doesn't match net given by schematic (/AT2_XI)
+    Local override; warning
+    @(191.5800 mm, 130.0500 mm): Pad 1 [AT2_XI] of C1107 on F.Cu
+[net_conflict]: Pad net (AT2_XO) doesn't match net given by schematic (/AT2_XO)
+    Local override; warning
+    @(197.3700 mm, 128.3500 mm): Pad 1 [AT2_XO] of C1108 on F.Cu
+[net_conflict]: Pad net (AT2_NRST) doesn't match net given by schematic (/AT2_NRST)
+    Local override; warning
+    @(185.8800 mm, 129.4500 mm): Pad 1 [AT2_NRST] of C1109 on F.Cu
+[net_conflict]: Pad net (VBUS_KB) doesn't match net given by schematic (/VBUS_KB)
+    Local override; warning
+    @(112.0000 mm, 172.2000 mm): Pad 1 [VBUS_KB] of C1203 on F.Cu
+[net_conflict]: Pad net (VBUS_MS) doesn't match net given by schematic (/VBUS_MS)
+    Local override; warning
+    @(147.0000 mm, 172.2000 mm): Pad 1 [VBUS_MS] of C1303 on F.Cu
+[net_conflict]: Pad net (VBUS_OT) doesn't match net given by schematic (/VBUS_OT)
+    Local override; warning
+    @(182.0000 mm, 172.2000 mm): Pad 1 [VBUS_OT] of C1403 on F.Cu
+[net_conflict]: Pad net (KEY) doesn't match net given by schematic (/KEY)
+    Local override; warning
+    @(172.2000 mm, 152.3200 mm): Pad 1 [KEY] of C1501 on F.Cu
+[net_conflict]: Pad net (CC1_PC1) doesn't match net given by schematic (/CC1_PC1)
+    Local override; warning
+    @(121.9125 mm, 108.9000 mm): Pad 1 [CC1_PC1] of D101 on F.Cu
+[net_conflict]: Pad net (CC2_PC1) doesn't match net given by schematic (/CC2_PC1)
+    Local override; warning
+    @(121.9125 mm, 110.8000 mm): Pad 2 [CC2_PC1] of D101 on F.Cu
+[net_conflict]: Pad net (VBUS_PC1) doesn't match net given by schematic (/VBUS_PC1)
+    Local override; warning
+    @(108.3500 mm, 116.0000 mm): Pad 1 [VBUS_PC1] of D102 on F.Cu
+[net_conflict]: Pad net (CC1_PC2) doesn't match net given by schematic (/CC1_PC2)
+    Local override; warning
+    @(211.9125 mm, 108.9000 mm): Pad 1 [CC1_PC2] of D201 on F.Cu
+[net_conflict]: Pad net (CC2_PC2) doesn't match net given by schematic (/CC2_PC2)
+    Local override; warning
+    @(211.9125 mm, 110.8000 mm): Pad 2 [CC2_PC2] of D201 on F.Cu
+[net_conflict]: Pad net (VBUS_PC2) doesn't match net given by schematic (/VBUS_PC2)
+    Local override; warning
+    @(198.3500 mm, 116.0000 mm): Pad 1 [VBUS_PC2] of D202 on F.Cu
+[net_conflict]: Pad net (CC1_PWR) doesn't match net given by schematic (/CC1_PWR)
+    Local override; warning
+    @(166.9125 mm, 108.9000 mm): Pad 1 [CC1_PWR] of D301 on F.Cu
+[net_conflict]: Pad net (CC2_PWR) doesn't match net given by schematic (/CC2_PWR)
+    Local override; warning
+    @(166.9125 mm, 110.8000 mm): Pad 2 [CC2_PWR] of D301 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(153.3500 mm, 116.0000 mm): Pad 1 [VBUS_PWR] of D302 on F.Cu
+[footprint_symbol_mismatch]: Footprint attributes don't match symbol: 'Exclude from bill of materials' settings differ
+    Local override; warning
+    @(160.0000 mm, 158.5800 mm): Footprint D1501
+[net_conflict]: Pad net (LED_D5) doesn't match net given by schematic (/LED_D5)
+    Local override; warning
+    @(162.7250 mm, 157.8300 mm): Pad 2 [LED_D5] of D1501 on B.Cu
+[net_conflict]: Pad net (LED_D0) doesn't match net given by schematic (/LED_D0)
+    Local override; warning
+    @(108.3250 mm, 178.9050 mm): Pad 1 [LED_D0] of D1502 on F.Cu
+[net_conflict]: Pad net (LED_D1) doesn't match net given by schematic (/LED_D1)
+    Local override; warning
+    @(105.9251 mm, 178.8925 mm): Pad 3 [LED_D1] of D1502 on F.Cu
+[net_conflict]: Pad net (LED_D1) doesn't match net given by schematic (/LED_D1)
+    Local override; warning
+    @(114.8250 mm, 178.9050 mm): Pad 1 [LED_D1] of D1503 on F.Cu
+[net_conflict]: Pad net (LED_D2) doesn't match net given by schematic (/LED_D2)
+    Local override; warning
+    @(112.4251 mm, 178.8925 mm): Pad 3 [LED_D2] of D1503 on F.Cu
+[net_conflict]: Pad net (LED_D2) doesn't match net given by schematic (/LED_D2)
+    Local override; warning
+    @(149.8250 mm, 178.9050 mm): Pad 1 [LED_D2] of D1504 on F.Cu
+[net_conflict]: Pad net (LED_D3) doesn't match net given by schematic (/LED_D3)
+    Local override; warning
+    @(147.4251 mm, 178.8925 mm): Pad 3 [LED_D3] of D1504 on F.Cu
+[net_conflict]: Pad net (LED_D3) doesn't match net given by schematic (/LED_D3)
+    Local override; warning
+    @(184.8250 mm, 178.9050 mm): Pad 1 [LED_D3] of D1505 on F.Cu
+[net_conflict]: Pad net (LED_D4) doesn't match net given by schematic (/LED_D4)
+    Local override; warning
+    @(182.4251 mm, 178.8925 mm): Pad 3 [LED_D4] of D1505 on F.Cu
+[net_conflict]: Pad net (LED_D4) doesn't match net given by schematic (/LED_D4)
+    Local override; warning
+    @(215.3250 mm, 178.9050 mm): Pad 1 [LED_D4] of D1506 on F.Cu
+[net_conflict]: Pad net (LED_D5) doesn't match net given by schematic (/LED_D5)
+    Local override; warning
+    @(212.9251 mm, 178.8925 mm): Pad 3 [LED_D5] of D1506 on F.Cu
+[net_conflict]: Pad net (VBUS_PC1) doesn't match net given by schematic (/VBUS_PC1)
+    Local override; warning
+    @(117.4500 mm, 107.6950 mm): Pad A4 [VBUS_PC1] of J101 on F.Cu
+[net_conflict]: Pad net (CC1_PC1) doesn't match net given by schematic (/CC1_PC1)
+    Local override; warning
+    @(116.2500 mm, 107.6950 mm): Pad A5 [CC1_PC1] of J101 on F.Cu
+[net_conflict]: Pad net (PC1_DP) doesn't match net given by schematic (/PC1_DP)
+    Local override; warning
+    @(115.2500 mm, 107.6950 mm): Pad A6 [PC1_DP] of J101 on F.Cu
+[net_conflict]: Pad net (PC1_DM) doesn't match net given by schematic (/PC1_DM)
+    Local override; warning
+    @(114.7500 mm, 107.6950 mm): Pad A7 [PC1_DM] of J101 on F.Cu
+[net_conflict]: Pad net (VBUS_PC1) doesn't match net given by schematic (/VBUS_PC1)
+    Local override; warning
+    @(112.5500 mm, 107.6950 mm): Pad A9 [VBUS_PC1] of J101 on F.Cu
+[net_conflict]: Pad net (VBUS_PC1) doesn't match net given by schematic (/VBUS_PC1)
+    Local override; warning
+    @(112.5500 mm, 107.6950 mm): Pad B4 [VBUS_PC1] of J101 on F.Cu
+[net_conflict]: Pad net (CC2_PC1) doesn't match net given by schematic (/CC2_PC1)
+    Local override; warning
+    @(113.2500 mm, 107.6950 mm): Pad B5 [CC2_PC1] of J101 on F.Cu
+[net_conflict]: Pad net (PC1_DP) doesn't match net given by schematic (/PC1_DP)
+    Local override; warning
+    @(114.2500 mm, 107.6950 mm): Pad B6 [PC1_DP] of J101 on F.Cu
+[net_conflict]: Pad net (PC1_DM) doesn't match net given by schematic (/PC1_DM)
+    Local override; warning
+    @(115.7500 mm, 107.6950 mm): Pad B7 [PC1_DM] of J101 on F.Cu
+[net_conflict]: Pad net (VBUS_PC1) doesn't match net given by schematic (/VBUS_PC1)
+    Local override; warning
+    @(117.4500 mm, 107.6950 mm): Pad B9 [VBUS_PC1] of J101 on F.Cu
+[net_conflict]: Pad net (VBUS_PC2) doesn't match net given by schematic (/VBUS_PC2)
+    Local override; warning
+    @(207.4500 mm, 107.6950 mm): Pad A4 [VBUS_PC2] of J201 on F.Cu
+[net_conflict]: Pad net (CC1_PC2) doesn't match net given by schematic (/CC1_PC2)
+    Local override; warning
+    @(206.2500 mm, 107.6950 mm): Pad A5 [CC1_PC2] of J201 on F.Cu
+[net_conflict]: Pad net (PC2_DP) doesn't match net given by schematic (/PC2_DP)
+    Local override; warning
+    @(205.2500 mm, 107.6950 mm): Pad A6 [PC2_DP] of J201 on F.Cu
+[net_conflict]: Pad net (PC2_DM) doesn't match net given by schematic (/PC2_DM)
+    Local override; warning
+    @(204.7500 mm, 107.6950 mm): Pad A7 [PC2_DM] of J201 on F.Cu
+[net_conflict]: Pad net (VBUS_PC2) doesn't match net given by schematic (/VBUS_PC2)
+    Local override; warning
+    @(202.5500 mm, 107.6950 mm): Pad A9 [VBUS_PC2] of J201 on F.Cu
+[net_conflict]: Pad net (VBUS_PC2) doesn't match net given by schematic (/VBUS_PC2)
+    Local override; warning
+    @(202.5500 mm, 107.6950 mm): Pad B4 [VBUS_PC2] of J201 on F.Cu
+[net_conflict]: Pad net (CC2_PC2) doesn't match net given by schematic (/CC2_PC2)
+    Local override; warning
+    @(203.2500 mm, 107.6950 mm): Pad B5 [CC2_PC2] of J201 on F.Cu
+[net_conflict]: Pad net (PC2_DP) doesn't match net given by schematic (/PC2_DP)
+    Local override; warning
+    @(204.2500 mm, 107.6950 mm): Pad B6 [PC2_DP] of J201 on F.Cu
+[net_conflict]: Pad net (PC2_DM) doesn't match net given by schematic (/PC2_DM)
+    Local override; warning
+    @(205.7500 mm, 107.6950 mm): Pad B7 [PC2_DM] of J201 on F.Cu
+[net_conflict]: Pad net (VBUS_PC2) doesn't match net given by schematic (/VBUS_PC2)
+    Local override; warning
+    @(207.4500 mm, 107.6950 mm): Pad B9 [VBUS_PC2] of J201 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(162.4500 mm, 107.6950 mm): Pad A4 [VBUS_PWR] of J301 on F.Cu
+[net_conflict]: Pad net (CC1_PWR) doesn't match net given by schematic (/CC1_PWR)
+    Local override; warning
+    @(161.2500 mm, 107.6950 mm): Pad A5 [CC1_PWR] of J301 on F.Cu
+[net_conflict]: Pad net (SVC_DP) doesn't match net given by schematic (/SVC_DP)
+    Local override; warning
+    @(160.2500 mm, 107.6950 mm): Pad A6 [SVC_DP] of J301 on F.Cu
+[net_conflict]: Pad net (SVC_DM) doesn't match net given by schematic (/SVC_DM)
+    Local override; warning
+    @(159.7500 mm, 107.6950 mm): Pad A7 [SVC_DM] of J301 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(157.5500 mm, 107.6950 mm): Pad A9 [VBUS_PWR] of J301 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(157.5500 mm, 107.6950 mm): Pad B4 [VBUS_PWR] of J301 on F.Cu
+[net_conflict]: Pad net (CC2_PWR) doesn't match net given by schematic (/CC2_PWR)
+    Local override; warning
+    @(158.2500 mm, 107.6950 mm): Pad B5 [CC2_PWR] of J301 on F.Cu
+[net_conflict]: Pad net (SVC_DP) doesn't match net given by schematic (/SVC_DP)
+    Local override; warning
+    @(159.2500 mm, 107.6950 mm): Pad B6 [SVC_DP] of J301 on F.Cu
+[net_conflict]: Pad net (SVC_DM) doesn't match net given by schematic (/SVC_DM)
+    Local override; warning
+    @(160.7500 mm, 107.6950 mm): Pad B7 [SVC_DM] of J301 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(162.4500 mm, 107.6950 mm): Pad B9 [VBUS_PWR] of J301 on F.Cu
+[net_conflict]: Pad net (RP_SWDIO) doesn't match net given by schematic (/RP_SWDIO)
+    Local override; warning
+    @(168.7300 mm, 140.8650 mm): Pad 2 [RP_SWDIO] of J501 on F.Cu
+[net_conflict]: Pad net (RP_RUN) doesn't match net given by schematic (/RP_RUN)
+    Local override; warning
+    @(170.0000 mm, 142.1350 mm): Pad 3 [RP_RUN] of J501 on F.Cu
+[net_conflict]: Pad net (RP_SWCLK) doesn't match net given by schematic (/RP_SWCLK)
+    Local override; warning
+    @(170.0000 mm, 140.8650 mm): Pad 4 [RP_SWCLK] of J501 on F.Cu
+[net_conflict]: Pad net (DBG_TX) doesn't match net given by schematic (/DBG_TX)
+    Local override; warning
+    @(171.2700 mm, 140.8650 mm): Pad 6 [DBG_TX] of J501 on F.Cu
+[net_conflict]: Pad net (AT1_SWDIO) doesn't match net given by schematic (/AT1_SWDIO)
+    Local override; warning
+    @(105.7150 mm, 140.2700 mm): Pad 2 [AT1_SWDIO] of J1001 on F.Cu
+[net_conflict]: Pad net (AT1_NRST) doesn't match net given by schematic (/AT1_NRST)
+    Local override; warning
+    @(106.9850 mm, 139.0000 mm): Pad 3 [AT1_NRST] of J1001 on F.Cu
+[net_conflict]: Pad net (AT1_SWCLK) doesn't match net given by schematic (/AT1_SWCLK)
+    Local override; warning
+    @(105.7150 mm, 139.0000 mm): Pad 4 [AT1_SWCLK] of J1001 on F.Cu
+[net_conflict]: Pad net (AT2_SWDIO) doesn't match net given by schematic (/AT2_SWDIO)
+    Local override; warning
+    @(201.3650 mm, 139.2700 mm): Pad 2 [AT2_SWDIO] of J1101 on F.Cu
+[net_conflict]: Pad net (AT2_NRST) doesn't match net given by schematic (/AT2_NRST)
+    Local override; warning
+    @(202.6350 mm, 138.0000 mm): Pad 3 [AT2_NRST] of J1101 on F.Cu
+[net_conflict]: Pad net (AT2_SWCLK) doesn't match net given by schematic (/AT2_SWCLK)
+    Local override; warning
+    @(201.3650 mm, 138.0000 mm): Pad 4 [AT2_SWCLK] of J1101 on F.Cu
+[net_conflict]: Pad net (VBUS_KB) doesn't match net given by schematic (/VBUS_KB)
+    Local override; warning
+    @(121.5000 mm, 166.8000 mm): PTH pad 1 [VBUS_KB] of J1201
+[net_conflict]: Pad net (KB_DM) doesn't match net given by schematic (/KB_DM)
+    Local override; warning
+    @(124.0000 mm, 166.8000 mm): PTH pad 2 [KB_DM] of J1201
+[net_conflict]: Pad net (KB_DP) doesn't match net given by schematic (/KB_DP)
+    Local override; warning
+    @(126.0000 mm, 166.8000 mm): PTH pad 3 [KB_DP] of J1201
+[net_conflict]: Pad net (VBUS_MS) doesn't match net given by schematic (/VBUS_MS)
+    Local override; warning
+    @(156.5000 mm, 166.8000 mm): PTH pad 1 [VBUS_MS] of J1301
+[net_conflict]: Pad net (MS_DM) doesn't match net given by schematic (/MS_DM)
+    Local override; warning
+    @(159.0000 mm, 166.8000 mm): PTH pad 2 [MS_DM] of J1301
+[net_conflict]: Pad net (MS_DP) doesn't match net given by schematic (/MS_DP)
+    Local override; warning
+    @(161.0000 mm, 166.8000 mm): PTH pad 3 [MS_DP] of J1301
+[net_conflict]: Pad net (VBUS_OT) doesn't match net given by schematic (/VBUS_OT)
+    Local override; warning
+    @(191.5000 mm, 166.8000 mm): PTH pad 1 [VBUS_OT] of J1401
+[net_conflict]: Pad net (OT_DM) doesn't match net given by schematic (/OT_DM)
+    Local override; warning
+    @(194.0000 mm, 166.8000 mm): PTH pad 2 [OT_DM] of J1401
+[net_conflict]: Pad net (OT_DP) doesn't match net given by schematic (/OT_DP)
+    Local override; warning
+    @(196.0000 mm, 166.8000 mm): PTH pad 3 [OT_DP] of J1401
+[net_conflict]: Pad net (SW_3V3) doesn't match net given by schematic (/SW_3V3)
+    Local override; warning
+    @(186.8500 mm, 114.0000 mm): Pad 1 [SW_3V3] of L401 on F.Cu
+[net_conflict]: Pad net (CC1_PC1) doesn't match net given by schematic (/CC1_PC1)
+    Local override; warning
+    @(117.3900 mm, 110.3500 mm): Pad 1 [CC1_PC1] of R101 on F.Cu
+[net_conflict]: Pad net (CC2_PC1) doesn't match net given by schematic (/CC2_PC1)
+    Local override; warning
+    @(109.9500 mm, 110.3400 mm): Pad 1 [CC2_PC1] of R102 on F.Cu
+[net_conflict]: Pad net (VBUS_PC1) doesn't match net given by schematic (/VBUS_PC1)
+    Local override; warning
+    @(108.3500 mm, 111.2600 mm): Pad 1 [VBUS_PC1] of R103 on F.Cu
+[net_conflict]: Pad net (VDET_PC1) doesn't match net given by schematic (/VDET_PC1)
+    Local override; warning
+    @(108.3500 mm, 110.2400 mm): Pad 2 [VDET_PC1] of R103 on F.Cu
+[net_conflict]: Pad net (VDET_PC1) doesn't match net given by schematic (/VDET_PC1)
+    Local override; warning
+    @(108.9500 mm, 119.5600 mm): Pad 1 [VDET_PC1] of R104 on F.Cu
+[net_conflict]: Pad net (CC1_PC2) doesn't match net given by schematic (/CC1_PC2)
+    Local override; warning
+    @(207.3900 mm, 110.3500 mm): Pad 1 [CC1_PC2] of R201 on F.Cu
+[net_conflict]: Pad net (CC2_PC2) doesn't match net given by schematic (/CC2_PC2)
+    Local override; warning
+    @(199.9500 mm, 110.3400 mm): Pad 1 [CC2_PC2] of R202 on F.Cu
+[net_conflict]: Pad net (VBUS_PC2) doesn't match net given by schematic (/VBUS_PC2)
+    Local override; warning
+    @(198.3500 mm, 111.2600 mm): Pad 1 [VBUS_PC2] of R203 on F.Cu
+[net_conflict]: Pad net (VDET_PC2) doesn't match net given by schematic (/VDET_PC2)
+    Local override; warning
+    @(198.3500 mm, 110.2400 mm): Pad 2 [VDET_PC2] of R203 on F.Cu
+[net_conflict]: Pad net (VDET_PC2) doesn't match net given by schematic (/VDET_PC2)
+    Local override; warning
+    @(198.9500 mm, 119.5600 mm): Pad 1 [VDET_PC2] of R204 on F.Cu
+[net_conflict]: Pad net (CC1_PWR) doesn't match net given by schematic (/CC1_PWR)
+    Local override; warning
+    @(162.3900 mm, 110.3500 mm): Pad 1 [CC1_PWR] of R301 on F.Cu
+[net_conflict]: Pad net (CC2_PWR) doesn't match net given by schematic (/CC2_PWR)
+    Local override; warning
+    @(154.9500 mm, 110.3400 mm): Pad 1 [CC2_PWR] of R302 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(153.3500 mm, 111.2600 mm): Pad 1 [VBUS_PWR] of R303 on F.Cu
+[net_conflict]: Pad net (VSNS_PWR) doesn't match net given by schematic (/VSNS_PWR)
+    Local override; warning
+    @(153.3500 mm, 110.2400 mm): Pad 2 [VSNS_PWR] of R303 on F.Cu
+[net_conflict]: Pad net (VSNS_PWR) doesn't match net given by schematic (/VSNS_PWR)
+    Local override; warning
+    @(153.9500 mm, 119.5600 mm): Pad 1 [VSNS_PWR] of R304 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(178.6500 mm, 107.7600 mm): Pad 1 [VBUS_PWR] of R401 on F.Cu
+[net_conflict]: Pad net (PR1) doesn't match net given by schematic (/PR1)
+    Local override; warning
+    @(178.6500 mm, 106.7400 mm): Pad 2 [PR1] of R401 on F.Cu
+[net_conflict]: Pad net (PR1) doesn't match net given by schematic (/PR1)
+    Local override; warning
+    @(177.2400 mm, 105.1000 mm): Pad 1 [PR1] of R402 on F.Cu
+[net_conflict]: Pad net (PWR_ST) doesn't match net given by schematic (/PWR_ST)
+    Local override; warning
+    @(172.7000 mm, 106.1100 mm): Pad 2 [PWR_ST] of R403 on F.Cu
+[net_conflict]: Pad net (ILM) doesn't match net given by schematic (/ILM)
+    Local override; warning
+    @(172.3600 mm, 110.5000 mm): Pad 1 [ILM] of R404 on F.Cu
+[net_conflict]: Pad net (FB_3V3) doesn't match net given by schematic (/FB_3V3)
+    Local override; warning
+    @(191.5000 mm, 106.5400 mm): Pad 2 [FB_3V3] of R405 on F.Cu
+[net_conflict]: Pad net (FB_3V3) doesn't match net given by schematic (/FB_3V3)
+    Local override; warning
+    @(189.7400 mm, 104.8500 mm): Pad 1 [FB_3V3] of R406 on F.Cu
+[net_conflict]: Pad net (VBUS_PCS) doesn't match net given by schematic (/VBUS_PCS)
+    Local override; warning
+    @(174.2000 mm, 118.2400 mm): Pad 1 [VBUS_PCS] of R407 on F.Cu
+[net_conflict]: Pad net (CP2) doesn't match net given by schematic (/CP2)
+    Local override; warning
+    @(174.2000 mm, 119.2600 mm): Pad 2 [CP2] of R407 on F.Cu
+[net_conflict]: Pad net (CP2) doesn't match net given by schematic (/CP2)
+    Local override; warning
+    @(178.6500 mm, 109.3400 mm): Pad 1 [CP2] of R408 on F.Cu
+[net_conflict]: Pad net (VBUS_PWR) doesn't match net given by schematic (/VBUS_PWR)
+    Local override; warning
+    @(181.1600 mm, 107.7500 mm): Pad 1 [VBUS_PWR] of R409 on F.Cu
+[net_conflict]: Pad net (OV1) doesn't match net given by schematic (/OV1)
+    Local override; warning
+    @(180.1400 mm, 107.7500 mm): Pad 2 [OV1] of R409 on F.Cu
+[net_conflict]: Pad net (OV1) doesn't match net given by schematic (/OV1)
+    Local override; warning
+    @(180.1400 mm, 109.4000 mm): Pad 1 [OV1] of R410 on F.Cu
+[net_conflict]: Pad net (VBUS_PCS) doesn't match net given by schematic (/VBUS_PCS)
+    Local override; warning
+    @(178.2500 mm, 114.6600 mm): Pad 1 [VBUS_PCS] of R411 on F.Cu
+[net_conflict]: Pad net (OV2) doesn't match net given by schematic (/OV2)
+    Local override; warning
+    @(178.2500 mm, 113.6400 mm): Pad 2 [OV2] of R411 on F.Cu
+[net_conflict]: Pad net (OV2) doesn't match net given by schematic (/OV2)
+    Local override; warning
+    @(178.3400 mm, 111.9000 mm): Pad 1 [OV2] of R412 on F.Cu
+[net_conflict]: Pad net (RP_VREG) doesn't match net given by schematic (/RP_VREG)
+    Local override; warning
+    @(163.0500 mm, 134.3900 mm): Pad 2 [RP_VREG] of R501 on F.Cu
+[net_conflict]: Pad net (RP_XOUT) doesn't match net given by schematic (/RP_XOUT)
+    Local override; warning
+    @(162.6000 mm, 138.0400 mm): Pad 1 [RP_XOUT] of R502 on F.Cu
+[net_conflict]: Pad net (RP_XO_R) doesn't match net given by schematic (/RP_XO_R)
+    Local override; warning
+    @(162.6000 mm, 139.0600 mm): Pad 2 [RP_XO_R] of R502 on F.Cu
+[net_conflict]: Pad net (RP_USB_DP_PIN) doesn't match net given by schematic (/RP_USB_DP_PIN)
+    Local override; warning
+    @(154.5900 mm, 128.4000 mm): Pad 1 [RP_USB_DP_PIN] of R503 on F.Cu
+[net_conflict]: Pad net (RP_DP) doesn't match net given by schematic (/RP_DP)
+    Local override; warning
+    @(155.6100 mm, 128.4000 mm): Pad 2 [RP_DP] of R503 on F.Cu
+[net_conflict]: Pad net (RP_USB_DM_PIN) doesn't match net given by schematic (/RP_USB_DM_PIN)
+    Local override; warning
+    @(154.5900 mm, 129.6000 mm): Pad 1 [RP_USB_DM_PIN] of R504 on F.Cu
+[net_conflict]: Pad net (RP_DM) doesn't match net given by schematic (/RP_DM)
+    Local override; warning
+    @(155.6100 mm, 129.6000 mm): Pad 2 [RP_DM] of R504 on F.Cu
+[net_conflict]: Pad net (RP_RUN) doesn't match net given by schematic (/RP_RUN)
+    Local override; warning
+    @(172.3000 mm, 144.2400 mm): Pad 2 [RP_RUN] of R505 on F.Cu
+[net_conflict]: Pad net (QSPI_SS) doesn't match net given by schematic (/QSPI_SS)
+    Local override; warning
+    @(141.2100 mm, 124.9500 mm): Pad 1 [QSPI_SS] of R506 on F.Cu
+[net_conflict]: Pad net (BOOTSEL) doesn't match net given by schematic (/BOOTSEL)
+    Local override; warning
+    @(140.1900 mm, 124.9500 mm): Pad 2 [BOOTSEL] of R506 on F.Cu
+[net_conflict]: Pad net (AT1_BOOT0) doesn't match net given by schematic (/AT1_BOOT0)
+    Local override; warning
+    @(107.6100 mm, 149.1000 mm): Pad 1 [AT1_BOOT0] of R507 on F.Cu
+[net_conflict]: Pad net (AT2_BOOT0) doesn't match net given by schematic (/AT2_BOOT0)
+    Local override; warning
+    @(197.0100 mm, 125.4000 mm): Pad 1 [AT2_BOOT0] of R508 on F.Cu
+[net_conflict]: Pad net (HUB0_VBUS) doesn't match net given by schematic (/HUB0_VBUS)
+    Local override; warning
+    @(138.1500 mm, 124.9600 mm): Pad 1 [HUB0_VBUS] of R509 on F.Cu
+[net_conflict]: Pad net (SVC_SEL) doesn't match net given by schematic (/SVC_SEL)
+    Local override; warning
+    @(144.8100 mm, 121.9500 mm): Pad 1 [SVC_SEL] of R510 on F.Cu
+[net_conflict]: Pad net (CC1_PWR) doesn't match net given by schematic (/CC1_PWR)
+    Local override; warning
+    @(162.9400 mm, 111.8500 mm): Pad 1 [CC1_PWR] of R511 on F.Cu
+[net_conflict]: Pad net (RP_CC1) doesn't match net given by schematic (/RP_CC1)
+    Local override; warning
+    @(163.9600 mm, 111.8500 mm): Pad 2 [RP_CC1] of R511 on F.Cu
+[net_conflict]: Pad net (CC2_PWR) doesn't match net given by schematic (/CC2_PWR)
+    Local override; warning
+    @(157.6600 mm, 109.8500 mm): Pad 1 [CC2_PWR] of R512 on F.Cu
+[net_conflict]: Pad net (RP_CC2) doesn't match net given by schematic (/RP_CC2)
+    Local override; warning
+    @(156.6400 mm, 109.8500 mm): Pad 2 [RP_CC2] of R512 on F.Cu
+[net_conflict]: Pad net (H0_RBIAS) doesn't match net given by schematic (/H0_RBIAS)
+    Local override; warning
+    @(157.0100 mm, 125.4000 mm): Pad 1 [H0_RBIAS] of R701 on F.Cu
+[net_conflict]: Pad net (H0_CFG0) doesn't match net given by schematic (/H0_CFG0)
+    Local override; warning
+    @(165.5000 mm, 116.3100 mm): Pad 1 [H0_CFG0] of R702 on F.Cu
+[net_conflict]: Pad net (H0_CFG1) doesn't match net given by schematic (/H0_CFG1)
+    Local override; warning
+    @(166.7000 mm, 116.3100 mm): Pad 1 [H0_CFG1] of R703 on F.Cu
+[net_conflict]: Pad net (H0_NR1) doesn't match net given by schematic (/H0_NR1)
+    Local override; warning
+    @(164.3000 mm, 116.3100 mm): Pad 1 [H0_NR1] of R704 on F.Cu
+[net_conflict]: Pad net (H0_NR0) doesn't match net given by schematic (/H0_NR0)
+    Local override; warning
+    @(157.6600 mm, 117.8500 mm): Pad 1 [H0_NR0] of R705 on F.Cu
+[net_conflict]: Pad net (HUB0_RST) doesn't match net given by schematic (/HUB0_RST)
+    Local override; warning
+    @(157.1600 mm, 113.9500 mm): Pad 2 [HUB0_RST] of R706 on F.Cu
+[net_conflict]: Pad net (H0_D4_DP) doesn't match net given by schematic (/H0_D4_DP)
+    Local override; warning
+    @(166.4000 mm, 124.8100 mm): Pad 1 [H0_D4_DP] of R707 on F.Cu
+[net_conflict]: Pad net (H0_D4_DM) doesn't match net given by schematic (/H0_D4_DM)
+    Local override; warning
+    @(167.6500 mm, 124.8100 mm): Pad 1 [H0_D4_DM] of R708 on F.Cu
+[net_conflict]: Pad net (H1_RBIAS) doesn't match net given by schematic (/H1_RBIAS)
+    Local override; warning
+    @(112.0100 mm, 125.4000 mm): Pad 1 [H1_RBIAS] of R801 on F.Cu
+[net_conflict]: Pad net (H1_CFG0) doesn't match net given by schematic (/H1_CFG0)
+    Local override; warning
+    @(120.5000 mm, 116.3100 mm): Pad 1 [H1_CFG0] of R802 on F.Cu
+[net_conflict]: Pad net (H1_CFG1) doesn't match net given by schematic (/H1_CFG1)
+    Local override; warning
+    @(121.7000 mm, 116.3100 mm): Pad 1 [H1_CFG1] of R803 on F.Cu
+[net_conflict]: Pad net (H1_NR1) doesn't match net given by schematic (/H1_NR1)
+    Local override; warning
+    @(119.3000 mm, 116.3100 mm): Pad 1 [H1_NR1] of R804 on F.Cu
+[net_conflict]: Pad net (H1_NR0) doesn't match net given by schematic (/H1_NR0)
+    Local override; warning
+    @(112.6600 mm, 117.8500 mm): Pad 1 [H1_NR0] of R805 on F.Cu
+[net_conflict]: Pad net (HUB1_RST) doesn't match net given by schematic (/HUB1_RST)
+    Local override; warning
+    @(112.1600 mm, 113.9500 mm): Pad 2 [HUB1_RST] of R806 on F.Cu
+[net_conflict]: Pad net (H2_RBIAS) doesn't match net given by schematic (/H2_RBIAS)
+    Local override; warning
+    @(202.0100 mm, 125.4000 mm): Pad 1 [H2_RBIAS] of R901 on F.Cu
+[net_conflict]: Pad net (H2_CFG0) doesn't match net given by schematic (/H2_CFG0)
+    Local override; warning
+    @(210.5000 mm, 116.3100 mm): Pad 1 [H2_CFG0] of R902 on F.Cu
+[net_conflict]: Pad net (H2_CFG1) doesn't match net given by schematic (/H2_CFG1)
+    Local override; warning
+    @(211.7000 mm, 116.3100 mm): Pad 1 [H2_CFG1] of R903 on F.Cu
+[net_conflict]: Pad net (H2_NR1) doesn't match net given by schematic (/H2_NR1)
+    Local override; warning
+    @(209.3000 mm, 116.3100 mm): Pad 1 [H2_NR1] of R904 on F.Cu
+[net_conflict]: Pad net (H2_NR0) doesn't match net given by schematic (/H2_NR0)
+    Local override; warning
+    @(202.6600 mm, 117.8500 mm): Pad 1 [H2_NR0] of R905 on F.Cu
+[net_conflict]: Pad net (HUB2_RST) doesn't match net given by schematic (/HUB2_RST)
+    Local override; warning
+    @(202.1600 mm, 113.9500 mm): Pad 2 [HUB2_RST] of R906 on F.Cu
+[net_conflict]: Pad net (AT1_ROLE) doesn't match net given by schematic (/AT1_ROLE)
+    Local override; warning
+    @(116.7400 mm, 149.1000 mm): Pad 1 [AT1_ROLE] of R1001 on F.Cu
+[net_conflict]: Pad net (AT1_RREF) doesn't match net given by schematic (/AT1_RREF)
+    Local override; warning
+    @(117.9400 mm, 132.8000 mm): Pad 1 [AT1_RREF] of R1002 on F.Cu
+[net_conflict]: Pad net (AT1_NRST) doesn't match net given by schematic (/AT1_NRST)
+    Local override; warning
+    @(122.0900 mm, 149.2000 mm): Pad 2 [AT1_NRST] of R1003 on F.Cu
+[net_conflict]: Pad net (CC1_PC1) doesn't match net given by schematic (/CC1_PC1)
+    Local override; warning
+    @(124.1000 mm, 142.6400 mm): Pad 1 [CC1_PC1] of R1004 on F.Cu
+[net_conflict]: Pad net (AT1_CC1) doesn't match net given by schematic (/AT1_CC1)
+    Local override; warning
+    @(124.1000 mm, 143.6600 mm): Pad 2 [AT1_CC1] of R1004 on F.Cu
+[net_conflict]: Pad net (CC2_PC1) doesn't match net given by schematic (/CC2_PC1)
+    Local override; warning
+    @(124.1000 mm, 138.7400 mm): Pad 1 [CC2_PC1] of R1005 on F.Cu
+[net_conflict]: Pad net (AT1_CC2) doesn't match net given by schematic (/AT1_CC2)
+    Local override; warning
+    @(124.1000 mm, 139.7600 mm): Pad 2 [AT1_CC2] of R1005 on F.Cu
+[net_conflict]: Pad net (AT2_ROLE) doesn't match net given by schematic (/AT2_ROLE)
+    Local override; warning
+    @(202.3000 mm, 129.9100 mm): Pad 1 [AT2_ROLE] of R1101 on F.Cu
+[net_conflict]: Pad net (AT2_RREF) doesn't match net given by schematic (/AT2_RREF)
+    Local override; warning
+    @(189.0400 mm, 144.2000 mm): Pad 1 [AT2_RREF] of R1102 on F.Cu
+[net_conflict]: Pad net (AT2_NRST) doesn't match net given by schematic (/AT2_NRST)
+    Local override; warning
+    @(185.9100 mm, 127.8000 mm): Pad 2 [AT2_NRST] of R1103 on F.Cu
+[net_conflict]: Pad net (CC1_PC2) doesn't match net given by schematic (/CC1_PC2)
+    Local override; warning
+    @(183.9000 mm, 134.3600 mm): Pad 1 [CC1_PC2] of R1104 on F.Cu
+[net_conflict]: Pad net (AT2_CC1) doesn't match net given by schematic (/AT2_CC1)
+    Local override; warning
+    @(183.9000 mm, 133.3400 mm): Pad 2 [AT2_CC1] of R1104 on F.Cu
+[net_conflict]: Pad net (CC2_PC2) doesn't match net given by schematic (/CC2_PC2)
+    Local override; warning
+    @(183.9000 mm, 138.2600 mm): Pad 1 [CC2_PC2] of R1105 on F.Cu
+[net_conflict]: Pad net (AT2_CC2) doesn't match net given by schematic (/AT2_CC2)
+    Local override; warning
+    @(183.9000 mm, 137.2400 mm): Pad 2 [AT2_CC2] of R1105 on F.Cu
+[net_conflict]: Pad net (KB_SEL0) doesn't match net given by schematic (/KB_SEL0)
+    Local override; warning
+    @(106.5100 mm, 155.0500 mm): Pad 1 [KB_SEL0] of R1201 on F.Cu
+[net_conflict]: Pad net (KB_SEL1) doesn't match net given by schematic (/KB_SEL1)
+    Local override; warning
+    @(104.0100 mm, 155.2000 mm): Pad 2 [KB_SEL1] of R1202 on F.Cu
+[net_conflict]: Pad net (KB_ILIM) doesn't match net given by schematic (/KB_ILIM)
+    Local override; warning
+    @(106.6400 mm, 162.1000 mm): Pad 1 [KB_ILIM] of R1203 on F.Cu
+[net_conflict]: Pad net (KB_FLT) doesn't match net given by schematic (/KB_FLT)
+    Local override; warning
+    @(104.9500 mm, 162.0900 mm): Pad 2 [KB_FLT] of R1204 on F.Cu
+[net_conflict]: Pad net (KB_EN) doesn't match net given by schematic (/KB_EN)
+    Local override; warning
+    @(103.0000 mm, 160.9100 mm): Pad 1 [KB_EN] of R1205 on F.Cu
+[net_conflict]: Pad net (MS_SEL0) doesn't match net given by schematic (/MS_SEL0)
+    Local override; warning
+    @(141.5100 mm, 155.0500 mm): Pad 1 [MS_SEL0] of R1301 on F.Cu
+[net_conflict]: Pad net (MS_SEL1) doesn't match net given by schematic (/MS_SEL1)
+    Local override; warning
+    @(139.0100 mm, 155.2000 mm): Pad 2 [MS_SEL1] of R1302 on F.Cu
+[net_conflict]: Pad net (MS_ILIM) doesn't match net given by schematic (/MS_ILIM)
+    Local override; warning
+    @(141.6400 mm, 162.1000 mm): Pad 1 [MS_ILIM] of R1303 on F.Cu
+[net_conflict]: Pad net (MS_FLT) doesn't match net given by schematic (/MS_FLT)
+    Local override; warning
+    @(139.9500 mm, 162.0900 mm): Pad 2 [MS_FLT] of R1304 on F.Cu
+[net_conflict]: Pad net (MS_EN) doesn't match net given by schematic (/MS_EN)
+    Local override; warning
+    @(138.0000 mm, 160.9100 mm): Pad 1 [MS_EN] of R1305 on F.Cu
+[net_conflict]: Pad net (OT_SEL0) doesn't match net given by schematic (/OT_SEL0)
+    Local override; warning
+    @(176.5100 mm, 155.0500 mm): Pad 1 [OT_SEL0] of R1401 on F.Cu
+[net_conflict]: Pad net (OT_SEL1) doesn't match net given by schematic (/OT_SEL1)
+    Local override; warning
+    @(174.0100 mm, 155.2000 mm): Pad 2 [OT_SEL1] of R1402 on F.Cu
+[footprint_symbol_mismatch]: Footprint attributes don't match symbol: 'Exclude from bill of materials' settings differ
+    Local override; warning
+    @(160.0000 mm, 153.5000 mm): Footprint SW1501
 
 ** Ignored checks **
     - Footprint has no courtyard defined

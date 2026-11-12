@@ -94,37 +94,10 @@ sym('SK6812SIDE-A', 'D', 'CustomFootprints:LED_SK6812SIDE-A_4.0x1.6mm',
     width=10.16, lcsc='C5378721')
 
 
-# ESP32-C3-MINI-1, Bluetooth LE coprocessor (0.16.0), 53-pad LGA (esp32-c3-mini-1 datasheet v2.2, table 3-1).  Every
-# ground pad (1, 2, 11, 14, 36-48 under the antenna end, the exposed pad 49, the corner pads 50-53) is one stacked GND
-# pin; the NC pads are pins too, so the netlist covers every pad of the footprint.
-sym('ESP32-C3-MINI-1', 'U', 'CustomFootprints:ESP32-C3-MINI-1',
-    'https://documentation.espressif.com/esp32-c3-mini-1_datasheet_en.pdf',
-    'ESP32-C3 module: RISC-V 160 MHz, Bluetooth LE 5 + Wi-Fi 4, 4 MB flash, PCB antenna, 13.2 x 16.6 mm. '
-    'Strapping: IO2 and IO8 high, IO9 low at reset = UART download; EN high = on',
-    left=[('3', '3V3', 'power_in'), None, ('8', 'EN', 'input'), None,
-          ('30', 'RXD0/IO20', 'bidirectional'), ('31', 'TXD0/IO21', 'bidirectional'), None,
-          ('5', 'IO2', 'bidirectional'), ('22', 'IO8', 'bidirectional'), ('23', 'IO9', 'bidirectional'), None,
-          ('26', 'IO18/USB_D-', 'bidirectional'), ('27', 'IO19/USB_D+', 'bidirectional')],
-    right=[('12', 'IO0', 'bidirectional'), ('13', 'IO1', 'bidirectional'), ('6', 'IO3', 'bidirectional'),
-           ('18', 'IO4/MTMS', 'bidirectional'), ('19', 'IO5/MTDI', 'bidirectional'),
-           ('20', 'IO6/MTCK', 'bidirectional'), ('21', 'IO7/MTDO', 'bidirectional'),
-           ('16', 'IO10', 'bidirectional'), None]
-          + [(str(n), 'NC', 'no_connect') for n in (4, 7, 9, 10, 15, 17, 24, 25, 28, 29, 32, 33, 34, 35)],
-    bottom=[([str(n) for n in (1, 2, 11, 14, *range(36, 54))], 'GND', 'power_in')],
-    width=20.32, lcsc='C41349510')
-
-
-def pin(num, name, etype, x, y, ang, hide=False):
+def pin(num, name, etype, x, y, ang):
     eff = ['effects', ['font', ['size', 1.27, 1.27]]]
-    return ['pin', etype, 'line', ['at', x, y, ang], ['length', P]] + ([['hide', 'yes']] if hide else []) + \
-        [['name', Q(name), eff], ['number', Q(num), eff]]
-
-
-def pins_at(it, x, y, ang):
-    """One pin, or a stack of pins at one spot (it[0] a list of numbers): all but the first hidden, as KiCad's own
-    module symbols stack their ground pads."""
-    nums = it[0] if isinstance(it[0], list) else [it[0]]
-    return [pin(n, it[1], it[2], x, y, ang, hide=k > 0) for k, n in enumerate(nums)]
+    return ['pin', etype, 'line', ['at', x, y, ang], ['length', P],
+            ['name', Q(name), eff], ['number', Q(num), eff]]
 
 
 def prop(name, value, at, hide=False, justify=None):
@@ -149,7 +122,7 @@ def build(s):
         y = top - P
         for it in items:
             if it is not None:
-                pins.extend(pins_at(it, x, y, ang))
+                pins.append(pin(it[0], it[1], it[2], x, y, ang))
             y -= P
 
     side(s['left'], -hw - P, 0)
@@ -157,10 +130,10 @@ def build(s):
     bottom_y = top - (rows + 1) * P
     for k, it in enumerate(s['bottom']):
         x = (k - (len(s['bottom']) - 1) / 2) * P * 2
-        pins.extend(pins_at(it, round(x / P) * P, bottom_y - P, 90))
+        pins.append(pin(it[0], it[1], it[2], round(x / P) * P, bottom_y - P, 90))
     for k, it in enumerate(s['top']):
         x = (k - (len(s['top']) - 1) / 2) * P * 2
-        pins.extend(pins_at(it, round(x / P) * P, top + P, 270))
+        pins.append(pin(it[0], it[1], it[2], round(x / P) * P, top + P, 270))
     name = s['name']
     node = ['symbol', Q(name), ['pin_names', ['offset', 1.016]], ['exclude_from_sim', 'no'],
             ['in_bom', 'no' if s['ref'] == 'TP' else 'yes'], ['on_board', 'yes'],

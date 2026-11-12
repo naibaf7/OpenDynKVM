@@ -44,10 +44,7 @@ USB_A_Y = Y1 - 13.2                 # pad row; receptacle face flush with the fr
 REAR_X = {'J101': 115.0, 'J301': 160.0, 'J201': 205.0}     # USB-C centres, 45 mm pitch
 PORT_C = {'KB': 125.0, 'MS': 160.0, 'OT': 195.0}           # USB-A centres, 35 mm pitch
 PORT_X = {p: c - 3.5 for p, c in PORT_C.items()}           # USB-A pin 1 (VBUS); D-/D+ at +2.5/+4.5
-# Side LEDs at 0 degrees: the lens (the footprint's +Y side, away from its pads) faces the front edge, 0.5 mm from it.
-# Up to 0.16.0 they sat at 180 degrees, pads 0.5 mm from the edge, and shone into the board (errata E3).  The
-# courtyard keeps the same span (body 1.36 mm and courtyard 1.6 mm south of the origin, 0.85 mm north of it).
-LED_Y = Y1 - 0.5 - 1.36
+LED_Y = Y1 - 1.12                   # side LEDs: pads 0.5 mm from the edge, light exits forwards
 
 KEY = (160.0, 153.5)                # MX key, centred left-right, right behind the middle USB-A port
 KEY_CLEAR = 11.25                   # no parts within the 18 mm keycap + 2.25 mm
@@ -175,7 +172,7 @@ PLACEMENT = {
     'U1501': (134.0, 141.4, 0),                                      # LED data buffer west of the key's corner, west of
     'C1502': (131.1, 140.4, 90), 'C1503': (131.1, 142.45, 90),       # the RP2354B's fan-out; its and the key LED's caps
     # status LEDs on the front edge, left to right: PC1, KB, MS, OT (each left of its port), PC2
-    'D1502': (106.5, LED_Y, 0), 'D1506': (213.5, LED_Y, 0),
+    'D1502': (106.5, LED_Y, 180), 'D1506': (213.5, LED_Y, 180),
     'H1501': (104.0, 104.0, 0), 'H1502': (216.0, 104.0, 0), 'H1503': (104.0, 170.0, 0), 'H1504': (216.0, 170.0, 0),
 }
 for j, pb, hb in (('J101', 1, 8), ('J301', 3, 7), ('J201', 2, 9)):
@@ -184,7 +181,7 @@ for j, pb, hb in (('J101', 1, 8), ('J301', 3, 7), ('J201', 2, 9)):
 for k, p in enumerate(['KB', 'MS', 'OT']):
     for key, (dx, y, rot) in OUT_MACRO.items():
         PLACEMENT[key.format(b=12 + k)] = (PORT_C[p] + dx, y, rot)
-    PLACEMENT[f'D{1503 + k}'] = (PORT_C[p] - 12.0, LED_Y, 0)      # port status LED, left of the port
+    PLACEMENT[f'D{1503 + k}'] = (PORT_C[p] - 12.0, LED_Y, 180)    # port status LED, left of the port
 # rev 8: the service switch (U601, PLACEMENT above) sits exactly where the hub macro puts its NR0 strap resistor, so
 # Hub-0's copy of R{h}05 is overridden here, after the macro has written it (an entry in the literal above would be
 # overwritten by the loop).  Only Hub-0 is affected - it is the one hub with a switch beside it.  The new spot is south
@@ -257,40 +254,6 @@ PLACEMENT['R510'] = (135.5, 120.5, 270)
 PLACEMENT['C510'] = (142.5, 123.6, 180)
 PLACEMENT['C710'] = (147.15, 120.5, 180)
 
-# ── Bluetooth LE module (0.16.0, block 16; fitted on the BT variant only) ─────────────────────────────────────────────
-# ESP32-C3-MINI-1 on the bottom side near the south-east corner, its antenna end on the east edge (x 220.0, flush;
-# Espressif's placement guide: antenna at the board edge, no copper under it on any layer).  The only board edge with
-# room: the north edge has the three USB-C ports, the west edge and the band north of here carry the hub lanes, the
-# south edge the USB-A ports and the LEDs.  On the bottom: Hub-2's lanes come down x 205-209 on F.Cu to y 140 and turn
-# south-west to x 199 by y 146-151, over the module's north-west corner.  On 2026-11-08/09 it moved up (from
-# y 158.5 to 152.5), then, for no overhang past the board edge, a bit down and west (to 208.5 / 156.0).
-# Its 22 ground pads join the B.Cu GND pour instead of taking a via each (route.py POUR_PADS), which the stitching vias
-# round it tie to In1.Cu; several of them sit under those lanes, where no via may go.
-# Rotated 90 and flipped: antenna east, pads 1-11 along the south side (3V3 at x 211.4, EN 207.4, IO2 209.8, IO3 209.0),
-# pads 12-24 along the west side (IO8 at y ESP_AT + 3.2, IO9 + 2.4 ... from the north), pads 25-35 along the north side
-# (RXD0 at x 208.5, TXD0 209.3), the ground row 36-48 along the antenna end.  Its passives sit south and west of it.
-# The antenna end is at x 219.5, 0.5 mm inside the board edge, and the UART pads at y 150.1, 9 mm south of the lowest
-# lane where it passes above them.
-ESP_AT = (208.5, 156.0)
-_ex, _ey = ESP_AT
-PLACEMENT.update({
-    'U1601': (_ex, _ey, 90, 'B'),
-    'C1602': (_ex + 2.55, _ey + 7.6, 0, 'B'),     # 100 nF at the 3V3 pad
-    'R1602': (_ex + 0.5, _ey + 7.6, 0, 'B'),      # IO2 pull-up, at its pad
-    'R1601': (_ex - 1.7, _ey + 7.6, 0, 'B'),      # EN pull-up and EN delay cap, at the EN pad
-    'C1601': (_ex + 1.9, _ey + 9.25, 0, 'B'),     # 10 uF on the 3V3 pad's line
-    'C1603': (_ex - 1.7, _ey + 9.1, 0, 'B'),
-    'TP1601': (_ex - 6.4, _ey + 8.6, 0, 'B'),     # the module's log (IO3)
-    'R1604': (_ex - 8.5, _ey - 4.0, 0, 'B'),      # RXD0 / IO9 pull-up (boot from flash), beside IO9 (pad 23)
-    'R1603': (_ex - 6.7, _ey - 3.2, 90, 'B'),     # IO8 pull-up, west of its pad
-})
-# Antenna keep-out, a board-level rule area on every copper layer (route.py honours it, and the zone filler
-# leaves every plane out of it - GND on F.Cu, In1.Cu and B.Cu, +3V3 on In2.Cu): no track, via or zone fill from the
-# antenna's start (5.6 mm beyond the pad centre, datasheet figure 10-1) to the board edge, and 15 mm beyond the module's
-# sides along the edge (Espressif's clearance) - northwards, and southwards as far as H1504's courtyard (y 166.5; the
-# hole is bare, a pad there is allowed).  Relative to ESP_AT: (x0, y0, x1, y1).
-ANT_KEEPOUT = (5.6, -6.6 - 15.0, 220.0 - ESP_AT[0], 166.4 - ESP_AT[1])
-
 # no auto-placed parts here: the key, the planned USB pair corridors (see tools/route.py) and their via sites
 KEEP_FREE = [
     (KEY[0] - KEY_CLEAR, KEY[1] - KEY_CLEAR, KEY[0] + KEY_CLEAR, KEY[1] + KEY_CLEAR),
@@ -307,13 +270,6 @@ KEEP_FREE = [
     (AT1_X + 1.5, 126.4, AT1_X + 3.0, AT1_Y - 3.1),           # ... down into its OTGHS pins
     (160 + AT_X - 2.8, AT2_Y + 3.9, 160 + AT_X - 1.2, 146.1), # Hub-2 -> AT32 #2, up into its OTGHS pins
     (142.5, 125.6, 155.0, 127.6),  # Hub-0's ports face the RP2354B: their lines fan out in this gap
-    # the Bluetooth module (bottom) and its passives, and its antenna keep-out (from ESP_AT: a box at a fixed place
-    # pushed Hub-2's C907 off its spot, and the hub macro's twins C707 / C807 with it - C807 then sat on CC2_PC1's
-    # 0.15.0 via, and CC1/CC2_PC1 went unrouted in three runs)
-    (ESP_AT[0] - 8.5, ESP_AT[1] - 7.0, 220.0, ESP_AT[1] + 10.2),
-    (ESP_AT[0] + 5.4, ESP_AT[1] - 21.8, 220.0, 166.5),
-    (184.15, 149.65, 199.55, 162.45),  # the OpenDynKVM logo (LOGOS)
-    (124.95, 101.4, 132.25, 110.1),    # the OSHW logo and the version
     (138.3, 112.3, 141.7, 115.7),  # the service switch U601 (rev 8): Hub-0's decoupling ring must place clear of it
 ]
 for _x in REAR_X.values():                    # per input macro
@@ -426,28 +382,8 @@ STACKUP = [   # (layer, type, thickness mm, dielectric Er)
 SILK_TEXT = [
     ('PC1', (123.0, 106.0), 0), ('PWR / SERVICE', (171.0, 101.2), 0), ('PC2', (197.0, 106.0), 0),
     ('KEYBOARD', (PORT_C['KB'], 163.2), 0), ('MOUSE', (PORT_C['MS'], 163.2), 0), ('OTHER', (PORT_C['OT'], 163.2), 0),
+    ('OpenDynKVM r1', (127.5, 103.5), 0),
 ]
-
-# The board's version, printed on it (DEVELOPMENT.md "Versions"): a new major version is a different board, a minor version a
-# revision of this one.  It is the version of the design being worked on: once a board is ordered, its commit is
-# tagged hw-vX.Y.Z and this moves on to the next one.  kvm_proto::HARDWARE_VERSION, what the firmware reports, is the
-# newest board that was ordered (0.12.0 while 0.17.0 is designed).  0.13.0 and 0.14.0 were designed and never ordered:
-# 0.14.0 replaced 0.13.0 (errata.md E1), and 0.15.0 is 0.14.0's netlist routed from scratch.  0.16.0 adds the Bluetooth
-# module (block 16, design.md 16), fitted or not.  0.17.0 fixes what the first 0.12.0 board showed: SVC_SEL's pull-up
-# (errata.md E2) and the side LEDs' direction (E3).
-HW_VERSION = '0.17.0'
-
-# The logos (2026-11-08: reworked for 0.16.0, whose Bluetooth module took the badge's corner).  Before, one badge
-# bottom right (2026-11-03): the OpenDynKVM logo over the open source hardware logo and the version.  The board has no
-# other part-free 15 x 19 mm spot on top, so they are apart now: the OpenDynKVM logo behind the OTHER port, beside the
-# module (x 184.5-199.2, y 150-162 is free of parts, and 0.15.0's copper had one signal via there, VBUS_OT's); the OSHW
-# logo with the version at the rear, between the PC1 port and BOOTSEL (only ground stitching vias there in 0.15.0).
-# West of the key was the first try: it took the vias of the lines around the keyboard and mouse switches.
-# Each keeps vias out of its print with a rule area on every copper layer (route.py honours it).  Absolute positions;
-# a keep-out is (x0, y0, x1, y1).
-LOGOS = [('LOGO1', 'CustomFootprints:OpenDynKVM_Logo_14mm_SilkScreen', (191.85, 156.05), (184.15, 149.65, 199.55, 162.45)),
-         ('LOGO2', 'Symbol:OSHW-Logo2_7.3x6mm_SilkScreen', (128.6, 104.5), (124.95, 101.4, 132.25, 110.1))]
-VERSION_AT = (128.6, 109.3)
 
 
 def export_netlist():
@@ -601,7 +537,7 @@ def main():
         fp.SetSheetfile(os.path.basename(SCH))
         for f in find(comp, 'property'):
             key, val = first(f, 'name')[1], (first(f, 'value') or [None, ''])[1]
-            if key in ('LCSC', 'MPN', 'Fit') and val:
+            if key in ('LCSC', 'MPN') and val:
                 fp.SetField(key, val)
                 fp.GetField(key).SetVisible(False)
             # the symbol's BOM / placement-file exclusion goes onto the footprint (today only the Tag-Connect pads and
@@ -965,7 +901,7 @@ def main():
             twin.SetPosition(pcbnew.VECTOR2I_MM(pcbnew.ToMM(q.x) + dx, pcbnew.ToMM(q.y)))
             board.Add(twin)
 
-    # ── the hubs' VDD33 caps on B.Cu, under their own pins (rev 11, 2026-10-27, user) ─────────────────────────────────
+    # ── the hubs' VDD33 caps on B.Cu, under their own pins (rev 11, 2026-10-27) ───────────────────────────────────────
     # The per-pin pass above finds no spot under a hub (0.5 mm between the exposed-pad via keep-out and the pins) and
     # "just outside the pin" is the USB pairs' corridor, so the six 100 nF caps of each hub sat in the ring 5.1-8.1 mm
     # away, joined only through In2.Cu.  Here each one goes on B.Cu *radially under its pin*: the +3V3 pad under the pin's
@@ -1047,9 +983,6 @@ def main():
         t.SetTextAngleDegrees(rot)
         board.Add(t)
 
-    place_badge(board)
-    place_antenna_keepout(board)
-
     # place/drill origin at the bottom-left corner: CPL and gerbers share it (tools/make_fab.py)
     board.GetDesignSettings().SetAuxOrigin(pcbnew.VECTOR2I_MM(X0, Y1))
 
@@ -1065,61 +998,6 @@ def main():
     print(f'wrote {PCB}:{len(comps)} footprints ({len(PLACEMENT)} placed by hand), {len(netinfo)} nets')
     if failed:
         print('NOT PLACED (parked right of the board):', ' '.join(failed))
-
-
-def place_antenna_keepout(board):
-    """ANT_KEEPOUT as a board-level rule area: no tracks, vias or zone fills on any copper layer; pads and footprints
-    are allowed, so the module itself does not violate it.  On the board, not in the module: a zone inside the
-    footprint made the board's copy differ from the library's (DRC lib_footprint_mismatch); route.py reads both."""
-    fp = board.FindFootprintByReference('U1601')
-    if fp is None:
-        return
-    x0, y0, x1, y1 = ANT_KEEPOUT
-    keep = pcbnew.ZONE(board)
-    keep.SetIsRuleArea(True)
-    keep.SetZoneName('antenna')
-    keep.SetDoNotAllowVias(True)
-    keep.SetDoNotAllowTracks(True)
-    keep.SetDoNotAllowZoneFills(True)
-    keep.SetDoNotAllowPads(False)
-    keep.SetDoNotAllowFootprints(False)
-    keep.SetLayerSet(pcbnew.LSET.AllCuMask())
-    o = keep.Outline()
-    o.NewOutline()
-    ex, ey = ESP_AT
-    for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
-        o.Append(pcbnew.FromMM(ex + x), pcbnew.FromMM(ey + y))
-    board.Add(keep)
-
-
-def place_badge(board):
-    """The logos and the version (LOGOS), board-only footprints that stay out of the BOM and the CPL."""
-    for ref, fpid, (x, y), (x0, y0, x1, y1) in LOGOS:
-        fp = load_fp(fpid)
-        fp.SetReference(ref)
-        fp.Reference().SetVisible(False)
-        fp.SetBoardOnly(True)
-        fp.SetPosition(pcbnew.VECTOR2I_MM(x, y))
-        board.Add(fp)
-        keep = pcbnew.ZONE(fp)
-        keep.SetIsRuleArea(True)
-        keep.SetDoNotAllowVias(True)
-        for rule in (keep.SetDoNotAllowTracks, keep.SetDoNotAllowPads, keep.SetDoNotAllowZoneFills,
-                     keep.SetDoNotAllowFootprints):
-            rule(False)
-        keep.SetLayerSet(pcbnew.LSET.AllCuMask())
-        o = keep.Outline()
-        o.NewOutline()
-        for px, py in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
-            o.Append(pcbnew.FromMM(px), pcbnew.FromMM(py))
-        fp.Add(keep)
-    t = pcbnew.PCB_TEXT(board)
-    t.SetText(f'V{HW_VERSION}')
-    t.SetPosition(pcbnew.VECTOR2I_MM(*VERSION_AT))
-    t.SetLayer(pcbnew.F_SilkS)
-    t.SetTextSize(pcbnew.VECTOR2I_MM(1.0, 1.0))
-    t.SetTextThickness(pcbnew.FromMM(0.15))
-    board.Add(t)
 
 
 if __name__ == '__main__':

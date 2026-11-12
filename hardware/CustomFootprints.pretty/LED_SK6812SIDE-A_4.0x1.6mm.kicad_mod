@@ -3,11 +3,11 @@
 	(generator "pcbnew")
 	(generator_version "10.0")
 	(layer "F.Cu")
-	(descr "SK6812SIDE-A side-emitting RGB LED 4.0x2.0x1.6 mm; light exits towards +Y (away from the pads)")
+	(descr "SK6812SIDE-A side-emitting RGB LED 4.0x2.0x1.6 mm; light exits towards -Y (pad side)")
 	(property "Reference" ""
 		(at 0 -1.65 0)
 		(layer "F.SilkS")
-		(uuid "50926d8c-8965-4c0a-8238-36545e66b46e")
+		(uuid "e38d5d0c-d05c-4257-823a-5a6f4d90772b")
 		(effects
 			(font
 				(size 1.27 1.27)
@@ -17,7 +17,7 @@
 	(property "Value" ""
 		(at 0 2.4 0)
 		(layer "F.Fab")
-		(uuid "f1deccd1-fe04-472b-8156-6227461faf6c")
+		(uuid "f10a75c3-b807-4ed0-a4e8-10f9dfd3f179")
 		(effects
 			(font
 				(size 1.27 1.27)
@@ -28,7 +28,7 @@
 		(at 0 0 0)
 		(layer "F.Fab")
 		(hide yes)
-		(uuid "0dabd10a-f869-4002-a45f-10426c3f34ee")
+		(uuid "08969cec-e25e-40da-92ad-229cbcfafc82")
 		(effects
 			(font
 				(size 1.27 1.27)
@@ -39,7 +39,7 @@
 		(at 0 0 0)
 		(layer "F.Fab")
 		(hide yes)
-		(uuid "46790cc7-d89e-49e4-9c52-f2cbb04d2bb6")
+		(uuid "5c8893b0-e89e-4161-97b2-505e36905739")
 		(effects
 			(font
 				(size 1.27 1.27)
@@ -56,7 +56,7 @@
 			(type default)
 		)
 		(layer "F.SilkS")
-		(uuid "1a289a67-6c12-4914-8599-773ac120926f")
+		(uuid "b8d8246d-19a4-45ca-a0d4-14bf7857319a")
 	)
 	(fp_line
 		(start -1.171778 1.362481)
@@ -66,7 +66,7 @@
 			(type default)
 		)
 		(layer "F.SilkS")
-		(uuid "8bd46559-6564-42a8-a971-19dd5ad17b65")
+		(uuid "bbc55da9-483b-4436-b9d4-ba70c0399e6a")
 	)
 	(fp_line
 		(start -1.125067 1.362481)
@@ -76,7 +76,7 @@
 			(type default)
 		)
 		(layer "F.SilkS")
-		(uuid "48d92304-fc81-4b5b-b573-f49aea003b24")
+		(uuid "c13c7183-179d-4a42-914c-80f9beb0ffe2")
 	)
 	(fp_line
 		(start -0.87508 1.112494)
@@ -86,7 +86,7 @@
 			(type default)
 		)
 		(layer "F.SilkS")
-		(uuid "8efc6740-692a-4538-8025-d488ac6d5b84")
+		(uuid "b912de0c-bb8c-4724-abcc-68baf669a7e1")
 	)
 	(fp_line
 		(start 0.887958 1.112494)
@@ -96,7 +96,7 @@
 			(type default)
 		)
 		(layer "F.SilkS")
-		(uuid "197625b0-3806-4bac-9415-269176b416af")
+		(uuid "1dc0f61a-720d-4717-a4fb-7c74f6c4dc8e")
 	)
 	(fp_line
 		(start 1.999919 0.685139)
@@ -106,7 +106,7 @@
 			(type default)
 		)
 		(layer "F.SilkS")
-		(uuid "799cda72-d459-4311-a118-f1c0f976362d")
+		(uuid "ffbc29b0-a217-447a-be78-23568be0e594")
 	)
 	(fp_line
 		(start 1.999919 1.362481)
@@ -116,7 +116,7 @@
 			(type default)
 		)
 		(layer "F.SilkS")
-		(uuid "51f67062-58f7-4d15-9837-cf911a742895")
+		(uuid "a93d0580-2c07-4efe-b051-e0fa0f9113f7")
 	)
 	(fp_line
 		(start -2.55 -0.85)
@@ -126,7 +126,7 @@
 			(type default)
 		)
 		(layer "F.CrtYd")
-		(uuid "d3a23154-7d86-4c34-939d-26595e9651f4")
+		(uuid "6e52e25c-7858-4502-930b-8191f24ba223")
 	)
 	(fp_line
 		(start -2.55 1.6)
@@ -136,7 +136,7 @@
 			(type default)
 		)
 		(layer "F.CrtYd")
-		(uuid "1dfa4ffb-c217-401a-bad5-baad364db26a")
+		(uuid "8a3b5d05-b6f5-4095-9a58-7d6d36191141")
 	)
 	(fp_line
 		(start 2.55 -0.85)
@@ -146,7 +146,7 @@
 			(type default)
 		)
 		(layer "F.CrtYd")
-		(uuid "5edbb7e9-c7ff-403e-b076-a411aee0d875")
+		(uuid "a83d665a-30d0-416f-9cb6-6d850fb50b91")
 	)
 	(fp_line
 		(start 2.55 1.6)
@@ -156,7 +156,7 @@
 			(type default)
 		)
 		(layer "F.CrtYd")
-		(uuid "b4d90973-7cc1-4f1e-871e-8fa9b8f523ac")
+		(uuid "f4f18383-4134-441c-826f-7a9c69eba04c")
 	)
 	(fp_line
 		(start -2.000097 -0.237515)
@@ -166,7 +166,7 @@
 			(type default)
 		)
 		(layer "F.Fab")
-		(uuid "d8e5e295-3f42-46bb-894c-fcea4e3203b5")
+		(uuid "ac077f20-cbff-4ac1-9430-8f3d75f2262e")
 	)
 	(fp_line
 		(start -2.000097 1.362481)
@@ -176,7 +176,7 @@
 			(type default)
 		)
 		(layer "F.Fab")
-		(uuid "6f170a68-5b42-4869-b492-97cbe44762e6")
+		(uuid "bf188cc6-c000-48eb-b733-1f49502aaf0a")
 	)
 	(fp_line
 		(start 1.999894 -0.237515)
@@ -186,7 +186,7 @@
 			(type default)
 		)
 		(layer "F.Fab")
-		(uuid "d08bfd48-b8e1-4722-b5bb-ae92299c5d14")
+		(uuid "cbf755b7-5a16-41fb-aa04-c4bdc2f2571f")
 	)
 	(fp_line
 		(start 1.999894 1.362481)
@@ -196,7 +196,7 @@
 			(type default)
 		)
 		(layer "F.Fab")
-		(uuid "5b25c8ba-552f-42cd-8d57-096036dac029")
+		(uuid "756b91d1-94da-42a2-a517-45ea9a865b40")
 	)
 	(pad "1" smd custom
 		(at -1.82504 -0.025025)
@@ -217,7 +217,7 @@
 				(fill yes)
 			)
 		)
-		(uuid "4811ed80-80a7-4813-a7d4-44205e688a5c")
+		(uuid "69b6b8fd-92d9-4bc3-a3fa-5d785ac39873")
 	)
 	(pad "2" smd custom
 		(at -0.450049 -0.012522)
@@ -237,7 +237,7 @@
 				(fill yes)
 			)
 		)
-		(uuid "4fe616b7-c233-4167-bebc-f46140da70de")
+		(uuid "70c14b5e-92d8-4a84-8e14-bccd4c51ad72")
 	)
 	(pad "3" smd custom
 		(at 0.574916 -0.012496)
@@ -257,7 +257,7 @@
 				(fill yes)
 			)
 		)
-		(uuid "92b35aff-c9ab-4167-9d6f-27bf6c664a46")
+		(uuid "d2711cd9-8ada-43f0-87d7-289e3cb5c723")
 	)
 	(pad "4" smd custom
 		(at 1.824955 -0.049945)
@@ -278,7 +278,7 @@
 				(fill yes)
 			)
 		)
-		(uuid "d7143e71-f5bb-4510-a948-bea7ceb65347")
+		(uuid "a6983c4d-2122-4321-b9b0-969e21557f0e")
 	)
 	(embedded_fonts no)
 )

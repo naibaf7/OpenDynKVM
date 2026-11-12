@@ -46,7 +46,7 @@ MM = pcbnew.ToMM
 CELL = 1.5                       # spatial hash cell, mm
 LAYERS = ('F.Cu', 'B.Cu', 'In1.Cu', 'In2.Cu')
 PAIR_NAMES = ('H0_', 'H1_', 'H2_', 'PC1_', 'PC2_', 'KB_', 'MS_', 'OT_')
-PAIR_W, PAIR_S = 0.15, 0.15      # the design's HS pair width and gap (design.md §11: ~88 ohm differential over L2)
+PAIR_W, PAIR_S = 0.15, 0.15      # the design's HS pair width and gap (README: ~88 ohm differential over L2)
 PAIR_SKEW_MAX = 1.2              # mm of length mismatch that is still inside a high-speed pair's budget: 8 ps at
 #                              6.7 ps/mm.  Was 0.75 mm (5 ps), the number usually quoted for USB 2.0 HS; rev 9 sets
 #                              1.2 mm, which is 0.4 % of a 480 Mb/s bit and still ~6x tighter than the ~50 ps that HS

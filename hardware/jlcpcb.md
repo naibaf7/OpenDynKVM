@@ -1,16 +1,14 @@
 # Ordering OpenDynKVM at JLCPCB
 
-What to select in JLCPCB's quote form for the 0.16.0 board, and why. Written for rev 12 (0.12.0) on 2026-10-27/28
-against the quote form as it looked then (`datasheets/Online PCB Instant Quote - JLCPCB.pdf`); the board's measured
-numbers were updated for 0.16.0 on 2026-11-09, and stock and prices change daily.  Every measured
+What to select in JLCPCB's quote form for the rev 12 board, and why. Written 2026-10-27/28 against the quote form as
+it looked then (`datasheets/Online PCB Instant Quote - JLCPCB.pdf`); stock and prices change daily.  Every measured
 number here comes from a tool in `tools/` - section 13 lists which - so after a board change re-run the tool rather
 than trusting the text.
 
 **Short version:** 4 layers, 1.6 mm, **stack-up JLC04161H-3313** (without the paid impedance control), standard
 1 oz / 0.5 oz copper, ENIG, **epoxy filled & capped vias**, Standard PCBA on **both sides**, edge rails by JLCPCB,
 **confirm parts placement**.  The quote's defaults for stack-up, via covering and placement confirmation are wrong for
-this board.  The order is blocked until the TS3USB3031 is in stock (§8).  Two assembly variants: with the Bluetooth
-module (`jlcpcb_bom.csv` / `jlcpcb_cpl.csv`) or without it (`*_nobt.csv`, the board works the same minus Bluetooth).  Standard copper is enough: since rev 12 the
+this board.  The order is blocked until the RP2354B is in stock (§8).  Standard copper is enough: since rev 12 the
 power rails are sized for the 0.5 oz inner layer they partly run on (§5).
 
 ## 1. Files
@@ -24,13 +22,8 @@ python3 tools/make_fab.py
 | Upload | File | Content |
 |---|---|---|
 | PCB | `kvm_gerbers.zip` | 4 copper, 2 mask, 2 paste, 2 silkscreen, outline, plated + non-plated drill, job file (with the stack-up) |
-| BOM | `bom/jlcpcb_bom.csv` | 41 lines, every part with an LCSC number (with the Bluetooth module) |
-| CPL | `bom/jlcpcb_cpl.csv` | 251 parts: 209 top, 42 bottom, JLC rotation/offset corrections applied |
-| BOM, no Bluetooth | `bom/jlcpcb_bom_nobt.csv` | 40 lines: the module U1601 and its seven passives (Fit = BT) left out |
-| CPL, no Bluetooth | `bom/jlcpcb_cpl_nobt.csv` | 243 parts: 209 top, 34 bottom |
-
-Upload one BOM/CPL pair.  Without the module the board works as 0.15.0 does: the firmware finds no module at boot and
-offers no Bluetooth (design.md §16); the module's pads and its antenna keep-out stay bare.
+| BOM | `bom/jlcpcb_bom.csv` | 40 lines, every part with an LCSC number |
+| CPL | `bom/jlcpcb_cpl.csv` | 243 parts: 209 top, 34 bottom, JLC rotation/offset corrections applied |
 
 ## 2. What JLCPCB will see
 
@@ -40,12 +33,12 @@ From `python3 tools/fab_facts.py`:
 |---|---|
 | Outline | 120 x 80 mm; one internal cut-out, the key LED D1501's, 3.63 x 3.23 mm overall |
 | Copper | L1 signals + GND pour, L2 GND plane, L3 +3V3 plane (short power-rail runs cross it, sized for its 0.5 oz, §5), L4 signals + GND pour |
-| Tracks | 3076 segments, 0.15-1.39 mm wide |
+| Tracks | 3002 segments, 0.15-1.39 mm wide |
 | Rules | clearance >= 0.15 mm, copper to board edge >= 0.5 mm, except D1501's pads: 0.2 mm from their own cut-out (custom rule in `kvm.kicad_dru`) |
-| Vias | 1010, all through, 0.6 mm pad / 0.3 mm drill, tented both sides in the gerbers; 36 of them sit in the exposed pads of U501, U701, U801 and U901 (§6) |
+| Vias | 1059, all through, 0.6 mm pad / 0.3 mm drill, tented both sides in the gerbers; 36 of them sit in the exposed pads of U501, U701, U801 and U901 (§6) |
 | Plated holes | 12 x 0.95 mm and 6 x 2.3 mm (USB-A); 6 slots 0.6 x 1.2 mm and 6 slots 0.6 x 1.7 mm (USB-C shells) |
 | Non-plated holes | 24: 4 x 3.2 mm (M3), the MX switch and socket (4.0, 2 x 1.75, 2 x 3.05 mm), 6 x 0.65 mm (USB-C pegs), 9 x 0.99 mm (guide holes of the three Tag-Connect SWD pads) |
-| Edges | the USB-C bodies reach 0.05 mm past the north edge, the USB-A bodies end 0.16 mm inside the south edge, the Bluetooth module's antenna end (bottom side) 0.45 mm inside the east edge; no other part within 0.5 mm |
+| Edges | the USB-C bodies reach 0.05 mm past the north edge, the USB-A bodies end 0.16 mm inside the south edge; no other part within 0.5 mm |
 | Through-hole parts | 3 x USB-C (4 shell legs each), 3 x USB-A (6 pins each): JLC solders these by hand, for a separate fee |
 
 ## 3. PCB options
@@ -136,35 +129,26 @@ switches also has a drop rule (1 mV/mm at its 2.24 A): 1.1 mm on F.Cu / B.Cu.  R
 From `python3 tools/dc_drop.py +5V U402.1,U402.8 U1203=... U1303=... U1403=... U403=...` (U1203 / U1303 / U1403 are
 the Keyboard / Mouse / Other port switches, U403 the 3.3 V buck):
 
-| Load case | Drop U402 -> port switches, 0.17.0 | 0.16.0 | 0.15.0 | rev 12 | rev 11 |
-|---|---|---|---|---|---|
-| USB-rated: 3 ports x 0.5 A + buck 0.5 A (2.0 A) | **85 / 74 / 54 mV** | 84 / 74 / 49 mV | 96 / 87 / 66 mV | 91 / 82 / 59 mV | 206 / 185 / 148 mV |
-| typical: 0.1 / 0.1 / 0.5 A + buck 0.4 A (1.1 A) | 32 / 30 / 27 mV | 30 / 28 / 23 mV | 38 / 36 / 32 mV | 34 / 32 / 28 mV | 82 / 78 / 70 mV |
+| Load case | Drop U402 -> port switches, rev 12 | rev 11 |
+|---|---|---|
+| USB-rated: 3 ports x 0.5 A + buck 0.5 A (2.0 A) | **91 / 82 / 59 mV** | 206 / 185 / 148 mV |
+| typical: 0.1 / 0.1 / 0.5 A + buck 0.4 A (1.1 A) | 34 / 32 / 28 mV | 82 / 78 / 70 mV |
 
-On 0.16.0 the +5 V track runs 174 mm on F.Cu, 95.5 mm on B.Cu and 13.6 mm on In2.Cu (12 % of the loss; 0.15.0:
-35.5 mm on In2.Cu, 59 %; rev 12: 24 mm, 31 %; rev 11: 106 mm, 84 %).  Its most loaded inner segment, 2.6 mm at
-(170.25, 151.75-154.35) on the way to the port switches, carries 1.5 A at 71 A/mm2: ~8 K by IPC-2221's external chart,
-at most 38 K by its internal one, which ignores the planes either side (0.15.0: 2.0 A, 95 A/mm2, ~15 K; rev 11: 2.0 A,
-219 A/mm2, ~61 K).  The hottest copper on rev 12, 0.15.0 and 0.16.0 alike is 0.5 mm outer track at 2.0 A, 114 A/mm2
-(~21 K): the whole 52 mm `VBUS_PWR` feed from J301 and +5 V's 0.5 mm neck out of U402.
-
-**A full run can pass every board check with a bad feed.**  The router has no drop budget, and three full runs of
-0.15.0 from the same sources gave 495, 121 and 96 mV at the USB-rated load (the first ran +5 V 196 mm on B.Cu, the
-second 96.5 mm on In2.Cu).  0.16.0's trial runs gave 212 mV once (+5 V 158 mm on B.Cu).  Run the drop after every full
-run (§12).
+The +5 V track on In2.Cu is down to 24 mm (1.39 mm wide, 31 % of the loss; rev 11: 106 mm, 84 %), its most loaded
+segment carries 1.5 A at 71 A/mm2 (~8 K by IPC-2221's external chart; rev 11: 2.0 A, 219 A/mm2, ~61 K).
 
 **At the ports**, from a 5.00 V adapter at the USB-rated load, with typical on-resistance at 25 C:
 
 | Step | Drop |
 |---|---|
-| VBUS_PWR copper, USB-C -> TPS2121 (`dc_drop.py VBUS_PWR J301 U402.7=2.0`) | 48 mV |
+| VBUS_PWR copper, USB-C -> TPS2121 (`dc_drop.py VBUS_PWR J301 U402.7=2.0`) | 47 mV |
 | TPS2121, 2.0 A x 56 mOhm (tps2121.pdf, RON) | 112 mV |
-| **+5 V copper, TPS2121 -> port switch** | **49-84 mV** (0.15.0: 66-96 mV; rev 12: 59-91 mV; rev 11: 148-206 mV) |
+| **+5 V copper, TPS2121 -> port switch** | **59-91 mV** (rev 11: 148-206 mV) |
 | TPS2553, 0.5 A x 85 mOhm (tps2553.pdf, rDS(on), DBV) | 43 mV |
-| VBUS copper, port switch -> USB-A (`dc_drop.py VBUS_KB U1203.6 J1201=0.5`) | 8-9 mV |
-| **Port voltage** | **4.71-4.74 V** (0.15.0: 4.69-4.72 V; rev 12: 4.70-4.73 V; rev 11: 4.58-4.64 V; USB asks for >= 4.75 V, devices work down to about 4.4 V) |
+| VBUS copper, port switch -> USB-A (`dc_drop.py VBUS_KB U1203.6 J1201=0.5`) | 7-9 mV |
+| **Port voltage** | **4.70-4.73 V** (rev 11: 4.58-4.64 V; USB asks for >= 4.75 V, devices work down to about 4.4 V) |
 
-At the full rated load the ports reach 4.75 V from a 5.05 V adapter; at the typical load they sit at 4.84-4.87 V from
+At the full rated load the ports reach 4.75 V from a 5.05 V adapter; at the typical load they sit at 4.83-4.87 V from
 5.00 V.  Measure the port voltage under load on the first boards.
 
 **1 oz inner copper is not needed.**  JLC's 3313 build with it has 0.092 mm prepreg, 0.03 mm inner copper and a
@@ -180,7 +164,7 @@ pad, and each via sits inside one of the footprint's 9 paste openings; there is 
 
 | Via covering | Effect |
 |---|---|
-| **Epoxy Filled & Capped** (recommended) | the vias are filled and plated over, so the exposed pads are flat and keep their paste.  Applies to all 1014 vias; extra cost on 4 layers (the quote shows it) |
+| **Epoxy Filled & Capped** (recommended) | the vias are filled and plated over, so the exposed pads are flat and keep their paste.  Applies to all 1059 vias; extra cost on 4 layers (the quote shows it) |
 | Tented | the gerbers' default.  Paste in the open pad flows into the vias during reflow: less solder under the four chips, possible voids |
 | Plugged / Untented | meant for vias outside pads; no advantage here |
 
@@ -191,7 +175,7 @@ The hubs' decoupling caps on the bottom side have their GND stubs to these vias,
 | Option | Select | Why |
 |---|---|---|
 | PCBA type | **Standard** | double-sided assembly (Economic has been one side only) |
-| Assembly side | **Both sides** | 42 parts on the bottom, 34 without the Bluetooth module (§9) |
+| Assembly side | **Both sides** | 34 parts on the bottom (§9) |
 | PCBA qty | 5, or 2 | 2 is the minimum; assembling 2 and keeping 3 bare boards cuts the parts cost of a first prototype |
 | Edge rails / fiducials | **Added by JLCPCB** | the board has no fiducials, and the connectors sit flush with both long edges (§2).  JLC adds two 5 mm rails (120 x 90 mm) |
 | Confirm parts placement | **Yes** | a JLC engineer checks the placement before production; the bottom rows use a derived rotation convention (§9) |
@@ -214,43 +198,40 @@ The hubs' decoupling caps on the bottom side have their GND stubs to these vias,
 
 ## 8. Parts and stock
 
-From `python3 tools/jlc_stock.py` on 2026-11-09, for 5 assembled boards with the Bluetooth module:
+From `python3 tools/jlc_stock.py` on 2026-10-28, for 5 assembled boards:
 
 | Part | LCSC | Need | Stock | |
 |---|---|---|---|---|
-| **TS3USB3031** (U601, U1202, U1302, U1402) | C2652459 | 20 | **0** | **blocks the order** (82 on 2026-10-28) |
-| AT32F405CCT7 | C47115471 | 10 | 114 | thin (below 20 x the need) |
-| RP2354B | C39843328 | 5 | 632 | in stock again (0 on 2026-10-28) |
-| USB-A receptacle | C2798029 | 15 | 3848 | |
-| TLV73311 | C2865431 | 5 | 3924 | |
-| ESP32-C3-MINI-1-H4X (U1601, Bluetooth variant only) | C41349510 | 5 | 4772 | |
-| 12 MHz crystal | C20625731 | 15 | 9411 | |
-| the other 34 lines | | | 7800+ | |
+| **RP2354B** (U501) | C39843328 | 5 | **0** | **blocks the order** |
+| TS3USB3031 | C2652459 | 20 | 82 | thin (below 10 x the need) |
+| AT32F405CCT7 | C47115471 | 10 | 132 | |
+| 12 MHz crystal | C20625731 | 15 | 2016 | |
+| USB-A receptacle | C2798029 | 15 | 4224 | |
+| TLV73311 | C2865431 | 5 | 4758 | |
+| the other 34 lines | | | 10 000+ | |
 
-24 of the 41 lines are Extended parts (23 of 40 without the module); JLC charges a loading fee per Extended line
-(shown in the quote).  Stock is not reserved until the order is paid, so re-run the tool right before ordering, or buy
-the thin lines into your JLC parts inventory together with the blocking one.
+23 of the 40 lines are Extended parts; JLC charges a loading fee per Extended line (shown in the quote).  Stock is not
+reserved until the order is paid, so re-run the tool right before ordering, or buy the thin lines into your JLC parts
+inventory together with the RP2354B.
 
-Ways round the TS3USB3031:
+Ways round the RP2354B:
 
-- **JLC global sourcing / parts pre-order:** buy 20 into your JLC parts inventory, wait for them to arrive, then order
-  the PCBA.  The usual path.
+- **JLC global sourcing / parts pre-order:** buy 5 into your JLC parts inventory, wait for them to arrive, then order
+  the PCBA.  The usual path.  Ask for stepping A4 if you have the choice; A2 works on this board too (analysis.md
+  finding 14).
 - **Consign:** buy the chips elsewhere and ship them to JLC.
 - **Wait** for LCSC stock.
-- **Fit them by hand:** order with the four marked "do not place".  A 0.4 mm pitch WQFN-12 (2.25 x 2 mm) with no exposed
-  pad: hot air or a hotplate, and four per board.
+- **Fit it by hand:** order with U501 marked "do not place".  This is a 0.4 mm pitch QFN-80 with an exposed pad, so it
+  needs hot air or a hotplate.  It is easier with filled vias (§6).
 
-The RP2354B blocked the order on 2026-10-28 (0 in stock).  If it runs out again: the same four ways (ask for stepping
-A4 if you have the choice; A2 works on this board too, analysis.md finding 14), or fit U501 by hand, a 0.4 mm pitch
-QFN-80 with an exposed pad (easier with filled vias, §6).  The RP2350B (C42415655) is not a drop-in: it has no
-in-package flash and would need a QSPI flash chip and a re-layout around the MCU.
+The RP2350B (C42415655, in stock) is not a drop-in: it has no in-package flash and would need a QSPI flash chip and a
+re-layout around the MCU.
 
 ## 9. The bottom side
 
-42 parts with the Bluetooth module, 34 without (`fab_facts.py`, "assembly"): 32 x 100 nF 0402 under their supply pins
-(RP2354B C501-C506, C513, C515; AT32s C1001-C1004, C1101-C1104; hubs C702-C705, C801-C806, C901-C906), the key LED D1501
-and the MX hot-swap socket SW1501; with the module also U1601 (ESP32-C3-MINI-1-H4X) and its passives C1601 (10 uF),
-C1602 (100 nF), C1603 (1 uF) and R1601-R1604 (10 k).
+34 parts (`fab_facts.py`, "assembly"): 32 x 100 nF 0402 under their supply pins (RP2354B C501-C506, C513, C515;
+AT32s C1001-C1004, C1101-C1104; hubs C702-C705, C801-C806, C901-C906), the key LED D1501 and the MX hot-swap socket
+SW1501.
 
 `make_fab.py` writes the bottom rows with the convention of kicad-jlcpcb-tools: the rotation of a flipped footprint
 is `180 - phi + theta`, and the part offset is mirrored in x.  In JLC's placement preview, check:
@@ -267,10 +248,6 @@ is `180 - phi + theta`, and the part offset is mirrored in x.  In JLC's placemen
   of symmetry, so barrels and tabs stay where they were).  JLC's land pattern for the socket is 0.51 mm wider than
   ours, so its tabs may look 0.26 mm off our pads on each side while the part is centred.  That is expected: do not
   let it be "corrected" off-centre.
-- **U1601** (Bluetooth variant): the module's antenna end (the end with no pads under it) at the east board edge,
-  0.45 mm inside it, over the bare antenna keep-out; seen from the top, pin 1 (GND) is the east end of the pad row along
-  the module's south side, next to the antenna.  JLC's footprint for C41349510 matched ours with no rotation or offset
-  correction (`jlc_corrections.json`).
 - A few of the 32 caps, to confirm the bottom transform in general.  They are not polarized, so any 180 degree error
   there is harmless.
 
@@ -299,13 +276,11 @@ The stack-up, filled vias, assembly, through-hole soldering, parts and Extended-
 Before ordering:
 
 1. Run the chain in `README.md` on the final board.  DRC with schematic parity, `check_copper.py`, `check_spacing.py`,
-   `check_aux.py` and `check_usb_si.py` must be clean, and the +5 V drop (§5) near the table's.  Then run
-   `make_fab.py`.
+   `check_aux.py` and `check_usb_si.py` must be clean.  Then run `make_fab.py`.
 2. Check JLC's impedance calculator result for 0.15 / 0.15 mm on JLC04161H-3313 (§4).
-3. Resolve the TS3USB3031 and re-run `tools/jlc_stock.py` (§8).
-4. Choose the variant (§1: with or without the Bluetooth module), upload the gerbers and that BOM/CPL pair; set §3 and
-   §7, paste the two remarks.
-5. In the placement preview, check D1501, SW1501, U1601 (with the module) and a few bottom caps (§9).
+3. Resolve the RP2354B and re-run `tools/jlc_stock.py` (§8).
+4. Upload the three files; set §3 and §7, paste the two remarks.
+5. In the placement preview, check D1501, SW1501 and a few bottom caps (§9).
 6. Expect DFM questions about the vias in pads, D1501's 0.2 mm edge clearance and the flush connectors at the rails;
    the remarks answer them.
 

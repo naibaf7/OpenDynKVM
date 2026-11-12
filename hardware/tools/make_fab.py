@@ -6,10 +6,6 @@ Writes bom/jlcpcb_bom.csv and bom/jlcpcb_cpl.csv from kvm.kicad_pcb (LCSC number
 come from the symbols' LCSC field).  Once the board is routed it also writes gerbers + drill
 files to fab/ and zips them.  Coordinates use the board's place/drill origin (bottom-left).
 
-Two assembly variants (0.16.0): every part, and every part but those with the field Fit = BT (the Bluetooth module and
-its parts, hardware/tools/gen_schematic.py block 16), written as jlcpcb_bom.csv / jlcpcb_cpl.csv and
-jlcpcb_bom_nobt.csv / jlcpcb_cpl_nobt.csv.  The board works either way: the firmware finds the module or its absence.
-
 JLC assembles exactly the parts with an LCSC number, on both sides (since 2026-10-27: the per-pin decoupling
 caps under the chips make it double-sided assembly anyway, so the MX key's hot-swap socket and the reverse-mount key
 LED go to JLC too; only the switch itself is plugged in afterwards).  A part with only an MPN would go to
@@ -101,37 +97,30 @@ def main():
                 raise SystemExit(f'{ref} has neither an LCSC number nor an MPN')
             continue
         key = (fp.GetFPID().GetLibItemName().wx_str(), lcsc)
-        fit = fp.GetFieldText('Fit') if fp.HasField('Fit') else ''
-        groups.setdefault(key, []).append((ref, fp.GetValue(), fit))
+        groups.setdefault(key, []).append((ref, fp.GetValue()))
         qx, qy, rot = jlc_place(fp, lcsc, corr)
-        rows.append((ref, qx - pcbnew.ToMM(origin.x), pcbnew.ToMM(origin.y) - qy, side, rot, fit))
+        rows.append((ref, qx - pcbnew.ToMM(origin.x), pcbnew.ToMM(origin.y) - qy, side, rot))
+
 
     os.makedirs(BOMDIR, exist_ok=True)
-    for suffix, keep in (('', lambda fit: True), ('_nobt', lambda fit: fit != 'BT')):
-        with open(os.path.join(BOMDIR, f'jlcpcb_bom{suffix}.csv'), 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(['Comment', 'Designator', 'Footprint', 'LCSC Part #'])
-            for (fpname, lcsc), items in sorted(groups.items(), key=lambda kv: natural(min(r for r, _, _ in kv[1]))):
-                items = [(r, v) for r, v, fit in items if keep(fit)]
-                if not items:
-                    continue
-                refs = sorted((r for r, _ in items), key=natural)
-                values = sorted({v for _, v in items})
-                w.writerow(['/'.join(values), ','.join(refs), fpname, lcsc])
-        with open(os.path.join(BOMDIR, f'jlcpcb_cpl{suffix}.csv'), 'w', newline='') as f:
-            w = csv.writer(f)
-            w.writerow(['Designator', 'Mid X', 'Mid Y', 'Layer', 'Rotation'])
-            for ref, x, y, layer, rot, fit in sorted(rows, key=lambda r: natural(r[0])):
-                if keep(fit):
-                    w.writerow([ref, f'{x:.3f}mm', f'{y:.3f}mm', layer, f'{rot:.1f}'])
+    with open(os.path.join(BOMDIR, 'jlcpcb_bom.csv'), 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['Comment', 'Designator', 'Footprint', 'LCSC Part #'])
+        for (fpname, lcsc), items in sorted(groups.items(), key=lambda kv: natural(min(r for r, _ in kv[1]))):
+            refs = sorted((r for r, _ in items), key=natural)
+            values = sorted({v for _, v in items})
+            w.writerow(['/'.join(values), ','.join(refs), fpname, lcsc])
+    with open(os.path.join(BOMDIR, 'jlcpcb_cpl.csv'), 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['Designator', 'Mid X', 'Mid Y', 'Layer', 'Rotation'])
+        for ref, x, y, layer, rot in sorted(rows, key=lambda r: natural(r[0])):
+            w.writerow([ref, f'{x:.3f}mm', f'{y:.3f}mm', layer, f'{rot:.1f}'])
     with open(os.path.join(BOMDIR, 'hand_assembly.csv'), 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['Designator', 'Value', 'MPN', 'Layer', 'X', 'Y'])
         for ref, val, mpn, side, x, y in sorted(hand, key=lambda r: natural(r[0])):
             w.writerow([ref, val, mpn, side, f'{x:.3f}mm', f'{y:.3f}mm'])
-    bt = sum(1 for r in rows if r[5] == 'BT')
-    print(f'BOM: {len(groups)} lines, CPL: {len(rows)} parts ({len(rows) - bt} without the Bluetooth module\'s {bt}), '
-          f'hand assembly: {len(hand)} parts -> {BOMDIR}')
+    print(f'BOM: {len(groups)} lines, CPL: {len(rows)} parts, hand assembly: {len(hand)} parts -> {BOMDIR}')
 
     if not len(board.GetTracks()):
         print('board not routed yet: skipping gerbers/drill')

@@ -3,19 +3,15 @@
 KVM project footprints -- generator (KiCad 10 pcbnew API).
 
 Footprints for parts KiCad's library lacks are converted from the EasyEDA footprint JLCPCB
-assembles with (so JLC's placement needs no correction), plus the MX hot-swap key footprint
-and the OpenDynKVM logo as silkscreen (from ../branding/, drawn by branding/make_logo.py).
+assembles with (so JLC's placement needs no correction), plus the MX hot-swap key footprint.
 EasyEDA data is cached in tools/easyeda_cache/ (fetched like tools/jlc_align.py does).
 
 Run from hardware/ (network only for uncached parts):   python3 tools/gen_footprints.py
 """
 import json
-import math
 import os
-import re
 import subprocess
 import sys
-from functools import reduce
 
 import pcbnew
 
@@ -29,9 +25,7 @@ HDRS = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML
 # KiCad footprint name -> (LCSC part, description, fab body (w, h) centred on the pad pattern or None)
 FROM_EASYEDA = {
     'TI_RUX0012A_VQFN-HR-12_2x2.5mm_P0.5mm': ('C485916', 'TI RUX0012A VQFN-HR-12 2.0x2.5 mm (TPS2121), JLC land pattern', (2.0, 2.5)),
-    # The pads are the package's back row, overhanging its body at -Y; the lens is the long face at +Y, away from the
-    # pads (datasheet §4, §6).  Every board up to 0.16.0 read it the other way round (errata E3).
-    'LED_SK6812SIDE-A_4.0x1.6mm': ('C5378721', 'SK6812SIDE-A side-emitting RGB LED 4.0x2.0x1.6 mm; light exits towards +Y (away from the pads)', None),
+    'LED_SK6812SIDE-A_4.0x1.6mm': ('C5378721', 'SK6812SIDE-A side-emitting RGB LED 4.0x2.0x1.6 mm; light exits towards -Y (pad side)', None),
 }
 
 
@@ -200,156 +194,11 @@ def mx_hotswap():
     return name, fp
 
 
-# The logo, mark over wordmark, LOGO_W mm wide.  At that width the wordmark's thinnest strokes ("KVM", Montserrat
-# Regular) are 0.14 mm; LOGO_GAIN thickens every edge so they reach the 0.15 mm JLC prints as a silkscreen line.
-LOGO_SVG = os.path.join(HERE, '..', 'branding', 'opendynkvm-logo-on-light.svg')
-LOGO_W = 14.0
-LOGO_GAIN = 0.01
-
-
-def svg_rings(d, step=1.0):
-    """The closed subpaths of SVG path data (absolute M, L, H, V, C, Q, Z) as polylines, curves cut into pieces of
-    about `step` units."""
-    rings, ring, pos = [], [], (0.0, 0.0)
-    tokens = re.findall(r'[MLHVCQZ]|-?(?:\d+\.?\d*|\.\d+)(?:e-?\d+)?', d)
-    i, cmd = 0, None
-
-    def take(n):
-        nonlocal i
-        vals = [float(t) for t in tokens[i:i + n]]
-        i += n
-        return vals
-
-    def curve(pts):
-        length = sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))
-        n = max(2, math.ceil(length / step))
-        k = len(pts) - 1
-        for j in range(1, n + 1):
-            t = j / n
-            ring.append(tuple(sum(math.comb(k, m) * (1 - t) ** (k - m) * t ** m * p[c] for m, p in enumerate(pts))
-                              for c in (0, 1)))
-
-    while i < len(tokens):
-        if tokens[i].isalpha():
-            cmd = tokens[i]
-            i += 1
-        if cmd == 'M':
-            if len(ring) > 2:
-                rings.append(ring)
-            pos = tuple(take(2))
-            ring = [pos]
-            cmd = 'L'                            # further pairs after M are lines
-        elif cmd == 'L':
-            pos = tuple(take(2))
-            ring.append(pos)
-        elif cmd == 'H':
-            pos = (take(1)[0], pos[1])
-            ring.append(pos)
-        elif cmd == 'V':
-            pos = (pos[0], take(1)[0])
-            ring.append(pos)
-        elif cmd in 'CQ':
-            v = take(6 if cmd == 'C' else 4)
-            pts = [pos] + [tuple(v[j:j + 2]) for j in range(0, len(v), 2)]
-            curve(pts)
-            pos = pts[-1]
-        elif cmd == 'Z':
-            if len(ring) > 2:
-                rings.append(ring)
-            ring = []
-            cmd = None
-        else:
-            sys.exit(f'{LOGO_SVG}: unexpected path data at {tokens[i]!r}')
-    if len(ring) > 2:
-        rings.append(ring)
-    return rings
-
-
-def logo():
-    """The OpenDynKVM logo as filled F.SilkS polygons, centred on the origin; board-only, not in the BOM or the CPL."""
-    text = open(LOGO_SVG).read()
-    w, h = (float(v) for v in re.search(r'viewBox="0 0 ([\d.]+) ([\d.]+)"', text).groups())
-    d = ' '.join(re.findall(r' d="([^"]+)"', text))
-    k = LOGO_W / w
-    from shapely.geometry import Polygon          # only the logo needs shapely
-    rings = [Polygon([((x - w / 2) * k, (y - h / 2) * k) for x, y in r]).buffer(0) for r in svg_rings(d)]
-    ink = reduce(lambda a, b: a.symmetric_difference(b), rings)       # the even-odd area: holes stay holes
-    ink = ink.buffer(LOGO_GAIN, join_style='mitre')
-    name = f'OpenDynKVM_Logo_{LOGO_W:g}mm_SilkScreen'
-    fp = pcbnew.FOOTPRINT(None)
-    for poly in getattr(ink, 'geoms', [ink]):
-        s = pcbnew.SHAPE_POLY_SET()
-        o = s.NewOutline()
-        for x, y in poly.exterior.coords[:-1]:
-            s.Append(pcbnew.FromMM(x), pcbnew.FromMM(y), o)
-        for hole in poly.interiors:
-            hi = s.NewHole(o)
-            for x, y in hole.coords[:-1]:
-                s.Append(pcbnew.FromMM(x), pcbnew.FromMM(y), o, hi)
-        s.Fracture()                             # holes bridged into the outline, as KiCad stores a filled polygon
-        shape = pcbnew.PCB_SHAPE(fp)
-        shape.SetShape(pcbnew.SHAPE_T_POLY)
-        shape.SetPolyShape(s)
-        shape.SetLayer(pcbnew.F_SilkS)
-        shape.SetWidth(0)
-        shape.SetFilled(True)
-        fp.Add(shape)
-    fp.SetFPID(pcbnew.LIB_ID('CustomFootprints', name))
-    fp.SetLibDescription(f'OpenDynKVM logo (branding/opendynkvm-logo-on-light.svg), {LOGO_W:g} mm wide, silkscreen')
-    fp.SetAttributes(pcbnew.FP_EXCLUDE_FROM_POS_FILES | pcbnew.FP_EXCLUDE_FROM_BOM | pcbnew.FP_BOARD_ONLY)
-    fp.SetAllowMissingCourtyard(True)
-    fp.Reference().SetText('LOGO**')
-    fp.Reference().SetLayer(pcbnew.F_SilkS)
-    fp.Reference().SetVisible(False)
-    fp.Value().SetText(name)
-    fp.Value().SetLayer(pcbnew.F_Fab)
-    fp.Value().SetVisible(False)
-    return name, fp, ink.bounds
-
-
-MINI1_SRC = ('/usr/share/kicad/footprints/RF_Module.pretty', 'ESP32-C6-MINI-1')
-
-
-def esp32_c3_mini():
-    """ESP32-C3-MINI-1 (0.16.0's Bluetooth LE coprocessor).  Its land pattern (datasheet v2.2 figure 11-1: 48 pads
-    0.8 x 0.4 at 0.8 mm, a 3 x 3 grid of 1.45 mm ground pads, four 0.7 mm corner pads, 13.2 x 16.6 mm body) is the
-    one KiCad ships for the ESP32-C6-MINI-1, the same module outline; the pads are taken from there.  Left out: that
-    footprint's keep-out zone (43.2 x 20.4 mm, Espressif's 15 mm round a module whose antenna sits on the board) and
-    its courtyard, which follows that zone.  The board places its own antenna keep-out (tools/gen_pcb.py ANT_KEEPOUT),
-    cut to what is on the board, and the courtyard here is the module body: the antenna end at y = -11, the pad end
-    at +5.6 (the C3 and C6 modules have the same outline, datasheet figure 10-1)."""
-    src = pcbnew.FootprintLoad(*MINI1_SRC)
-    fp = pcbnew.FOOTPRINT(None)
-    fp.SetAttributes(pcbnew.FP_SMD)
-    for p in src.Pads():
-        q = p.Duplicate()
-        q.SetParent(fp)
-        fp.Add(q)
-    add_rect(fp, pcbnew.F_Fab, -6.6, -11.0, 6.6, 5.6, 0.1)
-    add_line(fp, pcbnew.F_Fab, (-6.6, -5.6), (6.6, -5.6), 0.1)          # where the antenna area begins
-    add_rect(fp, pcbnew.F_SilkS, -6.75, -11.15, 6.75, 5.75, 0.12)
-    add_line(fp, pcbnew.F_SilkS, (-7.2, -4.0), (-7.2, -3.2), 0.12)      # pin 1 mark
-    name = 'ESP32-C3-MINI-1'
-    finish(fp, name, 'Espressif ESP32-C3-MINI-1 (-H4X), 13.2 x 16.6 mm LGA-53, PCB antenna towards -Y; land pattern '
-           'of datasheet v2.2 figure 11-1 (KiCad ESP32-C6-MINI-1 pads, same outline). The antenna keep-out on '
-           'the board is placed with the footprint (tools/gen_pcb.py)', (-6.6, -11.0, 6.6, 5.6))
-    return name, fp
-
-
 def main():
     os.makedirs(LIB, exist_ok=True)
     name, fp = mx_hotswap()
     pcbnew.FootprintSave(LIB, fp)
     print(f'{name}: MX holes + hot-swap socket pads')
-    name, fp = esp32_c3_mini()
-    pcbnew.FootprintSave(LIB, fp)
-    print(f'{name}: {len(fp.Pads())} pads (from KiCad {MINI1_SRC[1]})')
-    try:
-        name, fp, (x0, y0, x1, y1) = logo()
-        pcbnew.FootprintSave(LIB, fp)
-        print(f'{name}: {x1 - x0:.2f} x {y1 - y0:.2f} mm')
-    except ImportError:
-        print('logo: shapely is not installed, the logo footprint is left as it is')
     for name, (lcsc, desc, body) in FROM_EASYEDA.items():
         fp = from_easyeda(name, lcsc, desc, body)
         pcbnew.FootprintSave(LIB, fp)

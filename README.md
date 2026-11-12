@@ -7,6 +7,11 @@
 
 # OpenDynKVM
 
+> **Branch `hardware-0.12.0`:** the board as it was ordered from JLCPCB on 2026-10-29 (hardware 0.12.0, revision
+> 12), with the generator scripts and the router that produced it, in [`hardware/`](hardware/). Everything else is
+> as on `main`: firmware 0.1.10, which runs on this board, the host software and the documentation. `main` has the
+> current design (0.17.0). The faults found on this board and their workarounds: [hardware/errata.md](hardware/errata.md).
+
 An open-source USB KVM switch for two PCs that switches in under a millisecond. Each PC is permanently connected to a
 keyboard, mouse and "other" device emulated by the KVM ("persistent emulation"), so a switch only changes where the
 reports go: no PC sees a disconnect, nothing re-enumerates, and High-Speed USB on the PC side adds about 0.1 ms of

@@ -42,8 +42,7 @@ def gap(a, b):
 def main():
     board = pcbnew.LoadBoard(PCB)
     edge = bbox(board.GetBoardEdgesBoundingBox())
-    # board-only footprints without pads are print (logos), not parts: no body to space
-    fps = {fp.GetReference(): fp for fp in board.GetFootprints() if fp.Pads() or not fp.IsBoardOnly()}
+    fps = {fp.GetReference(): fp for fp in board.GetFootprints()}
     # courtyards and pad gaps are only compared within one side: since rev 9 the per-pin decoupling caps sit on B.Cu
     # *under* their chip on purpose, which is not a spacing problem (a footprint flipped to B.Cu has no F.CrtYd at all)
     def side_court(fp):

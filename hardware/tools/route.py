@@ -37,7 +37,6 @@ Debug hooks for one net without a full run (tools/check_copper.py still checks t
 Neither hook changes a full run.
 """
 
-import collections
 import ctypes
 import functools
 import heapq
@@ -48,7 +47,6 @@ import re
 import subprocess
 import sys
 import time
-import types
 
 import numpy as np
 import pcbnew
@@ -98,9 +96,6 @@ EDGE_KEEP = 1.6
 EDGE_PAD_R = 1.2
 HOLE_CLR = 0.25                # copper to NPTH hole, hole to hole
 THERMAL_GAP, ZONE_MIN_W = 0.3, 0.2   # the pours' thermal-relief gap round through-hole pads, and their minimum width
-# Room for a GND through-hole pad's thermal spokes on the outer layers (Board.__init__): other nets keep CLR from the pad
-# grown by this much, so the pours (0.2 mm clearance) can lay THERMAL_GAP and a ZONE_MIN_W ring all round it
-THT_SPOKE_ROOM = THERMAL_GAP + ZONE_MIN_W + 0.05
 VIA_D, VIA_DRILL = 0.6, 0.3
 EPS = 0.005
 W_SIG, W_GND = 0.15, 0.3
@@ -166,7 +161,6 @@ PLANES = {'GND': 'In1.Cu', '+3V3': 'In2.Cu'}
 LAYER_COST = (1.0, 1.1, 1.3)   # per-step cost factor F.Cu, B.Cu, In2.Cu (B.Cu nearly as cheap: a full signal layer)
 VIA_COST = 30.0                # in grid steps
 TURN_COST = {1: 3.0, 2: 8.0}   # 45 deg, 90 deg (in grid steps); sharper turns forbidden
-PAIR_SKEW_MAX = 1.2            # mm: a pair's skew budget, as check_usb_si.py SKEW_MAX and check_copper.py PAIR_SKEW_MAX
 KINK_SKEW_MAX = 0.45           # mm of pair skew a lane leg may take from its own corners before the leg is searched
 #                              again with both layers: a turn of exterior angle phi costs the pair PAIR_O*tan(phi/2) a
 #                              side (outside line longer, inside shorter), so a zig-zag of two 45s is near this and a
@@ -240,32 +234,6 @@ FANOUT_IC = {'U501': dict(zone=RP_ZONE, max=_sides(4.6, 4.6, 3.0, 3.45), end=_si
 # and has to climb past it before turning west to pins 67/66, whose own lanes it then descends; without the lane the
 # fan-out's easternmost vias sit in that climb.
 PAIR_LANE = 0.7                # fan-out vias keep this far (along the side) from a lane a pair runs through
-# Pins that get no planned via, only a lane straight out of the pin, which the fan keeps clear (as for bus stubs); the
-# signal phase routes them, on F.Cu as far as it can.  None since 0.16.0: the Bluetooth module's UART pins (U501.36/37)
-# were tried here, and as fixed lanes they split the south row's plan in two and pushed pins 21-35's via sites west
-# (MS_SEL1 and RP_SWCLK lost theirs).  They get planned sites like any pin now, held for them until they route, last.
-FANOUT_SURFACE = set()
-# Pins the dense fan-out leaves alone: their via comes from the plane fan-out (step 3), round whatever is there by then.
-# U501.29 (+3V3) sits beside the crystal input (pin 30): planned, its via sat on the crystal's way down past R502, the
-# crystal lifted it ("lifted 3 plane fan-out items for RP_XIN") and in one run the pin was left with no via at all (DRC:
-# U501.29 unconnected).  Left alone, the plane fan-out ties it inwards along the pin row, as on 0.15.0.
-FANOUT_SKIP = {'U501.29'}
-# Crystal lines laid as fixed copper before the dense fan-outs are planned (reserve_xtal_lanes), so the plans go round
-# them.  The RP2354B's crystal input has to cross the fan-out of pins 33-40 to reach Y501, and 0.15.0 threaded it
-# through the room pins 36-39 left; 0.16.0 put the Bluetooth module's UART on pins 36/37, and in full runs the crystal,
-# routed after the fan-out was planned, found no way through ("no way through at all"), or found one and shut a
-# neighbour in - every via spot west of R502 boxed in MS_FLT (pin 28), every one east of it RP_SWCLK (pin 33).  This
-# path drops to B.Cu right under pins 29/30, above R502 (0.24 mm off pin 29, 0.18 mm off R502), runs on B.Cu along
-# y 141.85 between the pin row and the via rows (y 143.95 / 144.65), so every south pin's lane crosses over it, comes up
-# at (152.75, 141.85) and goes on F.Cu to Y501: 13.5 mm, two vias (0.15.0: 15.5 mm, two vias).  Pins 29-32 need no
-# outward escape (29 ties inwards, 30/31 are the crystal, 32 is +1V1), so it takes no other pin's way out.  If copper (a
-# pair) is in its way it is not laid, and the line is routed like any other.
-XTAL_LANES = {'RP_XIN': [
-    ('seg', (147.80, 141.35, 147.70, 141.85, W_SIG, 0)),
-    ('via', (147.70, 141.85)),
-    ('seg', (147.70, 141.85, 152.75, 141.85, W_SIG, 1)),
-    ('via', (152.75, 141.85)),
-    ('seg', (152.75, 141.85, 159.30, 141.85, W_SIG, 0)), ('seg', (159.30, 141.85, 159.75, 142.30, W_SIG, 0))]}
 _hub_fan = dict(zone=_sides(0.4, 0.4, 0.4, 0.4), max=_sides(3.6, 3.6, 3.6, 3.6), end=_sides(2.5, 2.5, 2.5, 2.5),
                 step=_sides(*[FANOUT_STEP] * 4))
 FANOUT_IC['U701'] = dict(_hub_fan, max=_sides(2.4, 3.6, 3.6, 3.6), lanes={'b': [163.75, 167.0], 'l': [118.0]})
@@ -322,13 +290,6 @@ POWER_ORDER = ['VBUS_PC1', 'VBUS_PWR', 'VBUS_PC2', 'VBUS_PCS', 'SW_3V3', 'RP_VRE
 NOROUTE_BODY = {'J101': (0,), 'J201': (0,), 'J301': (0,), 'J1201': (0,), 'J1301': (0,), 'J1401': (0,),
                 'SW501': (0,)}
 EP_PADS = {('U501', '81'): 3, ('U701', '37'): 3, ('U801', '37'): 3, ('U901', '37'): 3}   # n x n via arrays
-# Footprints whose GND pads join their own layer's GND pour instead of taking a via each (0.16.0): the Bluetooth module
-# U1601 on B.Cu.  Its 22 ground pads (a row of 13 along the antenna end, four corners, the 3 x 3 centre grid) lie in
-# the B.Cu GND zone, which the stitching vias round the module tie to In1.Cu; a via per pad would put 22 drills under
-# the module, and the row along the antenna end would sit at the antenna keep-out's edge.  Its 3V3 pad takes a plane
-# via like any other; the signal pads leave on B.Cu (the module needs no fan-out reservation: 0.8 mm pitch, and every
-# failed 0.16.0 route of its lines failed at the RP2354B's end, never here).
-POUR_PADS = {'U1601'}
 # parts whose pads need a reserved way out (a straight run plus a via site) before the signals are routed, the same
 # as a dense IC's pins: the edge-mounted parts would otherwise have no escape left, and the 0.5 mm-pitch power path
 # is closed off by the 0.5-0.6 mm rails around it
@@ -598,18 +559,6 @@ class Board:
                     self.pads.setdefault(name, []).append((key, shapes))
         # plane nets' through-hole pads: legal_via keeps plane vias out of their thermal relief
         self.tht_pads = {n: [s[0] for _, s in lst if len(s[0].layers) > 1] for n, lst in self.pads.items() if n in PLANES}
-        # ... and every other net keeps out of the ring the outer GND pours need round them (THT_SPOKE_ROOM): KiCad wants
-        # two of a pad's thermal spokes to reach the pour (the project's min_resolved_spokes), and a track that runs
-        # closer than gap + fill + zone clearance cuts them off.  Measured on 0.15.0's first full run: +5V and VBUS_PWR
-        # on B.Cu either side of J301's south-west shield pad left it one spoke, into a 3.4 mm2 island - DRC
-        # starved_thermal, the run's only violation.  The grown pad goes into the static field as GND copper, so GND's
-        # own copper ignores it and every other net's tracks and vias keep CLR from it.
-        for sh in self.tht_pads.get('GND', []):
-            g, p = THT_SPOKE_ROOM, sh.p
-            q = {'circle': lambda: (p[0], p[1], p[2] + g), 'seg': lambda: (*p[:4], p[4] + g),
-                 'rect': lambda: (p[0], p[1], p[2] + g, p[3] + g, p[4], (p[5] if len(p) > 5 else 0.0) + g)}.get(sh.kind)
-            if q is not None:
-                self.static.add(Shape(sh.kind, q(), sh.net, tuple(L for L in (0, 1) if L in sh.layers)))
         X, Y = np.meshgrid(XS, YS)
         self.edge = np.minimum.reduce([X - X0, X1 - X, Y - Y0, Y1 - Y]).astype(np.float32)
         outl = pcbnew.SHAPE_POLY_SET()
@@ -621,24 +570,22 @@ class Board:
                 j0, j1, i0, i1 = cut.window(pad=2.0)
                 np.minimum(self.edge[j0:j1, i0:i1], cut.dist(X[j0:j1, i0:i1], Y[j0:j1, i0:i1]).astype(np.float32),
                            out=self.edge[j0:j1, i0:i1])
-        # rule areas (touch electrode, logos, the Bluetooth module's antenna): per-layer track keep-out, via keep-out.
-        # The grids hold copper *centres*, and KiCad tests the copper itself, so the area grows by the via radius and
-        # by a signal track's half width (0.16.0's first full run put two vias 0.15 mm outside the logo's no-via area,
-        # their pads 0.15 mm inside it: DRC items_not_allowed).  Footprint rule areas and board-level ones alike.
+        # rule areas (touch electrode): per-layer track keep-out, via keep-out
         self.keep_trk = np.zeros((NL, NY, NX), bool)
         self.keep_via = np.zeros((NY, NX), bool)
-        for z in [z for fp in board.GetFootprints() for z in fp.Zones()] + list(board.Zones()):
-            if not z.GetIsRuleArea():
-                continue
-            o = z.Outline().Outline(0)
-            pts = [(MM(o.CPoint(k).x), MM(o.CPoint(k).y)) for k in range(o.PointCount())]
-            dist = Shape('poly', pts, -1, (0,)).dist(X, Y)
-            if z.GetDoNotAllowVias():
-                self.keep_via |= dist <= VIA_D / 2 + EPS
-            if z.GetDoNotAllowTracks():
-                for L, lyr in enumerate(LAYERS):
-                    if z.IsOnLayer(lyr):
-                        self.keep_trk[L] |= dist <= W_SIG / 2 + EPS
+        for fp in board.GetFootprints():
+            for z in fp.Zones():
+                if not z.GetIsRuleArea():
+                    continue
+                o = z.Outline().Outline(0)
+                pts = [(MM(o.CPoint(k).x), MM(o.CPoint(k).y)) for k in range(o.PointCount())]
+                inside = Shape('poly', pts, -1, (0,)).dist(X, Y) <= 0
+                if z.GetDoNotAllowVias():
+                    self.keep_via |= inside
+                if z.GetDoNotAllowTracks():
+                    for L, lyr in enumerate(LAYERS):
+                        if z.IsOnLayer(lyr):
+                            self.keep_trk[L] |= inside
         self.noroute = np.zeros((NL, NY, NX), bool)
         # ... and the inside of a fine-pitch QFN (the band between its pin ring and its exposed pad) separately: no
         # F.Cu *track* may run there, but a via may - that is where a bottom-side decoupling cap's supply via belongs,
@@ -980,10 +927,7 @@ XTAL_GUARD = 0.5
 # within this of a crystal's chip (beyond its courtyard) the guard round crystal lines is off: the chip's other pins sit
 # 0.4-0.5 mm from its crystal pins and must escape past them (measured, rev 12's first crystal run: the hubs' PLLFILT,
 # the RP2354B's SWCLK and MS_FLT, AT1_CC1 walled in), and the RP2354B's series R sits there too
-XTAL_PIN_ZONE = 3.5
-# 0.16.0: 2.5 -> 3.5, so the zone covers a dense fan-out's deepest via row (FANOUT_IC: the RP2354B's south side plans
-# vias 3.3 mm below its pad tips, plus the via's radius).  With the Bluetooth module's UART on pins 36/37 the plan put
-# RP_SWDIO's site there, 0.53 mm from RP_XO_R's way south past R502, and the guard vetoed it: RP_SWDIO unrouted.
+XTAL_PIN_ZONE = 2.5
 # grid steps: a via costs a crystal line 5 mm of detour.  At 20 mm AT2_XO took a 16.9 mm F.Cu detour instead of a
 # 5.3 mm line with two vias - more track (and pickup) than the vias' ~0.4 pF are worth
 XTAL_VIA_COST = 100.0
@@ -1597,8 +1541,6 @@ def dense_fanout(B, log, ref):
         key = f'{ref}.{pad.GetNumber()}'
         if key in getattr(B, 'tied_pins', ()):
             continue                                  # tied to its cap's via inwards: no outward stub, no lane
-        if key in FANOUT_SKIP:
-            continue
         if name in PLANES and key not in open_plane:
             continue                                  # has its via already
         shapes = [sh for k, sh in B.pads.get(name, []) if k == key]
@@ -1610,8 +1552,7 @@ def dense_fanout(B, log, ref):
         else:
             side = 't' if py < cy else 'b'
             tip, along = (MM(bb.GetTop()) if side == 't' else MM(bb.GetBottom())), px
-        if name in FANOUT_LEN or name in B.pair_of or not shapes or len(terminals(B, name)) < 2 and name not in PLANES \
-                or key in FANOUT_SURFACE:
+        if name in FANOUT_LEN or name in B.pair_of or not shapes or len(terminals(B, name)) < 2 and name not in PLANES:
             fixed_at[side].append(along)              # bus stubs / pairs / routed already: a lane the fan keeps out of
             continue
         pins.append(dict(side=side, along=along, tip=tip, name=name, key=key, shapes=shapes[0], px=px, py=py))
@@ -2265,13 +2206,9 @@ PAIR_END_RUNS = {('H0_OT_DP', 'B'): 10, ('H0_MS_DP', 'A'): 10,
                  # into its crossover zone the pair cannot also start 0.5 mm east of the connector's centre line, so it
                  # ran past the zone and came back - the roundabout the two PC links never had (rev 9, measured: 38
                  # cells, P 1.78 mm / N 1.19 mm, skew 0.59 mm against J101 -> U101's 20 cells, 0.93 / 0.93, skew 0.00).
-                 # Its A end, the connector, takes the default run as well since 0.15.0: with 10 cells it failed in every
-                 # run from 0.12.0 on, "lines only 0.050 mm apart at (160.25,109.36)" (hidden until 0.15.0 by a verdict
-                 # keyed by net, see pair_failed); with 4 it routes exactly as the two PC links do, 20 cells, P 0.93 /
-                 # N 0.93 mm, skew 0.00 mm (2026-11-07).  The rev-9 measurement that had asked for 10 ("lines only 0.142
-                 # mm apart") predates the ESDs' move north.
-                 ('SVC_DP', 'A'): 10, ('SVC_DP', 'B', 'U301.4'): 10, ('H0_UP_DP', 'A'): 10,
-                 ('SVC_DP', 'A', 'J301'): PAIR_END_RUN}
+                 # Its A end does need the run (measured without it: "lines only 0.142 mm apart", the offset lines
+                 # folding at the fan-out corner).
+                 ('SVC_DP', 'A'): 10, ('SVC_DP', 'B', 'U301.4'): 10, ('H0_UP_DP', 'A'): 10}
 
 
 def straight_cells(R, cell, d, k):
@@ -2353,125 +2290,6 @@ def seg_seg_dist(a, b, c, d):
     if cross(a, b, c) * cross(a, b, d) < 0 and cross(c, d, a) * cross(c, d, b) < 0:
         return 0.0
     return min(pt_seg(a, c, d), pt_seg(b, c, d), pt_seg(c, a, b), pt_seg(d, a, b))
-
-
-def items_clash(a, b, clr=CLR):
-    """Two tracks / vias closer than clr (copper to copper); tracks on different layers never clash."""
-    (ka, da), (kb, db) = a, b
-    if ka != 'via' and kb != 'via' and da[5] != db[5]:
-        return False
-    ra = VIA_D / 2 if ka == 'via' else da[4] / 2
-    rb = VIA_D / 2 if kb == 'via' else db[4] / 2
-    pa = ((da[0], da[1]), (da[0], da[1])) if ka == 'via' else ((da[0], da[1]), (da[2], da[3]))
-    pb = ((db[0], db[1]), (db[0], db[1])) if kb == 'via' else ((db[0], db[1]), (db[2], db[3]))
-    return seg_seg_dist(pa[0], pa[1], pb[0], pb[1]) < ra + rb + clr - EPS
-
-
-def seg_free(B, d, name, step=0.05, skip=0.3):
-    """A track (x0, y0, x1, y1, w, layer) of net ``name`` clears all foreign copper and reservations by CLR (pads included,
-    the grids hold them), sampled along its centre line; its first ``skip`` mm (the pin it leaves) excepted."""
-    x0, y0, x1, y1, w, L = d
-    n = max(1, int(math.hypot(x1 - x0, y1 - y0) / step))
-    net = B.code(name)
-    thr = CLR + w / 2 - EPS
-    for k in range(n + 1):
-        t = k / n
-        x, y = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
-        if math.hypot(x - x0, y - y0) < skip:
-            continue
-        i, j = gi(x, X0), gi(y, Y0)
-        if not (0 <= i < NX and 0 <= j < NY):
-            return False
-        for fld in (B.static, B.dyn):
-            fd = fld.d1[int(L), j, i] if fld.n1[int(L), j, i] != net else fld.d2[int(L), j, i]
-            if fd < thr:
-                return False
-    return True
-
-
-def relane(B, name, pin, via, avoid):
-    """A pin's planned way out to ``via`` re-laid round ``avoid`` (items): straight out of the pin, a 45-degree jog
-    over to the via's line, on to the via - the jog as close to the pin as clears, then a straight lane to a via at the
-    same depth.  Returns the items, or None."""
-    (px, py), (vx, vy) = pin, via
-    radial_y = abs(vy - py) >= abs(vx - px)
-    out = (vy - py) if radial_y else (vx - px)
-    side = (vx - px) if radial_y else (vy - py)
-    sgn, depth, jog = (1 if out > 0 else -1), abs(out), abs(side)
-
-    def at(r, t):                         # r out of the pin, t along the side
-        return (px + t, py + sgn * r) if radial_y else (px + sgn * r, py + t)
-    cands = []
-    for k in range(int((depth - jog - 0.3) / G) + 1):
-        r = 0.3 + k * G
-        p1, p2 = at(r, 0.0), at(r + jog, side)
-        cands.append(([(px, py, *p1), (*p1, *p2), (*p2, vx, vy)], (vx, vy)))
-    end = at(depth, 0.0)
-    cands.append(([(px, py, *end)], end))
-    for segs, v in cands:
-        items = [('seg', (*sg, W_SIG, 0)) for sg in segs if math.hypot(sg[2] - sg[0], sg[3] - sg[1]) > EPS]
-        items.append(('via', v))
-        if any(items_clash(it, x) for it in items for x in avoid):
-            continue
-        if not legal_via(B, v[0], v[1], name):
-            continue
-        if all(seg_free(B, it[1], name, skip=0.3 if k == 0 else 0.0) for k, it in enumerate(items[:-1])):
-            return items
-    return None
-
-
-def reserve_xtal_lanes(B, log):
-    """XTAL_LANES: lay a crystal line's way out as fixed copper before the dense fan-outs are planned (see XTAL_LANES).
-    A planned way out of another pin that it touches (none in a full run: the plans come after) is re-laid or dropped."""
-    for name, items in XTAL_LANES.items():
-        if name not in B.netcode or len(terminals(B, name)) <= 1:
-            continue
-        hit = sorted({n for n, k, d in B.tracks if n != name and any(items_clash(it, (k, d)) for it in items)})
-        if hit:
-            log.append(f'{name}: crystal lane not reserved, copper of {hit} in the way')
-            print(log[-1], flush=True)
-            continue
-        # Another net's planned way out that touches the lane goes, pin by pin (a pin's items are its lane segments up
-        # to and including its via site).  Such a pin then gets its lane re-laid to the same via site with the jog
-        # further out (relane), if one clears the crystal's lane and everything else; otherwise it routes without one.
-        # (0.16.0: MS_FLT, pin 28, planned with a 0.4 mm jog that ran past the crystal's first via; without any lane
-        # MS_EN jogged into its column and MS_FLT was left with no way out, "no way through at all".)
-        cut = []
-        for n in list(B.escape):
-            if n == name:
-                continue
-            chains, cur = [], []
-            for it in B.escape[n]:
-                cur.append(it)
-                if it[0] == 'via':
-                    chains.append(cur)
-                    cur = []
-            if cur:
-                chains.append(cur)
-            bad = [c for c in chains if any(items_clash(it, x) for it in c for x in items)]
-            if bad:
-                B.escape[n] = [it for c in chains if c not in bad for it in c]
-                cut += [(n, c) for c in bad]
-        for kind, data in items:                       # laid as fixed copper: the fan-out plans and every net see it
-            B.add_track(name, kind, data, fixed=True)
-        B.rebuild()
-        straight, dropped = [], []
-        for n, c in cut:
-            segs, vias = [it for it in c if it[0] == 'seg'], [it for it in c if it[0] == 'via']
-            alt = None
-            if segs and vias:
-                alt = relane(B, n, (segs[0][1][0], segs[0][1][1]), vias[-1][1], items)
-            if alt:
-                B.escape[n] = B.escape[n] + alt
-                for kind, data in alt:
-                    B._add_dyn(n, kind, data)
-                straight.append(n)
-            else:
-                dropped.append(n)
-        B.rebuild()
-        log.append(f'{name}: crystal lane laid; planned ways out it crossed: re-laid {straight or "none"}, '
-                   f'dropped {dropped or "none"}')
-        print(log[-1], flush=True)
 
 
 def pair_min_gap(items, P, N):
@@ -2639,11 +2457,9 @@ def direct_pair(B, P, N, termA, termB, log):
     return True
 
 
-def swap_zone(P, N, start, d, sideP, gap, Lt=1.6, out=0.65, p_out=None, layer=0):
+def swap_zone(P, N, start, d, sideP, gap, Lt=1.6):
     """P/N swap: after a straight lead-in of length gap, P crosses over on F.Cu while N hops under it on
-    B.Cu (two vias outside the pair).  P enters on side sideP (left normal of d) and leaves on -sideP.  p_out: the
-    height of P's S, if not N's hop (``out``) - a taller or flatter S lengthens or shortens P alone (twist_sites trims
-    skew with it).  layer: the one P crosses on (and both lines arrive on); N hops on the other."""
+    B.Cu (two vias outside the pair).  P enters on side sideP (left normal of d) and leaves on -sideP."""
     nl = left_of(d)
     o = PAIR_O
 
@@ -2655,22 +2471,20 @@ def swap_zone(P, N, start, d, sideP, gap, Lt=1.6, out=0.65, p_out=None, layer=0)
     s = sideP
     items = []
     if gap > 0:
-        items += [(P, 'seg', (*at(start, 0, s * o), *at(start, gap, s * o), PAIR_W, layer)),
-                  (N, 'seg', (*at(start, 0, -s * o), *at(start, gap, -s * o), PAIR_W, layer))]
-    v1 = snap(at(start, gap + 0.3, -s * out))
-    v2 = snap(at(start, gap + Lt - 0.3, s * out))
+        items += [(P, 'seg', (*at(start, 0, s * o), *at(start, gap, s * o), PAIR_W, 0)),
+                  (N, 'seg', (*at(start, 0, -s * o), *at(start, gap, -s * o), PAIR_W, 0))]
+    v1 = snap(at(start, gap + 0.3, -s * 0.65))
+    v2 = snap(at(start, gap + Lt - 0.3, s * 0.65))
     # P takes the *same* lateral excursion as N's hop (out to 0.65 and back across), so the two lines leave the twist
     # with the same length.  N's two vias force it to detour sideways and a straight crossing gets none of that back -
     # that is the 0.6 mm (4 ps) a twist used to cost, and most of what H1_AT's 1.17 mm (7.9 ps) was, on a link too short
     # to dilute it.  A symmetric S on F.Cu costs no copper and makes the pair equal again.
-    A = out if p_out is None else p_out
-    hop = 1 - layer
-    items += [(P, 'seg', (*at(start, gap, s * o), *at(start, gap + 0.3, s * A), PAIR_W, layer)),
-              (P, 'seg', (*at(start, gap + 0.3, s * A), *at(start, gap + Lt - 0.3, -s * A), PAIR_W, layer)),
-              (P, 'seg', (*at(start, gap + Lt - 0.3, -s * A), *at(start, gap + Lt, -s * o), PAIR_W, layer)),
-              (N, 'seg', (*at(start, gap, -s * o), *v1, PAIR_W, layer)), (N, 'via', v1),
-              (N, 'seg', (*v1, *v2, PAIR_W, hop)), (N, 'via', v2),
-              (N, 'seg', (*v2, *at(start, gap + Lt, s * o), PAIR_W, layer))]
+    items += [(P, 'seg', (*at(start, gap, s * o), *at(start, gap + 0.3, s * 0.65), PAIR_W, 0)),
+              (P, 'seg', (*at(start, gap + 0.3, s * 0.65), *at(start, gap + Lt - 0.3, -s * 0.65), PAIR_W, 0)),
+              (P, 'seg', (*at(start, gap + Lt - 0.3, -s * 0.65), *at(start, gap + Lt, -s * o), PAIR_W, 0)),
+              (N, 'seg', (*at(start, gap, -s * o), *v1, PAIR_W, 0)), (N, 'via', v1),
+              (N, 'seg', (*v1, *v2, PAIR_W, 1)), (N, 'via', v2),
+              (N, 'seg', (*v2, *at(start, gap + Lt, s * o), PAIR_W, 0))]
     return items, snap(at(start, gap + Lt, 0))
 
 
@@ -2829,12 +2643,10 @@ def collapse_hops(B, log, max_hop=1.35):
     return n
 
 
-def items_legal(B, name, items, strict=False, fd=None):
+def items_legal(B, name, items, strict=False):
     """Clearance check of fixed copper (segments sampled every grid step, vias as circles). strict: the router's own
-    free-space threshold (copper it places must pass the same test the search uses), else one grid step of slack.
-    fd: B.foreign(name), when the caller checks many candidates against an unchanged board (it is a whole-board array:
-    seed_twist's blocker search spent 45 s recomputing it, 2026-11-06)."""
-    fd = B.foreign(name) if fd is None else fd
+    free-space threshold (copper it places must pass the same test the search uses), else one grid step of slack."""
+    fd = B.foreign(name)
     slack = -EPS if strict else G
     guarded = xtal_guarded(name)
     for nm, k, d in items:
@@ -3165,16 +2977,13 @@ def route_pair(B, P, N, termA, termB, log, layers=(0, 1), b_cost=1.6, twist_at='
     """Route one differential link between two pair terminals. Returns True on success.
     wps: optional lane waypoints (x, y, layer after, travel direction) from A to B.
     ends: 'part.pad' keys of the A and B terminals, so PAIR_END_RUNS can tell the two ends of a net that two links
-    reach from different parts (the two SVC links, one on either side of the same ESD).
-    twist_at: where the crossover goes when the two ends disagree on which side P is: 'A' / 'B', a zone in front of that
-    terminal; 'run', inside the run (twist_in_run), which needs no room at either end."""
+    reach from different parts (the two SVC links, one on either side of the same ESD)."""
     escA, stA_P, stA_N, sA = fanout(termA)
     escB, stB_P, stB_N, sB = fanout(termB)
     outA, outB = termA[2], termB[2]
     # handedness: going from A to B the P line must stay on the same side; arriving at B the travel
     # direction is -outB, so P must be on side sA relative to -outB.  B's own side is relative to outB.
     twist = (sA == sB)            # left of -outB == right of outB
-    in_run = twist and twist_at == 'run'
     stubs = []
     for nm, pts in ((P, stA_P), (N, stA_N), (P, stB_P), (N, stB_N)):
         for a, b in zip(pts, pts[1:]):
@@ -3183,7 +2992,7 @@ def route_pair(B, P, N, termA, termB, log, layers=(0, 1), b_cost=1.6, twist_at='
         B.add_track(nm, 'seg', d)
     endB, startA, s_route = escB, escA, sA
     twist_items = []
-    if twist and not in_run:
+    if twist:
         done = False
         if twist_at == 'A':
             # swap right after A's fan-out (A = the AT32, which has room around its pins)
@@ -3331,19 +3140,6 @@ def route_pair(B, P, N, termA, termB, log, layers=(0, 1), b_cost=1.6, twist_at='
             items.append((N, 'seg', (a[0], a[1], b[0], b[1], PAIR_W, L)))
         din = unit((pts[-1][0] - pts[-2][0], pts[-1][1] - pts[-2][1]))
         prev_end = (L, lp[-1] if lp else None, ln[-1] if ln else None, din)
-    run_note = ''
-    if in_run:
-        # routed as if no crossover were needed, so P's line ends on N's stub at B: the twist goes into the run now
-        segs = lambda pts: [(a[0], a[1], b[0], b[1], PAIR_W, 0) for a, b in zip(pts, pts[1:])]
-        twisted, run_note = twist_in_run(B, P, N, items, segs(stA_P) + segs(stA_N), segs(stB_P) + segs(stB_N), log)
-        if twisted is None:
-            for nm, d in stubs:
-                B.tracks.remove((nm, 'seg', tuple(d)))
-            B.rebuild()
-            log.append(f'  PAIR FAIL {P}/{N} {run_note}')
-            return False
-        items = twisted
-        run_note = ', ' + run_note
     for nm, k, d in items:
         if k == 'seg' and math.hypot(d[2] - d[0], d[3] - d[1]) < 1e-4:
             continue
@@ -3374,7 +3170,7 @@ def route_pair(B, P, N, termA, termB, log, layers=(0, 1), b_cost=1.6, twist_at='
                    f'({gwhere[0]:.2f},{gwhere[1]:.2f}) on {gwhere[2]} | {gdetail}')
         return False
     log.append(f'{P}/{N}: {len(path)} cells, P {lenP:.2f} mm N {lenN:.2f} mm (skew {abs(lenP - lenN):.2f} mm), '
-               f'{nv} vias{", swapped" if twist else ""}{run_note}, P-N gap {gap:.3f} mm')
+               f'{nv} vias{", swapped" if twist else ""}, P-N gap {gap:.3f} mm')
     return True
 
 
@@ -4057,8 +3853,6 @@ def plane_open_pads(B, name):
     for ref, shapes in B.pads[name]:
         if (ref.split('.')[0], ref.split('.')[1]) in EP_PADS or len(shapes[0].layers) > 1:
             continue
-        if name == 'GND' and ref.split('.')[0] in POUR_PADS:
-            continue
         roots = {root(owner[c]) for c in pad_cells(shapes) if c in owner}
         if not roots & has_via:
             out.append(ref)
@@ -4144,8 +3938,6 @@ def plane_fanout(B, name, log, only=None):
             continue
         if (ref.split('.')[0], ref.split('.')[1]) in EP_PADS:
             continue
-        if name == 'GND' and ref.split('.')[0] in POUR_PADS:
-            continue                                  # joins the pour on its own layer (POUR_PADS)
         if len(shapes[0].layers) > 1:                 # through-hole pad already reaches every layer
             continue
         L = shapes[0].layers[0]                       # SMD pad on F.Cu or B.Cu
@@ -4333,481 +4125,6 @@ def stitching(B, log, pitch=3.0):
 
 
 # ── write back to KiCad ───────────────────────────────────────────────────────
-def seed_copper(B, board, path, log):
-    """--seed=BOARD: keep a routed board's copper (see main()).  Every track and via of the seed whose net still has the
-    same pads goes in as fixed copper, unless a rule area of this board forbids it there (a via in a no-via keepout);
-    the stage-1 copper of those nets is dropped for it.  Returns the nets left to route: every net with a pad whose net
-    differs from the seed's, and their pair mates.  The placement must be the seed's - copper does not fit moved parts.
-    Parts the seed does not have (0.16.0: the Bluetooth module and its passives) are added: seed copper that touches
-    their pads goes, and so does its net's (it is re-routed).  A plane net keeps its copper; its new pads get their via
-    in main().  ``--reroute=NET,NET`` re-routes more nets, to clear a new net's way out of a dense pin row."""
-    seed = pcbnew.LoadBoard(path)
-    moved = []
-    for f in seed.GetFootprints():
-        if not f.GetPadCount():
-            continue          # a logo: no copper the routing depends on, and its no-via area is a rule area (below)
-        g = board.FindFootprintByReference(f.GetReference())
-        if (g is None or g.GetPosition() != f.GetPosition() or g.GetOrientationDegrees() != f.GetOrientationDegrees()
-                or g.GetLayer() != f.GetLayer()):
-            moved.append(f.GetReference())
-    if moved:
-        raise SystemExit(f'--seed: {len(moved)} footprint(s) placed differently from {path} ({", ".join(moved[:8])}): '
-                         f'its copper does not fit this board - route it from scratch')
-
-    def pad_nets(b):
-        return {(f.GetReference(), p.GetNumber()): p.GetNetname() for f in b.GetFootprints() for p in f.Pads()}
-    old, new = pad_nets(seed), pad_nets(board)
-    changed = {n for k in set(old) | set(new) if old.get(k) != new.get(k) for n in (old.get(k), new.get(k)) if n}
-    # A plane's copper stays (its vias are the seed's, and the planes are refilled anyway); only its new pads need a via
-    B.seed_plane_pads = {pn: {f'{r}.{num}' for (r, num), nm in new.items() if nm == pn and old.get((r, num)) != pn}
-                         for pn in PLANES}
-    changed = {n for n in changed if n not in PLANES and not n.startswith('unconnected-')}
-    extra = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--reroute=')), '')
-    missing = [n for n in extra.split(',') if n and n not in B.netcode]
-    if missing:
-        raise SystemExit(f'--reroute: no such net(s) {missing}')
-    reroute = set(changed) | {n for n in extra.split(',') if n}
-    lidx = {lyr: k for k, lyr in enumerate(LAYERS)}
-    # the new parts' pads: seed copper must keep CLR from them (and must not run through them)
-    new_refs = {f.GetReference() for f in board.GetFootprints()} - {f.GetReference() for f in seed.GetFootprints()}
-    new_pads = [(p, lyr) for f in board.GetFootprints() if f.GetReference() in new_refs for p in f.Pads()
-                for lyr in LAYERS if p.IsOnLayer(lyr)]
-    clr = pcbnew.FromMM(CLR)
-
-    def collides(t):
-        bb = t.GetBoundingBox()
-        for p, lyr in new_pads:
-            if t.GetClass() != 'PCB_VIA' and t.GetLayer() != lyr:
-                continue
-            pb = p.GetBoundingBox()
-            if (bb.GetRight() + clr < pb.GetLeft() or pb.GetRight() + clr < bb.GetLeft()
-                    or bb.GetBottom() + clr < pb.GetTop() or pb.GetBottom() + clr < bb.GetTop()):
-                continue
-            if p.GetEffectiveShape(lyr).Collide(t.GetEffectiveShape(lyr), clr):
-                return True
-        return False
-
-    # The seed's copper met the seed's rules, so only a rule area this board has and the seed has not can forbid it
-    # (the 0.13 badge's no-via area).  The router's own keep-out grids are not the test: they also cover places where
-    # its fan-out may put a via all the same (inside a QFN), and the seed has exactly those vias.
-    def rule_areas(b):
-        zs = list(b.Zones()) + [z for f in b.GetFootprints() for z in f.Zones()]
-        out = {}
-        for z in zs:
-            if z.GetIsRuleArea():
-                o = z.Outline().Outline(0)
-                out[tuple((o.CPoint(k).x, o.CPoint(k).y) for k in range(o.PointCount()))] = z
-        return out
-    seed_rules = rule_areas(seed)
-    new_rules = [z for k, z in rule_areas(board).items() if k not in seed_rules]
-
-    def forbidden(t):
-        for z in new_rules:
-            ol = z.Outline()
-            if t.GetClass() == 'PCB_VIA':
-                if z.GetDoNotAllowVias() and ol.Contains(t.GetPosition()):
-                    return True
-            elif z.GetDoNotAllowTracks() and z.IsOnLayer(t.GetLayer()):
-                s, e = t.GetStart(), t.GetEnd()
-                n = max(1, int(math.hypot(e.x - s.x, e.y - s.y) / pcbnew.FromMM(G)))
-                if any(ol.Contains(pcbnew.VECTOR2I(int(s.x + (e.x - s.x) * k / n), int(s.y + (e.y - s.y) * k / n)))
-                       for k in range(n + 1)):
-                    return True
-        return False
-    # a signal whose seed copper this board forbids or a new part's pad touches is re-routed (a plane net only loses
-    # that via or track: its pads reach the plane through their own vias)
-    hit = {t.GetNetname() for t in seed.GetTracks()
-           if t.GetNetname() not in PLANES and t.GetNetname() not in reroute and (forbidden(t) or collides(t))}
-    if hit:
-        log.append(f'seed: re-routing {sorted(hit)}: their copper touches a new part or a new rule area')
-        print(log[-1], flush=True)
-    reroute |= hit
-    for n in list(reroute):
-        reroute |= set(B.pair_of.get(n, ()))
-    keep, dropped, rerouted = [], [], 0
-    for t in seed.GetTracks():
-        name = t.GetNetname()
-        if name in reroute:
-            rerouted += 1
-            continue
-        if t.GetClass() == 'PCB_VIA':
-            item = (name, 'via', (MM(t.GetPosition().x), MM(t.GetPosition().y)))
-        else:
-            if t.GetLayer() not in lidx:
-                raise SystemExit(f'--seed: {name} has copper on {seed.GetLayerName(t.GetLayer())}, not a routing layer')
-            item = (name, 'seg', (MM(t.GetStart().x), MM(t.GetStart().y), MM(t.GetEnd().x), MM(t.GetEnd().y),
-                                  MM(t.GetWidth()), lidx[t.GetLayer()]))
-        (dropped if name not in B.netcode or forbidden(t) or collides(t) else keep).append(item)
-    B.tracks = [t for t in B.tracks if t[0] in reroute or t[0].startswith('__')] + keep
-    B.fixed = [t for t in B.fixed if t[0] in reroute or t[0].startswith('__')] + keep
-    B.release_escape([n for n in list(B.escape_on) if n not in reroute])
-    B.rebuild()
-    # A pair whose two lines only changed places at one part keeps its seed copper and gets a twist instead.
-    for Pn, Nn in sorted({B.pair_of[n] for n in changed if n in B.pair_of}):
-        ends = {k for k in set(old) | set(new) if old.get(k) != new.get(k) and {old.get(k), new.get(k)} & {Pn, Nn}}
-        if len({k[0] for k in ends}) == 1 and all({old.get(k), new.get(k)} == {Pn, Nn} for k in ends):
-            ok, cut = seed_twist(B, seed, Pn, Nn, next(iter(ends))[0], log)
-            if ok:
-                reroute = (reroute - {Pn, Nn}) | cut
-                rerouted -= sum(1 for t in seed.GetTracks() if t.GetNetname() in (Pn, Nn))
-            print(log[-1], flush=True)
-    log.append(f'seed {os.path.basename(path)}: {len(keep)} items kept as fixed copper, {rerouted} of the re-routed '
-               f'nets dropped, {len(dropped)} dropped for this board\'s rules '
-               f'({", ".join(sorted({d[0] for d in dropped})) or "none"}); re-routing {sorted(reroute) or "nothing"}')
-    return reroute
-
-
-def line_pieces(items):
-    """Connected pieces of one line's copper, [(kind, d)]: items join where an end of one lies on the other (segments on
-    different layers meet only through a via)."""
-    def joined(i1, i2):
-        if i1[0] == 'seg' and i2[0] == 'seg' and i1[1][5] != i2[1][5]:
-            return False
-        return any(_on_item(x, y, i2) for x, y in _ends(i1)) or any(_on_item(x, y, i1) for x, y in _ends(i2))
-    groups = []
-    for it in items:
-        hit = [g for g in groups if any(joined(it, o) for o in g)]
-        merged = [it] + [o for g in hit for o in g]
-        groups = [g for g in groups if g not in hit] + [merged]
-    return groups
-
-
-def cut_run(seg, t0, t1, a0, d):
-    """seg (a straight run along d) without its part between t0 and t1 (distances along d from a0)."""
-    x1, y1, x2, y2, w, L = seg
-    p = lambda t: (a0[0] + d[0] * t, a0[1] + d[1] * t)
-    s1 = (x1 - a0[0]) * d[0] + (y1 - a0[1]) * d[1]
-    s2 = (x2 - a0[0]) * d[0] + (y2 - a0[1]) * d[1]
-    lo, hi = (s1, s2) if s1 <= s2 else (s2, s1)
-    out = []
-    if t0 - lo > 1e-6:
-        out.append(('seg', (*p(lo), *p(t0), w, L)))
-    if hi - t1 > 1e-6:
-        out.append(('seg', (*p(t1), *p(hi), w, L)))
-    return out
-
-
-def zone_self_clear(zone, P, N):
-    """A twist's crossing line keeps clear of the other line's two vias.  P and N share a net code (Board.__init__), so
-    items_legal() does not check them against each other."""
-    vias = [z[2] for z in zone if z[0] == N and z[1] == 'via']
-    need = VIA_D / 2 + PAIR_W / 2 + CLR
-    return all(seg_point_dist(vx, vy, *z[2][:4]) >= need - 1e-6
-               for z in zone if z[0] == P and z[1] == 'seg' for vx, vy in vias)
-
-
-def twist_sites(P, N, lines, at_end, at_other, Lt=1.6, margin=0.2, outs=(0.65, 0.55, 0.45), layers=(0,)):
-    """Every place a twist can go in a pair whose two lines reach one end on each other's pads, and what each costs in
-    skew.  Used on a seeded board (seed_twist) and on a link just routed as if it needed no crossover (twist_in_run).
-
-    lines: {P: [(kind, d)], N: [...]}, the pair's copper.  at_end(piece) is True for a piece of one line that reaches the
-    end where the lines arrive swapped; at_other(piece) for one that reaches anything else the line serves (its other
-    end, another part on the way).  Between the twist and that end each line takes the other net, so a site whose stretch
-    would also reach something else is refused: a line through the service ESD (U301) would hand the ESD's pads the
-    wrong net, a short the DRC finds only afterwards.
-
-    A site is a straight run where both lines are parallel at the pair's spacing on one of ``layers``, at least Lt + 2
-    margin long.  swap_zone crosses P over on that layer while N hops on the other one.  Behind the twist the two lines
-    trade their remaining lengths, corners included, so where it goes sets the pair's skew: each site's skew is worked
-    out (each net's total track length, as check_usb_si.py measures it).  And every site is offered again with the
-    crossing's S drawn taller or flatter than N's hop, which lengthens or shortens P alone - by -0.55 to +0.6 mm, from
-    the pair's own offset to 0.2 mm beyond the hop in 0.05 mm steps (0.14.0: it brought the service pair's only site
-    with room from 1.30 mm back inside the 1.2 mm budget, to 0.64 mm).
-
-    Returns a namespace: sites; build(site), the pair's copper with that twist as [(net, kind, d)]; skew[id(site)], P
-    minus N in mm; amp[id(site)], the S height; before, the skew without a twist; refused, sites whose stretch reached
-    more than the end."""
-    sites = []
-    for ka, a in enumerate(lines[P]):
-        if a[0] != 'seg' or a[1][5] not in layers:
-            continue
-        ax1, ay1, ax2, ay2 = a[1][:4]
-        La = math.hypot(ax2 - ax1, ay2 - ay1)
-        if La < Lt + 2 * margin:
-            continue
-        rest = [o for o in lines[P] if o is not a]
-        # d points from the swapped end towards the unchanged one, along this run
-        d = ((ax2 - ax1) / La, (ay2 - ay1) / La)
-        a0 = (ax1, ay1)
-        far = [g for g in line_pieces(rest) if any(_on_item(ax2, ay2, o) for o in g)]
-        if far and at_end(far[0]):
-            d, a0 = (-d[0], -d[1]), (ax2, ay2)
-        nl = left_of(d)
-        for kb, b in enumerate(lines[N]):
-            if b[0] != 'seg' or b[1][5] != a[1][5]:
-                continue
-            bx1, by1, bx2, by2 = b[1][:4]
-            Lb = math.hypot(bx2 - bx1, by2 - by1)
-            if Lb < Lt or abs((bx2 - bx1) * d[1] - (by2 - by1) * d[0]) / Lb > 1e-3:
-                continue                                       # not parallel
-            off = (bx1 - a0[0]) * nl[0] + (by1 - a0[1]) * nl[1]
-            if abs(abs(off) - 2 * PAIR_O) > 0.01:
-                continue                                       # not this pair's spacing
-            tb = sorted(((bx1 - a0[0]) * d[0] + (by1 - a0[1]) * d[1], (bx2 - a0[0]) * d[0] + (by2 - a0[1]) * d[1]))
-            lo, hi = max(0.0, tb[0]) + margin, min(La, tb[1]) - margin - Lt
-            side_b = 1 if off > 0 else -1
-            for out_, t in [(o_, lo + k * 0.1) for o_ in outs for k in range(int((hi - lo) / 0.1 + 1e-9) + 1)]:
-                centre = (a0[0] + d[0] * t + nl[0] * off / 2, a0[1] + d[1] * t + nl[1] * off / 2)
-                # behind the twist each line is its own again, so P leaves on its own side (-side_b)
-                zone, _ = swap_zone(P, N, centre, d, side_b, gap=0.0, Lt=Lt, out=out_, layer=a[1][5])
-                sites.append((out_, t, centre, zone, a, ka, b, kb, a0, d, nl, off))
-
-    def kept_pieces(site):
-        out_, t, centre, zone, a, ka, b, kb, a0, d, nl, off = site
-        res = []
-        for net, line, cut in ((P, lines[P], a), (N, lines[N], b)):
-            o = (net == N) * off
-            base = (a0[0] + nl[0] * o, a0[1] + nl[1] * o)
-            res.append((net, line_pieces([x for x in line if x is not cut] + cut_run(cut[1], t, t + Lt, base, d))))
-        return res
-    # Which stretch moves depends only on which two runs are cut, so it is worked out once per pair of runs.
-    seen = {}
-
-    def relabel_ok(site):
-        key = (site[5], site[7], site[8], site[9])
-        if key not in seen:
-            seen[key] = not any(at_end(g) and at_other(g) for _, gs in kept_pieces(site) for g in gs)
-        return seen[key]
-    n0 = len(sites)
-    sites = [site for site in sites if relabel_ok(site)]
-    refused = n0 - len(sites)
-
-    def build(site):
-        out = []
-        for net, gs in kept_pieces(site):
-            other = N if net == P else P
-            for g in gs:
-                out += [(other if at_end(g) else net, k2, d2) for k2, d2 in g]
-        return out + site[3]
-
-    def seg_len(items, net):
-        return sum(math.hypot(dd[2] - dd[0], dd[3] - dd[1]) for nm, k, dd in items if nm == net and k == 'seg')
-    plain = [(n, k, dd) for n in (P, N) for k, dd in lines[n]]
-    before = seg_len(plain, P) - seg_len(plain, N)
-    skew, amp = {}, {}
-    for site in sites:
-        out = build(site)
-        skew[id(site)] = seg_len(out, P) - seg_len(out, N)
-        amp[id(site)] = site[0]
-
-    def p_len(A):
-        return 2 * math.hypot(0.3, A - PAIR_O) + math.hypot(Lt - 0.6, 2 * A)
-    variants = []
-    for site in sites:
-        out_ = site[0]
-        variants.append(site)
-        for A in sorted({round(out_ + 0.05 * k, 3) for k in range(-12, 5)} - {round(out_, 3)}):
-            if not PAIR_O - 1e-9 <= A <= out_ + 0.2 + 1e-9:
-                continue
-            zone, _ = swap_zone(P, N, site[2], site[9], 1 if site[11] > 0 else -1, gap=0.0, Lt=Lt, out=out_, p_out=A,
-                                layer=site[4][1][5])
-            v = (*site[:3], zone, *site[4:])
-            skew[id(v)] = skew[id(site)] + p_len(A) - p_len(out_)
-            amp[id(v)] = A
-            variants.append(v)
-
-    def rank(site):
-        """Inside the skew budget first; then the least skew, to 0.1 mm (finer is not worth an odd shape); then the usual
-        via distance, the S of the hop's own height, and the site nearest the run's start."""
-        return (abs(skew[id(site)]) > PAIR_SKEW_MAX, round(abs(skew[id(site)]), 1), site[0] != outs[0],
-                round(abs(amp[id(site)] - site[0]), 3), site[1])
-    return types.SimpleNamespace(sites=variants, build=build, skew=skew, amp=amp, before=before, refused=refused,
-                                 rank=rank)
-
-
-def twist_legal(B, P, N, zone, fd=None):
-    """A twist zone clears foreign copper, and its crossing line clears the other line's vias."""
-    return (zone_self_clear(zone, P, N)
-            and items_legal(B, P, [z for z in zone if z[0] == P], strict=True, fd=fd)
-            and items_legal(B, N, [z for z in zone if z[0] == N], strict=True, fd=fd))
-
-
-def twist_in_run(B, P, N, items, stubsA, stubsB, log, Lt=1.6):
-    """route_pair(twist_at='run'): the link has been routed as if it needed no crossover, so its two lines reach the B
-    end on each other's stubs.  Splice the twist into a straight stretch of the new lines that has room (twist_sites),
-    as seed_twist does on a seeded board, and hand back the link's items with it - P's line again ending on P's stub.
-
-    A twist at one end (swap_zone in front of a terminal) needs 1.6 mm of free copper right at the pins plus a lead-in,
-    and neither the service pair nor the RP pair has that at either end (errata.md E1: since 0.14.0 both cross over in
-    copper; measured in an unseeded run, 2026-11-06: "no pair path from (0, 272, 842) to (0, 364, 1200)" and "leg 3 ->
-    (136.8, 114.0) blocked by ['RP_DM']", the zone in front of the switch sitting on the lane's own last waypoint).
-    Inside the run the pair has a whole lane to choose from, and the pairs are routed before anything but the fixed
-    copper, so a stretch with room for two vias 0.45-0.65 mm beside it is the rule, not the exception.
-    Returns (items, note) or (None, why)."""
-    lines = {n: [(k, d) for nm, k, d in items if nm == n] for n in (P, N)}
-    endB = [('seg', d) for d in stubsB]
-    endA = [('seg', d) for d in stubsA]
-
-    def touches(g, stubs):
-        return any(_on_item(x, y, s, tol=0.02) for k, d in g for x, y in _ends((k, d)) for s in stubs)
-    ts = twist_sites(P, N, lines, lambda g: touches(g, endB), lambda g: touches(g, endA), Lt=Lt, layers=(0, 1))
-    fd = B.foreign(P)
-    best = next((s for s in sorted(ts.sites, key=ts.rank) if twist_legal(B, P, N, s[3], fd)), None)
-    if best is None:
-        return None, f'no straight stretch with room for a twist ({len(ts.sites)} sites, {ts.refused} refused)'
-    out_, t, centre, zone, a = best[:5]
-    if os.environ.get('ROUTE_TWIST_DEBUG') in (P, N, 'all'):    # debugging: the chosen site and the pair's new copper
-        print(f'  TWIST {P}/{N}: {len(ts.sites)} sites, {ts.refused} refused; chosen out {out_} t {t:.2f} centre '
-              f'{centre} along {best[9]} on L{a[1][5]}, S {ts.amp[id(best)]}', flush=True)
-        for nm, k, d in ts.build(best):
-            print(f'    {nm} {k} ' + ' '.join(f'{v:.3f}' for v in d), flush=True)
-    note = (f'twist in the run at ({centre[0]:.2f}, {centre[1]:.2f}) on {"FB"[a[1][5]]}.Cu, vias {out_} mm out'
-            + (f', crossing S {ts.amp[id(best)]:.2f} mm' if abs(ts.amp[id(best)] - out_) > 1e-6 else '')
-            + f', skew {abs(ts.skew[id(best)]):.2f} mm (untwisted {abs(ts.before):.2f} mm)')
-    return ts.build(best), note
-
-
-def seed_twist(B, seed, P, N, ref, log, Lt=1.6, margin=0.2, outs=(0.65, 0.55, 0.45)):
-    """--seed, a pair whose two lines changed places at one end (pads of ``ref``; errata.md E1: U601's pair pins): keep
-    the seed's two lines and splice a twist (swap_zone: one line crosses on F.Cu, the other hops under it on B.Cu) into a
-    straight stretch where the router's own clearance check passes (twist_sites: the least skew that fits).  Between that
-    twist and ``ref`` each line carries the other net.  The pair then differs from the seed by the twist alone - a fresh
-    lane would have to fit the corridor the seed's later nets left, which they packed at bare clearance round the old
-    copper.  Returns (True if placed, the nets cut to make room)."""
-    lines = {n: [] for n in (P, N)}
-    for t in seed.GetTracks():
-        n = t.GetNetname()
-        if n in lines:
-            if t.GetClass() == 'PCB_VIA':
-                lines[n].append(('via', (MM(t.GetPosition().x), MM(t.GetPosition().y))))
-            elif t.GetLayer() in LAYERS:
-                lines[n].append(('seg', (MM(t.GetStart().x), MM(t.GetStart().y), MM(t.GetEnd().x), MM(t.GetEnd().y),
-                                         MM(t.GetWidth()), LAYERS.index(t.GetLayer()))))
-    fp = seed.FindFootprintByReference(ref)
-    swapped_pads = [p for p in fp.Pads() if p.GetNetname() in lines]
-    # the pair's pads on every other part: the stretch that changes net must not reach one of them
-    other_pads = [p for f in seed.GetFootprints() if f.GetReference() != ref for p in f.Pads()
-                  if p.GetNetname() in lines]
-
-    def touches(items, pads):
-        return any(p.HitTest(pcbnew.VECTOR2I_MM(x, y)) for k, d in items for (x, y) in
-                   ([(d[0], d[1]), (d[2], d[3])] if k == 'seg' else [d]) for p in pads)
-    ts = twist_sites(P, N, lines, lambda g: touches(g, swapped_pads), lambda g: touches(g, other_pads), Lt=Lt,
-                     margin=margin, outs=outs, layers=(0,))
-    if ts.refused:
-        log.append(f'seed twist {P}/{N}: {ts.refused} sites refused, beyond another part of the line')
-        print(log[-1], flush=True)
-    sites, skews, amp, seed_skew = ts.sites, ts.skew, ts.amp, ts.before
-
-    def legal(zone, fd=None):
-        return twist_legal(B, P, N, zone, fd)
-
-    def place(site, ripped):
-        out_, t, centre, zone, a, ka, b, kb, a0, d, nl, off = site
-        out = ts.build(site)
-        # the seed's lines replace whatever stage 1 laid for this pair (they contain its fan-outs)
-        B.tracks = [x for x in B.tracks if x[0] not in (P, N)] + out
-        B.fixed = [x for x in B.fixed if x[0] not in (P, N)] + out
-        B.release_escape([P, N])
-        B.rebuild()
-        log.append(f'seed twist {P}/{N}: spliced into the seed\'s run at ({centre[0]:.2f}, {centre[1]:.2f}), '
-                   f'{Lt} mm along ({d[0]:.2f}, {d[1]:.2f}), vias {out_} mm out at '
-                   f'{[tuple(round(v, 2) for v in z[2]) for z in zone if z[1] == "via"]}'
-                   + (f', crossing S {amp[id(site)]:.2f} mm' if abs(amp[id(site)] - out_) > 1e-6 else '')
-                   + f', skew '
-                   f'{abs(skews[id(site)]):.2f} mm (seed {abs(seed_skew):.2f} mm, {len(sites)} sites)'
-                   + (f'; cut {sorted(ripped)} within {RIP_R} mm, re-routed after' if ripped else ''))
-        return True, set(ripped)
-
-    def over(site):
-        return abs(skews[id(site)]) > PAIR_SKEW_MAX
-    rank = ts.rank
-    fd0 = B.foreign(P)                                # P and N share a code, so this is both lines' field
-    free = next((site for site in sorted(sites, key=rank) if legal(site[3], fd0)), None)
-    if free is not None and not over(free):           # a site with room as it is, the best of those
-        return place(free, ())
-    # None: free a site by cutting the simple signals in its way (never a pair, a crystal line, a rail or a plane) near
-    # it - the signal router re-joins each cut net afterwards, so the board changes by the twist and those few mm.
-    codes = {c: n for n, c in B.netcode.items()}
-    RIP_R = 1.5
-
-    def blockers(zone, fd=None):
-        nets = set()
-        for nm, k, dd in zone:
-            if items_legal(B, nm, [(nm, k, dd)], strict=True, fd=fd):
-                continue
-            pts = [(dd[0], dd[1], range(NL))] if k == 'via' else [
-                (dd[0] + (dd[2] - dd[0]) * q / 8, dd[1] + (dd[3] - dd[1]) * q / 8, (int(dd[5]),)) for q in range(9)]
-            for x, y, Ls in pts:
-                j, i = gi(y, Y0), gi(x, X0)
-                for L in Ls:
-                    c = int(B.dyn.n1[L, j, i])
-                    nets.add(codes.get(c, '#'))
-        return nets
-
-    def rippable(n):
-        return (n in B.netcode and n not in B.pair_of and n not in PLANES and n not in POWER
-                and not re.match(XTAL_NETS, n))
-    if os.environ.get('ROUTE_SEED_TWIST_DEBUG'):      # debugging: per pair of runs, the sites, their skew, what blocks
-        free_ids = {id(x) for x in sites if legal(x[3], fd0)}
-        runs = {}
-        for site in sites:
-            runs.setdefault((site[5], site[7]), []).append(site)
-        for (ka, kb), ss in runs.items():
-            a = ss[0][4][1]
-            fr = [x for x in ss if id(x) in free_ids]
-            sk = sorted(abs(skews[id(x)]) for x in ss)
-            bl = collections.Counter(n for x in ss if id(x) not in free_ids for n in blockers(x[3], fd0) - {P, N})
-            print(f'  seed twist {P}: run ({a[0]:.2f},{a[1]:.2f})-({a[2]:.2f},{a[3]:.2f}): {len(ss)} sites, '
-                  f'{len(fr)} fit, skew {sk[0]:.2f}-{sk[-1]:.2f} mm'
-                  + (f' (fitting {min(abs(skews[id(x)]) for x in fr):.2f})' if fr else '')
-                  + f', blocked by {dict(bl.most_common(6))}', flush=True)
-    ranked = []
-    for site in sites:
-        if not zone_self_clear(site[3], P, N):
-            continue
-        bl = blockers(site[3], fd0) - {P, N}
-        if bl and all(rippable(n) for n in bl):
-            r = rank(site)
-            ranked.append(((r[0], len(bl)) + r[1:], bl, site))
-    for _, bl, site in sorted(ranked, key=lambda r: r[0]):
-        if free is not None and over(site):
-            break                                     # no cut buys a site within budget: take the best free one below
-        cx, cy = site[2]
-        near = [x for x in B.tracks if x[0] in bl and (
-            math.hypot(x[2][0] - cx, x[2][1] - cy) <= RIP_R if x[1] == 'via' else
-            seg_point_dist(cx, cy, *x[2][:4]) <= RIP_R)]
-        B.tracks = [x for x in B.tracks if x not in near]
-        B.fixed = [x for x in B.fixed if x not in near]
-        B.rebuild()
-        if legal(site[3]):
-            return place(site, bl)
-        B.tracks += near
-        B.fixed += near
-        B.rebuild()
-    if free is not None:                              # nothing within the skew budget: the least skew that fits
-        return place(free, ())
-    log.append(f'seed twist {P}/{N}: no straight stretch with room for a twist - re-routing the pair')
-    return False, set()
-
-
-def seg_point_dist(x, y, x1, y1, x2, y2):
-    L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2
-    u = 0.0 if L2 == 0 else max(0.0, min(1.0, ((x - x1) * (x2 - x1) + (y - y1) * (y2 - y1)) / L2))
-    return math.hypot(x - x1 - u * (x2 - x1), y - y1 - u * (y2 - y1))
-
-
-def _ends(item):
-    k, d = item
-    return [(d[0], d[1]), (d[2], d[3])] if k == 'seg' else [d]
-
-
-def _on_item(x, y, item, tol=1e-3):
-    k, d = item
-    if k == 'via':
-        return math.hypot(x - d[0], y - d[1]) <= tol
-    x1, y1, x2, y2 = d[:4]
-    L2 = (x2 - x1) ** 2 + (y2 - y1) ** 2
-    u = 0.0 if L2 == 0 else max(0.0, min(1.0, ((x - x1) * (x2 - x1) + (y - y1) * (y2 - y1)) / L2))
-    return math.hypot(x - x1 - u * (x2 - x1), y - y1 - u * (y2 - y1)) <= tol
-
-
-def _nm(x, y):
-    """mm -> board units, rounded: VECTOR2I_MM truncates, so 128.2 (128.19999...) became 128199999 nm and a seeded run
-    (--seed) moved every such point of the seed by 1 nm."""
-    return pcbnew.VECTOR2I(int(round(x * 1e6)), int(round(y * 1e6)))
-
-
 def write_board(B, zones=True):
     n = collapse_hops(B, [])         # last: every net is routed, so nothing depends on the old copper any more
     if n:
@@ -4816,22 +4133,21 @@ def write_board(B, zones=True):
     for t in list(board.GetTracks()):
         board.Remove(t)
     for z in list(board.Zones()):
-        if not z.GetIsRuleArea():                     # the old pours go; rule areas (the antenna keep-out) stay
-            board.Remove(z)
+        board.Remove(z)
     nets = {n: board.FindNet(n) for n in set(B.netcode)}
     for name, kind, data in B.tracks:
         data = tuple(float(v) for v in data)
         if kind == 'seg':
             x1, y1, x2, y2, w, L = data
             t = pcbnew.PCB_TRACK(board)
-            t.SetStart(_nm(x1, y1))
-            t.SetEnd(_nm(x2, y2))
+            t.SetStart(pcbnew.VECTOR2I_MM(x1, y1))
+            t.SetEnd(pcbnew.VECTOR2I_MM(x2, y2))
             t.SetWidth(pcbnew.FromMM(w))
             t.SetLayer(LAYERS[int(L)])
         else:
             x, y = data
             t = pcbnew.PCB_VIA(board)
-            t.SetPosition(_nm(x, y))
+            t.SetPosition(pcbnew.VECTOR2I_MM(x, y))
             t.SetViaType(pcbnew.VIATYPE_THROUGH)
             t.SetLayerPair(pcbnew.F_Cu, pcbnew.B_Cu)
             t.SetWidth(pcbnew.FromMM(VIA_D))
@@ -5048,7 +4364,6 @@ HUB_REF = {0: 'U701', 1: 'U801', 2: 'U901'}
 # their two lanes on opposite sides of each other and needs the layer change below (see the lane plan).
 MUX_PINS = {0: ('7', '8'), 1: ('5', '6'), 2: ('3', '4')}
 E, W, N, S = (1, 0), (-1, 0), (0, -1), (0, 1)
-NE = (1, -1)                   # a waypoint inside a diagonal leg (DIRS has all eight)
 # Lane plan (port router -> hub): waypoints (x, y, layer after it, travel direction), each in the middle of a
 # straight run (or at both ends of a corner, so a lane cannot cut across the inside of the corner where the next
 # lane runs).  The routers sit left of their USB-A ports: each has its MHL pins facing west, its USB1/USB2 pins
@@ -5190,11 +4505,8 @@ AT_LANES = {1: [(119.8, 130.0, 0, N), (119.8, 127.6, 0, N)],
             2: [(198.0, 145.5, 0, E), (205.25, 135.0, 0, N)]}            # #2 wraps around its east side, up to
                                                                          # Hub-2's west end
 PORT_C = {'KB': 125.0, 'MS': 160.0, 'OT': 195.0}                       # USB-A centres (tools/gen_pcb.py)
-H0_LANES = {'KB': [(107.0, 153.75, 1, W), (105.0, 153.75, 1, W), (105.0, 150.5, 1, N), (110.5, 147.5, 1, NE),
+H0_LANES = {'KB': [(107.0, 153.75, 1, W), (105.0, 153.75, 1, W), (105.0, 150.5, 1, N), (110.5, 147.5, 1, N),
                    (132.0, 132.0, 1, N), (157.9, 126.55, 0, E)],
-            # 0.15.0: (110.5, 147.5) heads NE, the way the lane leaves it.  Marked N, it made the search turn E -> N ->
-            # NE within 0.1 mm and the inner line folded back on itself: "lines only 0.137 mm apart (want 0.150 mm) at
-            # (109.79,147.60) on B.Cu", the link's failure in every unseeded --pairs-only run (0.12.0's sources too).
             # rev 6: the MHL pads (7/8) are on this lane's own row, so it runs west 3.75 mm along that row - where the
             # pair sits exactly on its two pads - and drops to B.Cu at the via pair in the reserved box; that is what
             # lets the Hub-1 lane escape over it on F.Cu.  Then north on B.Cu (west of AT32 #1's crystal, whose GND pad
@@ -5277,16 +4589,14 @@ def pair_links(B):
     # rev 9: its B end keeps the default end run (see PAIR_END_RUNS - 0.5 mm of straight run into the crossover zone
     # did not fit between the zone and the connector's centre line, and the search made a roundabout of it).
     links.append(('SVC_DP', 'SVC_DM', ('usbc', 'J301'), ('pads', 'U301', '3', '1'), (0,), 9.9, ()))
-    # This pair crosses over since 0.14.0: the switch's D+ is pin 5 again, the eastern pin (gen_schematic.py block 6,
-    # errata.md E1), while the ESD has D+ on its western pad.  Rev 8 to 0.13 had SVC_DP on pin 6 to avoid exactly that,
-    # because neither of route_pair's swap zones fits here: the A end's via lands in the neighbouring USB1 terminal's
-    # reserved corridor 0.8 mm away; the B end needs 1.6 mm of copper beyond the ESD's escape, which is Hub-0's north
-    # pad row - measured as "no pair path ... (0,344,1108) to (0,380,1200)" and, when room was made, "lines only
-    # -0.190 mm apart"; unseeded, 0.14.0 failed with "no pair path from (0, 272, 842) to (0, 364, 1200)", 2026-11-06).
-    # 0.14.0 was therefore routed from 0.12.0 with the twist spliced into the seed's lines (seed_twist).  Since 0.15.0
-    # the link takes twist_at='run': it is routed as if no crossover were needed, and the twist goes into a straight
-    # stretch of its own new lines (twist_in_run).
-    links.append(('SVC_DP', 'SVC_DM', ('pads', 'U601', '5', '6'), ('pads', 'U301', '4', '6'), (0,), (9.9, 'run'), ()))
+    # No crossover and no 'A' hint: this pair's two ends agree on which side D+ is on, because the service channel of the
+    # switch carries D+ on pin 6 rather than pin 5 (gen_schematic.py block 6 - the switch is passive, so the two lines of
+    # a pair are interchangeable on its pins).  That is what replaced the whole crossover hunt: with D+ on the eastern
+    # pin the pair would have to swap sides, and neither swap zone fits (the A end's via lands in the neighbouring USB1
+    # terminal's reserved corridor 0.8 mm away; the B end needs 1.6 mm of copper beyond the ESD's escape, which is Hub-0's
+    # north pad row - measured as "no pair path ... (0,344,1108) to (0,380,1200)" and, when room was made, "lines only
+    # -0.190 mm apart").
+    links.append(('SVC_DP', 'SVC_DM', ('pads', 'U601', '6', '5'), ('pads', 'U301', '4', '6'), (0,), 9.9, ()))
     # The RP2354B's own USB (the switch's common port, pins 11/10), both sections as pairs: its pins to the 27R series
     # resistors R503/R504 - which the RP2350 requires, so they stay - and then those resistors to the switch.  The second
     # section's two lines sit on two different parts, which is what padpair_terminal() is for: before rev 8 this link
@@ -5301,22 +4611,15 @@ def pair_links(B):
     # so whichever is routed second must thread the first one's reserved corridor.  Routed the other way round, RP_DP
     # could not leave its own fan-out - "(145.40,122.70) blocked by ['#-9', 'RP_DM']", i.e. RP_USB's reservation plus
     # this pair's own N stubs, the same symptom the H0_UP pair once had (see pair_nets below).
-    # The last waypoint sits in the short east leg into the escape (x 137.95), not at the corner: at (137.7, 114.0),
-    # on the north leg's own x, the pair could only be heading east there by jogging west first, and the jog folded the
-    # inner line to 0.063 mm from the outer one (measured with the twist in the run, 2026-11-07: centre ... (137.70,
-    # 114.20) (137.62,114.12) (137.62,114.08) (137.70,114.00) (138.40,114.00)).
     # RP_DP is hand-planned, because the direct line from the resistors to the port is blocked by the chip itself: at rot
     # 90 the common port faces **west**, so its escape at (138.4,114.0) wants the pair arriving *from the west*, while the
     # 27R resistors are east of the chip (145.4,122.7).  The pair therefore leaves the resistors northwards, crosses west
     # south of the chip, comes up its west flank and turns east into the escape - the three waypoints below mark the middle
-    # of each straight leg.  Rev 8 to 0.13 had RP_DP on the port's pin 10 so that it needed no crossover, which the
-    # router could not place here; since 0.14.0 RP_DP is on pin 11, the common D+ (gen_schematic.py block 6), and the
-    # crossover is a twist inside the run (twist_at='run', twist_in_run - 0.14.0 spliced it into 0.12.0's copper
-    # instead).  A zone in front of the switch cannot work here: it would sit on the lane's own last waypoint, measured
-    # "leg 3 -> (136.8, 114.0) on F.Cu | (136.80,114.00) blocked by ['RP_DM']" (unseeded, 2026-11-06).
+    # of each straight leg.  It also needs no crossover, because RP_DP sits on the port's pin 10 rather than 11
+    # (gen_schematic.py block 6), which is what the router could not place here.
     links.append(('RP_DP', 'RP_DM', ('padpair', 'R503', '2', 'R504', '2', N),
-                  ('pads', 'U601', '11', '10'), (0, 1), (2.0, 'run'),
-                  [(145.4, 118.5, 0, W), (137.7, 118.5, 0, N), (137.95, 114.0, 0, E)]))
+                  ('pads', 'U601', '10', '11'), (0, 1), 2.0,
+                  [(145.4, 118.5, 0, W), (137.7, 118.5, 0, N), (137.7, 114.0, 0, E)]))
     links.append(('RP_USB_DP_PIN', 'RP_USB_DM_PIN', ('pads', 'U501', '67', '66'),
                   ('padpair', 'R503', '1', 'R504', '1', S), (0, 1), 2.0, ()))
     # Hub-0's port 4 is unused - its two lines are pulled to +3V3 by R707/R708 to tell the hub the port is not removable -
@@ -5362,8 +4665,6 @@ def pair_links(B):
     # Hub-0's upstream is on USB1 (pins 3/4): both lines are the ordinary HS channels now, MHL is left unused (on
     # purpose), and with D+ on the eastern pin as usual this pair's two ends already agree on which side D+
     # is (the hub's own DP pin 31 is north of its DM pin 30, which is the matching side), so no crossover either.
-    # 0.13.0 had D+ on U601 pin 4 and a twist in this pair (errata.md E1); since 0.14.0 D+ is pin 3, USB1+, again, and
-    # the pair runs straight, as on 0.12.0.
     links.append(('H0_UP_DP', 'H0_UP_DM', ('pads', 'U601', '3', '4'), ('pads', HUB_REF[0], '31', '30'), (0, 1), 0.9, ()))
     return links
 
@@ -5429,20 +4730,13 @@ def main():
             return padpair_terminal(B, t[1], t[2], t[3], t[4], t[5] if len(t) > 5 else None)
         return pad_terminal(B, t[1], t[2], t[3])
 
-    # (P, A end, B end) -> (P, N) for links still unrouted after every retry: the USB phase's verdict.  Keyed by link,
-    # not by net: the two service links share SVC_DP/SVC_DM (one either side of the ESD U301), and keyed by P the second
-    # link's success erased the first one's failure - measured, J301 -> U301 failed in every run from 0.12.0 on while
-    # the verdict read "2 of 2 link(s) routed" (ROUTE_ONLY_PAIRS=SVC_DP, 0.12.0's own sources, 2026-11-07).
-    pair_failed = {}
+    pair_failed = {}               # P -> (P, N) for links still unrouted after every retry: the USB phase's verdict
 
     def end_key(t):
         """'part.pad' for a link terminal: the pad matters where two links of one net end on the same part."""
         if t[0] == 'usbc':
             return t[1]
         return f'{t[1]}.{t[2]}'
-
-    def link_key(link):
-        return (link[0], end_key(link[2]), end_key(link[3]))
 
     def run(link):
         P, N, ta, tb, layers, bcost, wps = link
@@ -5452,7 +4746,7 @@ def main():
             ok = direct_pair(B, P, N, term(ta), term(tb), log)
         else:
             bc, tw = bcost if isinstance(bcost, tuple) else (bcost, 'B')
-            before = collections.Counter(x for x in B.tracks if x[0] in (P, N))
+            n0 = len(B.tracks)
             live_ghost_clear((P, N))     # a new attempt for these nets replaces the discarded picture of the last one
             B.attempt_log = []           # everything this attempt lays, even what it takes back before returning
             ok = route_pair(B, P, N, term(ta), term(tb), log, layers=layers, b_cost=bc, twist_at=tw, wps=wps,
@@ -5468,11 +4762,7 @@ def main():
             if not ok:
                 # Nothing of a failed link may stay on the board: pieces added before the mark (a retained stub, a
                 # restored reservation, first-mile copper) have been seen left behind as stray stubs and half routes.
-                # But only what *this attempt* added: the nets' copper from before it is another link's (the two
-                # service links share SVC_DP/SVC_DM) or fixed stage-1 copper (the USB-C breakout, the ESD's
-                # flow-through), and taking it away cut the service connector off its ESD whenever the switch's link
-                # failed.
-                _stray = list((collections.Counter(x for x in B.tracks if x[0] in (P, N)) - before).elements())
+                _stray = [(n2, k2, d2) for n2, k2, d2 in B.tracks if n2 in (P, N)]
                 if _stray:
                     log.append(f'  {P}/{N}: {len(_stray)} stray piece(s) of this failed link removed')
                     for _s in _stray:
@@ -5497,25 +4787,13 @@ def main():
         # The USB phase's verdict per link: a link whose *last* attempt failed is unrouted, whatever its earlier
         # retries did, and STOP_IF_USB_FAILS stops the run on it instead of routing the rest of the board around a hole.
         if ok:
-            pair_failed.pop(link_key(link), None)
+            pair_failed.pop(P, None)
         else:
-            pair_failed[link_key(link)] = (P, N)
+            pair_failed[P] = (P, N)
         live('USB pairs', P)
         return ok
 
     links = pair_links(B)
-    # Every pair terminal's pads must carry the link's nets.  pair_links() names its pads by number, so a netlist change
-    # it does not follow (errata.md E1: U601's pair pins changed in 0.13.0 and in 0.14.0) would route one net's line
-    # onto the other net's pad - a short that only the DRC would report, after a full run.
-    for _P, _N, _ta, _tb, *_ in links:
-        for _t in (_ta, _tb):
-            _ends = {'pads': lambda t: ((t[1], t[2], _P), (t[1], t[3], _N)),
-                     'padpair': lambda t: ((t[1], t[2], _P), (t[3], t[4], _N))}.get(_t[0], lambda t: ())(_t)
-            for _ref, _num, _want in _ends:
-                _got = B.padobj[f'{_ref}.{_num}'][0][0].GetNetname()
-                if _got != _want:
-                    raise SystemExit(f'pair_links(): {_P}/{_N} ends on {_ref}.{_num}, which is {_got}, not {_want} - '
-                                     f'the netlist changed: update the link')
     for _P, _N, *_rest in links:
         B.pair_of[_P] = B.pair_of[_N] = (_P, _N)      # belt and braces: pair_nets already gave the two lines one net code
     # Enforcement: no USB line may be routed as a plain signal.  Every net whose name says differential pair has to be in
@@ -5541,18 +4819,6 @@ def main():
         keep = set(only_pairs.split(','))
         links = [l for l in links if l[0] in keep or l[1] in keep]
         print(f'  ROUTE_ONLY_PAIRS: {len(links)} link(s) {[l[0] for l in links]}', flush=True)
-    # --seed=BOARD: an engineering change on a board that was ordered and verified.  The seed's copper stays, as fixed
-    # copper, for every net whose pads are the seed's; only the changed nets are routed (pairs here, any other net after
-    # the pair stage), and the planes are refilled.  So the revision differs from the seed in the changed links alone,
-    # where a full run would re-route the whole board (the router is not deterministic, and any change cascades).
-    # 0.14.0 = 0.12.0's copper with a twist in the RP and service pairs (errata.md E1).  Needs the seed's placement.
-    seed = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--seed=')), None)
-    reroute = set()
-    if seed:
-        reroute = seed_copper(B, board, seed, log)
-        extra = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--reroute=')), '')
-        print(log[-1], flush=True)
-        links = [l for l in links if l[0] in reroute or l[1] in reroute]
     # every pair terminal keeps its fan-out and a short straight run beyond the escape point free of
     # other pairs (an earlier pair must not run along the front of a pin row it does not end in); on B.Cu
     # only the fan-out itself, so planned lanes can pass under a router's pin row
@@ -5585,7 +4851,7 @@ def main():
                         if f'{t[1]}.{nb}' in plane_pad and (t[1], str(nb)) not in BETWEEN_SKIP \
                                 and f'{t[1]}.{nb}' not in getattr(B, 'tied_pins', ()):    # tied: has its via
                             between[plane_pad[f'{t[1]}.{nb}']].add(f'{t[1]}.{nb}')
-    for pn, keys in ({} if seed else between).items():      # seeded: the seed has these vias
+    for pn, keys in between.items():
         if keys:
             n0 = len(B.tracks)
             plane_fanout(B, pn, log, only=keys)
@@ -5624,10 +4890,8 @@ def main():
     # rows, and route_usb_group() walks its orders until all its links fit.  The hubs' own fan-outs stay after their
     # pairs - the pair lanes there are hand-set and must not be blocked.
     B.clear_reserved()
-    if not seed:
-        reserve_xtal_lanes(B, log)                   # before the fan-out plans, so they go round it (XTAL_LANES)
-    for ref in (() if seed else ('U501', 'U1001', 'U1101', 'U601', 'U1202', 'U1302', 'U1402', 'U701', 'U801', 'U901')):
-        dense_fanout(B, log, ref)                    # seeded: the seed has these fan-outs
+    for ref in ('U501', 'U1001', 'U1101', 'U601', 'U1202', 'U1302', 'U1402', 'U701', 'U801', 'U901'):
+        dense_fanout(B, log, ref)
 
     for hub in (() if from_cache else (1, 2, 0)):
         group = [l for l in links if l[0].startswith(f'H{hub}_') and not l[0].startswith(f'H{hub}_AT')
@@ -5641,9 +4905,6 @@ def main():
             # with the old order: 43 sites; with this one the guarantee pass gives every pin a site (probe: 42 + 7
             # vias, 'no site for []').
             route_usb_group(0, group)
-            if seed:                                      # the buses and their plane vias are seeded nets
-                B.unreserve({nm for nm, *_ in B.tracks if nm in B.pair_of})
-                continue
             # The plane pads in the buses' way get their via *before* the buses: step 3 ("plane vias first") does that
             # for every other pad, but these two buses route here, inside the pair phase, so they used to come first.
             # AT2's bus then wrapped C511.1 (+3V3, the RP's cap at (159.05, 132.12)) on three sides with a via in the
@@ -5682,7 +4943,7 @@ def main():
     # abandoned while the board still has space for it.  The retry runs before any signal, so the pair still gets the
     # first pick of that space (a signal would otherwise take it).
     for P, N, ta, tb, layers, bcost, wps in links:
-        if bcost == 'direct' or len(terminals(B, P)) <= 1 or link_key((P, N, ta, tb)) not in pair_failed:
+        if bcost == 'direct' or len(terminals(B, P)) <= 1 or P not in pair_failed:
             # ... and only a link that is *not* routed.  This pass used to re-run every link: route_pair() plans
             # from the terminals again over its own copper, and when the re-plan failed (it has to find a *new* path
             # now that the pairs routed after it have taken the old one) run() removed every piece of that net - so a
@@ -5694,69 +4955,6 @@ def main():
         print(log[-1], flush=True)
         run((P, N, ta, tb, layers, bcost, wps))
         live('USB pairs', P)
-    if seed:
-        # the new parts' plane pads get their via first, as in a full run ("plane vias first")
-        for pn, keys in B.seed_plane_pads.items():
-            keys &= set(plane_open_pads(B, pn))
-            if keys:
-                plane_fanout(B, pn, log, only=keys)
-                print(next(l for l in reversed(log) if l.startswith(f'{pn} fanout vias')) + ' (new pads)', flush=True)
-        rest = sorted(n for n in reroute if n not in PLANES and n not in B.pair_of and len(terminals(B, n)) > 1)
-        if rest:
-            # crystals first, then the --reroute nets in the order given (they make room for the changed nets, and are
-            # the ones with one way to go: 0.16.0's SWD lines to J501), then the nets that end on the RP2354B in its
-            # nesting order, then the rest by span
-            xtal = [n for n in rest if re.match(r'.*_X(I|O|IN|OUT|O_R)$', n)]
-            given = [n for n in extra.split(',') if n in rest and n not in xtal]
-            on_rp = [n for n in rest if n not in xtal + given and any(r.startswith('U501.') for r, _ in B.pads[n])]
-            route_all(B, rest, log, first=xtal + given + (escape_order(B, on_rp, 'U501') if on_rp else []))
-            # The cut nets' leftovers: the new run joins a piece wherever it likes, so the seed's old path beyond that
-            # point is a dead end now.  Trim dangling tracks and drop vias that no longer hop between layers (KiCad:
-            # via_dangling), in turns, until neither finds anything - each exposes more of the other.  Only the cut
-            # nets: the seed's own via tails into the planes (laid after its run's cleanup) look dangling too.
-            trimmed, dropped = 0, 0
-            for _ in range(20):
-                others = [x for x in B.tracks if x[0] not in rest]
-                n0 = len(B.tracks)
-                cleanup_dangling(B, log)
-                lost = [x for x in others if x not in B.tracks]
-                if lost:
-                    B.tracks += lost
-                    B.fixed += [x for x in lost if x not in B.fixed]
-                    B.rebuild()
-                cut_now = n0 - len(B.tracks)                # the cut nets' tracks this pass trimmed
-                trimmed += cut_now
-                gone = []
-                for x in [x for x in B.tracks if x[1] == 'via' and x[0] in rest]:
-                    on_pad = any(s_.dist(np.array([x[2][0]]), np.array([x[2][1]]))[0] <= 0
-                                 for _, sh in B.pads[x[0]] for s_ in sh)
-                    layers = {int(o[2][5]) for o in B.tracks if o[0] == x[0] and o[1] == 'seg'
-                              and _on_item(*x[2], ('seg', o[2]), tol=0.05)}
-                    if not on_pad and len(layers) <= 1:
-                        gone.append(x)
-                if not gone and not cut_now:
-                    break
-                B.tracks = [x for x in B.tracks if x not in gone]
-                B.fixed = [x for x in B.fixed if x not in gone]
-                B.rebuild()
-                dropped += len(gone)
-            log.append(f'  seed: the cut nets\' leftovers trimmed: {trimmed} track(s), {dropped} via(s)')
-        left = sorted(n for n in B.pads if n not in PLANES and len(terminals(B, n)) > 1)
-        if LIVE is not None:
-            LIVE.unrouted = list(left)
-        log.append(f'unrouted: {len(left)} nets {left}')
-        print(log[-1], flush=True)
-        if left:
-            raise SystemExit(f'--seed: {len(left)} net(s) unrouted, board not written (the live view shows why)')
-        live('writing board', '', force=True)
-        write_board(B)
-        log.append(f'done: {sum(t[1] == "seg" for t in B.tracks)} segments, {sum(t[1] == "via" for t in B.tracks)} vias, '
-                   f'{time.time() - t0:.0f}s')
-        live('done', '', force=True)
-        print('\n'.join(l for l in log if l.startswith(('  ', 'seed', 'unrouted', 'done'))))
-        with open(os.path.join(HERE, 'tools', 'route.log'), 'w') as f:
-            f.write('\n'.join(log) + '\n')
-        return
     if cache and not os.path.exists(cache):
         import pickle
         pickle.dump((B.tracks, B.fixed, B.escape, B.escape_on), open(cache, 'wb'))
@@ -5831,15 +5029,7 @@ def main():
     first += sorted((n for n in names if n not in first and n not in POWER and span(n) < 6.0), key=span)
     # then the densest chip: every other net on the RP2354B (64 pins at 0.4 mm, its crystal included) in nesting order,
     # before power and the rest crowd it
-    # (the Bluetooth module's two UART lines excepted: slow lines, they route last, from the via sites the fan-out plan
-    # holds for them.  Routed with the RP2354B's nets they took the crystal's corridor, and routed before power they
-    # took the In2.Cu crossing of the OTHER port's pairs that +5 V needs: +5 V unrouted in three runs of 0.16.0.)
-    esp = [n for n in names if n.startswith('ESP_')]
-    # the SWD connector's lines (and RUN) next: the board's programming interface, with one short way each to J501;
-    # 0.16.0 with the Bluetooth module's UART on pins 36/37 left RP_RUN walled in when OT_EN went first
-    swd = [n for n in names if n not in first and n in ('RP_SWCLK', 'RP_SWDIO', 'RP_RUN')]
-    first += escape_order(B, swd, 'U501') if swd else []
-    first += escape_order(B, [n for n in names if n not in first and on_rp(n) and n not in esp], 'U501')
+    first += escape_order(B, [n for n in names if n not in first and on_rp(n)], 'U501')
     first += [n for n in names if re.match(groups[3], n) and n not in first]
     # USB, SPI (routed already), crystals - and the USB data lines themselves: the pairs route in the pair phase,
     # before any signal, and no signal may rip them up or run along the front of their escape (they are not in
@@ -5853,12 +5043,6 @@ def main():
     first += [n for n in POWER_ORDER + list(POWER) if n in names and n not in first]
     first += [n for n in names if re.match(r'(AT[12]_(IRQ|NRST|BOOT0)|HUB\d_(RST|VBUS)|(KB|MS|OT)_(SEL[01]|EN|FLT)|'
                                            r'LED_DATA|KEY|RP_RUN)$', n) and n not in first]
-    # the rest by span, as route_all() orders them, then the Bluetooth module's lines
-    def span_all(n):
-        xs = [s[0].bbox()[0] for _, s in B.pads[n]]
-        ys = [s[0].bbox()[1] for _, s in B.pads[n]]
-        return (max(xs) - min(xs)) + (max(ys) - min(ys))
-    first += sorted((n for n in names if n not in first and n not in esp), key=span_all) + [n for n in esp if n not in first]
     route_all(B, names, log, first=first, protect=protect)
     for rnd in range(2):          # nets left partly unrouted: the board around them has changed since, try again
         left = [n for n in names if len(terminals(B, n)) > 1]

@@ -259,23 +259,13 @@
   "matched_by": "number",
   "note": ""
  },
- "C41349510": {
-  "footprint": "ESP32-C3-MINI-1",
-  "easyeda": "WIFIM-SMD_ESP32-C3-MINI-1",
-  "theta": 0,
-  "dx": 0.0,
-  "dy": 0.0,
-  "rms_mm": 0.0001,
-  "matched_by": "number",
-  "note": ""
- },
  "C43389": {
   "footprint": "L_Sunlord_SWPA3015S",
   "easyeda": "IND-SMD_L3.0-W3.0",
   "theta": 180,
   "dx": 0.0,
   "dy": 0.0,
-  "rms_mm": 0.05,
+  "rms_mm": 0.1779,
   "matched_by": "number",
   "note": ""
  },
