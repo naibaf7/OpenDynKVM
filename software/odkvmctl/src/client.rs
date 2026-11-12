@@ -8,7 +8,7 @@ use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::{
     Accel, BT_HOSTS, BtHostInfo, BtPolicy, ConfigValue, DeviceMsg, ErrorCode, Event, FW_CHUNK, FwState, FwTarget,
     Hotkey, Info, LearnEnd, MAX_PROFILES, MAX_SCREENS, Mapping, Pc, Port, PortInfo, PortMode, RebootTarget, Request,
-    Response, Screen, Status, StringKind, Target, caps, diag, key, status_flags,
+    Response, Screen, Status, StringKind, Target, Units, caps, diag, key, status_flags,
 };
 use kvm_proto::link::bt::host_flags;
 
@@ -119,6 +119,10 @@ pub struct HopView {
     pub corner: u16,
     /// PC1, PC2.
     pub mapping: [Mapping; 2],
+    /// What PC1's and PC2's desktop coordinates count.
+    pub units: [Units; 2],
+    /// The KVM is the built-in simulator: its screens aren't this computer's.
+    pub simulated: bool,
     pub screens: [Screen; MAX_SCREENS],
 }
 
@@ -150,6 +154,8 @@ impl Snapshot {
             resistance: 0,
             corner: 0,
             mapping: [Mapping::Desktop; 2],
+            units: [Units::Physical; 2],
+            simulated: self.info.caps & caps::SIMULATED != 0,
             screens: [Screen::NONE; MAX_SCREENS],
         };
         for c in &self.config {
@@ -160,6 +166,7 @@ impl Snapshot {
                 ConfigValue::HopResistance(r) => v.resistance = r,
                 ConfigValue::HopCorner(c) => v.corner = c,
                 ConfigValue::HopMapping(pc, m) => v.mapping[pc.index()] = m,
+                ConfigValue::HopUnits(pc, u) => v.units[pc.index()] = u,
                 ConfigValue::Screen(i, s) if (i as usize) < MAX_SCREENS => v.screens[i as usize] = s,
                 _ => {}
             }

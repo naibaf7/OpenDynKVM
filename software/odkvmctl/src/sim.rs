@@ -13,7 +13,8 @@
 //! it is up as above. Without either the module isn't fitted, as on most boards.
 //!
 //! With `OPENDYN_SIM_HOP=1` screen hop is set up and on in the first profile: the absolute pointer, PC1 with a
-//! 2560×1440 main screen and a 1920×1080 one left of it, PC2 with a 3840×2160 screen at 150 % to the right.
+//! 2560×1440 main screen and a 1920×1080 one left of it, PC2 with a 3840×2160 screen at 150 % to the right. That
+//! monitor is cabled to PC1 too: PC1's is off for hop and lies on PC2's.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -333,6 +334,8 @@ impl SimTransport {
             ConfigValue::Screen(0, Screen::new(Pc::Pc1, 2560, 1440, [0, 0])),
             ConfigValue::Screen(1, Screen { desk: [-1920, 360], ..Screen::new(Pc::Pc1, 1920, 1080, [-1920, 360]) }),
             ConfigValue::Screen(2, pc2),
+            // A monitor cabled to both: PC1 has it too, off for hop, laid on PC2's screen.
+            ConfigValue::Screen(3, Screen { pc: Some(Pc::Pc1), desk: [2560, -120], off: true, fixed: true, ..pc2 }),
         ] {
             let _ = engine.set_config(v, kvm_core::config::Origin::Device);
         }

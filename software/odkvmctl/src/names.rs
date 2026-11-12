@@ -7,7 +7,7 @@ use kvm_proto::ctrl::{
     Accel, Advertised, AutoReason, BT_HOSTS, BtPolicy, ConfigValue, ErrorCode, FaultKind, FwState, HOP_CORNER_MAX,
     HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Hotkey, HotkeyKind, KeyAction, LearnEnd, LinkState, MAX_PROFILES,
     MAX_SCREENS, Mapping, PROFILE_NAME_MAX, Pc, Polling, Port, PortMode, PortState, PowerSource, ProfileName, Rgb,
-    Screen, Speed, SwitchSource, VialMode, class, diag, key,
+    Screen, Speed, SwitchSource, Units, VialMode, class, diag, key,
 };
 
 pub fn error(c: ErrorCode) -> String {
@@ -287,12 +287,13 @@ pub fn mapping(m: Mapping) -> String {
     }
 }
 
-/// A screen slot as the CLI writes it: `pc1 2560x1440 150% at 1920,0 desk 0,0`, or `off`.
+/// A screen slot as the CLI writes it: `pc1 2560x1440 150% at 1920,0 desk 0,0`, then `no-hop` when it is off for
+/// screen hop and `fixed` when its place on its computer is; or `off` for a free slot.
 pub fn format_screen(s: &Screen) -> String {
     match s.pc {
         None => "off".into(),
         Some(pc) => format!(
-            "{} {}x{} {}% at {},{} desk {},{}",
+            "{} {}x{} {}% at {},{} desk {},{}{}{}",
             pc.name(),
             s.w,
             s.h,
@@ -300,8 +301,17 @@ pub fn format_screen(s: &Screen) -> String {
             s.at[0],
             s.at[1],
             s.desk[0],
-            s.desk[1]
+            s.desk[1],
+            if s.off { " no-hop" } else { "" },
+            if s.fixed { " fixed" } else { "" }
         ),
+    }
+}
+
+pub fn units(u: Units) -> String {
+    match u {
+        Units::Physical => fl!("units-physical"),
+        Units::Logical => fl!("units-logical"),
     }
 }
 
@@ -326,6 +336,8 @@ pub fn parse_screen(text: &str) -> Result<Screen, String> {
             "at" => s.at = point(words.next())?,
             "desk" => s.desk = point(words.next())?,
             w if w.ends_with('%') => s.scale = w.trim_end_matches('%').parse().map_err(|_| bad())?,
+            "no-hop" => s.off = true,
+            "fixed" => s.fixed = true,
             _ => return Err(bad()),
         }
     }
@@ -611,6 +623,8 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("hop-corner", key::HOP_CORNER),
     ("hop-mapping-pc1", key::HOP_MAPPING_BASE),
     ("hop-mapping-pc2", key::HOP_MAPPING_BASE + 1),
+    ("hop-units-pc1", key::HOP_UNITS_BASE),
+    ("hop-units-pc2", key::HOP_UNITS_BASE + 1),
     ("profile0-hop", key::PROFILE_HOP_BASE),
     ("profile1-hop", key::PROFILE_HOP_BASE + 1),
     ("profile2-hop", key::PROFILE_HOP_BASE + 2),
@@ -693,6 +707,7 @@ pub fn format_value(v: &ConfigValue) -> String {
         ConfigValue::HopSpeed(v) => v.to_string(),
         ConfigValue::HopResistance(v) | ConfigValue::HopCorner(v) => v.to_string(),
         ConfigValue::HopMapping(_, m) => m.name().into(),
+        ConfigValue::HopUnits(_, u) => u.name().into(),
         ConfigValue::Screen(_, s) => format_screen(s),
     }
 }
@@ -774,6 +789,10 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
             Mapping::from_name(s.trim())
                 .ok_or_else(|| fl!("parse-one-of", value = s, choices = "desktop, main-screen"))?,
         ),
+        k if (key::HOP_UNITS_BASE..key::HOP_UNITS_BASE + 2).contains(&k) => ConfigValue::HopUnits(
+            Pc::from_index((k - key::HOP_UNITS_BASE) as usize),
+            Units::from_name(s.trim()).ok_or_else(|| fl!("parse-one-of", value = s, choices = "physical, logical"))?,
+        ),
         k if (key::PROFILE_HOP_BASE..key::PROFILE_HOP_BASE + MAX_PROFILES as u16).contains(&k) => {
             ConfigValue::ProfileHop((k - key::PROFILE_HOP_BASE) as u8, parse_bool(s)?)
         }
@@ -844,6 +863,15 @@ mod tests {
         for bad in ["pc3 1920x1080", "pc1 1920", "pc1 10x10", "pc1 1920x1080 at 5", "pc1 1920x1080 50%"] {
             assert!(parse_screen(bad).is_err(), "{bad}");
         }
+        let off = Screen { off: true, fixed: true, ..s };
+        assert_eq!(format_screen(&off), "pc2 3840x2160 150% at -2560,120 desk -3840,0 no-hop fixed");
+        assert_eq!(parse_screen(&format_screen(&off)), Ok(off));
+        assert_eq!(
+            parse_screen("pc1 1920x1080 no-hop"),
+            Ok(Screen { off: true, ..Screen::new(Pc::Pc1, 1920, 1080, [0, 0]) })
+        );
+        assert_eq!(parse_value(key::HOP_UNITS_BASE + 1, "logical"), Ok(ConfigValue::HopUnits(Pc::Pc2, Units::Logical)));
+        assert!(parse_value(key::HOP_UNITS_BASE, "metric").is_err());
         assert!(parse_value(key::HOP_SPEED, "11").is_err());
         assert_eq!(parse_value(key::HOP_SPEED, "-4"), Ok(ConfigValue::HopSpeed(-4)));
     }

@@ -7,7 +7,7 @@ assembles with (so JLC's placement needs no correction), plus the MX hot-swap ke
 and the OpenDynKVM logo as silkscreen (from ../branding/, drawn by branding/make_logo.py).
 EasyEDA data is cached in tools/easyeda_cache/ (fetched like tools/jlc_align.py does).
 
-Run from hardware/ (network only for uncached parts):   python3 tools/gen_footprints.py
+Run from hardware/ (network only for uncached parts):   uv run tools/gen_footprints.py
 """
 import json
 import math

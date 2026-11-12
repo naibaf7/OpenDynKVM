@@ -1398,6 +1398,11 @@ impl Engine {
         }
     }
 
+    /// How `pc` takes the absolute pointer: its mapping and its desktop.
+    fn hop_map(&self, pc: Pc) -> hop::Map {
+        hop::Map { mapping: self.config.mapping(pc), units: self.config.units(pc) }
+    }
+
     /// Whether the pointer may hop onto `pc`: it is connected, awake and past its firmware setup.
     fn hop_open(&self, pc: Pc) -> bool {
         let s = &self.pcs[pc.index()];
@@ -1419,12 +1424,12 @@ impl Engine {
             corner: h.corner,
             buttons: m.buttons != 0,
             open: [self.hop_open(Pc::Pc1), self.hop_open(Pc::Pc2)],
-            mapping: h.mapping,
+            maps: [self.hop_map(Pc::Pc1), self.hop_map(Pc::Pc2)],
         };
         let screens = self.config.screens;
         let step = self.hop.motion(&screens, pc, d, self.now, &rules);
         let reports =
-            if step.reports.is_empty() { self.hop.here(&screens, pc, h.mapping[pc.index()]) } else { step.reports };
+            if step.reports.is_empty() { self.hop.here(&screens, pc, self.hop_map(pc)) } else { step.reports };
         // The wheel goes with the first report.
         let mut scroll = (m.wheel, m.pan);
         for r in reports {
@@ -1434,7 +1439,7 @@ impl Engine {
         if let Some(to) = step.hop {
             self.switch(if to == Pc::Pc1 { Target::Pc1 } else { Target::Pc2 }, SwitchSource::Edge);
             if self.active == to && self.bt.active.is_none() {
-                for r in self.hop.here(&screens, to, h.mapping[to.index()]) {
+                for r in self.hop.here(&screens, to, self.hop_map(to)) {
                     self.send_pointer_report(to, r, 0, 0, 0);
                 }
             }
@@ -2317,7 +2322,8 @@ impl Engine {
                 let pc = pc.ok_or(ErrorCode::NotActive)?;
                 if self.config.hop_on() {
                     let active = pc == self.active && self.bt.active.is_none();
-                    self.hop.sync(&self.config.screens, pc, *at, self.now, active);
+                    let map = self.hop_map(pc);
+                    self.hop.sync(&self.config.screens, pc, map, *at, self.now, active);
                 }
                 Response::Ok
             }

@@ -24,7 +24,7 @@ the Python reference).  Step 4 plans the next nets on threads (ROUTE_WORKERS, de
 commits them in order; a plan whose search region saw a change is planned again, so the result is
 identical to routing one net after the other.
 
-Run from hardware/ after tools/gen_pcb.py:   python3 tools/route.py [--live[=PORT]]
+Run from hardware/ after tools/gen_pcb.py:   uv run tools/route.py [--live[=PORT]]
 Writes kvm.kicad_pcb in place (routing is replaced, footprints untouched).  Log: tools/route.log.
 --live serves tools/route_view.html on http://localhost:8765/ (all copper layers, redrawn as routing goes).
 
@@ -120,7 +120,7 @@ PAIR_VIA_R = PAIR_VIA_O + VIA_D / 2      # radius kept free around a pair via si
 # (gen_pcb.py STACKUP): JLC04161H-3313 is 1 oz outside but 0.5 oz inside, so a rail on In2.Cu needs 2.3 x the width
 _CU = {n: t for n, kind, t, _ in board_stackup(PCB) if kind == 'copper'}
 if not _CU:
-    sys.exit(f'{PCB} has no stack-up: python3 tools/gen_pcb.py --stackup')
+    sys.exit(f'{PCB} has no stack-up: uv run tools/gen_pcb.py --stackup')
 CU = tuple(_CU[n] for n in ('F.Cu', 'B.Cu', 'In2.Cu'))
 RHO_CU = 1.72e-5               # copper resistivity, ohm mm
 
@@ -4874,7 +4874,7 @@ def write_board(B, zones=True):
 
 # ── live view: JSON snapshots for tools/route_view.html, served on localhost ──
 class Live:
-    """python3 tools/route.py --live[=PORT]  ->  http://localhost:PORT/ redraws all copper layers as routing goes."""
+    """uv run tools/route.py --live[=PORT]  ->  http://localhost:PORT/ redraws all copper layers as routing goes."""
 
     def __init__(self, B, board, log, port):
         import http.server

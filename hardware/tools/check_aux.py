@@ -23,7 +23,7 @@ Known, accepted results (they are geometry, not mistakes):
 
 Divider / series parts with two signal nets are not checked: they belong *between* their two connections.
 
-Run from hardware/:   python3 tools/check_aux.py
+Run from hardware/:   uv run tools/check_aux.py
 """
 
 import math

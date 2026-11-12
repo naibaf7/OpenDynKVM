@@ -13,9 +13,9 @@ either. This one follows it in the font list, cut down to what the Chinese trans
 HarfBuzz's `hb-subset` does the work: fontTools 4.68 fails to instance this CFF2 font (and to turn it into CFF).
 fontTools only finds the face and checks the result.
 
-    python3 -I software/odkvmctl/fonts/make_cjk_font.py [/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc]
+    uv run software/odkvmctl/fonts/make_cjk_font.py [/usr/share/fonts/google-noto-sans-cjk-vf-fonts/NotoSansCJK-VF.ttc]
 
-Needs `hb-subset` (HarfBuzz 6 or later; Fedora's `harfbuzz-utils`) and fontTools (`pip install fonttools`). The source:
+Needs `hb-subset` (HarfBuzz 6 or later; Fedora's `harfbuzz-utils`) and fontTools (in the repository's environment, DEVELOPMENT.md). The source:
 Fedora's `google-noto-sans-cjk-vf-fonts` 2.004, or https://github.com/notofonts/noto-cjk
 (Sans/Variable/OTC/NotoSansCJK-VF.otf.ttc), face "Noto Sans CJK SC".
 """
@@ -60,7 +60,7 @@ def main() -> None:
         check=True,
     )
 
-    font = TTFont(OUT)
+    font = TTFont(OUT, recalcTimestamp=False)  # keep the source's dates: the same input, the same file
     missing = [chr(c) for c in wanted if c not in font.getBestCmap()]
     if missing:
         sys.exit(f"{OUT.name} lacks {''.join(missing)!r}")

@@ -12,7 +12,7 @@ geometry; 2-pin polarized parts by the EasyEDA symbol's K/A pin names) and solve
 The result goes to tools/jlc_corrections.json, which tools/make_fab.py applies to the CPL:
         JLC rotation = KiCad rotation + theta,   JLC position = KiCad position + R(phi) * t
 
-Run from hardware/ (needs network):   python3 tools/jlc_align.py  (adapted from OpenRower)
+Run from hardware/ (needs network):   uv run tools/jlc_align.py  (adapted from OpenRower)
 """
 import json
 import math

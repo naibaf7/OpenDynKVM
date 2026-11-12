@@ -19,7 +19,7 @@ ranges (TOL), which are typical fab values, not JLC guarantees.
   --prepreg MM, --er X  evaluate another build without touching the board: the dielectric under the pair and its Er
              (e.g. JLC's 1 oz-inner 3313 build, 0.092 mm)
 
-Run from hardware/:   python3 tools/zsolve.py [--corners] [--prepreg MM] [--er X]     (each solve takes a few seconds)
+Run from hardware/:   uv run tools/zsolve.py [--corners] [--prepreg MM] [--er X]     (each solve takes a few seconds)
 """
 
 import math
@@ -115,7 +115,7 @@ def solve(w, s, h, t, er, mask_t=0.0, mask_er=MASK_ER, pair=True, dx=0.0025, hal
 def outer_stackup():
     st = board_stackup(PCB)
     if not st:
-        sys.exit('the board has no stack-up (python3 tools/gen_pcb.py --stackup)')
+        sys.exit('the board has no stack-up (uv run tools/gen_pcb.py --stackup)')
     names = [n for n, *_ in st]
     cu = names.index('F.Cu')
     _, _, t, _ = st[cu]

@@ -7,8 +7,8 @@ use core::ops::RangeInclusive;
 
 use kvm_proto::ctrl::{
     Accel, BT_HOSTS, BtPolicy, ConfigValue, ErrorCode, HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, Hotkey,
-    KeyAction, MAX_PROFILES, MAX_SCREENS, Mapping, Pc, Polling, Port, PortMode, ProfileName, Rgb, Screen, VialMode,
-    key,
+    KeyAction, MAX_PROFILES, MAX_SCREENS, Mapping, Pc, Polling, Port, PortMode, ProfileName, Rgb, Screen, Units,
+    VialMode, key,
 };
 use kvm_proto::wire::{Reader, Writer};
 
@@ -17,6 +17,7 @@ pub const ITEM: u16 = 0x0001;
 /// Room for every key with margin.
 /// 0.16.0 added the Bluetooth settings (a hotkey, four names, four policies): up to 83 bytes more.
 /// Screen hop added the absolute pointer, its settings, four profile switches and eight screens: 194 bytes more.
+/// Each PC's units for screen hop (protocol 8): 8 bytes more.
 pub const ITEM_MAX: usize = 576;
 /// The longest value of an entry (a screen: 15 bytes).
 const VALUE_MAX: usize = 22;
@@ -78,6 +79,8 @@ pub struct HopConfig {
     pub corner: u16,
     /// How PC1 and PC2 map the absolute pointer onto their screens.
     pub mapping: [Mapping; 2],
+    /// What PC1's and PC2's desktop coordinates count.
+    pub units: [Units; 2],
 }
 
 /// A set of port modes to switch between with the key, e.g. emulated for work and passthrough for games.
@@ -151,6 +154,7 @@ impl Config {
             resistance: 100,
             corner: 20,
             mapping: [Mapping::Desktop; 2],
+            units: [Units::Physical; 2],
         },
         screens: [Screen::NONE; MAX_SCREENS],
     };
@@ -172,6 +176,10 @@ impl Config {
 
     pub fn mapping(&self, pc: Pc) -> Mapping {
         self.hop.mapping[pc.index()]
+    }
+
+    pub fn units(&self, pc: Pc) -> Units {
+        self.hop.units[pc.index()]
     }
 }
 
@@ -237,6 +245,10 @@ impl Config {
             k if (key::HOP_MAPPING_BASE..key::HOP_MAPPING_BASE + 2).contains(&k) => {
                 let pc = Pc::from_index((k - key::HOP_MAPPING_BASE) as usize);
                 ConfigValue::HopMapping(pc, self.mapping(pc))
+            }
+            k if (key::HOP_UNITS_BASE..key::HOP_UNITS_BASE + 2).contains(&k) => {
+                let pc = Pc::from_index((k - key::HOP_UNITS_BASE) as usize);
+                ConfigValue::HopUnits(pc, self.units(pc))
             }
             k if (key::PROFILE_HOP_BASE..key::PROFILE_HOP_BASE + MAX_PROFILES as u16).contains(&k) => {
                 let i = k - key::PROFILE_HOP_BASE;
@@ -334,6 +346,7 @@ impl Config {
             ConfigValue::HopResistance(v) => self.hop.resistance = v,
             ConfigValue::HopCorner(v) => self.hop.corner = v,
             ConfigValue::HopMapping(pc, m) => self.hop.mapping[pc.index()] = m,
+            ConfigValue::HopUnits(pc, u) => self.hop.units[pc.index()] = u,
             ConfigValue::ProfileHop(i, b) => self.profiles[i as usize].hop = b,
             ConfigValue::Screen(i, s) => {
                 // A free slot is stored as such, whatever else came with it.
@@ -414,6 +427,7 @@ mod tests {
         c.set(ConfigValue::HopResistance(400), Origin::Software).unwrap();
         c.set(ConfigValue::HopCorner(0), Origin::Software).unwrap();
         c.set(ConfigValue::HopMapping(Pc::Pc2, Mapping::MainScreen), Origin::Software).unwrap();
+        c.set(ConfigValue::HopUnits(Pc::Pc1, Units::Logical), Origin::Software).unwrap();
         for i in 0..MAX_SCREENS as u8 {
             let s = Screen {
                 pc: Some(if i < 4 { Pc::Pc1 } else { Pc::Pc2 }),
@@ -422,17 +436,28 @@ mod tests {
                 scale: 150,
                 desk: [-3840 * (i as i16 % 4), 0],
                 at: [-20_000 + 2560 * i as i16, -1440],
+                off: i % 3 == 0,
+                fixed: i % 2 == 0,
             };
             c.set(ConfigValue::Screen(i, s), Origin::Software).unwrap();
         }
         let mut buf = [0xFFu8; ITEM_MAX];
         let n = c.encode(&mut buf);
-        assert!(n < ITEM_MAX);
+        // Everything at its longest, with room left for what comes next.
+        assert!(n + 32 <= ITEM_MAX, "item {n} bytes of {ITEM_MAX}");
         let d = Config::decode(&buf[..n]);
         assert_eq!(d, c);
+        assert!(d.screens[3].off && d.screens[4].fixed && !d.screens[4].off);
         assert_eq!(d.port_modes(), [PortMode::Auto, PortMode::Mirrored, PortMode::Auto]);
         assert_eq!(d.profiles[0].port_modes[Port::Other.index()], PortMode::PassthroughPc1);
         assert_eq!(Config::decode(&[]), Config::default());
+    }
+
+    #[test]
+    fn a_freed_screen_slot_has_no_flags() {
+        let mut c = Config::default();
+        let off = Screen { pc: None, off: true, fixed: true, ..Screen::new(Pc::Pc1, 3840, 2160, [-2560, 360]) };
+        assert_eq!(c.set(ConfigValue::Screen(3, off), Origin::Software), Ok(ConfigValue::Screen(3, Screen::NONE)));
     }
 
     #[test]

@@ -626,9 +626,20 @@ engine, on the motion of the normalized pointing devices; the PCs get an absolut
   never does, so a profile without hop (gaming) gets the relative mouse at once. In boot protocol everything is
   relative.
 - **Arrangement:** 8 screen slots (`screen0`–`screen7`), each a PC's: resolution, display scaling (100–400 %), its
-  top-left in that PC's own display arrangement (`desk`, the PC's pixels), and its top-left in the arrangement
-  (`at`, logical pixels: a screen at 150 % takes two thirds of its pixels each way, so screens of the same physical
-  size line up). The pointer lives in the arrangement, in logical pixels with sub-pixel precision.
+  top-left in that PC's own display arrangement (`desk`, in the PC's units, below), and its top-left in the
+  arrangement (`at`, logical pixels: a screen at 150 % takes two thirds of its pixels each way, so screens of the same
+  physical size line up). The pointer lives in the arrangement, in logical pixels with sub-pixel precision. Two flags
+  per screen (protocol 8, in the slot's PC byte):
+  - **Off for hop** (`off`): a screen of a monitor cabled to both PCs, on the PC it doesn't show. It lies where the
+    other PC's screen is; the pointer never goes onto it, but it still counts for its PC's desktop (mapping, below).
+    Measured on the first board's desk (2026-11-12): PC1 (KDE) had the shared 4K monitor left of its HD monitor, and
+    with the HD monitor alone in the arrangement the cursor sat 2.33× too far along, on the 4K monitor's hidden area,
+    before every hop.
+  - **Fixed** (`fixed`): its `desk` is the PC's own (detected, or typed in); the app doesn't derive it from where the
+    screen is dragged. The KVM only stores it.
+- **Units** (`hop-units-pc1/-pc2`, protocol 8): what a PC's `desk` coordinates count. `physical` (Windows, X11): a
+  screen covers its resolution there. `logical` (Wayland desktops: KDE Plasma, GNOME): it covers its arrangement
+  size, its resolution over its scaling, and an absolute pointer is spread in those units.
 - **Edges**, axis by axis: past a screen's edge, the next screen in that direction among those spanning the pointer's
   other coordinate (the nearest, however far: a gap is jumped; up to 8 pixels of overlap still count).
   - The same PC's: the pointer goes on, by what is left of the motion.
@@ -639,8 +650,9 @@ engine, on the motion of the normalized pointing devices; the PCs get an absolut
     released (a switch like any other, `SwitchSource::Edge`), and the other PC the pointer at the same place along
     its screen's edge.
   - Nothing there: a wall.
-- **Mapping** (`hop-mapping-pc1/-pc2`): where a PC puts 0–32767. `desktop`: across the bounding box of its screens'
-  `desk` rectangles (Linux: X11, GNOME, KDE). `main-screen`: on its main screen only, the one at `desk` 0,0 (Windows
+- **Mapping** (`hop-mapping-pc1/-pc2`): where a PC puts 0–32767. `desktop`: across the bounding box of all its
+  screens' `desk` rectangles, those off for hop included (Linux: X11, GNOME, KDE). `main-screen`: on its main screen
+  only, the one at `desk` 0,0 (Windows
   10 and later map an absolute HID mouse onto the primary monitor). Its other screens get relative motion instead: the
   KVM knows where it last put the cursor (an absolute report puts it exactly there) and sends the difference to where
   the pointer is, in the PC's pixels; back on the main screen, the next absolute report puts it exactly in place again.
@@ -923,7 +935,8 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x00A4 | corners: how far from each end of such an edge it never hops, 0–500 (default 20) |
 | 0x00A6 / 0x00A7 | how PC1 / PC2 maps the absolute pointer: across all its screens (default) or onto its main screen only |
 | 0x00A8–0x00AB | screen hop on in profile 0–3 (default off) |
-| 0x00B0–0x00B7 | screen slot 0–7: PC (0 = free), width, height, scaling %, `desk` x, y, `at` x, y (15 bytes) |
+| 0x00AC / 0x00AD | what PC1's / PC2's desktop coordinates count: physical pixels (default) or logical (protocol 8) |
+| 0x00B0–0x00B7 | screen slot 0–7: PC (0 = free; bit 7 off for hop, bit 6 fixed place, protocol 8), width, height, scaling %, `desk` x, y, `at` x, y (15 bytes) |
 
 The config item (§4.8) keeps 0x0030–0x0032 too, so firmware from before profiles still finds the active profile's
 modes, and a config saved by it loads its modes into profile 0. Hosts skip keys an older firmware refuses.
@@ -992,11 +1005,14 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     `odkvmctl status` names the Bluetooth module's firmware, or what it is doing instead, where one is fitted.
   - `odkvmctl display [list]`, `odkvmctl display input <id> <value>`: the monitors' inputs over DDC/CI (no KVM needed).
   - `odkvmctl screens [list]`: screen hop's state, the arrangement slot by slot, each PC's mapping and the pointer
-    settings; `odkvmctl screens detect` puts this computer's screens in (as PC1 or PC2, whichever the KVM says this
-    computer is) and sets its mapping (§4.14). The settings themselves are `config set abs-pointer`, `hop-accel`,
-    `hop-speed`, `hop-resistance`, `hop-corner`, `hop-mapping-pc1/2`, `profileN-hop`, and `screenN` as
-    `pc1 2560x1440 150% at 1920,0 desk 0,0` (scaling and positions may be left out) or `off`. `odkvmctl status` has a
-    screen-hop line.
+    settings, with a warning when this computer's display settings no longer match the KVM's copy; `odkvmctl screens
+    detect` brings this computer's screens up to date (as PC1 or PC2, whichever the KVM says this computer is: those
+    already there keep their place and on/off, new ones go beside their neighbours, gone ones go) and sets its mapping
+    and units (§4.14). The settings themselves are `config set abs-pointer`, `hop-accel`, `hop-speed`,
+    `hop-resistance`, `hop-corner`, `hop-mapping-pc1/2`, `hop-units-pc1/2`, `profileN-hop`, and `screenN` as
+    `pc1 2560x1440 150% at 1920,0 desk 0,0` (scaling and positions may be left out; `no-hop` for a screen off for hop,
+    `fixed` for a place on its computer that dragging doesn't change) or `off`. `odkvmctl status` has a screen-hop
+    line.
   - `--sim` runs any command against a built-in simulated device (`OPENDYN_SIM_HOP=1`: with screen hop set up).
 - **GUI** (`opendyn-kvm`), laid out after Creative's Sound Blaster app: a sidebar with the logo, coloured page icons
   and, at its foot, the quick controls (profile, PC1 / PC2 in the KVM's LED colours, LED brightness, dark / light), and
@@ -1011,18 +1027,26 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     runs and, if not, what it needs, with a button for the absolute pointer or the Mouse port's mode; the profiles it
     is on in; the absolute pointer. The arrangement on a canvas: the screens to scale in their PC's colour (its main
     screen marked), the pointer live on them; a click selects a screen, a drag moves it, its edges snapping to the
-    others' (the canvas keeps its scale during a drag, the grabbed point stays under the pointer, and the slot is sent
-    when the drag ends; a screen sent stays shown as sent until the KVM's copy has it); a warning where
-    screens overlap. Where a screen sits next to its PC's other screens is where it is on that PC: a drop, an added or
-    removed screen, or a new resolution or scaling gives that PC's screens their place on their computer (`desk`) from
-    the arrangement (`odkvmctl::screens::desks`, the inverse of detection); a place typed in stays until the
-    arrangement changes. (Before, a screen added by hand kept "right of the PC's others" whichever side it was dragged
-    to, and the KVM moved that PC's cursor the wrong way: 2026-11-12.) On Windows, the window warns when this
-    computer's mapping is set to all its screens. Add a screen per PC, remove one, *Detect this computer's screens* (`odkvmctl::screens`: Windows'
-    monitor API with each monitor's DPI, Linux `xrandr --listmonitors`; placed where that PC's screens were, each next
-    to the neighbour it touches on its PC, since Windows' pixels are physical and the scalings differ), and the
-    selected screen's PC, resolution (a list, or typed), scaling, place on its own PC and place here. Each PC's
-    mapping. The pointer: acceleration, speed, edge resistance, corners. On Windows the worker reports this computer's
+    others' (the canvas keeps its scale during a drag, the grabbed point stays under the pointer); a warning where
+    screens overlap. Every edit of the arrangement (a drag, a screen added, removed or edited, *Detect*, a PC's
+    mapping or units) goes to a draft on the page, and to the KVM only with **Apply**, all of it at once; **Discard**
+    drops it. After Apply the draft stays until the KVM's copy has it all (at least 2 s, since the window's own copy
+    takes a setting as soon as it is sent), so a refused request keeps the edits for another try. (Before, each edit
+    was sent at once: a detection half taken left the arrangement neither old nor new, 2026-11-12.) Where a screen
+    sits next to its PC's other screens is where it is on that PC: a drop, an added or removed screen, or a new
+    resolution or scaling gives that PC's screens their place on their computer (`desk`) from the arrangement
+    (`odkvmctl::screens::desks`, the inverse of detection), except places that are fixed (detected or typed in). A
+    screen off for hop is drawn dashed, on top of the screen it lies on; clicking again picks the screen underneath.
+    (Before, a screen added by hand kept "right of the PC's others" whichever side it was dragged to, and the KVM moved
+    that PC's cursor the wrong way: 2026-11-12.) On Windows, the window warns when this
+    computer's mapping is set to all its screens, and the page warns when this computer's display settings no longer
+    match the KVM's copy (read every 3 s). Add a screen per PC, remove one, *Detect this computer's screens*
+    (`odkvmctl::screens`: Windows' monitor API with each monitor's DPI; on KDE Plasma under Wayland
+    `kscreen-doctor -j`, in logical pixels, since `xrandr` there sees XWayland's coordinates scaled by the largest
+    scaling; otherwise `xrandr --listmonitors`; merged into the arrangement, each new screen next to the neighbour it
+    touches on its PC, since Windows' pixels are physical and the scalings differ), and the selected screen's PC,
+    resolution (a list, or typed), scaling, place on its own PC, place here, and whether screen hop goes onto it. Each
+    PC's mapping and units. The pointer: acceleration, speed, edge resistance, corners. On Windows the worker reports this computer's
     cursor to the KVM each time it rests (cursor sync, §4.14);
   - *Keyboard*: hotkeys, typed or learned (**Learn**, then the hotkey on the KVM's keyboard; it goes into the field
     with any warning, and **Apply** sets it; offered from the active PC with a keyboard the KVM reads, on firmware with

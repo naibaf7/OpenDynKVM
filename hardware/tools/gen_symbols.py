@@ -6,7 +6,7 @@ Writes KVM.kicad_sym with the parts KiCad's stock libraries lack.  Every symbol 
 rectangle; pins are listed per side as (number, name, electrical type).  Pin numbers follow the
 datasheets in ../datasheets/ (cited per symbol) and the EasyEDA symbols JLC assembles from.
 
-Run from hardware/:   python3 tools/gen_symbols.py
+Run from hardware/:   uv run tools/gen_symbols.py
 """
 import os
 import sys

@@ -26,7 +26,7 @@ and as trustworthy as the board file.  The split budgets are engineering judgeme
 split_fallback and README), not a spec, so they are printed next to the measured numbers for review.  The neighbour
 check is a proxy: it sees distance and parallel length, not edge rates.
 
-Run from hardware/:   python3 tools/check_usb_si.py [--verbose]     (exit 1 if a hard budget is broken)
+Run from hardware/:   uv run tools/check_usb_si.py [--verbose]     (exit 1 if a hard budget is broken)
 """
 import collections
 import math

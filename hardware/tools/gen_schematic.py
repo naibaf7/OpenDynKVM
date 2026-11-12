@@ -8,7 +8,7 @@ explicit and reviewable in this file.  Reference designators are numbered per bl
 uses R301, C301, ...) so adding a part only renumbers its own block; symbol UUIDs derive from the
 reference, which keeps the PCB linked.  Symbols are laid out automatically, block by block.
 
-Run from hardware/:   python3 tools/gen_schematic.py
+Run from hardware/:   uv run tools/gen_schematic.py
 Overwrites kvm.kicad_sch.  Hand edits made in eeschema are lost on re-run.
 """
 

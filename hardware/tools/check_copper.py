@@ -28,7 +28,7 @@ that board really had doubled - SVC_DP and SVC_DM, each reaching U301 by two pat
 and plane checks are new: their output is reported in full and only counted as a failure once it agrees with the DRC
 and the design's own stack-up (see README).
 
-Run from hardware/:   python3 tools/check_copper.py [board.kicad_pcb]   (exit 1 if anything is wrong; the optional
+Run from hardware/:   uv run tools/check_copper.py [board.kicad_pcb]   (exit 1 if anything is wrong; the optional
                       board path checks that file instead, e.g. a revision to compare against)
 """
 import collections

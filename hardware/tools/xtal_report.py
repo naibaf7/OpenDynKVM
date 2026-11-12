@@ -14,7 +14,7 @@ Every crystal on the board, as its oscillator sees it - measured from the board 
 
 The oscillator requirements themselves are in the datasheets (design notes in gen_schematic.py `crystal`).
 
-Run from hardware/:   python3 tools/xtal_report.py [--pcb FILE]
+Run from hardware/:   uv run tools/xtal_report.py [--pcb FILE]
 """
 
 import math

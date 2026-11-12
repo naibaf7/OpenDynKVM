@@ -1481,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-proto"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "heapless 0.9.3",
 ]

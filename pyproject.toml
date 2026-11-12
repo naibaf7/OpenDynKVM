@@ -1,0 +1,27 @@
+# The Python environment for the repository's scripts (uv: https://docs.astral.sh/uv/): the hardware tools in
+# hardware/tools/ and hardware/case/board_facts.py, branding/make_logo.py and the font scripts in
+# software/odkvmctl/fonts/.  Versions are pinned in uv.lock.  The case generator, hardware/case/gen_case.py, declares
+# its own environment in the script (it needs OpenCascade, which has no build for every Python KiCad uses).
+#
+# The hardware tools import pcbnew, KiCad's own Python module, so the environment is built on the Python that KiCad
+# was built for and sees its packages.  Once, from the repository root (DEVELOPMENT.md has Windows and macOS):
+#
+#   uv venv --system-site-packages --python /usr/bin/python3
+#   uv sync
+#
+# Then any script runs with `uv run`, from anywhere in the repository, e.g.  cd hardware && uv run tools/check_copper.py
+
+[project]
+name = "opendynkvm-tools"
+version = "0.0.0"
+description = "Scripts that generate and check the OpenDynKVM hardware, logo and fonts (not a package)"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",       # router, dc_drop, zsolve
+    "scipy>=1.11",      # router, dc_drop, zsolve
+    "shapely>=2.0",     # router (loop-free pair offsets), logo footprint, branding/make_logo.py
+    "fonttools>=4.50",  # branding/make_logo.py, the font scripts
+]
+
+[tool.uv]
+package = false

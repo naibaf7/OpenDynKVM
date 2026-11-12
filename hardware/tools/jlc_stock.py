@@ -6,7 +6,7 @@ Extended line costs a loading fee).  Stock is not reserved until an order is pai
 
 Queries JLC's public parts search (the same one jlcpcb.com/parts uses) once per line; needs network.
 
-Run from hardware/:   python3 tools/jlc_stock.py [--boards N]          (default 5)
+Run from hardware/:   uv run tools/jlc_stock.py [--boards N]          (default 5)
 """
 
 import csv

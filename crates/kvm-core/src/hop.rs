@@ -8,15 +8,19 @@
 //!   An edge onto the other PC's screen holds it until it was pushed [`Rules::resistance`] pixels further (a pause
 //!   starts the push over), never near the screen's corners ([`Rules::corner`]), never while a button is held, and
 //!   only to a PC that is connected. Any other edge is a wall.
+//! - **Screens off for hop** ([`Screen::off`]): a PC's screen that another PC shows on (a monitor cabled to both). It
+//!   stands where that PC's screen does; the pointer never goes onto it, but its PC's desktop still includes it.
 //! - **Reports:** what the active PC gets is an absolute position, mapped onto its screens as it maps the absolute
-//!   pointer ([`Mapping`]): across all of them (Linux), or onto its main screen only (Windows), whose other screens the
-//!   KVM reaches with relative motion from where it last put the cursor.
+//!   pointer ([`Map`]): across all of them, those off for hop included (Linux), or onto its main screen only
+//!   (Windows), whose other screens the KVM reaches with relative motion from where it last put the cursor. A PC's
+//!   desktop counts physical pixels (Windows, X11) or logical ones (Wayland, [`Units`]), which decides how a screen's
+//!   arrangement size relates to its place there.
 //! - **Acceleration:** the PCs don't accelerate an absolute pointer, so the KVM does ([`Accelerator`]): flat, the curve
 //!   of Windows' "Enhance pointer precision", or libinput's adaptive profile, with the speed measured over the last
 //!   reports as libinput measures it.
 
 use heapless::Vec;
-use kvm_proto::ctrl::{Accel, MAX_SCREENS, Mapping, Pc, Screen};
+use kvm_proto::ctrl::{Accel, MAX_SCREENS, Mapping, Pc, Screen, Units};
 
 pub use kvm_hid::normalized::ABS_MAX;
 
@@ -42,6 +46,18 @@ pub enum Report {
 
 pub type Reports = Vec<Report, 2>;
 
+/// How a PC takes the absolute pointer: where it spreads 0–[`ABS_MAX`], and what its desktop coordinates count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Map {
+    pub mapping: Mapping,
+    pub units: Units,
+}
+
+impl Map {
+    pub const DESKTOP: Map = Map { mapping: Mapping::Desktop, units: Units::Physical };
+    pub const MAIN_SCREEN: Map = Map { mapping: Mapping::MainScreen, units: Units::Physical };
+}
+
 /// What the edges allow at the moment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rules {
@@ -51,7 +67,7 @@ pub struct Rules {
     pub buttons: bool,
     /// The PCs the pointer may hop to: connected, awake, in report protocol.
     pub open: [bool; 2],
-    pub mapping: [Mapping; 2],
+    pub maps: [Map; 2],
 }
 
 /// The outcome of a motion.
@@ -94,43 +110,60 @@ fn clamp_in(v: f32, min: f32, max: f32) -> f32 {
     v.clamp(min, (max - 1.0).max(min))
 }
 
+/// A screen of `pc` the pointer goes onto: not off for hop.
 fn usable(s: &Screen, pc: Pc) -> bool {
-    s.pc == Some(pc) && s.is_valid()
+    s.pc == Some(pc) && s.is_valid() && !s.off
 }
 
-/// The PC's screens, by slot.
+/// The PC's screens the pointer goes onto, by slot.
 fn screens_of(layout: &Layout, pc: Pc) -> impl Iterator<Item = (usize, &Screen)> {
     layout.iter().enumerate().filter(move |(_, s)| usable(s, pc))
 }
 
-/// Whether `pc` has a screen in the arrangement.
+/// All the PC's screens, those off for hop included: its desktop.
+fn desktop_of(layout: &Layout, pc: Pc) -> impl Iterator<Item = (usize, &Screen)> {
+    layout.iter().enumerate().filter(move |(_, s)| s.pc == Some(pc) && s.is_valid())
+}
+
+/// Whether `pc` has a screen in the arrangement that the pointer goes onto.
 pub fn has_screens(layout: &Layout, pc: Pc) -> bool {
     screens_of(layout, pc).next().is_some()
 }
 
-/// The PC's main screen: the one at 0,0 of its own arrangement (where Windows puts it), else its first.
+/// The PC's main screen: the one at 0,0 of its own arrangement (where Windows puts it), else its first; off for hop
+/// or not, as it is the PC's.
 pub fn main_screen(layout: &Layout, pc: Pc) -> Option<usize> {
-    screens_of(layout, pc).find(|(_, s)| s.desk == [0, 0]).or_else(|| screens_of(layout, pc).next()).map(|(i, _)| i)
+    desktop_of(layout, pc).find(|(_, s)| s.desk == [0, 0]).or_else(|| desktop_of(layout, pc).next()).map(|(i, _)| i)
 }
 
-/// Where `p` (arrangement) is in the PC's own pixels, on screen `s`.
-fn desk_of(s: &Screen, p: [f32; 2]) -> [f32; 2] {
-    let k = s.scale.max(1) as f32 / 100.0;
+/// Where the pointer goes on `pc` when it isn't found where it was left: its main screen, or its first that isn't off
+/// for hop.
+fn entry_screen(layout: &Layout, pc: Pc) -> Option<usize> {
+    main_screen(layout, pc)
+        .filter(|&m| usable(&layout[m], pc))
+        .or_else(|| screens_of(layout, pc).next().map(|(i, _)| i))
+}
+
+/// Where `p` (arrangement) is on the PC's desktop, on screen `s`, in the desktop's units.
+fn desk_of(s: &Screen, p: [f32; 2], units: Units) -> [f32; 2] {
+    let k = s.desk_per_logical(units);
     [s.desk[0] as f32 + (p[0] - s.at[0] as f32) * k, s.desk[1] as f32 + (p[1] - s.at[1] as f32) * k]
 }
 
-/// The PC's own pixels a screen covers: (top-left, bottom-right exclusive).
-fn desk_rect(s: &Screen) -> ([f32; 2], [f32; 2]) {
+/// What a screen covers on its PC's desktop: (top-left, bottom-right exclusive), in the desktop's units.
+fn desk_rect(s: &Screen, units: Units) -> ([f32; 2], [f32; 2]) {
     let min = [s.desk[0] as f32, s.desk[1] as f32];
-    (min, [min[0] + s.w as f32, min[1] + s.h as f32])
+    let [w, h] = s.desk_size(units);
+    (min, [min[0] + w as f32, min[1] + h as f32])
 }
 
-/// What 0–[`ABS_MAX`] spans on `pc`, in its own pixels.
-fn abs_area(layout: &Layout, pc: Pc, mapping: Mapping) -> Option<([f32; 2], [f32; 2])> {
-    match mapping {
-        Mapping::MainScreen => main_screen(layout, pc).map(|m| desk_rect(&layout[m])),
-        Mapping::Desktop => screens_of(layout, pc)
-            .map(|(_, s)| desk_rect(s))
+/// What 0–[`ABS_MAX`] spans on `pc`, on its desktop: its main screen (Windows), or the bounding box of all its
+/// screens, those off for hop included (Linux).
+fn abs_area(layout: &Layout, pc: Pc, map: Map) -> Option<([f32; 2], [f32; 2])> {
+    match map.mapping {
+        Mapping::MainScreen => main_screen(layout, pc).map(|m| desk_rect(&layout[m], map.units)),
+        Mapping::Desktop => desktop_of(layout, pc)
+            .map(|(_, s)| desk_rect(s, map.units))
             .reduce(|(a0, a1), (b0, b1)| ([a0[0].min(b0[0]), a0[1].min(b0[1])], [a1[0].max(b1[0]), a1[1].max(b1[1])])),
     }
 }
@@ -151,7 +184,7 @@ fn neighbour(layout: &Layout, slot: usize, axis: usize, dir: i8, across: f32) ->
     let o = 1 - axis;
     let mut best: Option<(usize, f32)> = None;
     for (i, s) in layout.iter().enumerate() {
-        if i == slot || s.pc.is_none() || !s.is_valid() {
+        if i == slot || s.pc.is_none() || !s.is_valid() || s.off {
             continue;
         }
         let n = rect(s);
@@ -251,7 +284,7 @@ impl Pointer {
             self.slot = Some(i);
             return;
         }
-        self.slot = main_screen(layout, pc);
+        self.slot = entry_screen(layout, pc);
         if let Some(i) = self.slot {
             let r = rect(&layout[i]);
             self.pos = [floor((r.min[0] + r.max[0]) / 2.0), floor((r.min[1] + r.max[1]) / 2.0)];
@@ -274,15 +307,15 @@ impl Pointer {
     }
 
     /// The reports that put `pc`'s cursor where the pointer is.
-    pub fn here(&mut self, layout: &Layout, pc: Pc, mapping: Mapping) -> Reports {
+    pub fn here(&mut self, layout: &Layout, pc: Pc, map: Map) -> Reports {
         let mut out = Reports::new();
         let Some(slot) = self.on(layout, pc) else { return out };
         let s = &layout[slot];
-        let desk = desk_of(s, self.pos);
+        let desk = desk_of(s, self.pos, map.units);
         let to_px = |d: [f32; 2]| d.map(round);
-        let absolute = mapping == Mapping::Desktop || main_screen(layout, pc) == Some(slot);
+        let absolute = map.mapping == Mapping::Desktop || main_screen(layout, pc) == Some(slot);
         if absolute {
-            if let Some(area) = abs_area(layout, pc, mapping) {
+            if let Some(area) = abs_area(layout, pc, map) {
                 let _ = out.push(Report::Abs(to_abs(desk, area)));
                 self.cursor[pc.index()] = Some(to_px(desk));
             }
@@ -294,7 +327,7 @@ impl Pointer {
             Some(c) => c,
             None => {
                 let Some(m) = main_screen(layout, pc) else { return out };
-                let (min, max) = desk_rect(&layout[m]);
+                let (min, max) = desk_rect(&layout[m], map.units);
                 let edge = to_px([clamp_in(desk[0], min[0], max[0]), clamp_in(desk[1], min[1], max[1])]);
                 let _ = out.push(Report::Abs(to_abs(edge, (min, max))));
                 edge
@@ -367,7 +400,7 @@ impl Pointer {
                 continue;
             }
             // Over: the PC left keeps its cursor at the edge, the other gets the pointer at the same place along it.
-            step.reports = self.here(layout, pc, rules.mapping[pc.index()]);
+            step.reports = self.here(layout, pc, rules.maps[pc.index()]);
             self.leave(layout, pc);
             let mut p = self.pos;
             p[axis] = if dir > 0 { nr.min[axis] } else { nr.max[axis] - 1.0 };
@@ -377,26 +410,30 @@ impl Pointer {
             step.hop = Some(to);
             return step;
         }
-        step.reports = self.here(layout, pc, rules.mapping[pc.index()]);
+        step.reports = self.here(layout, pc, rules.maps[pc.index()]);
         step
     }
 
     /// `pc`'s own cursor is at `desk` (its own pixels; `PointerAt`): taken over once the KVM hasn't moved the pointer
     /// for [`SYNC_QUIET_MS`] (a touchpad, a program or the PC's acceleration moved it). Returns whether it was.
-    pub fn sync(&mut self, layout: &Layout, pc: Pc, desk: [i16; 2], now: u32, active: bool) -> bool {
+    pub fn sync(&mut self, layout: &Layout, pc: Pc, map: Map, desk: [i16; 2], now: u32, active: bool) -> bool {
         if self.moved_at.is_some_and(|t| now.wrapping_sub(t) < SYNC_QUIET_MS) {
             return false;
         }
         let d = [desk[0] as f32, desk[1] as f32];
-        let Some((i, s)) = screens_of(layout, pc).find(|(_, s)| {
-            let (min, max) = desk_rect(s);
+        let Some((i, s)) = desktop_of(layout, pc).find(|(_, s)| {
+            let (min, max) = desk_rect(s, map.units);
             in_span(d[0], min[0], max[0]) && in_span(d[1], min[1], max[1])
         }) else {
             return false;
         };
-        let k = 100.0 / s.scale.max(1) as f32;
-        let p = [s.at[0] as f32 + (d[0] - s.desk[0] as f32) * k, s.at[1] as f32 + (d[1] - s.desk[1] as f32) * k];
         self.cursor[pc.index()] = Some(d);
+        // On a screen off for hop (one another PC shows on): where the cursor is, but no place for the pointer.
+        if s.off {
+            return false;
+        }
+        let k = 1.0 / s.desk_per_logical(map.units);
+        let p = [s.at[0] as f32 + (d[0] - s.desk[0] as f32) * k, s.at[1] as f32 + (d[1] - s.desk[1] as f32) * k];
         if active {
             if self.slot == Some(i) && (p[0] - self.pos[0]).abs() < 1.5 && (p[1] - self.pos[1]).abs() < 1.5 {
                 return false;
@@ -602,14 +639,14 @@ mod tests {
     }
 
     fn rules(resistance: u16) -> Rules {
-        Rules { resistance, corner: 20, buttons: false, open: [true, true], mapping: [Mapping::Desktop; 2] }
+        Rules { resistance, corner: 20, buttons: false, open: [true, true], maps: [Map::DESKTOP; 2] }
     }
 
     #[test]
     fn the_pointer_starts_in_the_middle_of_the_main_screen_and_maps_onto_the_desktop() {
         let l = two_pcs();
         let mut p = Pointer::NEW;
-        assert_eq!(p.here(&l, Pc::Pc1, Mapping::Desktop).as_slice(), &[Report::Abs([16392, 16399])]);
+        assert_eq!(p.here(&l, Pc::Pc1, Map::DESKTOP).as_slice(), &[Report::Abs([16392, 16399])]);
         assert_eq!(p.position(), [960, 540]);
         let s = p.motion(&l, Pc::Pc1, [-2000.0, -2000.0], 0, &rules(100));
         assert_eq!(s.reports.as_slice(), &[Report::Abs([0, 0])]);
@@ -638,7 +675,7 @@ mod tests {
         assert_eq!(s.reports.as_slice(), &[Report::Abs([ABS_MAX, 16399])]);
         assert_eq!(p.position(), [1920, 540]);
         // 540 + 36 = 576 of PC2's 1152 logical lines: its 720th of 1440 pixels.
-        assert_eq!(p.here(&l, Pc::Pc2, Mapping::Desktop).as_slice(), &[Report::Abs([0, 16395])]);
+        assert_eq!(p.here(&l, Pc::Pc2, Map::DESKTOP).as_slice(), &[Report::Abs([0, 16395])]);
         // And back: the push starts from nothing on the new PC.
         let s = p.motion(&l, Pc::Pc2, [-1.0, 0.0], 520, &r);
         assert_eq!(s.hop, None);
@@ -696,11 +733,11 @@ mod tests {
             Screen { desk: [-1920, 0], ..Screen::new(Pc::Pc1, 1920, 1080, [0, 0]) },
         ]);
         let mut r = rules(0);
-        r.mapping = [Mapping::MainScreen; 2];
+        r.maps = [Map::MAIN_SCREEN; 2];
         let mut p = Pointer::NEW;
         p.enter(&l, Pc::Pc1);
         assert_eq!(p.screen(), Some(0));
-        assert_eq!(p.here(&l, Pc::Pc1, Mapping::MainScreen).as_slice(), &[Report::Abs([16392, 16399])]);
+        assert_eq!(p.here(&l, Pc::Pc1, Map::MAIN_SCREEN).as_slice(), &[Report::Abs([16392, 16399])]);
         // 1000 left: 40 pixels into the second screen; the cursor goes there from the middle of the main one.
         let s = p.motion(&l, Pc::Pc1, [-1000.0, 0.0], 0, &r);
         assert_eq!(s.reports.as_slice(), &[Report::Rel([-1000, 0])]);
@@ -714,7 +751,7 @@ mod tests {
         p.motion(&l, Pc::Pc1, [-1500.0, 0.0], 3, &r);
         p.forget_cursor(Pc::Pc1);
         assert_eq!(
-            p.here(&l, Pc::Pc1, Mapping::MainScreen).as_slice(),
+            p.here(&l, Pc::Pc1, Map::MAIN_SCREEN).as_slice(),
             &[Report::Abs([0, 16490]), Report::Rel([-551, 0])]
         );
     }
@@ -725,15 +762,106 @@ mod tests {
         let mut p = Pointer::NEW;
         p.enter(&l, Pc::Pc1);
         p.motion(&l, Pc::Pc1, [10.0, 0.0], 1000, &rules(100));
-        assert!(!p.sync(&l, Pc::Pc1, [100, 100], 1000 + SYNC_QUIET_MS - 1, true));
-        assert!(p.sync(&l, Pc::Pc1, [100, 100], 1000 + SYNC_QUIET_MS, true));
+        assert!(!p.sync(&l, Pc::Pc1, Map::MAIN_SCREEN, [100, 100], 1000 + SYNC_QUIET_MS - 1, true));
+        assert!(p.sync(&l, Pc::Pc1, Map::MAIN_SCREEN, [100, 100], 1000 + SYNC_QUIET_MS, true));
         assert_eq!(p.position(), [100, 100]);
         // The inactive PC: where the pointer is found on return. Its pixels at 125 % are 0.8 logical ones.
-        assert!(p.sync(&l, Pc::Pc2, [1000, 500], 5000, false));
+        assert!(p.sync(&l, Pc::Pc2, Map::MAIN_SCREEN, [1000, 500], 5000, false));
         p.leave(&l, Pc::Pc1);
         p.enter(&l, Pc::Pc2);
         assert_eq!(p.position(), [2720, 364]);
-        assert!(!p.sync(&l, Pc::Pc2, [9000, 9000], 6000, true), "not on any of its screens");
+        assert!(!p.sync(&l, Pc::Pc2, Map::MAIN_SCREEN, [9000, 9000], 6000, true), "not on any of its screens");
+    }
+
+    /// Where a Wayland compositor puts an absolute position across a desktop `w` × `h` logical pixels wide (libinput's
+    /// `get_absolute_x_transformed`, as KWin and Mutter use it): the range 0–32767 spread over the whole desktop.
+    fn compositor(abs: [u16; 2], w: f32, h: f32) -> [f32; 2] {
+        [abs[0] as f32 * w / 32768.0, abs[1] as f32 * h / 32768.0]
+    }
+
+    /// The first board's desk (2026-11-12): PC1 runs KDE Plasma on Wayland with the 4K monitor (3840×2160 at 150 %,
+    /// 2560×1440 logical) at 0,0 and the HD monitor (1920×1080) right of it at 2560,270. The 4K monitor shows PC2, so
+    /// PC1's is off for hop and lies where PC2's is; PC1 has the HD monitor.
+    fn monitor_on_both(with_shared: bool) -> Layout {
+        let hd = Screen { desk: [2560, 270], fixed: true, ..Screen::new(Pc::Pc1, 1920, 1080, [0, 720]) };
+        let pc2 = Screen { scale: 150, ..Screen::new(Pc::Pc2, 3840, 2160, [-2560, 360]) };
+        let pc1_shared =
+            Screen { off: true, fixed: true, scale: 150, ..Screen::new(Pc::Pc1, 3840, 2160, [-2560, 360]) };
+        if with_shared { layout(&[hd, pc2, pc1_shared]) } else { layout(&[hd, pc2]) }
+    }
+
+    const KDE: Map = Map { mapping: Mapping::Desktop, units: Units::Logical };
+
+    #[test]
+    fn a_screen_off_for_hop_still_counts_for_its_pcs_desktop() {
+        let mut p = Pointer::NEW;
+        // The KVM's pointer 1041 into the HD monitor and 662 down, where it was measured.
+        p.enter(&monitor_on_both(true), Pc::Pc1);
+        p.pos = [1041.0, 1382.0];
+        // Without PC1's 4K monitor, the KVM spread 0–32767 over the HD monitor alone; KWin over its whole desktop put
+        // the cursor at 2431,884 - on the 4K monitor, which shows PC2: an invisible stretch on PC1 before every hop.
+        let [Report::Abs(abs)] = p.here(&monitor_on_both(false), Pc::Pc1, KDE)[..] else { panic!() };
+        let c = compositor(abs, 4480.0, 1440.0);
+        assert!((c[0] - 2430.0).abs() < 1.5 && (c[1] - 883.5).abs() < 1.5, "{c:?}");
+        // With it, the cursor is on the HD monitor's pixel 1041,662, and so are the HD monitor's edges.
+        let l = monitor_on_both(true);
+        for (pos, want) in
+            [([1041.0, 1382.0], [3601.0, 932.0]), ([0.0, 720.0], [2560.0, 270.0]), ([1919.0, 1799.0], [4479.0, 1349.0])]
+        {
+            p.pos = pos;
+            let [Report::Abs(abs)] = p.here(&l, Pc::Pc1, KDE)[..] else { panic!() };
+            let c = compositor(abs, 4480.0, 1440.0);
+            assert!((c[0] - want[0]).abs() < 1.0 && (c[1] - want[1]).abs() < 1.0, "{pos:?}: {c:?}");
+        }
+    }
+
+    #[test]
+    fn the_pointer_never_goes_onto_a_screen_off_for_hop() {
+        let l = monitor_on_both(true);
+        let mut r = rules(0);
+        r.corner = 0;
+        r.maps = [KDE, Map::MAIN_SCREEN];
+        // PC1's main screen (at 0,0 on PC1) is the 4K monitor, off for hop: the pointer starts on the HD monitor
+        // instead.
+        assert_eq!(main_screen(&l, Pc::Pc1), Some(2));
+        let mut p = Pointer::NEW;
+        p.enter(&l, Pc::Pc1);
+        assert_eq!(p.screen(), Some(0));
+        // Left out of the HD monitor: over to PC2's screen at once, not onto PC1's 4K monitor lying there.
+        p.pos = [3.0, 1000.0];
+        let s = p.motion(&l, Pc::Pc1, [-10.0, 0.0], 0, &r);
+        assert_eq!((s.hop, p.screen()), (Some(Pc::Pc2), Some(1)));
+        // And back right: onto the HD monitor.
+        let s = p.motion(&l, Pc::Pc2, [2600.0, 0.0], 10, &r);
+        assert_eq!((s.hop, p.screen()), (Some(Pc::Pc1), Some(0)));
+        // PC1's cursor reported on its 4K monitor (by its host software) moves no pointer there.
+        assert!(!p.sync(&l, Pc::Pc1, KDE, [100, 100], 100_000, true));
+        assert_eq!(p.screen(), Some(0));
+        // A PC with only screens off for hop has none for the pointer.
+        let mut only_off = l;
+        only_off[0].off = true;
+        assert!(!has_screens(&only_off, Pc::Pc1));
+    }
+
+    #[test]
+    fn a_logical_desktop_places_a_scaled_screen_by_its_logical_size() {
+        // Both of PC1's screens used by hop this time: on Wayland the 4K monitor covers 2560×1440 of the desktop, not
+        // its 3840×2160 pixels, and the HD monitor starts right after it.
+        let l = layout(&[
+            Screen { desk: [2560, 270], ..Screen::new(Pc::Pc1, 1920, 1080, [2560, 270]) },
+            Screen { scale: 150, ..Screen::new(Pc::Pc1, 3840, 2160, [0, 0]) },
+        ]);
+        let mut p = Pointer::NEW;
+        p.enter(&l, Pc::Pc1);
+        p.pos = [2559.0, 1439.0];
+        p.slot = Some(1);
+        let [Report::Abs(abs)] = p.here(&l, Pc::Pc1, KDE)[..] else { panic!() };
+        let c = compositor(abs, 4480.0, 1440.0);
+        assert!((c[0] - 2559.0).abs() < 1.0 && (c[1] - 1439.0).abs() < 1.0, "{c:?}");
+        // The PC's own cursor at the HD monitor's 100,100 (desktop 2660,370) is the arrangement's 2660,370.
+        assert!(p.sync(&l, Pc::Pc1, KDE, [2660, 370], 10_000, true));
+        assert_eq!(p.position(), [2660, 370]);
+        assert_eq!(p.screen(), Some(0));
     }
 
     #[test]

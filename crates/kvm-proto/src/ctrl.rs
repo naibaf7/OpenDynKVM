@@ -15,7 +15,10 @@ pub const PAYLOAD_LEN: usize = REPORT_LEN - 2;
 /// 7: screen hop (`caps::SCREEN_HOP`): the absolute pointer, the hop settings, the screen arrangement and each
 /// profile's hop switch (config keys 0x00A0–0x00B7), `SwitchSource::Edge`, the hop fields at the end of `Status`,
 /// `PointerAt`.
-pub const PROTOCOL_VERSION: u8 = 7;
+/// 8: screen hop: each PC's units (`HopUnits`, config keys 0x00AC–0x00AD: whether its desktop counts logical
+/// pixels), and a screen's flags in its slot's PC byte: off for hop (`Screen::off`, bit 7) and a fixed place on its
+/// PC (`Screen::fixed`, bit 6).
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// Vendor usage page and usage of the control interface; hosts discover it by these, not by VID/PID.
 pub const USAGE_PAGE: u16 = 0xFF4B;
@@ -512,6 +515,37 @@ impl Mapping {
 }
 
 wire_enum! {
+    /// What a PC's desktop coordinates count ([`Screen::desk`], `ConfigValue::HopUnits`, protocol 8).
+    pub enum Units {
+        /// Physical pixels: each screen covers its resolution (Windows, X11).
+        Physical = 0,
+        /// Logical pixels: each screen covers its size in the arrangement, its resolution over its scaling (Wayland
+        /// desktops: KDE Plasma, GNOME).
+        Logical = 1,
+    }
+}
+
+impl Units {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Units::Physical => "physical",
+            Units::Logical => "logical",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Units> {
+        Units::ALL.iter().copied().find(|u| u.name() == s)
+    }
+}
+
+/// Physical pixels: what the KVM assumed before protocol 8.
+impl Default for Units {
+    fn default() -> Self {
+        Units::Physical
+    }
+}
+
+wire_enum! {
     /// Whether screen hop moves the pointer now (`Status.hop`), and if not, why not.
     pub enum HopState {
         /// Not on in the active profile.
@@ -545,19 +579,45 @@ pub struct Screen {
     pub desk: [i16; 2],
     /// Its top-left corner in the arrangement, in logical pixels.
     pub at: [i16; 2],
+    /// Screen hop leaves it alone (protocol 8): its PC has it, but another PC shows on it (a monitor cabled to both).
+    /// It stands where that PC's screen does, and still counts for its PC's desktop: the PC spreads the absolute
+    /// pointer across it too.
+    pub off: bool,
+    /// Its place on its PC (`desk`) is the PC's own, detected or typed in, not derived from the arrangement (protocol
+    /// 8; the KVM only stores it).
+    pub fixed: bool,
 }
 
 impl Screen {
-    pub const NONE: Screen = Screen { pc: None, w: 0, h: 0, scale: 100, desk: [0, 0], at: [0, 0] };
+    pub const NONE: Screen =
+        Screen { pc: None, w: 0, h: 0, scale: 100, desk: [0, 0], at: [0, 0], off: false, fixed: false };
 
     pub const fn new(pc: Pc, w: u16, h: u16, at: [i16; 2]) -> Screen {
-        Screen { pc: Some(pc), w, h, scale: 100, desk: [0, 0], at }
+        Screen { pc: Some(pc), w, h, scale: 100, desk: [0, 0], at, off: false, fixed: false }
     }
 
     /// Its size in the arrangement (logical pixels).
     pub fn size(&self) -> [i32; 2] {
         let scale = self.scale.max(1) as i32;
         [self.w as i32 * 100 / scale, self.h as i32 * 100 / scale]
+    }
+
+    /// Its size on its PC's desktop, in the desktop's [`Units`]: its resolution in physical pixels, its size in the
+    /// arrangement in logical ones.
+    pub fn desk_size(&self, units: Units) -> [i32; 2] {
+        match units {
+            Units::Physical => [self.w as i32, self.h as i32],
+            Units::Logical => self.size(),
+        }
+    }
+
+    /// The desktop's units per logical pixel of the arrangement on this screen: its scaling in physical pixels, 1 in
+    /// logical ones.
+    pub fn desk_per_logical(&self, units: Units) -> f32 {
+        match units {
+            Units::Physical => self.scale.max(1) as f32 / 100.0,
+            Units::Logical => 1.0,
+        }
     }
 
     /// A screen of a PC with a size and scaling the KVM accepts, or a free slot.
@@ -584,6 +644,14 @@ pub mod class {
     pub const STORAGE: u16 = 1 << 10;
     pub const HUB: u16 = 1 << 11;
     pub const OTHER_HID: u16 = 1 << 12;
+}
+
+/// Bits of a screen slot's PC byte above the PC (protocol 8).
+pub mod screen_flags {
+    /// [`Screen::off`](super::Screen::off).
+    pub const OFF: u8 = 1 << 7;
+    /// [`Screen::fixed`](super::Screen::fixed).
+    pub const FIXED: u8 = 1 << 6;
 }
 
 /// `Status.flags` bits.
@@ -1188,6 +1256,8 @@ pub mod key {
     pub const HOP_CORNER: u16 = 0x00A4;
     pub const HOP_MAPPING_BASE: u16 = 0x00A6;
     pub const PROFILE_HOP_BASE: u16 = 0x00A8;
+    /// Each PC's [`Units`](super::Units) for screen hop, protocol 8.
+    pub const HOP_UNITS_BASE: u16 = 0x00AC;
     pub const SCREEN_BASE: u16 = 0x00B0;
 
     pub const ALL: &[u16] = &[
@@ -1242,6 +1312,8 @@ pub mod key {
         HOP_CORNER,
         HOP_MAPPING_BASE,
         HOP_MAPPING_BASE + 1,
+        HOP_UNITS_BASE,
+        HOP_UNITS_BASE + 1,
         PROFILE_HOP_BASE,
         PROFILE_HOP_BASE + 1,
         PROFILE_HOP_BASE + 2,
@@ -1303,6 +1375,8 @@ pub enum ConfigValue {
     HopCorner(u16),
     /// How the PC maps the absolute pointer onto its screens.
     HopMapping(Pc, Mapping),
+    /// What the PC's desktop coordinates count (protocol 8).
+    HopUnits(Pc, Units),
     /// Profile index, and whether screen hop is on in it.
     ProfileHop(u8, bool),
     /// Screen slot 0–7.
@@ -1348,6 +1422,7 @@ impl ConfigValue {
             ConfigValue::HopResistance(_) => key::HOP_RESISTANCE,
             ConfigValue::HopCorner(_) => key::HOP_CORNER,
             ConfigValue::HopMapping(pc, _) => key::HOP_MAPPING_BASE + pc.index() as u16,
+            ConfigValue::HopUnits(pc, _) => key::HOP_UNITS_BASE + pc.index() as u16,
             ConfigValue::ProfileHop(i, _) => key::PROFILE_HOP_BASE + *i as u16,
             ConfigValue::Screen(i, _) => key::SCREEN_BASE + *i as u16,
         }
@@ -1380,8 +1455,10 @@ impl ConfigValue {
             ConfigValue::HopSpeed(v) => w.u8(v as u8),
             ConfigValue::HopResistance(v) | ConfigValue::HopCorner(v) => w.u16(v),
             ConfigValue::HopMapping(_, m) => w.u8(m as u8),
+            ConfigValue::HopUnits(_, u) => w.u8(u as u8),
             ConfigValue::Screen(_, s) => {
-                w.u8(s.pc.map_or(0, |p| p as u8))?;
+                let flags = if s.off { screen_flags::OFF } else { 0 } | if s.fixed { screen_flags::FIXED } else { 0 };
+                w.u8(s.pc.map_or(0, |p| p as u8 | flags))?;
                 w.u16(s.w)?;
                 w.u16(s.h)?;
                 w.u16(s.scale)?;
@@ -1469,8 +1546,12 @@ impl ConfigValue {
             k if profiles(key::PROFILE_HOP_BASE).contains(&k) => {
                 ConfigValue::ProfileHop((k - key::PROFILE_HOP_BASE) as u8, r.bool()?)
             }
+            k if (key::HOP_UNITS_BASE..key::HOP_UNITS_BASE + 2).contains(&k) => {
+                ConfigValue::HopUnits(Pc::from_index((k - key::HOP_UNITS_BASE) as usize), r.u8()?.try_into()?)
+            }
             k if (key::SCREEN_BASE..key::SCREEN_BASE + MAX_SCREENS as u16).contains(&k) => {
-                let pc = match r.u8()? {
+                let b = r.u8()?;
+                let pc = match b & !(screen_flags::OFF | screen_flags::FIXED) {
                     0 => None,
                     p => Some(p.try_into()?),
                 };
@@ -1479,7 +1560,9 @@ impl ConfigValue {
                 for x in &mut v {
                     *x = r.u16()? as i16;
                 }
-                let s = Screen { pc, w, h, scale, desk: [v[0], v[1]], at: [v[2], v[3]] };
+                let (off, fixed) =
+                    (pc.is_some() && b & screen_flags::OFF != 0, pc.is_some() && b & screen_flags::FIXED != 0);
+                let s = Screen { pc, w, h, scale, desk: [v[0], v[1]], at: [v[2], v[3]], off, fixed };
                 ConfigValue::Screen((k - key::SCREEN_BASE) as u8, s)
             }
             _ => return Err(WireError::Invalid),
@@ -2073,6 +2156,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_screens_flags_are_in_its_pc_byte() {
+        let s = Screen { scale: 150, desk: [0, 0], ..Screen::new(Pc::Pc1, 3840, 2160, [-2560, 360]) };
+        let enc = |s: Screen| {
+            let mut b = [0u8; 32];
+            let mut w = Writer::new(&mut b);
+            ConfigValue::Screen(3, s).encode(&mut w).unwrap();
+            w.finish().to_vec()
+        };
+        // A slot stored before protocol 8 has neither.
+        assert_eq!(enc(s)[2], 1);
+        assert_eq!(enc(Screen { off: true, ..s })[2], 0x81);
+        assert_eq!(enc(Screen { fixed: true, ..s })[2], 0x41);
+        let both = enc(Screen { off: true, fixed: true, ..s });
+        assert_eq!(
+            ConfigValue::decode(&mut Reader::new(&both)),
+            Ok(ConfigValue::Screen(3, Screen { off: true, fixed: true, ..s }))
+        );
+    }
+
+    #[test]
     fn requests_roundtrip() {
         let reqs = [
             Request::GetInfo,
@@ -2113,10 +2216,16 @@ mod tests {
             Request::SetConfig(ConfigValue::HopResistance(250)),
             Request::SetConfig(ConfigValue::HopCorner(30)),
             Request::SetConfig(ConfigValue::HopMapping(Pc::Pc2, Mapping::MainScreen)),
+            Request::SetConfig(ConfigValue::HopUnits(Pc::Pc1, Units::Logical)),
+            Request::SetConfig(ConfigValue::HopUnits(Pc::Pc2, Units::Physical)),
             Request::SetConfig(ConfigValue::ProfileHop(3, true)),
             Request::SetConfig(ConfigValue::Screen(
                 7,
-                Screen { pc: Some(Pc::Pc2), w: 3840, h: 2160, scale: 150, desk: [-2560, 0], at: [-30000, 400] },
+                Screen { scale: 150, desk: [-2560, 0], ..Screen::new(Pc::Pc2, 3840, 2160, [-30000, 400]) },
+            )),
+            Request::SetConfig(ConfigValue::Screen(
+                2,
+                Screen { off: true, fixed: true, ..Screen::new(Pc::Pc1, 1920, 1080, [0, 0]) },
             )),
             Request::SetConfig(ConfigValue::Screen(0, Screen::NONE)),
         ];

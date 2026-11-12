@@ -23,6 +23,9 @@ __pycache__/
 # terms are unclear
 hardware/tools/easyeda_cache/
 
+# The Python environment (uv: pyproject.toml, uv.lock)
+.venv/
+
 # Tools build output (compiled astar.so, generated live viewer)
 hardware/tools/build/
 hardware/*.stale-route.kicad_pcb

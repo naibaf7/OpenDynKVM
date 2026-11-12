@@ -13,7 +13,7 @@ for jlcpcb.md sections 2, 5 and 8:
             rails and V-cuts must clear
   assembly  parts per side (by the CPL), the bottom side's parts, and the through-hole parts JLC solders by hand
 
-Run from hardware/:   python3 tools/fab_facts.py
+Run from hardware/:   uv run tools/fab_facts.py
 """
 
 import collections

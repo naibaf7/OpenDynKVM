@@ -15,9 +15,9 @@ cut down to what the window writes:
   the font against the translations: run this again after adding a character it lacks.
 - The kerning, contextual alternates and other default features stay: egui shapes text with harfrust.
 
-    python3 -I software/odkvmctl/fonts/make_ui_font.py [/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf]
+    uv run software/odkvmctl/fonts/make_ui_font.py [/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf]
 
-Needs fontTools (`pip install fonttools`). The source: Fedora's `adwaita-sans-fonts` 51.0, or
+Needs fontTools (in the repository's environment, DEVELOPMENT.md). The source: Fedora's `adwaita-sans-fonts` 51.0, or
 https://gitlab.gnome.org/GNOME/adwaita-fonts (fonts/AdwaitaSans-Regular.ttf).
 """
 

@@ -33,7 +33,7 @@ The colours are white `#ffffff` and dark `#0f1316`. The dark is the ink on light
 Edit `make_logo.py` and run it:
 
 ```sh
-python3 branding/make_logo.py          # or: --fonts DIR, a directory holding Montserrat
+uv run branding/make_logo.py           # or: --fonts DIR, a directory holding Montserrat
 ```
 
 Then rebuild the software, which embeds the files.

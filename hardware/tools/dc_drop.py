@@ -15,11 +15,11 @@ Load case: the SOURCE pads sit at 0 V and every SINK draws its current at the sa
     an inner-layer segment the internal chart (k = 0.024) is printed too: it assumes a trace with no copper around
     it and wildly overstates one that runs inside a plane layer (IPC-2152), so it is an upper bound, not an estimate.
 
-Run from hardware/:   python3 tools/dc_drop.py NET SOURCE SINK[=AMPS] ... [--outer UM] [--inner UM] [--top N]
+Run from hardware/:   uv run tools/dc_drop.py NET SOURCE SINK[=AMPS] ... [--outer UM] [--inner UM] [--top N]
   SOURCE  comma list of REF.PIN, tied together (e.g. U402.1,U402.8: the TPS2121's OUT pins)
   SINK    REF (all its pads on NET, tied) or a comma list of REF.PIN; AMPS defaults to 1
 Example (jlcpcb.md, copper weight; three front ports at 0.5 A and the 3.3 V buck at 0.5 A):
-  python3 tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5
+  uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5
 """
 
 import collections
@@ -71,7 +71,7 @@ def main():
     if opts['--inner']:
         thick.update({n: float(opts['--inner']) / 1000 for n in thick if n.startswith('In')})
     if not thick:
-        sys.exit('the board has no stack-up (python3 tools/gen_pcb.py --stackup)')
+        sys.exit('the board has no stack-up (uv run tools/gen_pcb.py --stackup)')
     if any(z.GetNetname() == net for z in board.Zones()):
         sys.exit(f'{net} has a zone; zones are not modelled')
 

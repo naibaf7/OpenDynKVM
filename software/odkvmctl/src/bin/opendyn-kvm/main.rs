@@ -663,8 +663,8 @@ mod tests {
         }
     }
 
-    /// A screen dragged on the Screen hop page's canvas goes to the KVM where it was dropped, and stays shown there from
-    /// the drop on: while the KVM takes it, and while the window refreshes.
+    /// A screen dragged on the Screen hop page's canvas stays where it was dropped, in the page's draft: the KVM keeps
+    /// its arrangement until Apply, then has the screen there, and the draft goes once the KVM's copy confirms it.
     #[test]
     fn a_screen_dragged_on_the_canvas_stays_where_it_is_dropped() {
         use kvm_proto::ctrl::Screen;
@@ -718,14 +718,26 @@ mod tests {
         run(&mut app, vec![button(start + egui::vec2(150.0, 0.0), false)]);
         let dropped = app.screens.drawn(1).unwrap().1.at;
         assert_eq!(dropped, sc.at, "dropped where it was dragged to");
-        // From the drop on, every frame shows it where it was dropped, until the KVM has it, and after two refreshes.
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+        // Not applied: shown where it was dropped, while the KVM keeps it where it was (through refreshes).
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
         while std::time::Instant::now() < until {
             run(&mut app, vec![]);
             assert_eq!(app.screens.drawn(1).unwrap().1.at, dropped, "snapped back");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        assert_eq!(kvm_at(&shared), Some([1920, 0]), "sent before Apply");
+        assert!(app.screens.has_draft());
+        // Applied: every frame still shows it there, the KVM gets it, and the draft goes after its grace.
+        let hop = shared.lock().unwrap().snap.as_ref().and_then(|s| s.hop()).unwrap();
+        app.apply(&hop);
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(3500);
+        while std::time::Instant::now() < until {
+            run(&mut app, vec![]);
+            assert_eq!(app.screens.drawn(1).unwrap().1.at, dropped, "snapped back after Apply");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(kvm_at(&shared), Some(dropped));
+        assert!(!app.screens.has_draft(), "the draft stayed after the KVM had it");
     }
 
     /// Turning a software lock off asks first; turning it back on waits for the key, which the simulator presses after

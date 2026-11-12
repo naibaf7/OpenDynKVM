@@ -7,7 +7,7 @@ distance to the board edges.  JLCPCB adds assembly rails only to boards smaller 
 this board is 120x80 mm, so no rail rule applies (RAIL_EDGES is empty).  The rear connectors
 and the front connectors / side LEDs sit at the edge on purpose (EDGE_PARTS).
 
-Run from hardware/:   python3 tools/check_spacing.py
+Run from hardware/:   uv run tools/check_spacing.py
 """
 import itertools
 import math

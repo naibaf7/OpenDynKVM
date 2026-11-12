@@ -40,6 +40,9 @@ There are no boards for sale. The board is ordered assembled from JLCPCB with th
 [hardware/jlcpcb.md](hardware/jlcpcb.md) lists every setting of the quote form. Only the MX key switch is plugged into
 its socket by hand. The Bluetooth module is optional (boards from 0.16.0): a BOM without it is included.
 
+A 3D-printable case (a tray, a lid with the logo, four spacers and four M3 screws) is in
+[`hardware/case/`](hardware/case/), with how to print and assemble it.
+
 ## First start of a new board
 
 The chips arrive blank. A USB-C cable is all it takes ([design.md §10](design.md)):
@@ -203,6 +206,10 @@ needed on the PCs; the KVM's mouse gets an absolute pointer for it.
 2. Arrange the screens: on each PC, *Detect this computer's screens* (`odkvmctl screens detect`) puts its screens in
    with their resolution, scaling and place in its display settings; then drag them where they stand. Or add them by
    hand (`odkvmctl config set screen0 "pc1 2560x1440 at 0,0"`).
+   A monitor cabled to both PCs appears for each of them. On the PC that doesn't show it, untick **Screen hop goes
+   onto it** and lay it on the other PC's screen: the pointer then passes to the other PC there, and its own PC still
+   counts it, so the pointer lands in the right place on that PC's other screens. When a PC's display settings
+   change, the page says so; detect its screens again (screens already there keep their place).
 3. Tick screen hop in the profiles that should use it (`odkvmctl config set profile0-hop on`). It needs the Mouse port
    in Normalized mode (Auto picks it for most mice); a profile without it gives games the ordinary relative mouse.
 

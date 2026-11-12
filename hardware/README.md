@@ -11,6 +11,7 @@ edit the generator scripts in `tools/`, not the schematic or board in eeschema /
 | `kvm.kicad_pcb` | `tools/gen_pcb.py` (placement), then `tools/route.py` (routing, planes) |
 | `bom/`, `fab/`, `kvm_gerbers.zip` | `tools/make_fab.py` |
 | `kvm_schematic.pdf` | `kicad-cli sch export pdf` |
+| `case/` | The 3D-printable case: `case/board_facts.py` (KiCad's Python) writes `case/board.json`, `case/gen_case.py` (its own environment: build123d) the STEP and 3MF files ([case/README.md](case/README.md)) |
 
 Checks that run on `kvm.kicad_pcb`: `tools/check_spacing.py` (courtyards, pad gaps, board edges),
 `tools/check_aux.py` (every auxiliary passive sits on the side of the chip pin it serves),
@@ -41,45 +42,48 @@ strict 0.15 mm gap.
 
 ## Regenerating
 
-Run everything from this folder:
+Run everything from this folder, with uv ([DEVELOPMENT.md](../DEVELOPMENT.md), "Python scripts", sets it up once):
 
 ```sh
-python3 tools/gen_symbols.py
-python3 tools/gen_footprints.py              # needs network for parts not in tools/easyeda_cache/ (a local cache,
+uv run tools/gen_symbols.py
+uv run tools/gen_footprints.py               # needs network for parts not in tools/easyeda_cache/ (a local cache,
                                              # not in git: a fresh clone fetches them once)
-python3 tools/gen_schematic.py
+uv run tools/gen_schematic.py
 kicad-cli sch erc kvm.kicad_sch              # expect 0 violations
 kicad-cli sch export netlist --format kicadsexpr -o /tmp/kvm.net kvm.kicad_sch
-python3 tools/check_netlist.py /tmp/kvm.net  # the KiCad netlist must equal the generator's pin map, and every USB
+uv run tools/check_netlist.py /tmp/kvm.net   # the KiCad netlist must equal the generator's pin map, and every USB
                                              # pair keeps D+ on D+ end to end, through the switches (errata.md E1)
-python3 tools/gen_pcb.py --force             # --force discards the routing
-python3 tools/check_spacing.py               # courtyards, pad gaps, edges
-python3 tools/check_aux.py                   # every auxiliary part is on the side of the pin it serves
-python3 tools/check_copper.py                 # shorts, stubs, doubled copper, unconnected nets, pair geometry
+uv run tools/gen_pcb.py --force              # --force discards the routing
+uv run tools/check_spacing.py                # courtyards, pad gaps, edges
+uv run tools/check_aux.py                    # every auxiliary part is on the side of the pin it serves
+uv run tools/check_copper.py                  # shorts, stubs, doubled copper, unconnected nets, pair geometry
                                               # under each HS pair (independent of the DRC; passes the committed board)
-python3 tools/check_usb_si.py                 # USB as a channel: per-lane length/skew (mm and ps), coupled vs split
+uv run tools/check_usb_si.py                  # USB as a channel: per-lane length/skew (mm and ps), coupled vs split
                                               # length, split runs vs the documented budgets, paired vias, aggressors
-python3 tools/jlc_align.py                   # after adding a part: JLC rotation/offset corrections
-python3 tools/route.py --live                # USB pairs, planes, power, signals (log: tools/route.log);
+uv run tools/jlc_align.py                    # after adding a part: JLC rotation/offset corrections
+uv run tools/route.py --live                 # USB pairs, planes, power, signals (log: tools/route.log);
                                              # --live: watch all layers at http://localhost:8765/
                                              #   the Marks panel lists the router's problem areas (a lane with no
                                              #   way through, where a twist went, where a centre line U-turns);
                                              #   click one to jump to it.  The same spots are in the log.
-                                             #   ROUTE_ONLY_PAIRS=H0_MS (comma list, P or N net name) routes that
-                                             #   link alone - 25-45 s instead of 20 min, same lanes and vias -
-                                             #   and ROUTE_DUMP_PAIR=H0_MS prints its centre runs and both
-                                             #   offset lines as they are laid.  Neither changes a full run.
+                                             #   ROUTE_ONLY_PAIRS=H0_MS_DP (comma list of P or N net names)
+                                             #   routes that link alone - with --pairs-only about 1.5 min in all
+                                             #   instead of 20, same lanes and vias - and ROUTE_DUMP_PAIR=H0_MS_DP
+                                             #   (or all) prints its centre runs and both offset lines as they
+                                             #   are laid.  Neither changes a full run.
 kicad-cli pcb drc --schematic-parity kvm.kicad_pcb
-python3 tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5
+uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5
                                              # the +5 V feed (jlcpcb.md §5): a full run can pass every check above
                                              # with a bad one (0.15.0's three runs: 495, 121 and 96 mV)
-python3 tools/make_fab.py                    # JLC BOM + CPL (corrections applied), gerbers, drill; two assembly
+uv run tools/make_fab.py                     # JLC BOM + CPL (corrections applied), gerbers, drill; two assembly
                                              # variants: jlcpcb_*.csv with the Bluetooth module, jlcpcb_*_nobt.csv
                                              # without its parts (Fit = BT, design.md §16)
+uv run case/board_facts.py                   # the case: what it needs from the board, into case/board.json
+uv run case/gen_case.py                      # then the case itself; it checks the board's parts against it first
 ```
 
-`python3 tools/gen_footprints.py` regenerates the custom footprints; the OpenDynKVM logo needs `shapely`, and without
-it the logo footprint is left as it is.
+`uv run tools/gen_footprints.py` regenerates the custom footprints; the OpenDynKVM logo needs `shapely` (in the
+environment; without it the logo footprint is left as it is).
 
 **Revising an ordered board (seeded routing).** A full run re-routes everything, and the router is not deterministic,
 so one changed pin moves copper all over the board. To change a board that was ordered and verified, seed the run
@@ -87,8 +91,8 @@ with that board instead:
 
 ```sh
 git show hw-vX.Y.Z:hardware/kvm.kicad_pcb > /tmp/seed.kicad_pcb   # the ordered board, from its tag
-python3 tools/gen_pcb.py --force                                    # the placement must be the seed's
-python3 -u tools/route.py --live --seed=/tmp/seed.kicad_pcb
+uv run tools/gen_pcb.py --force                                     # the placement must be the seed's
+uv run python -u tools/route.py --live --seed=/tmp/seed.kicad_pcb
 ```
 
 - **What it keeps:** the seed's tracks and vias stay, as fixed copper, for every net whose pads are the same as in the
@@ -133,7 +137,7 @@ python3 -u tools/route.py --live --seed=/tmp/seed.kicad_pcb
 - **Stack-up:** JLC04161H-3313, with L1 signals, L2 GND, L3 3V3 and L4 signals. USB HS pairs are 0.15 / 0.15 mm
   (≈ 88 Ω differential over L2; confirm with JLC's impedance calculator before ordering).  The board carries it
   (Board Setup → Physical Stackup, ENIG, impedance controlled; the name in the title block) from `gen_pcb.py`
-  `STACKUP`; `python3 tools/gen_pcb.py --stackup` rewrites just that on a routed board.
+  `STACKUP`; `uv run tools/gen_pcb.py --stackup` rewrites just that on a routed board.
 - **JLC assembly:** both sides, exactly the parts with an LCSC number - on the bottom the per-pin decoupling caps
   under the chips, the MX key's hot-swap socket and the SK6812MINI-E key LED (decided 2026-10-27: no BOM exclusion).
   `make_fab.py` refuses to write a CPL unless every LCSC part has a correction in `tools/jlc_corrections.json`; the

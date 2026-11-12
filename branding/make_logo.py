@@ -8,7 +8,7 @@ written as filled outlines whose curves are fitted again as cubic Béziers: the 
 support from whatever shows them.  The wordmark is Montserrat (SIL OFL 1.1), "OpenDyn" Bold and "KVM" Regular, as
 outlines.
 
-Run from anywhere:   python3 branding/make_logo.py [--fonts DIR]
+Run from anywhere:   uv run branding/make_logo.py [--fonts DIR]
 Needs shapely, fontTools and Montserrat-Bold / Montserrat-Regular (.otf or .ttf) in DIR or a usual font directory.
 """
 import argparse

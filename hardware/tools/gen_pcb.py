@@ -8,7 +8,7 @@ placed automatically next to the IC pin it serves, radially outward from that IC
 spot whose courtyard is clear.  Footprints are linked to their schematic symbols, so "Update PCB
 from Schematic" reports no changes afterwards.
 
-Run from hardware/:   python3 tools/gen_pcb.py [--force | --stackup]
+Run from hardware/:   uv run tools/gen_pcb.py [--force | --stackup]
 Refuses to touch a board that already contains tracks/vias/zones (i.e. after routing) unless
 --force is given -- regenerating throws the routing away.  --stackup only rewrites the physical
 stack-up (STACKUP) and the title block of the existing board, routed or not.

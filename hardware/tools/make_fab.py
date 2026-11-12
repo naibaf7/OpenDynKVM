@@ -20,7 +20,7 @@ from KiCad's for many packages.  The per-part corrections in tools/jlc_correctio
 tools/jlc_align.py from the actual EasyEDA footprints) are applied to the CPL:
     rotation = KiCad rotation + theta,   position = KiCad position + R(rotation) * t
 
-Run from hardware/:   python3 tools/make_fab.py
+Run from hardware/:   uv run tools/make_fab.py
 """
 import csv
 import json

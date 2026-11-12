@@ -18,7 +18,7 @@ power rails are sized for the 0.5 oz inner layer they partly run on (§5).
 Generate them from `hardware/` on the final board (the zip and `fab/` are not in git):
 
 ```sh
-python3 tools/make_fab.py
+uv run tools/make_fab.py
 ```
 
 | Upload | File | Content |
@@ -34,7 +34,7 @@ offers no Bluetooth (design.md §16); the module's pads and its antenna keep-out
 
 ## 2. What JLCPCB will see
 
-From `python3 tools/fab_facts.py`:
+From `uv run tools/fab_facts.py`:
 
 | Item | Value |
 |---|---|
@@ -98,7 +98,7 @@ stack-up from the quote form, so select it there as well.
 
 The USB High-Speed pairs are 0.15 mm wide with a 0.15 mm gap, on L1 over L2 and on L4 over L3.  USB 2.0 needs
 76.5-103.5 ohm differential (90 +-15 %) and 21-39 ohm common mode (30 +-30 %).  From
-`python3 tools/zsolve.py --corners`, a 2D field solve on the stack-up read from the board:
+`uv run tools/zsolve.py --corners`, a 2D field solve on the stack-up read from the board:
 
 | Case | Differential | |
 |---|---|---|
@@ -133,7 +133,7 @@ power rail for the copper of the layer it runs on (`route.py` `RAIL_LW`, from th
 switches also has a drop rule (1 mV/mm at its 2.24 A): 1.1 mm on F.Cu / B.Cu.  Rev 11 ran it 106 mm on In2.Cu at the
 0.6 mm meant for 1 oz outer copper.
 
-From `python3 tools/dc_drop.py +5V U402.1,U402.8 U1203=... U1303=... U1403=... U403=...` (U1203 / U1303 / U1403 are
+From `uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=... U1303=... U1403=... U403=...` (U1203 / U1303 / U1403 are
 the Keyboard / Mouse / Other port switches, U403 the 3.3 V buck):
 
 | Load case | Drop U402 -> port switches, 0.17.0 | 0.16.0 | 0.15.0 | rev 12 | rev 11 |
@@ -214,7 +214,7 @@ The hubs' decoupling caps on the bottom side have their GND stubs to these vias,
 
 ## 8. Parts and stock
 
-From `python3 tools/jlc_stock.py` on 2026-11-09, for 5 assembled boards with the Bluetooth module:
+From `uv run tools/jlc_stock.py` on 2026-11-09, for 5 assembled boards with the Bluetooth module:
 
 | Part | LCSC | Need | Stock | |
 |---|---|---|---|---|
@@ -318,12 +318,12 @@ Run from `hardware/`; each tool prints what it measured from the board file, the
 
 | Section | Command | What it gives |
 |---|---|---|
-| §2, §6, §9 | `python3 tools/fab_facts.py` | outline and cut-outs, stack-up, zones, track widths, design rules, vias and vias in pads, holes by size and owner, parts at the edges, parts per side, through-hole parts |
-| §4 | `python3 tools/zsolve.py --corners` (about 3 min) | the pair's differential and common-mode impedance on the board's stack-up, each fab tolerance, their spread, the stacked worst cases and the 7628 build |
-| §5 | `python3 tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5` (add `--inner 30` for 1 oz inner) | DC drop at each load, loss per layer, the most loaded segments with their current density and IPC-2221 rise |
-| §5 | `python3 tools/dc_drop.py VBUS_PWR J301 U402.7=2.0`, `... VBUS_KB U1203.6 J1201=0.5` | the adapter feed and a port leg |
-| §5 | `python3 tools/zsolve.py --corners --prepreg 0.092` | the pair on JLC's 1 oz-inner 3313 build |
-| §8 | `python3 tools/jlc_stock.py [--boards N]` (network) | stock, part class and need per BOM line; exits 1 if a line blocks the order |
+| §2, §6, §9 | `uv run tools/fab_facts.py` | outline and cut-outs, stack-up, zones, track widths, design rules, vias and vias in pads, holes by size and owner, parts at the edges, parts per side, through-hole parts |
+| §4 | `uv run tools/zsolve.py --corners` (about 3 min) | the pair's differential and common-mode impedance on the board's stack-up, each fab tolerance, their spread, the stacked worst cases and the 7628 build |
+| §5 | `uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5` (add `--inner 30` for 1 oz inner) | DC drop at each load, loss per layer, the most loaded segments with their current density and IPC-2221 rise |
+| §5 | `uv run tools/dc_drop.py VBUS_PWR J301 U402.7=2.0`, `... VBUS_KB U1203.6 J1201=0.5` | the adapter feed and a port leg |
+| §5 | `uv run tools/zsolve.py --corners --prepreg 0.092` | the pair on JLC's 1 oz-inner 3313 build |
+| §8 | `uv run tools/jlc_stock.py [--boards N]` (network) | stock, part class and need per BOM line; exits 1 if a line blocks the order |
 | §1, board checks | the chain in `README.md` | DRC, ERC, parity, copper, spacing, SI |
 
 The datasheet values in §5 are typical at 25 C: TPS2121 RON 56 mOhm (`datasheets/tps2121.pdf`, ON-RESISTANCE) and

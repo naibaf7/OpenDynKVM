@@ -357,6 +357,10 @@ fn print_screens(s: &Snapshot) {
             "{}",
             fl!("cli-hop-mapping", pc = pc.name().to_uppercase(), mapping = names::mapping(hop.mapping[pc.index()]))
         );
+        println!(
+            "  {}",
+            fl!("cli-hop-units", pc = pc.name().to_uppercase(), units = names::units(hop.units[pc.index()]))
+        );
     }
     println!(
         "{}",
@@ -368,6 +372,21 @@ fn print_screens(s: &Snapshot) {
             corner = hop.corner
         )
     );
+}
+
+/// Whether the KVM's copy of this computer's screens and units is what its display settings say (only when the KVM says
+/// which PC this is and has screens for it): a warning if not.
+fn check_screens(s: &Snapshot) {
+    let (Some(hop), Some(pc)) = (s.hop(), s.this_pc()) else { return };
+    // The simulator's screens aren't this computer's.
+    if !hop.screens.iter().any(|x| x.pc == Some(pc)) || hop.simulated {
+        return;
+    }
+    if let Ok(now) = odkvmctl::screens::detect()
+        && odkvmctl::screens::differs(&hop.screens, pc, hop.units[pc.index()], &now)
+    {
+        println!("{}", fl!("cli-hop-out-of-date"));
+    }
 }
 
 fn host_state(h: &BtHostView) -> String {
@@ -685,28 +704,34 @@ fn main() -> Result<()> {
         Cmd::List | Cmd::Display { .. } | Cmd::Update { .. } => unreachable!(),
         Cmd::Screens { action } => {
             let s = c.snapshot()?;
-            if matches!(action, Some(ScreensAction::Detect)) {
-                let Some(hop) = s.hop() else { bail!(fl!("hop-firmware-too-old")) };
-                let Some(pc) = s.this_pc() else { bail!(fl!("cli-screens-which-pc")) };
-                let found = odkvmctl::screens::detect().map_err(anyhow::Error::msg)?;
-                let next = odkvmctl::screens::place(&hop.screens, pc, &found);
-                for (i, (a, b)) in hop.screens.iter().zip(next.iter()).enumerate() {
-                    if a != b {
-                        c.set_config(ConfigValue::Screen(i as u8, *b))?;
+            match action {
+                Some(ScreensAction::Detect) => {
+                    let Some(hop) = s.hop() else { bail!(fl!("hop-firmware-too-old")) };
+                    let Some(pc) = s.this_pc() else { bail!(fl!("cli-screens-which-pc")) };
+                    let found = odkvmctl::screens::detect().map_err(anyhow::Error::msg)?;
+                    let next = odkvmctl::screens::merge(&hop.screens, pc, &found);
+                    for (i, (a, b)) in hop.screens.iter().zip(next.iter()).enumerate() {
+                        if a != b {
+                            c.set_config(ConfigValue::Screen(i as u8, *b))?;
+                        }
                     }
+                    c.set_config(ConfigValue::HopMapping(pc, odkvmctl::screens::MAPPING))?;
+                    c.set_config(ConfigValue::HopUnits(pc, found.units))?;
+                    println!(
+                        "{}",
+                        fl!(
+                            "hop-detected",
+                            count = found.screens.len(),
+                            pc = pc.name().to_uppercase(),
+                            mapping = names::mapping(odkvmctl::screens::MAPPING)
+                        )
+                    );
                 }
-                c.set_config(ConfigValue::HopMapping(pc, odkvmctl::screens::MAPPING))?;
-                println!(
-                    "{}",
-                    fl!(
-                        "hop-detected",
-                        count = found.len(),
-                        pc = pc.name().to_uppercase(),
-                        mapping = names::mapping(odkvmctl::screens::MAPPING)
-                    )
-                );
+                Some(ScreensAction::List) | None => {}
             }
-            print_screens(&c.snapshot()?);
+            let s = c.snapshot()?;
+            print_screens(&s);
+            check_screens(&s);
         }
         Cmd::Diag => {
             let items = match c.diag() {
