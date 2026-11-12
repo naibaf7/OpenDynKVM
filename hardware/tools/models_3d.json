@@ -1,0 +1,260 @@
+{
+ "C165948": {
+  "footprint": "CustomFootprints:USB_C_Receptacle_HRO_TYPE-C-31-M-12_Edge",
+  "easyeda": "USB-C_SMD-TYPE-C-31-M-12_1",
+  "uuid": "617b05f9bba7410b96c001093d8189e4",
+  "bottom": false,
+  "box": [
+   -4.47,
+   4.47,
+   -3.55,
+   4.35,
+   -0.85,
+   3.25
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C165948.step",
+    "offset": [
+     0.0,
+     -0.9525,
+     0.0
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     180.0
+    ]
+   }
+  ]
+ },
+ "C2652459": {
+  "footprint": "Package_DFN_QFN:Texas_RMG0012A_WQFN-12_1.8x1.8mm_P0.4mm",
+  "easyeda": "QFN-12L_L1.8-W1.8-P0.40-TL_TS3USB3031RMGR",
+  "uuid": "e6dff3a5338645a28fedf9bd5a7a1b79",
+  "bottom": false,
+  "box": [
+   -0.9,
+   0.9,
+   -0.9,
+   0.91,
+   0.0,
+   0.8
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C2652459.step",
+    "offset": [
+     0.0,
+     0.0051,
+     0.0
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   }
+  ]
+ },
+ "C318884": {
+  "footprint": "Button_Switch_SMD:SW_Push_1P1T_XKB_TS-1187A",
+  "easyeda": "SW-SMD_4P-L5.1-W5.1-P3.70-LS6.5-TL_H1.5",
+  "uuid": "91b67c1735f643ffb2e7226c23dd3492",
+  "bottom": false,
+  "box": [
+   -3.25,
+   3.25,
+   -2.6,
+   2.6,
+   0.0,
+   1.55
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C318884.step",
+    "offset": [
+     0.0,
+     -0.0005,
+     0.05
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   }
+  ]
+ },
+ "C39843328": {
+  "footprint": "Package_DFN_QFN:QFN-80-1EP_10x10mm_P0.4mm_EP3.4x3.4mm",
+  "easyeda": "QFN-80_L10.0-W10.0-P0.40-TL-EP3.4",
+  "uuid": "79624d072a514f4d8479339def74168a",
+  "bottom": false,
+  "box": [
+   -5.01,
+   5.01,
+   -5.01,
+   5.01,
+   0.0,
+   0.87
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C39843328.step",
+    "offset": [
+     0.0,
+     0.0,
+     0.03
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   }
+  ]
+ },
+ "C41349510": {
+  "footprint": "CustomFootprints:ESP32-C3-MINI-1",
+  "easyeda": "WIFIM-SMD_ESP32-C3-MINI-1",
+  "uuid": "789e2235438340f8bef14c336f136f9e",
+  "bottom": false,
+  "box": [
+   -6.6,
+   6.6,
+   -5.58,
+   11.02,
+   0.0,
+   2.5
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C41349510.step",
+    "offset": [
+     0.0,
+     2.715,
+     0.0
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   }
+  ]
+ },
+ "C485916": {
+  "footprint": "CustomFootprints:TI_RUX0012A_VQFN-HR-12_2x2.5mm_P0.5mm",
+  "easyeda": "VQFN-HR-12_L2.5-W2.0-P0.50-BL",
+  "uuid": "b3b163ff5ac04d1fb107c30a7d954e0d",
+  "bottom": false,
+  "box": [
+   -1.25,
+   1.25,
+   -1.0,
+   1.0,
+   0.0,
+   1.0
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C485916.step",
+    "offset": [
+     -0.0001,
+     0.0001,
+     0.0
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     270.0
+    ]
+   }
+  ]
+ },
+ "C49352235": {
+  "footprint": "CustomFootprints:SW_MX_Hotswap_Kailh_1u",
+  "easyeda": "TH_L10.9-W5.9-CPG151101S11-2",
+  "uuid": "b226c46d9f4847bc837da2470e6ffcc9",
+  "bottom": true,
+  "box": [
+   -7.87,
+   6.63,
+   0.86,
+   6.75,
+   -3.45,
+   -0.4
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C49352235.step",
+    "offset": [
+     -0.6215,
+     3.81,
+     -1.65
+    ],
+    "rotate": [
+     180.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "file": "${KIPRJMOD}/3dmodels/MX_Switch.step",
+    "offset": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "file": "${KIPRJMOD}/3dmodels/Keycap_1u.step",
+    "offset": [
+     0.0,
+     0.0,
+     0.0
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   }
+  ]
+ },
+ "C5378721": {
+  "footprint": "CustomFootprints:LED_SK6812SIDE-A_4.0x1.6mm",
+  "easyeda": "LED-SMD_4P-L4.0-W1.6-L",
+  "uuid": "67027208803a44bf8ed89d1ce8acb277",
+  "bottom": false,
+  "box": [
+   -2.0,
+   2.0,
+   -1.34,
+   0.26,
+   0.0,
+   2.02
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C5378721.step",
+    "offset": [
+     -0.0001,
+     -0.5418,
+     1.02
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     180.0
+    ]
+   }
+  ]
+ }
+}

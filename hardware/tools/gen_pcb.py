@@ -8,10 +8,11 @@ placed automatically next to the IC pin it serves, radially outward from that IC
 spot whose courtyard is clear.  Footprints are linked to their schematic symbols, so "Update PCB
 from Schematic" reports no changes afterwards.
 
-Run from hardware/:   uv run tools/gen_pcb.py [--force | --stackup]
+Run from hardware/:   uv run tools/gen_pcb.py [--force | --stackup | --models]
 Refuses to touch a board that already contains tracks/vias/zones (i.e. after routing) unless
 --force is given -- regenerating throws the routing away.  --stackup only rewrites the physical
-stack-up (STACKUP) and the title block of the existing board, routed or not.
+stack-up (STACKUP) and the title block of the existing board, routed or not; --models only the
+footprints' 3D models (tools/models_3d.json, else the library footprint's own), routed or not.
 """
 
 import json
@@ -31,6 +32,9 @@ SCH = os.path.join(HERE, 'kvm.kicad_sch')
 PCB = os.path.join(HERE, 'kvm.kicad_pcb')
 FPLIBS = {'CustomFootprints': os.path.join(HERE, 'CustomFootprints.pretty')}
 SYSFP = '/usr/share/kicad/footprints'
+# 3D models for the parts KiCad's 3D library has none for (EasyEDA's, placed on our footprints) and the MX key's
+# switch and keycap, by LCSC part: written by tools/fetch_3d.py, which also fetches the files into 3dmodels/
+MODELS_3D = os.path.join(HERE, 'tools', 'models_3d.json')
 
 # Board: 120 x 80 mm, origin (100, 100).  Rear edge (top, y = 100): USB-C PC1 / PWR-SERVICE / PC2.
 # Front edge (bottom, y = 180): USB-A Keyboard / Mouse / Other with the status LEDs; MX key in the centre.
@@ -258,31 +262,32 @@ PLACEMENT['C510'] = (142.5, 123.6, 180)
 PLACEMENT['C710'] = (147.15, 120.5, 180)
 
 # ── Bluetooth LE module (0.16.0, block 16; fitted on the BT variant only) ─────────────────────────────────────────────
-# ESP32-C3-MINI-1 on the bottom side near the south-east corner, its antenna end on the east edge (x 220.0, flush;
+# ESP32-C3-MINI-1 on the top side near the south-east corner, its antenna end on the east edge (x 220.0, flush;
 # Espressif's placement guide: antenna at the board edge, no copper under it on any layer).  The only board edge with
 # room: the north edge has the three USB-C ports, the west edge and the band north of here carry the hub lanes, the
-# south edge the USB-A ports and the LEDs.  On the bottom: Hub-2's lanes come down x 205-209 on F.Cu to y 140 and turn
-# south-west to x 199 by y 146-151, over the module's north-west corner.  On 2026-11-08/09 it moved up (from
-# y 158.5 to 152.5), then, for no overhang past the board edge, a bit down and west (to 208.5 / 156.0).
-# Its 22 ground pads join the B.Cu GND pour instead of taking a via each (route.py POUR_PADS), which the stitching vias
-# round it tie to In1.Cu; several of them sit under those lanes, where no via may go.
-# Rotated 90 and flipped: antenna east, pads 1-11 along the south side (3V3 at x 211.4, EN 207.4, IO2 209.8, IO3 209.0),
-# pads 12-24 along the west side (IO8 at y ESP_AT + 3.2, IO9 + 2.4 ... from the north), pads 25-35 along the north side
-# (RXD0 at x 208.5, TXD0 209.3), the ground row 36-48 along the antenna end.  Its passives sit south and west of it.
-# The antenna end is at x 219.5, 0.5 mm inside the board edge, and the UART pads at y 150.1, 9 mm south of the lowest
-# lane where it passes above them.
+# south edge the USB-A ports and the LEDs.  Hub-2's lanes come down x 205-209 on F.Cu to y 140 and turn south-west to
+# x 199 by y 146-151, north-west of the module.  On 2026-11-08/09 it moved up (from y 158.5 to 152.5), then, for no
+# overhang past the board edge, a bit down and west (to 208.5 / 156.0).  0.16.0 put it on the bottom; on 2026-11-12 it
+# moved to the top, its layout mirrored (same centre, antenna still east), so that the bottom carries only
+# small parts: routed by seeding 0.17.0's board and moving these nine parts (tools/route.py --move, README.md).
+# Its 22 ground pads join the F.Cu GND pour instead of taking a via each (route.py POUR_PADS).
+# Rotated 270: antenna east, pads 1-11 along the north side (3V3 at x 210.9, EN 206.9, IO2 209.3, IO3 208.5), pads 12-24
+# along the west side (IO8 at y ESP_AT + 3.2, IO9 + 4.0 ... from the north), pads 25-35 along the south side (RXD0 at
+# x 208.5, TXD0 209.3), the ground row 36-48 along the antenna end.  Its passives sit north and west of it, mirrored
+# from the bottom-side layout; the two pull-ups west stand on end in the 1.3 mm between the module and the logo.
+# The antenna end is at x 219.5, 0.5 mm inside the board edge.
 ESP_AT = (208.5, 156.0)
 _ex, _ey = ESP_AT
 PLACEMENT.update({
-    'U1601': (_ex, _ey, 90, 'B'),
-    'C1602': (_ex + 2.55, _ey + 7.6, 0, 'B'),     # 100 nF at the 3V3 pad
-    'R1602': (_ex + 0.5, _ey + 7.6, 0, 'B'),      # IO2 pull-up, at its pad
-    'R1601': (_ex - 1.7, _ey + 7.6, 0, 'B'),      # EN pull-up and EN delay cap, at the EN pad
-    'C1601': (_ex + 1.9, _ey + 9.25, 0, 'B'),     # 10 uF on the 3V3 pad's line
-    'C1603': (_ex - 1.7, _ey + 9.1, 0, 'B'),
-    'TP1601': (_ex - 6.4, _ey + 8.6, 0, 'B'),     # the module's log (IO3)
-    'R1604': (_ex - 8.5, _ey - 4.0, 0, 'B'),      # RXD0 / IO9 pull-up (boot from flash), beside IO9 (pad 23)
-    'R1603': (_ex - 6.7, _ey - 3.2, 90, 'B'),     # IO8 pull-up, west of its pad
+    'U1601': (_ex, _ey, 270),
+    'C1602': (_ex + 2.55, _ey - 7.6, 180),        # 100 nF at the 3V3 pad
+    'R1602': (_ex + 0.5, _ey - 7.6, 180),         # IO2 pull-up, at its pad
+    'R1601': (_ex - 1.7, _ey - 7.6, 180),         # EN pull-up and EN delay cap, at the EN pad
+    'C1601': (_ex + 1.9, _ey - 9.25, 180),        # 10 uF on the 3V3 pad's line
+    'C1603': (_ex - 1.7, _ey - 9.1, 180),
+    'TP1601': (_ex - 6.4, _ey - 8.6, 180),        # the module's log (IO3)
+    'R1604': (_ex - 6.7, _ey + 4.9, 90),          # RXD0 / IO9 pull-up (boot from flash), beside IO9 (pad 23)
+    'R1603': (_ex - 6.7, _ey + 2.6, 270),         # IO8 pull-up, west of its pad
 })
 # Antenna keep-out, a board-level rule area on every copper layer (route.py honours it, and the zone filler
 # leaves every plane out of it - GND on F.Cu, In1.Cu and B.Cu, +3V3 on In2.Cu): no track, via or zone fill from the
@@ -307,7 +312,7 @@ KEEP_FREE = [
     (AT1_X + 1.5, 126.4, AT1_X + 3.0, AT1_Y - 3.1),           # ... down into its OTGHS pins
     (160 + AT_X - 2.8, AT2_Y + 3.9, 160 + AT_X - 1.2, 146.1), # Hub-2 -> AT32 #2, up into its OTGHS pins
     (142.5, 125.6, 155.0, 127.6),  # Hub-0's ports face the RP2354B: their lines fan out in this gap
-    # the Bluetooth module (bottom) and its passives, and its antenna keep-out (from ESP_AT: a box at a fixed place
+    # the Bluetooth module and its south and west sides, and its antenna keep-out (from ESP_AT: a box at a fixed place
     # pushed Hub-2's C907 off its spot, and the hub macro's twins C707 / C807 with it - C807 then sat on CC2_PC1's
     # 0.15.0 via, and CC1/CC2_PC1 went unrouted in three runs)
     (ESP_AT[0] - 8.5, ESP_AT[1] - 7.0, 220.0, ESP_AT[1] + 10.2),
@@ -466,6 +471,48 @@ def load_fp(fpid):
     return fp
 
 
+def models_3d():
+    return json.load(open(MODELS_3D)) if os.path.exists(MODELS_3D) else {}
+
+
+def set_models(fp, models, lib_fp=None):
+    """The footprint's 3D models: tools/models_3d.json's for its LCSC part, else (with lib_fp) the library
+    footprint's own; a footprint that is in neither keeps what it has."""
+    lcsc = fp.GetFieldText('LCSC') if fp.HasField('LCSC') else ''
+    if lcsc in models:
+        want = []
+        for m in models[lcsc]['models']:
+            model = pcbnew.FP_3DMODEL()
+            model.m_Filename = m['file']
+            model.m_Offset = pcbnew.VECTOR3D(*m['offset'])
+            model.m_Rotation = pcbnew.VECTOR3D(*m['rotate'])
+            want.append(model)
+    elif lib_fp is not None:
+        want = list(lib_fp.Models())
+    else:
+        return
+    fp.Models().clear()
+    for model in want:
+        fp.Add3DModel(model)
+
+
+def write_models():
+    """Put the 3D models (set_models) on the existing board, routed or not; nothing else on it changes."""
+    models = models_3d()
+    board = pcbnew.LoadBoard(PCB)
+    for fp in board.GetFootprints():
+        fpid = fp.GetFPID()
+        lib = fpid.GetLibNickname().wx_str()
+        lib_fp = load_fp(f'{lib}:{fpid.GetLibItemName().wx_str()}') if lib else None
+        set_models(fp, models, lib_fp)
+    pro = PCB.replace('.kicad_pcb', '.kicad_pro')
+    keep = open(pro).read()          # SaveBoard rewrites the project file; keep ours
+    pcbnew.SaveBoard(PCB, board)
+    with open(pro, 'w') as f:
+        f.write(keep)
+    return sum(len(fp.Models()) for fp in board.GetFootprints())
+
+
 CONTENT_TAGS = {'footprint', 'segment', 'arc', 'via', 'zone', 'net', 'group', 'generated', 'dimension',
                 'image', 'table', 'target'}
 
@@ -564,6 +611,11 @@ def main():
         write_stackup()
         print(f'wrote the {STACKUP_NAME} stack-up into {PCB}')
         return
+    if '--models' in sys.argv:
+        n = write_models()
+        print(f'wrote {n} 3D models into {PCB}')
+        return
+    models = models_3d()
     board = base_board()
     net = export_netlist()
     pinnet = {}
@@ -612,6 +664,7 @@ def main():
                 fp.SetAttributes(fp.GetAttributes() | pcbnew.FP_EXCLUDE_FROM_BOM)
             if key == 'exclude_from_pos_files':
                 fp.SetAttributes(fp.GetAttributes() | pcbnew.FP_EXCLUDE_FROM_POS_FILES)
+        set_models(fp, models)
         if ref.startswith(FAB_REF_PREFIX):
             fp.Reference().SetLayer(pcbnew.F_Fab)
             fp.Reference().SetTextSize(pcbnew.VECTOR2I_MM(0.5, 0.5))

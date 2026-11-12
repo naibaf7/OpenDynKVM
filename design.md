@@ -968,11 +968,13 @@ software.md §4.13.
   ESP32-C3 for the certification it carries (the board's radio tests reuse the module's) and over an nRF54L15 module
   for price and LCSC stock. Bluetooth LE only: Classic-only devices (some keyboards, mice and game controllers) stay on the USB
   ports.
-- **Placement:** on the bottom side near the south-east corner (centre 208.5 / 156.0), its antenna end at x 219.5,
-  0.5 mm inside the east edge (nothing overhangs the board), its UART pads 9 mm south of Hub-2's lanes. A rule area
-  keeps every copper layer, every plane included, out from the antenna's start to the edge and 15 mm along the edge each
-  side (Espressif's clearance), as far as H1504. The module's ground pads join the B.Cu ground pour. The logos moved for it: the OpenDynKVM logo behind the
-  OTHER port, the OSHW logo and the version at the rear between PC1 and BOOTSEL.
+- **Placement:** on the top side near the south-east corner (centre 208.5 / 156.0), its antenna end at x 219.5,
+  0.5 mm inside the east edge (nothing overhangs the board), south-east of Hub-2's lanes; its UART pads face south.
+  0.16.0 put it on the bottom; on 2026-11-12 it moved to the top with its passives (same centre, the layout mirrored),
+  so that the bottom side carries only the decoupling caps, the key's socket and its LED. A rule area keeps every
+  copper layer, every plane included, out from the antenna's start to the edge and 15 mm along the edge each side
+  (Espressif's clearance), as far as H1504. The module's ground pads join the F.Cu ground pour. The logos moved for
+  it: the OpenDynKVM logo behind the OTHER port, the OSHW logo and the version at the rear between PC1 and BOOTSEL.
 - **Interface:** two wires, UART0 on GPIO28/29. The module's BOOT strap shares the RP2354B's TX line and its EN has
   only its RC, so the RP2354B gets the module into its ROM bootloader with a link command or a UART break across a
   reset, and programs it from its own image as it does the AT32F405s.

@@ -25,7 +25,7 @@ uv run tools/make_fab.py
 |---|---|---|
 | PCB | `kvm_gerbers.zip` | 4 copper, 2 mask, 2 paste, 2 silkscreen, outline, plated + non-plated drill, job file (with the stack-up) |
 | BOM | `bom/jlcpcb_bom.csv` | 41 lines, every part with an LCSC number (with the Bluetooth module) |
-| CPL | `bom/jlcpcb_cpl.csv` | 251 parts: 209 top, 42 bottom, JLC rotation/offset corrections applied |
+| CPL | `bom/jlcpcb_cpl.csv` | 251 parts: 217 top, 34 bottom, JLC rotation/offset corrections applied |
 | BOM, no Bluetooth | `bom/jlcpcb_bom_nobt.csv` | 40 lines: the module U1601 and its seven passives (Fit = BT) left out |
 | CPL, no Bluetooth | `bom/jlcpcb_cpl_nobt.csv` | 243 parts: 209 top, 34 bottom |
 
@@ -45,7 +45,7 @@ From `uv run tools/fab_facts.py`:
 | Vias | 1010, all through, 0.6 mm pad / 0.3 mm drill, tented both sides in the gerbers; 36 of them sit in the exposed pads of U501, U701, U801 and U901 (§6) |
 | Plated holes | 12 x 0.95 mm and 6 x 2.3 mm (USB-A); 6 slots 0.6 x 1.2 mm and 6 slots 0.6 x 1.7 mm (USB-C shells) |
 | Non-plated holes | 24: 4 x 3.2 mm (M3), the MX switch and socket (4.0, 2 x 1.75, 2 x 3.05 mm), 6 x 0.65 mm (USB-C pegs), 9 x 0.99 mm (guide holes of the three Tag-Connect SWD pads) |
-| Edges | the USB-C bodies reach 0.05 mm past the north edge, the USB-A bodies end 0.16 mm inside the south edge, the Bluetooth module's antenna end (bottom side) 0.45 mm inside the east edge; no other part within 0.5 mm |
+| Edges | the USB-C bodies reach 0.05 mm past the north edge, the USB-A bodies end 0.16 mm inside the south edge, the Bluetooth module's antenna end (top side) 0.45 mm inside the east edge; no other part within 0.5 mm |
 | Through-hole parts | 3 x USB-C (4 shell legs each), 3 x USB-A (6 pins each): JLC solders these by hand, for a separate fee |
 
 ## 3. PCB options
@@ -191,7 +191,7 @@ The hubs' decoupling caps on the bottom side have their GND stubs to these vias,
 | Option | Select | Why |
 |---|---|---|
 | PCBA type | **Standard** | double-sided assembly (Economic has been one side only) |
-| Assembly side | **Both sides** | 42 parts on the bottom, 34 without the Bluetooth module (§9) |
+| Assembly side | **Both sides** | 34 parts on the bottom, with or without the Bluetooth module (§9) |
 | PCBA qty | 5, or 2 | 2 is the minimum; assembling 2 and keeping 3 bare boards cuts the parts cost of a first prototype |
 | Edge rails / fiducials | **Added by JLCPCB** | the board has no fiducials, and the connectors sit flush with both long edges (§2).  JLC adds two 5 mm rails (120 x 90 mm) |
 | Confirm parts placement | **Yes** | a JLC engineer checks the placement before production; the bottom rows use a derived rotation convention (§9) |
@@ -247,10 +247,10 @@ in-package flash and would need a QSPI flash chip and a re-layout around the MCU
 
 ## 9. The bottom side
 
-42 parts with the Bluetooth module, 34 without (`fab_facts.py`, "assembly"): 32 x 100 nF 0402 under their supply pins
-(RP2354B C501-C506, C513, C515; AT32s C1001-C1004, C1101-C1104; hubs C702-C705, C801-C806, C901-C906), the key LED D1501
-and the MX hot-swap socket SW1501; with the module also U1601 (ESP32-C3-MINI-1-H4X) and its passives C1601 (10 uF),
-C1602 (100 nF), C1603 (1 uF) and R1601-R1604 (10 k).
+34 parts in both variants (`fab_facts.py`, "assembly"): 32 x 100 nF 0402 under their supply pins (RP2354B C501-C506,
+C513, C515; AT32s C1001-C1004, C1101-C1104; hubs C702-C705, C801-C806, C901-C906), the key LED D1501 and the MX
+hot-swap socket SW1501.  The Bluetooth module and its passives were on the bottom up to 2026-11-12; they are on the
+top now (design.md §16), so the bottom carries no part heavier than the socket.
 
 `make_fab.py` writes the bottom rows with the convention of kicad-jlcpcb-tools: the rotation of a flipped footprint
 is `180 - phi + theta`, and the part offset is mirrored in x.  In JLC's placement preview, check:
@@ -267,12 +267,13 @@ is `180 - phi + theta`, and the part offset is mirrored in x.  In JLC's placemen
   of symmetry, so barrels and tabs stay where they were).  JLC's land pattern for the socket is 0.51 mm wider than
   ours, so its tabs may look 0.26 mm off our pads on each side while the part is centred.  That is expected: do not
   let it be "corrected" off-centre.
-- **U1601** (Bluetooth variant): the module's antenna end (the end with no pads under it) at the east board edge,
-  0.45 mm inside it, over the bare antenna keep-out; seen from the top, pin 1 (GND) is the east end of the pad row along
-  the module's south side, next to the antenna.  JLC's footprint for C41349510 matched ours with no rotation or offset
-  correction (`jlc_corrections.json`).
 - A few of the 32 caps, to confirm the bottom transform in general.  They are not polarized, so any 180 degree error
   there is harmless.
+
+On the top side, also check **U1601** (Bluetooth variant): the module's antenna end (the end with no pads under it) at
+the east board edge, 0.45 mm inside it, over the bare antenna keep-out; pin 1 (GND) is the east end of the pad row
+along the module's north side, next to the antenna.  JLC's footprint for C41349510 matched ours with no rotation or
+offset correction (`jlc_corrections.json`).
 
 ## 10. Fitted after delivery
 

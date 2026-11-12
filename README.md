@@ -5,6 +5,10 @@
   </picture>
 </p>
 
+<p align="center">
+  <img src="hardware/render/kvm-front-readme.png" alt="The OpenDynKVM board, hardware 0.17.0: the front with its USB-A ports, the mechanical key and the status LEDs" width="720">
+</p>
+
 # OpenDynKVM
 
 An open-source USB KVM switch for two PCs that switches in under a millisecond. Each PC is permanently connected to a

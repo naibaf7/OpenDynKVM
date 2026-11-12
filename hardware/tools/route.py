@@ -323,11 +323,11 @@ NOROUTE_BODY = {'J101': (0,), 'J201': (0,), 'J301': (0,), 'J1201': (0,), 'J1301'
                 'SW501': (0,)}
 EP_PADS = {('U501', '81'): 3, ('U701', '37'): 3, ('U801', '37'): 3, ('U901', '37'): 3}   # n x n via arrays
 # Footprints whose GND pads join their own layer's GND pour instead of taking a via each (0.16.0): the Bluetooth module
-# U1601 on B.Cu.  Its 22 ground pads (a row of 13 along the antenna end, four corners, the 3 x 3 centre grid) lie in
-# the B.Cu GND zone, which the stitching vias round the module tie to In1.Cu; a via per pad would put 22 drills under
-# the module, and the row along the antenna end would sit at the antenna keep-out's edge.  Its 3V3 pad takes a plane
-# via like any other; the signal pads leave on B.Cu (the module needs no fan-out reservation: 0.8 mm pitch, and every
-# failed 0.16.0 route of its lines failed at the RP2354B's end, never here).
+# U1601 (on F.Cu since 2026-11-12, on B.Cu before).  Its 22 ground pads (a row of 13 along the antenna end, four
+# corners, the 3 x 3 centre grid) lie in its side's GND zone, which the stitching vias round the module tie to In1.Cu;
+# a via per pad would put 22 drills under the module, and the row along the antenna end would sit at the antenna
+# keep-out's edge.  Its 3V3 pad takes a plane via like any other; the signal pads leave on the module's side (it needs
+# no fan-out reservation: 0.8 mm pitch, and every failed 0.16.0 route of its lines failed at the RP2354B's end).
 POUR_PADS = {'U1601'}
 # parts whose pads need a reserved way out (a straight run plus a via site) before the signals are routed, the same
 # as a dense IC's pins: the edge-mounted parts would otherwise have no escape left, and the 0.5 mm-pitch power path
@@ -4340,27 +4340,39 @@ def seed_copper(B, board, path, log):
     differs from the seed's, and their pair mates.  The placement must be the seed's - copper does not fit moved parts.
     Parts the seed does not have (0.16.0: the Bluetooth module and its passives) are added: seed copper that touches
     their pads goes, and so does its net's (it is re-routed).  A plane net keeps its copper; its new pads get their via
-    in main().  ``--reroute=NET,NET`` re-routes more nets, to clear a new net's way out of a dense pin row."""
+    in main().  ``--reroute=NET,NET`` re-routes more nets, to clear a new net's way out of a dense pin row.
+    ``--move=REF,REF`` lets those parts sit elsewhere than in the seed (0.17.0: the Bluetooth module and its passives
+    moved to the top): each is taken as a new part, and the seed's copper at its old pads goes too - its signal nets
+    are re-routed, a plane net loses the tracks there and the +3V3 vias they led to."""
     seed = pcbnew.LoadBoard(path)
-    moved = []
+    allow = {r for r in next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--move=')), '').split(',') if r}
+    moved, shifted = [], []
     for f in seed.GetFootprints():
         if not f.GetPadCount():
             continue          # a logo: no copper the routing depends on, and its no-via area is a rule area (below)
         g = board.FindFootprintByReference(f.GetReference())
         if (g is None or g.GetPosition() != f.GetPosition() or g.GetOrientationDegrees() != f.GetOrientationDegrees()
                 or g.GetLayer() != f.GetLayer()):
-            moved.append(f.GetReference())
+            (shifted if g is not None and f.GetReference() in allow else moved).append(f.GetReference())
     if moved:
         raise SystemExit(f'--seed: {len(moved)} footprint(s) placed differently from {path} ({", ".join(moved[:8])}): '
-                         f'its copper does not fit this board - route it from scratch')
+                         f'its copper does not fit this board - route it from scratch, or name them with --move=')
+    if shifted:
+        log.append(f'seed: {len(shifted)} part(s) moved, taken as new parts: {", ".join(sorted(shifted))}')
+        print(log[-1], flush=True)
 
     def pad_nets(b):
         return {(f.GetReference(), p.GetNumber()): p.GetNetname() for f in b.GetFootprints() for p in f.Pads()}
     old, new = pad_nets(seed), pad_nets(board)
     changed = {n for k in set(old) | set(new) if old.get(k) != new.get(k) for n in (old.get(k), new.get(k)) if n}
+    # A moved part's signal nets keep their seed copper but the pieces at its old or new pads: the router joins what
+    # is left to the pads where they are now, and trims the dead ends afterwards (main()), as for a cut net
+    moved_nets = {nm for (r, _), nm in new.items() if r in shifted and nm and nm not in PLANES
+                  and not nm.startswith('unconnected-')}
+    changed |= moved_nets
     # A plane's copper stays (its vias are the seed's, and the planes are refilled anyway); only its new pads need a via
-    B.seed_plane_pads = {pn: {f'{r}.{num}' for (r, num), nm in new.items() if nm == pn and old.get((r, num)) != pn}
-                         for pn in PLANES}
+    B.seed_plane_pads = {pn: {f'{r}.{num}' for (r, num), nm in new.items()
+                              if nm == pn and (old.get((r, num)) != pn or r in shifted)} for pn in PLANES}
     changed = {n for n in changed if n not in PLANES and not n.startswith('unconnected-')}
     extra = next((a.split('=', 1)[1] for a in sys.argv if a.startswith('--reroute=')), '')
     missing = [n for n in extra.split(',') if n and n not in B.netcode]
@@ -4369,14 +4381,17 @@ def seed_copper(B, board, path, log):
     reroute = set(changed) | {n for n in extra.split(',') if n}
     lidx = {lyr: k for k, lyr in enumerate(LAYERS)}
     # the new parts' pads: seed copper must keep CLR from them (and must not run through them)
-    new_refs = {f.GetReference() for f in board.GetFootprints()} - {f.GetReference() for f in seed.GetFootprints()}
+    new_refs = ({f.GetReference() for f in board.GetFootprints()} - {f.GetReference() for f in seed.GetFootprints()}
+                | set(shifted))
     new_pads = [(p, lyr) for f in board.GetFootprints() if f.GetReference() in new_refs for p in f.Pads()
+                for lyr in LAYERS if p.IsOnLayer(lyr)]
+    old_pads = [(p, lyr) for f in seed.GetFootprints() if f.GetReference() in shifted for p in f.Pads()
                 for lyr in LAYERS if p.IsOnLayer(lyr)]
     clr = pcbnew.FromMM(CLR)
 
-    def collides(t):
+    def collides(t, pads=None):
         bb = t.GetBoundingBox()
-        for p, lyr in new_pads:
+        for p, lyr in new_pads if pads is None else pads:
             if t.GetClass() != 'PCB_VIA' and t.GetLayer() != lyr:
                 continue
             pb = p.GetBoundingBox()
@@ -4417,7 +4432,8 @@ def seed_copper(B, board, path, log):
     # a signal whose seed copper this board forbids or a new part's pad touches is re-routed (a plane net only loses
     # that via or track: its pads reach the plane through their own vias)
     hit = {t.GetNetname() for t in seed.GetTracks()
-           if t.GetNetname() not in PLANES and t.GetNetname() not in reroute and (forbidden(t) or collides(t))}
+           if t.GetNetname() not in PLANES and t.GetNetname() not in reroute
+           and (forbidden(t) or collides(t) or collides(t, old_pads))}
     if hit:
         log.append(f'seed: re-routing {sorted(hit)}: their copper touches a new part or a new rule area')
         print(log[-1], flush=True)
@@ -4427,7 +4443,7 @@ def seed_copper(B, board, path, log):
     keep, dropped, rerouted = [], [], 0
     for t in seed.GetTracks():
         name = t.GetNetname()
-        if name in reroute:
+        if name in reroute and name not in moved_nets:
             rerouted += 1
             continue
         if t.GetClass() == 'PCB_VIA':
@@ -4437,10 +4453,21 @@ def seed_copper(B, board, path, log):
                 raise SystemExit(f'--seed: {name} has copper on {seed.GetLayerName(t.GetLayer())}, not a routing layer')
             item = (name, 'seg', (MM(t.GetStart().x), MM(t.GetStart().y), MM(t.GetEnd().x), MM(t.GetEnd().y),
                                   MM(t.GetWidth()), lidx[t.GetLayer()]))
-        (dropped if name not in B.netcode or forbidden(t) or collides(t) else keep).append(item)
-    B.tracks = [t for t in B.tracks if t[0] in reroute or t[0].startswith('__')] + keep
-    B.fixed = [t for t in B.fixed if t[0] in reroute or t[0].startswith('__')] + keep
-    B.release_escape([n for n in list(B.escape_on) if n not in reroute])
+        (dropped if name not in B.netcode or forbidden(t) or collides(t) or collides(t, old_pads) else keep).append(item)
+    # a moved part's +3V3 vias: the tracks to its old pads are gone, and +3V3 has no pour on an outer layer, so such a
+    # via would touch In2.Cu alone (KiCad: via_dangling).  GND vias stay: the outer pours still join them to In1.Cu.
+    def ends(it):
+        return [it[2][:2], it[2][2:4]] if it[1] == 'seg' else [it[2]]
+    near = lambda a, b: abs(a[0] - b[0]) < 0.05 and abs(a[1] - b[1]) < 0.05
+    orphan = [it for it in keep if it[1] == 'via' and it[0] in PLANES and it[0] != 'GND'
+              and any(d[0] == it[0] and d[1] == 'seg' and any(near(e, it[2]) for e in ends(d)) for d in dropped)
+              and not any(k[0] == it[0] and k[1] == 'seg' and any(near(e, it[2]) for e in ends(k)) for k in keep)]
+    keep = [it for it in keep if it not in orphan]
+    dropped += orphan
+    fresh = lambda n: (n in reroute and n not in moved_nets) or n.startswith('__')    # nets routed anew: stage-1 copper
+    B.tracks = [t for t in B.tracks if fresh(t[0])] + keep
+    B.fixed = [t for t in B.fixed if fresh(t[0])] + keep
+    B.release_escape([n for n in list(B.escape_on) if not fresh(n)])
     B.rebuild()
     # A pair whose two lines only changed places at one part keeps its seed copper and gets a twist instead.
     for Pn, Nn in sorted({B.pair_of[n] for n in changed if n in B.pair_of}):

@@ -22,6 +22,12 @@ __pycache__/
 # EasyEDA/LCSC component data fetched by gen_footprints.py and jlc_align.py: a local cache only, its redistribution
 # terms are unclear
 hardware/tools/easyeda_cache/
+# The 3D models tools/fetch_3d.py fetches (EasyEDA's, the same terms) and draws (the MX switch and keycap); where they
+# go on the board is tracked (tools/models_3d.json)
+hardware/3dmodels/
+# Renders of the board (tools/render_3d.py): full size, local only; README.md's picture is the one small copy in git
+hardware/render/*
+!hardware/render/kvm-front-readme.png
 
 # The Python environment (uv: pyproject.toml, uv.lock)
 .venv/

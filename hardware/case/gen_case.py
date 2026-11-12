@@ -99,9 +99,10 @@ TOP_PARTS = {                   # footprint name prefix: height above the board 
     'SOT-23': 1.45, 'SOT-583': 0.6, 'QFN-': 1.0, 'TI_RUX0012A': 1.0, 'Texas_RMG0012A': 0.8,
     'Crystal_SMD_3225': 1.0, 'D_SOD-123F': 1.1, 'C_0402': 0.6, 'C_0603': 0.9, 'C_0805': 1.3, 'R_0402': 0.4,
     'Tag-Connect': 0.0, 'TestPoint': 0.0, 'MountingHole': 0.0, 'OSHW-Logo': 0.0, 'OpenDynKVM_Logo': 0.0,
+    'ESP32-C3-MINI-1': 2.55,
 }
 UNDER_PARTS = {                 # on the bottom side
-    'ESP32-C3-MINI-1': 2.55, 'LED_SK6812MINI-E': 2.0, 'C_0402': 0.6, 'C_0603': 0.9, 'R_0402': 0.4,
+    'LED_SK6812MINI-E': 2.0, 'C_0402': 0.6, 'C_0603': 0.9, 'R_0402': 0.4,
     'TestPoint': 0.0,
 }
 LEADS = {'USB_A_Molex_67643': 2.5}            # through-hole leads under the board

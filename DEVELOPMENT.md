@@ -55,7 +55,10 @@ own environment (OpenCascade has no build for every Python KiCad uses): `uv run`
 - **KiCad 10**: `kicad-cli`, and its `pcbnew` Python module (above).
 - A C compiler as `cc`: the router compiles its A* kernel on first use.
 - **curl and network access** on the first run: `gen_footprints.py` and `jlc_align.py` fetch part data from EasyEDA into
-  a local cache, which is not part of the repository.
+  a local cache, `fetch_3d.py` the 3D models KiCad's library lacks; neither is part of the repository.
+- **KiCad's 3D models**, for the 3D viewer and `render_3d.py`: part of KiCad's installer on Windows and macOS, the
+  separate package `kicad-packages3d` on Fedora.  `render_3d.py` makes the README's picture with Pillow
+  (`python3-pillow`).
 - **HarfBuzz's `hb-subset`** for the Chinese UI font (`software/odkvmctl/fonts/make_cjk_font.py`).
 
 **Flashing**: nothing beyond a USB-C cable for the normal paths. Optional: a debug probe via the Tag-Connect TC2030

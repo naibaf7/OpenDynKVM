@@ -4,8 +4,9 @@ Placement spacing report for kvm.kicad_pcb (adapted from the OpenRower checker).
 
 Checks, per footprint pair: courtyard gap and copper pad-to-pad gap; per footprint: body
 distance to the board edges.  JLCPCB adds assembly rails only to boards smaller than 70x70 mm;
-this board is 120x80 mm, so no rail rule applies (RAIL_EDGES is empty).  The rear connectors
-and the front connectors / side LEDs sit at the edge on purpose (EDGE_PARTS).
+this board is 120x80 mm, so no rail rule applies (RAIL_EDGES is empty).  The rear connectors,
+the front connectors / side LEDs and the Bluetooth module's antenna end sit at the edge on purpose
+(EDGE_PARTS).  Bodies are read from F.Fab, so a part on the bottom side is not measured here.
 
 Run from hardware/:   uv run tools/check_spacing.py
 """
@@ -23,7 +24,8 @@ MIN_PAD_GAP = 0.25          # mm, copper of different footprints
 MIN_RAIL_EDGE = 2.5         # mm, body to an edge that carries JLC rails
 RAIL_EDGES = ()             # none: the board is larger than 70x70 mm
 MIN_EDGE = 0.5              # mm, body to left/right edge (edge-mounted parts exempt)
-EDGE_PARTS = {'J101', 'J201', 'J301', 'J1201', 'J1301', 'J1401', 'D1502', 'D1503', 'D1504', 'D1505', 'D1506'}
+EDGE_PARTS = {'J101', 'J201', 'J301', 'J1201', 'J1301', 'J1401', 'D1502', 'D1503', 'D1504', 'D1505', 'D1506',
+              'U1601'}     # the module's PCB antenna at the board edge (Espressif), 0.47 mm inside it: no overhang
 MM = pcbnew.ToMM
 
 

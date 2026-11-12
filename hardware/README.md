@@ -11,6 +11,8 @@ edit the generator scripts in `tools/`, not the schematic or board in eeschema /
 | `kvm.kicad_pcb` | `tools/gen_pcb.py` (placement), then `tools/route.py` (routing, planes) |
 | `bom/`, `fab/`, `kvm_gerbers.zip` | `tools/make_fab.py` |
 | `kvm_schematic.pdf` | `kicad-cli sch export pdf` |
+| `tools/models_3d.json`, `3dmodels/` | `tools/fetch_3d.py`: 3D models for the parts KiCad's 3D library has none for (EasyEDA's, the ones JLC's preview shows) and the MX switch and keycap; the JSON says where each goes on its footprint (`gen_pcb.py` puts them there), the STEP files are a local cache, not in git |
+| `render/` | `tools/render_3d.py`: the board raytraced by KiCad, top, bottom and at an angle from the front and the rear; local only, but for `kvm-front-readme.png`, the README's picture (256 colours, at most 256 KB) |
 | `case/` | The 3D-printable case: `case/board_facts.py` (KiCad's Python) writes `case/board.json`, `case/gen_case.py` (its own environment: build123d) the STEP and 3MF files ([case/README.md](case/README.md)) |
 
 Checks that run on `kvm.kicad_pcb`: `tools/check_spacing.py` (courtyards, pad gaps, board edges),
@@ -80,7 +82,20 @@ uv run tools/make_fab.py                     # JLC BOM + CPL (corrections applie
                                              # without its parts (Fit = BT, design.md §16)
 uv run case/board_facts.py                   # the case: what it needs from the board, into case/board.json
 uv run case/gen_case.py                      # then the case itself; it checks the board's parts against it first
+uv run tools/fetch_3d.py                     # after adding a part (and jlc_align.py): 3D models KiCad lacks, into
+                                             # 3dmodels/ and tools/models_3d.json (network for new ones)
+uv run tools/gen_pcb.py --models             # put them on the board; touches nothing else, routed or not
+uv run tools/render_3d.py                    # render/kvm-{top,bottom,front,rear}.png (--quick: basic quality)
 ```
+
+**3D models and renders.** Every part has a 3D model: KiCad's 3D library (on Fedora the separate package
+`kicad-packages3d`) for most, and for the eight LCSC parts it has none for (KiCad 10.0.8 ships no file for the
+RP2354B's QFN-80, the TS3USB3031's WQFN-12, the HRO USB-C receptacle or the TS-1187A button, and nothing for our own
+footprints) the part's EasyEDA model, placed on the KiCad footprint by EasyEDA's own placement data and the JLC
+correction (`tools/fetch_3d.py` documents how, and what it was checked against).  The MX key carries its hot-swap
+socket, an MX switch and a keycap drawn to the case's numbers.  After a fresh clone, `uv run tools/fetch_3d.py` fills
+`3dmodels/`; then KiCad's 3D viewer (Alt+3) shows the whole board, and `tools/render_3d.py` refuses to render while a
+model is missing.
 
 `uv run tools/gen_footprints.py` regenerates the custom footprints; the OpenDynKVM logo needs `shapely` (in the
 environment; without it the logo footprint is left as it is).
@@ -108,7 +123,13 @@ uv run python -u tools/route.py --live --seed=/tmp/seed.kicad_pcb
   keep their copper, and their new pads get a via of their own.
 - **More nets:** `--reroute=NET,NET` re-routes nets whose pads did not change, in the order given and before the
   changed nets, to clear a new net's way out of a dense pin row.  A seeded net that is not listed cannot be ripped up.
-- **What it refuses:** to run if any footprint with pads moved (logos may move), and to write the board if a net
+- **Moved parts:** `--move=REF,REF` lets the parts named sit elsewhere than in the seed; each is taken as a new part.
+  Its own signal nets keep their seed copper except where it touches the part's old or new pads, and the router joins
+  what is left to the pads where they are now, then trims the dead ends; a plane net loses its tracks to the old pads
+  and the +3V3 vias they led to.  0.17.0's Bluetooth module went from the bottom to the top this way (2026-11-12, 18 s,
+  six nets re-joined; dropping the module's lines entirely and routing them anew left one of the two UART lines
+  unrouted, as did a full run).
+- **What it refuses:** to run if any other footprint with pads moved (logos may move), and to write the board if a net
   stays unrouted.
 - **Where it stops:** 0.16.0 could not be seeded from 0.15.0.  The module's UART pins (RP2354B pins 36/37) sit
   between the SWD and crystal lines and Hub-0's mouse pair, which 0.15.0 had packed for two unused pins, and every
