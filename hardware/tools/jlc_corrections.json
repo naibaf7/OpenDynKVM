@@ -1,0 +1,412 @@
+{
+ "C11702": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C141836": {
+  "footprint": "SOT-23-5",
+  "easyeda": "SOT-23-5_L3.0-W1.7-P0.95-LS2.8-BR",
+  "theta": 180,
+  "dx": 0.0,
+  "dy": -0.0,
+  "rms_mm": 0.1593,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C1525": {
+  "footprint": "C_0402_1005Metric",
+  "easyeda": "C0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0599,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C1548": {
+  "footprint": "C_0402_1005Metric",
+  "easyeda": "C0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0599,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C1549": {
+  "footprint": "C_0402_1005Metric",
+  "easyeda": "C0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0599,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C16251": {
+  "footprint": "QFN-36-1EP_6x6mm_P0.5mm_EP3.7x3.7mm",
+  "easyeda": "VQFN-36_L6.0-W6.0-P0.50-BL-EP",
+  "theta": 270,
+  "dx": -0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0338,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C165948": {
+  "footprint": "USB_C_Receptacle_HRO_TYPE-C-31-M-12_Edge",
+  "easyeda": "USB-C_SMD-TYPE-C-31-M-12_1",
+  "theta": 0,
+  "dx": -0.0,
+  "dy": -1.4975,
+  "rms_mm": 0.0667,
+  "matched_by": "geometry",
+  "note": ""
+ },
+ "C193402": {
+  "footprint": "D_SOD-123F",
+  "easyeda": "SOD-123FL_L2.7-W1.8-LS3.8-RD",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.235,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C19702": {
+  "footprint": "C_0603_1608Metric",
+  "easyeda": "C0603",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.075,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C20625731": {
+  "footprint": "Crystal_SMD_3225-4Pin_3.2x2.5mm",
+  "easyeda": "CRYSTAL-SMD_4P-L3.2-W2.5-BL",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0001,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C23733": {
+  "footprint": "C_0402_1005Metric",
+  "easyeda": "C0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0599,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25100": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25105": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25741": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25744": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25752": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25768": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25779": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25792": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25905": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C2652459": {
+  "footprint": "Texas_RMG0012A_WQFN-12_1.8x1.8mm_P0.4mm",
+  "easyeda": "QFN-12L_L1.8-W1.8-P0.40-TL_TS3USB3031RMGR",
+  "theta": 0,
+  "dx": -0.0,
+  "dy": -0.0001,
+  "rms_mm": 0.1262,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C2798029": {
+  "footprint": "USB_A_Molex_67643_Horizontal",
+  "easyeda": "USB-A-TH_676432911",
+  "theta": 0,
+  "dx": 3.5,
+  "dy": 1.355,
+  "rms_mm": 0.0001,
+  "matched_by": "geometry",
+  "note": ""
+ },
+ "C2865431": {
+  "footprint": "SOT-23-5",
+  "easyeda": "SOT-23-5_L2.9-W1.6-P0.95-LS2.8-BR",
+  "theta": 180,
+  "dx": -0.0001,
+  "dy": 0.0,
+  "rms_mm": 0.0367,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C318884": {
+  "footprint": "SW_Push_1P1T_XKB_TS-1187A",
+  "easyeda": "SW-SMD_4P-L5.1-W5.1-P3.70-LS6.5-TL_H1.5",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0251,
+  "matched_by": "geometry",
+  "note": ""
+ },
+ "C3235556": {
+  "footprint": "SOT-583-8",
+  "easyeda": "SOT-583-8_L2.1-W1.2-P0.50-LS1.6-BL",
+  "theta": 270,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0999,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C39843328": {
+  "footprint": "QFN-80-1EP_10x10mm_P0.4mm_EP3.4x3.4mm",
+  "easyeda": "QFN-80_L10.0-W10.0-P0.40-TL-EP3.4",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0422,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C41349510": {
+  "footprint": "ESP32-C3-MINI-1",
+  "easyeda": "WIFIM-SMD_ESP32-C3-MINI-1",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0001,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C43389": {
+  "footprint": "L_Sunlord_SWPA3015S",
+  "easyeda": "IND-SMD_L3.0-W3.0",
+  "theta": 180,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.05,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C45783": {
+  "footprint": "C_0805_2012Metric",
+  "easyeda": "C0805",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.05,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C46550458": {
+  "footprint": "CP_Elec_6.3x7.7",
+  "easyeda": "CAP-SMD_BD6.3-L6.6-W6.6-LS7.3",
+  "theta": 0,
+  "dx": -0.0,
+  "dy": 0.0,
+  "rms_mm": 0.03,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C47115471": {
+  "footprint": "LQFP-48_7x7mm_P0.5mm",
+  "easyeda": "LQFP-48_L7.0-W7.0-P0.50-LS9.0-BL_1",
+  "theta": 270,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0525,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C485916": {
+  "footprint": "TI_RUX0012A_VQFN-HR-12_2x2.5mm_P0.5mm",
+  "easyeda": "VQFN-HR-12_L2.5-W2.0-P0.50-BL",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C49338": {
+  "footprint": "SOT-23",
+  "easyeda": "SOT-23_L2.9-W1.3-P1.90-LS2.4-BR",
+  "theta": 180,
+  "dx": -0.0,
+  "dy": -0.0,
+  "rms_mm": 0.2003,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C49352235": {
+  "footprint": "SW_MX_Hotswap_Kailh_1u",
+  "easyeda": "TH_L10.9-W5.9-CPG151101S11-2",
+  "theta": 180,
+  "dx": 0.6215,
+  "dy": -3.81,
+  "rms_mm": 0.2614,
+  "matched_by": "number",
+  "note": "socket turned so its curved side wraps the switch centre post"
+ },
+ "C5149201": {
+  "footprint": "LED_SK6812MINI-E_3.2x2.8mm_P1.5mm_ReverseMount",
+  "easyeda": "LED-SMD_4P-L3.2-W2.8-LS5.9_SK6812MINI-E",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0354,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C52923": {
+  "footprint": "C_0402_1005Metric",
+  "easyeda": "C0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0599,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C5378721": {
+  "footprint": "LED_SK6812SIDE-A_4.0x1.6mm",
+  "easyeda": "LED-SMD_4P-L4.0-W1.6-L",
+  "theta": 0,
+  "dx": -0.0,
+  "dy": -0.0312,
+  "rms_mm": 0.0258,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C55266": {
+  "footprint": "SOT-23-6",
+  "easyeda": "SOT-23-6_L2.9-W1.6-P0.95-LS2.8-BR",
+  "theta": 180,
+  "dx": 0.0,
+  "dy": -0.0,
+  "rms_mm": 0.2125,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C70590": {
+  "footprint": "Crystal_SMD_3225-4Pin_3.2x2.5mm",
+  "easyeda": "CRYSTAL-SMD_4P-L3.2-W2.5-BL",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0001,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C7484": {
+  "footprint": "SOT-23-5",
+  "easyeda": "SOT-23-5_L3.0-W1.7-P0.95-LS2.8-BR",
+  "theta": 180,
+  "dx": 0.0,
+  "dy": -0.0,
+  "rms_mm": 0.1593,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C7519": {
+  "footprint": "SOT-23-6",
+  "easyeda": "SOT-23-6_L2.9-W1.6-P0.95-LS2.8-BL",
+  "theta": 270,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0116,
+  "matched_by": "number",
+  "note": ""
+ }
+}

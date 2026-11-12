@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "software/odkvmctl", "xtask"]
+# Each firmware is its own workspace with its own target (see software.md §2).
+exclude = ["firmware/rp2354", "firmware/at32f405", "firmware/esp32c3"]
+
+[workspace.package]
+version = "0.1.10"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+
+[workspace.dependencies]
+kvm-proto = { path = "crates/kvm-proto" }
+kvm-hid = { path = "crates/kvm-hid" }
+kvm-core = { path = "crates/kvm-core" }
+kvm-usbdev = { path = "crates/kvm-usbdev" }
+kvm-vial = { path = "crates/kvm-vial" }
+heapless = "0.9"
+defmt = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,36 @@
+[package]
+name = "kvm-at32f405"
+description = "OpenDynKVM firmware for the two PC-facing AT32F405s (software.md §5)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+kvm-proto = { path = "../../crates/kvm-proto", features = ["defmt"] }
+kvm-usbdev = { path = "../../crates/kvm-usbdev", features = ["defmt"] }
+at32f4xx-pac = { version = "0.4", features = ["at32f405", "rt", "critical-section"] }
+cortex-m = { version = "0.7.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7.5"
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "defmt"] }
+embassy-sync = "0.8"
+embassy-time = { version = "0.5.1", features = ["defmt"] }
+embassy-time-driver = { version = "0.2.2", features = ["tick-hz-1_000"] }
+embassy-time-queue-utils = "0.3"
+embassy-futures = "0.1.2"
+embassy-usb-driver = "0.2.2"
+embassy-usb-synopsys-otg = { version = "0.4", features = ["defmt"] }
+critical-section = "1.2"
+heapless = "0.9"
+static_cell = "2.1"
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

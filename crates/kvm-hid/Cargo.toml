@@ -1,0 +1,13 @@
+[package]
+name = "kvm-hid"
+description = "HID report-descriptor parsing, normalization and the OpenDynKVM's normalized interfaces"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+heapless.workspace = true
+defmt = { workspace = true, optional = true }
+
+[features]
+defmt = ["dep:defmt", "heapless/defmt"]

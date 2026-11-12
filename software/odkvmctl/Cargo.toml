@@ -1,0 +1,72 @@
+[package]
+name = "odkvmctl"
+description = "Control software for the OpenDynKVM: command line (odkvmctl) and window + tray icon (opendyn-kvm)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "odkvmctl"
+path = "src/bin/odkvmctl.rs"
+
+[[bin]]
+name = "opendyn-kvm"
+path = "src/bin/opendyn-kvm/main.rs"
+
+[dependencies]
+kvm-proto.workspace = true
+kvm-core.workspace = true
+kvm-hid.workspace = true
+heapless.workspace = true
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1"
+eframe = "0.37"
+# Only for the bundled monochrome emoji fonts (the page icons), which egui 0.37 leaves out by default.
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+serde = { version = "1", features = ["derive"] }
+# The icons and the wordmark, drawn from the logo's SVG files (branding/); no text, fonts or bitmaps needed. 0.45 uses
+# the tiny-skia that eframe's Wayland decorations already bring.
+resvg = { version = "0.45", default-features = false }
+serde_json = "1"
+# Translations (software.md §9 "Languages"): Fluent files in i18n/<language>/odkvmctl.ftl, embedded; `fl!` checks the
+# message ids and their arguments against the English file at compile time.
+i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
+i18n-embed-fl = "0.10"
+rust-embed = "8"
+# The RP2350's boot ROM on the PWR/SERVICE port (`bootsel`): its PICOBOOT interface, in pure Rust (usbfs on Linux,
+# WinUSB on Windows, which the ROM's descriptors ask for).
+nusb = "0.2"
+# The firmware file picker: the desktop's own dialog (XDG portal on Linux, no GTK; the system dialog on Windows).
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+
+# Pure-Rust HID backends on both platforms: no libudev or C compiler needed.
+[target.'cfg(target_os = "linux")'.dependencies]
+# DDC/CI: the I2C_SLAVE ioctl on /dev/i2c-*.
+libc = "0.2"
+hidapi = { version = "2.6.7", default-features = false, features = ["linux-native-basic-udev"] }
+ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
+
+[target.'cfg(windows)'.dependencies]
+hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
+tray-icon = "0.26"
+# Autostart (registry), the single-instance event, DDC/CI (dxva2), the monitor list, the screens with their scaling
+# and the cursor for screen hop, and the removable drives (the RP2350's bootloader drive).
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_Display",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(not(any(windows, target_os = "linux")))'.dependencies]
+hidapi = "2.6.7"
+
+[dev-dependencies]
+# Checks that every translation has the English file's messages, with the same arguments.
+fluent-syntax = "0.12"
+fluent-bundle = "0.16"

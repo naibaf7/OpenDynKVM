@@ -1,0 +1,4 @@
+(version 1)
+(rule "Key LED pads at its own cut-out"
+  (condition "A.Parent == 'D1501'")
+  (constraint edge_clearance (min 0.2mm)))

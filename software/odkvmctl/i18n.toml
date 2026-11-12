@@ -1,0 +1,5 @@
+# i18n-embed: the translations of odkvmctl and opendyn-kvm (software.md §9 "Languages").
+fallback_language = "en"
+
+[fluent]
+assets_dir = "i18n"

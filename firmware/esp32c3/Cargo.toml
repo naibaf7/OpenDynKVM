@@ -1,0 +1,33 @@
+[package]
+name = "kvm-esp32c3"
+description = "OpenDynKVM firmware for the Bluetooth LE coprocessor, an ESP32-C3-MINI-1 (software.md §4.13)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+kvm-proto = { path = "../../crates/kvm-proto" }
+esp-hal = { version = "1.2", features = ["esp32c3", "unstable"] }
+esp-rtos = { version = "0.4", features = ["esp32c3", "embassy", "esp-radio"] }
+esp-radio = { version = "1.0.0-beta.1", features = ["esp32c3", "ble", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.6", features = ["esp32c3"] }
+esp-storage = { version = "0.10", features = ["esp32c3"] }
+esp-alloc = "0.11"
+critical-section = "1.2"
+trouble-host = { version = "0.8", features = ["derive", "security", "scan"] }
+bt-hci = "0.11"
+embassy-executor = "0.10"
+embassy-time = "0.5.1"
+embassy-sync = "0.8"
+embassy-futures = "0.1.2"
+heapless = "0.9"
+static_cell = "2.1"
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+opt-level = "s"

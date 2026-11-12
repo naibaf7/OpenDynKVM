@@ -1,0 +1,20 @@
+[package]
+name = "kvm-vial"
+description = "Vial keymap editor and keymap engine of the OpenDynKVM (sans I/O); parts adapted from RMK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvm-hid.workspace = true
+heapless.workspace = true
+defmt = { workspace = true, optional = true }
+
+[build-dependencies]
+xz2 = "0.1"
+
+[dev-dependencies]
+xz2 = "0.1"
+
+[features]
+defmt = ["dep:defmt", "heapless/defmt", "kvm-hid/defmt"]

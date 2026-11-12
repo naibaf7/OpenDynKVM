@@ -1,0 +1,20 @@
+[package]
+name = "kvm-usbdev"
+description = "USB device core that serves a OpenDynKVM descriptor set, generic over embassy-usb-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvm-proto.workspace = true
+heapless.workspace = true
+embassy-usb-driver = "0.2.2"
+embassy-futures = "0.1.2"
+defmt = { workspace = true, optional = true }
+
+[features]
+defmt = ["dep:defmt", "kvm-proto/defmt", "embassy-usb-driver/defmt"]
+
+[dev-dependencies]
+kvm-core.workspace = true
+kvm-hid.workspace = true

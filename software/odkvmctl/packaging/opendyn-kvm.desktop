@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenDynKVM
+GenericName=KVM switch control
+Comment=Switch PCs and configure the OpenDynKVM
+Exec=opendyn-kvm
+Icon=opendyn-kvm
+Terminal=false
+Categories=Utility;Settings;HardwareSettings;
+Keywords=KVM;switch;keyboard;mouse;Vial;
+StartupWMClass=opendyn-kvm

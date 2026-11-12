@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Route Live View</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #2a2f3a; --text: #d7dbe3; --muted: #8a91a0; --accent: #e8c547;
+    --ok: #5cc98a; --bad: #ef6b6b;
+    --f-cu: #d0453f; --b-cu: #4f86d9; --in2-cu: #d6a72c; --in1-cu: #47a565;
+    --pad-f: #e2675f; --pad-b: #6d9fe8; --pad-tht: #c9b458; --board: #13261a; --edge: #d8d26a;
+    --pad-sel: #a855f7;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+               font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #app { display: flex; height: 100%; }
+  #view { flex: 1; position: relative; min-width: 0; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  canvas.drag { cursor: grabbing; }
+  #hud { position: absolute; left: 10px; bottom: 8px; color: var(--muted); font-variant-numeric: tabular-nums;
+         background: rgba(15, 17, 21, .75); padding: 3px 8px; border-radius: 4px; pointer-events: none; }
+  #conn { position: absolute; right: 10px; top: 8px; padding: 3px 8px; border-radius: 4px; font-size: 12px;
+          background: rgba(15, 17, 21, .8); }
+  aside { width: 300px; background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto;
+          padding: 12px 14px; display: flex; flex-direction: column; gap: 14px; }
+  h1 { font-size: 15px; margin: 0; letter-spacing: .02em; }
+  h2 { font-size: 11px; margin: 0 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-variant-numeric: tabular-nums; }
+  .kv span:nth-child(odd) { color: var(--muted); }
+  .layers label { display: flex; align-items: center; gap: 8px; padding: 2px 0; cursor: pointer; }
+  .sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+  input[type=text] { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+                     border-radius: 4px; padding: 5px 7px; font: inherit; }
+  button { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px;
+           padding: 4px 9px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--muted); }
+  ul { list-style: none; margin: 0; padding: 0; }
+  #fails li { padding: 2px 4px; border-radius: 3px; cursor: pointer; color: var(--bad); }
+  #fails li:hover, #fails li.sel { background: var(--line); }
+  #log { font: 11px/1.35 ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); white-space: pre-wrap;
+         word-break: break-all; max-height: 260px; overflow-y: auto; }
+  .bad { color: var(--bad); } .ok { color: var(--ok); }
+  @media (max-width: 720px) {
+    #app { flex-direction: column; }
+    aside { width: 100%; height: 45%; border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <canvas id="cv"></canvas>
+    <div id="hud">–</div>
+    <div id="conn">connecting…</div>
+  </div>
+  <aside>
+    <h1>Route live view</h1>
+    <section>
+      <h2>Progress</h2>
+      <div class="kv">
+        <span>stage</span><span id="stage">–</span>
+        <span>net</span><span id="net">–</span>
+        <span>attempts</span><span id="cnt">–</span>
+        <span>copper</span><span id="copper">–</span>
+        <span>elapsed</span><span id="elapsed">–</span>
+      </div>
+    </section>
+    <section class="layers">
+      <h2>Layers</h2>
+      <label><input type="checkbox" data-l="0" checked><i class="sw" style="background:var(--f-cu)"></i>F.Cu (signals)</label>
+      <label><input type="checkbox" data-l="2" checked><i class="sw" style="background:var(--in2-cu)"></i>In2.Cu (+3V3 plane, slow signals)</label>
+      <label><input type="checkbox" data-l="3"><i class="sw" style="background:var(--in1-cu)"></i>In1.Cu (GND plane: vias)</label>
+      <label><input type="checkbox" data-l="1" checked><i class="sw" style="background:var(--b-cu)"></i>B.Cu (signals)</label>
+      <label><input type="checkbox" id="pads" checked><i class="sw" style="background:var(--pad-tht)"></i>pads</label>
+    </section>
+    <section>
+      <h2>Highlight net</h2>
+      <input type="text" id="q" placeholder="net name, or click copper" list="netlist">
+      <datalist id="netlist"></datalist>
+      <div style="margin-top:6px; display:flex; gap:6px"><button id="fit">Fit board</button><button id="clr">Clear</button></div>
+    </section>
+    <section>
+      <h2>Unrouted <span id="nfail"></span></h2>
+      <ul id="fails"></ul>
+    </section>
+    <section>
+      <h2>Log</h2>
+      <div id="log"></div>
+    </section>
+  </aside>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const COL = { 0: css('--f-cu'), 1: css('--b-cu'), 2: css('--in2-cu'), 3: css('--in1-cu') };
+let S = null, T = null, seq = -1, hl = null, show = { 0: true, 1: true, 2: true, 3: false }, showPads = true;
+let view = { s: 8, x: 0, y: 0 }, fitted = false, lastOk = 0;
+
+function resize() {
+  const r = cv.getBoundingClientRect(), d = devicePixelRatio || 1;
+  cv.width = Math.round(r.width * d); cv.height = Math.round(r.height * d);
+  if (S && !fitted) fit();
+  draw();
+}
+function fit() {
+  const [x0, y0, x1, y1] = S.extent, r = cv.getBoundingClientRect(), m = 20;
+  view.s = Math.min((r.width - 2 * m) / (x1 - x0), (r.height - 2 * m) / (y1 - y0));
+  view.x = (r.width - view.s * (x1 - x0)) / 2 - view.s * x0;
+  view.y = (r.height - view.s * (y1 - y0)) / 2 - view.s * y0;
+  fitted = true;
+}
+const toMM = (px, py) => [(px - view.x) / view.s, (py - view.y) / view.s];
+
+function padPath(p) {
+  const [kind, a] = p;
+  ctx.beginPath();
+  if (kind === 'circle') ctx.arc(a[0], a[1], a[2], 0, 2 * Math.PI);
+  else if (kind === 'rect') {
+    ctx.save(); ctx.translate(a[0], a[1]); ctx.rotate(a[4]); ctx.rect(-a[2], -a[3], 2 * a[2], 2 * a[3]); ctx.restore();
+  } else if (kind === 'seg') {
+    const dx = a[2] - a[0], dy = a[3] - a[1], L = Math.hypot(dx, dy) || 1, nx = -dy / L * a[4], ny = dx / L * a[4];
+    const ang = Math.atan2(dy, dx);
+    ctx.moveTo(a[0] + nx, a[1] + ny); ctx.lineTo(a[2] + nx, a[3] + ny);
+    ctx.arc(a[2], a[3], a[4], ang + Math.PI / 2, ang - Math.PI / 2, true);
+    ctx.lineTo(a[0] - nx, a[1] - ny);
+    ctx.arc(a[0], a[1], a[4], ang - Math.PI / 2, ang + Math.PI / 2, true);
+  } else if (kind === 'poly') { a.forEach(([x, y], k) => k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); }
+}
+
+function draw() {
+  const d = devicePixelRatio || 1;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = css('--bg'); ctx.fillRect(0, 0, cv.width, cv.height);
+  if (!S) return;
+  ctx.setTransform(d * view.s, 0, 0, d * view.s, d * view.x, d * view.y);
+  // board
+  ctx.beginPath();                                   // outline and cut-outs in one path: holes stay empty
+  for (const o of S.outline) { o.forEach(([x, y], k) => k ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); }
+  ctx.fillStyle = css('--board'); ctx.fill('evenodd');
+  ctx.strokeStyle = css('--edge'); ctx.lineWidth = 1.2 / view.s; ctx.stroke();
+  const net = hl === null ? -1 : S.nets.indexOf(hl);
+  const dim = n => net >= 0 && n !== net;
+  const segs = T ? T.segs : [], vias = T ? T.vias : [];
+  ctx.lineCap = 'round';
+  for (const L of [1, 2, 0]) {                       // bottom to top
+    if (show[L]) {
+      ctx.strokeStyle = COL[L];
+      for (const pass of [0, 1]) {
+        for (const s of segs) {
+          if (s[5] !== L || (pass === 0) !== dim(s[6])) continue;
+          ctx.globalAlpha = pass === 0 ? 0.18 : (L === 0 ? 0.92 : 0.8);
+          ctx.lineWidth = s[4];
+          ctx.beginPath(); ctx.moveTo(s[0], s[1]); ctx.lineTo(s[2], s[3]); ctx.stroke();
+        }
+      }
+    }
+    if (showPads && L !== 2) {
+      for (const p of S.pads) {
+        const onF = p[2].includes(0), onB = p[2].includes(1);
+        if ((L === 0 && !onF) || (L === 1 && (onF || !onB))) continue;
+        if (!show[L] && !(onF && onB)) continue;
+        ctx.globalAlpha = dim(p[3]) ? 0.25 : 0.9;
+        ctx.fillStyle = onF && onB ? css('--pad-tht') : (onF ? css('--pad-f') : css('--pad-b'));
+        padPath(p); ctx.fill();
+      }
+    }
+  }
+  // vias: ring in the colour of every visible layer they serve, drill on top
+  for (const v of vias) {
+    ctx.globalAlpha = dim(v[2]) ? 0.2 : 0.95;
+    ctx.fillStyle = show[3] && S.nets[v[2]] === 'GND' ? COL[3] : (show[2] && S.nets[v[2]] === '+3V3' ? COL[2] : '#b9bcc4');
+    ctx.beginPath(); ctx.arc(v[0], v[1], 0.3, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = css('--bg'); ctx.beginPath(); ctx.arc(v[0], v[1], 0.15, 0, 2 * Math.PI); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  // the selected net's pads stand out in the highlight colour, on both layers, whatever the layer switches say
+  if (net >= 0) {
+    ctx.fillStyle = css('--pad-sel'); ctx.strokeStyle = css('--pad-sel'); ctx.lineWidth = 2 / view.s;
+    for (const p of S.pads) {
+      if (p[3] !== net) continue;
+      ctx.globalAlpha = 0.35; padPath(p); ctx.fill();
+      ctx.globalAlpha = 1; padPath(p); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  // unrouted nets: mark their pads. Pads of the selected net keep the highlight above, never this red, so a
+  // selection is never confused with the "still unrouted" markers
+  if (T && T.unrouted.length) {
+    ctx.strokeStyle = css('--bad'); ctx.lineWidth = 2 / view.s;
+    const bad = new Set(T.unrouted.map(n => S.nets.indexOf(n)));
+    for (const p of S.pads) {
+      if (!bad.has(p[3]) || p[3] === net) continue;
+      ctx.globalAlpha = net >= 0 ? 0.45 : 1;
+      padPath(p); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+function setStatus(t) {
+  $('stage').textContent = t.stage || '–';
+  $('net').textContent = t.net || '–';
+  $('cnt').innerHTML = `<span class="ok">${t.ok} ok</span> · <span class="${t.failed ? 'bad' : ''}">${t.failed} failed</span>`;
+  const n = [0, 1, 2].map(L => t.segs.filter(s => s[5] === L).length);
+  $('copper').textContent = `F ${n[0]} · B ${n[1]} · In2 ${n[2]} segs, ${t.vias.length} vias`;
+  const e = Math.round(t.elapsed); $('elapsed').textContent = `${Math.floor(e / 60)}m ${e % 60}s`;
+  $('nfail').textContent = t.unrouted.length ? `(${t.unrouted.length})` : '';
+  $('fails').innerHTML = t.unrouted.map(n => `<li data-n="${n}" class="${n === hl ? 'sel' : ''}">${n}</li>`).join('');
+  const lg = $('log'), atEnd = lg.scrollTop + lg.clientHeight >= lg.scrollHeight - 4;
+  lg.textContent = t.log.join('\n');
+  if (atEnd) lg.scrollTop = lg.scrollHeight;
+}
+
+async function poll() {
+  try {
+    const t = await (await fetch('state.json', { cache: 'no-store' })).json();
+    if (!S || S.run !== t.run) {                // first load, or a new run (possibly a new placement): reload pads
+      S = await (await fetch('static.json', { cache: 'no-store' })).json();
+      $('netlist').innerHTML = S.nets.map(n => `<option value="${n}">`).join('');
+      if (!fitted) fit();
+      seq = -1;
+    }
+    lastOk = Date.now();
+    if (t.seq !== seq) { seq = t.seq; T = t; setStatus(t); draw(); }
+    $('conn').innerHTML = t.stage === 'done' ? '<span class="ok">finished</span>' : '<span class="ok">● live</span>';
+  } catch (e) {
+    $('conn').innerHTML = Date.now() - lastOk > 3000 ? '<span class="bad">router not reachable</span>' : $('conn').innerHTML;
+  }
+  setTimeout(poll, 700);
+}
+
+// interaction
+let drag = null;
+cv.addEventListener('mousedown', e => { drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false }; cv.classList.add('drag'); });
+addEventListener('mouseup', e => {
+  cv.classList.remove('drag');
+  if (drag && !drag.moved && T) pick(e);
+  drag = null;
+});
+addEventListener('mousemove', e => {
+  const r = cv.getBoundingClientRect(), [x, y] = toMM(e.clientX - r.left, e.clientY - r.top);
+  $('hud').textContent = `x ${x.toFixed(2)}  y ${y.toFixed(2)} mm` + (hl ? `   ·   ${hl}` : '');
+  if (!drag) return;
+  if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 3) drag.moved = true;
+  view.x = drag.vx + e.clientX - drag.x; view.y = drag.vy + e.clientY - drag.y; draw();
+});
+cv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top, k = Math.exp(-e.deltaY * 0.0015);
+  view.x = px - (px - view.x) * k; view.y = py - (py - view.y) * k; view.s *= k; draw();
+}, { passive: false });
+function pick(e) {
+  const r = cv.getBoundingClientRect(), [x, y] = toMM(e.clientX - r.left, e.clientY - r.top);
+  let best = null, bd = 0.6;
+  for (const s of T.segs) {
+    if (!show[s[5]]) continue;
+    const dx = s[2] - s[0], dy = s[3] - s[1], L2 = dx * dx + dy * dy;
+    const t = L2 ? Math.max(0, Math.min(1, ((x - s[0]) * dx + (y - s[1]) * dy) / L2)) : 0;
+    const dd = Math.hypot(x - s[0] - t * dx, y - s[1] - t * dy) - s[4] / 2;
+    if (dd < bd) { bd = dd; best = s[6]; }
+  }
+  for (const v of T.vias) { const dd = Math.hypot(x - v[0], y - v[1]) - 0.3; if (dd < bd) { bd = dd; best = v[2]; } }
+  for (const p of S.pads) {
+    const a = p[1], c = p[0] === 'poly' ? a[0] : a, dd = Math.hypot(x - c[0], y - c[1]) - 0.4;
+    if (p[3] >= 0 && dd < bd) { bd = dd; best = p[3]; }
+  }
+  setHl(best === null ? null : S.nets[best]);
+}
+function setHl(n) { hl = n; $('q').value = n || ''; if (T) setStatus(T); draw(); }
+$('q').addEventListener('change', e => setHl(S && S.nets.includes(e.target.value) ? e.target.value : null));
+$('fails').addEventListener('click', e => { const n = e.target.dataset.n; if (n) setHl(n === hl ? null : n); });
+$('fit').onclick = () => { fit(); draw(); };
+$('clr').onclick = () => setHl(null);
+document.querySelectorAll('[data-l]').forEach(c => c.onchange = () => { show[c.dataset.l] = c.checked; draw(); });
+$('pads').onchange = e => { showPads = e.target.checked; draw(); };
+addEventListener('resize', resize);
+resize();
+poll();
+</script>
+</body>
+</html>

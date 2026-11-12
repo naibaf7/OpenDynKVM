@@ -1,0 +1,43 @@
+[package]
+name = "kvm-rp2354"
+description = "OpenDynKVM firmware for the RP2354B: USB host, switching, link to the AT32F405s (software.md §4)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+kvm-proto = { path = "../../crates/kvm-proto", features = ["defmt"] }
+kvm-hid = { path = "../../crates/kvm-hid", features = ["defmt"] }
+kvm-core = { path = "../../crates/kvm-core", features = ["defmt"] }
+# `imagedef-none`: main.rs supplies the IMAGE_DEF (with a VERSION item).
+embassy-rp = { version = "0.10", features = ["rp235xb", "time-driver", "critical-section-impl", "unstable-pac", "defmt", "binary-info", "imagedef-none"] }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
+embassy-sync = "0.8"
+embassy-time = { version = "0.5.1", features = ["defmt"] }
+embassy-futures = "0.1.2"
+embassy-usb-driver = "0.2.2"
+embassy-usb-host = { version = "0.1", features = ["defmt"] }
+cortex-m = { version = "0.7.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7.5"
+critical-section = "1.2"
+heapless = "0.9"
+static_cell = "2.1"
+smart-leds = "0.4"
+defmt = "1"
+defmt-rtt = "1"
+panic-probe = { version = "1", features = ["print-defmt"] }
+embedded-io-async = "0.7"
+
+[build-dependencies]
+# The Bluetooth module's image goes in compressed (its ROM inflates it) and is checked by MD5 (software.md §4.13).
+flate2 = "1"
+md-5 = "0.10"
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

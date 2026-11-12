@@ -1,0 +1,22 @@
+# OpenDynKVM: lets the logged-in user use odkvmctl and opendyn-kvm without root. The packages install this file and
+# load i2c-dev; by hand:
+#
+#   sudo cp 70-opendyn-kvm.rules /etc/udev/rules.d/ && echo i2c-dev | sudo tee /etc/modules-load.d/opendyn-kvm.conf
+#   sudo modprobe i2c-dev && sudo udevadm control --reload && sudo udevadm trigger
+
+# The control interface. Matched by the interface string, not by VID:PID: in "Mirrored + identity" mode the KVM
+# presents another device's VID:PID.
+SUBSYSTEM=="hidraw", ATTRS{interface}=="OpenDynKVM Control", TAG+="uaccess"
+
+# The Vial interface (keymap editing in vial.rocks or the Vial app): the browser runs as the logged-in user and opens
+# the hidraw node itself. Matched by its interface string too, so that only this interface opens up, not the KVM's
+# keyboard interfaces as Vial's own rule (any hidraw of a device whose serial has "vial:f64c2b3c") would.
+SUBSYSTEM=="hidraw", ATTRS{interface}=="OpenDynKVM Vial", TAG+="uaccess"
+
+# The RP2350's boot ROM (the KVM in its bootloader, on the PWR/SERVICE port): its PICOBOOT interface, which tells the
+# window and `odkvmctl update` whether the board is a KVM or a new one, and how far a UF2 copied onto its drive got.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2e8a", ATTR{idProduct}=="000f", TAG+="uaccess"
+
+# Monitor inputs that follow the KVM (DDC/CI): the I2C buses of the graphics cards (PCI class 0x03), which carry the
+# monitors' DDC lines. The same rule as ddcutil's; other I2C buses (sensors, SMBus) stay root-only.
+SUBSYSTEM=="i2c-dev", KERNEL=="i2c-[0-9]*", ATTRS{class}=="0x03*", TAG+="uaccess"

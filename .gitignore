@@ -1,0 +1,52 @@
+# Rust build output (root workspace and both firmware workspaces)
+target/
+**/*.rs.bk
+
+# Release artifacts (cargo xtask dist: .bin, .uf2, partition table)
+/dist/
+
+# Vendor reference material (vendor PDFs/ZIPs, not source)
+/datasheets/
+
+# KiCad
+*.lck
+~*
+*-bak
+*.kicad_prl
+kvm-backups/
+
+# Python (hardware/tools generators)
+__pycache__/
+*.py[cod]
+
+# EasyEDA/LCSC component data fetched by gen_footprints.py and jlc_align.py: a local cache only, its redistribution
+# terms are unclear
+hardware/tools/easyeda_cache/
+
+# Tools build output (compiled astar.so, generated live viewer)
+hardware/tools/build/
+hardware/*.stale-route.kicad_pcb
+
+# Router debug snapshots: the *numbered* iterations of one experiment are superseded by the next (and by the tracked
+# hardware/debug/swap-attempt/, which carries a README).  The named ones - rev8-h0-pair/, h0up-pair/, route2-bus/,
+# discarded-attempt/ - stay tracked: report.md, analysis.md and errata.md point at them.
+hardware/debug/swap-attempt-*/
+
+# Router experiments that did not make it into tools/: kept locally, not published
+hardware/experimental/
+
+# Fabrication archive (tools/make_fab.py: gerbers, drill, the JLC upload zip).  The JLC BOM / CPL stay tracked
+# (hardware/bom/), like the schematic PDF: they are the record of what was ordered
+hardware/fab/
+hardware/kvm_gerbers.zip
+
+# Editors / OS
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log
+*.tmp

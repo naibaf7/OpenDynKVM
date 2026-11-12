@@ -1,0 +1,13 @@
+[package]
+name = "kvm-proto"
+description = "Wire formats of the OpenDynKVM: RP2354B <-> AT32F405 link, descriptor sets, control protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+heapless.workspace = true
+defmt = { workspace = true, optional = true }
+
+[features]
+defmt = ["dep:defmt", "heapless/defmt"]
