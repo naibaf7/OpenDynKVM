@@ -21,7 +21,7 @@ pub const fn version_u32(major: u8, minor: u8, patch: u8) -> u32 {
 /// The firmware's version, the same on the RP2354B and both AT32F405s (DEVELOPMENT.md "Versions"): the host software's version
 /// of the release that last changed the firmware. It is never ahead of the host software and doesn't move with every
 /// host release.
-pub const FIRMWARE_VERSION: (u8, u8, u8) = (0, 1, 11);
+pub const FIRMWARE_VERSION: (u8, u8, u8) = (0, 1, 12);
 
 /// The board the firmware is built for (DEVELOPMENT.md "Versions"). A new major version is a different board with its own
 /// firmware image; minor versions are revisions of one board, which one image serves. The board carries no ID of its

@@ -20,7 +20,7 @@ use embassy_usb_host::{BusController, BusHandle, BusRoute, BusState, bus};
 use heapless::Vec;
 use kvm_core::engine::{CtrlData, MAX_CONFIG_DESC, MAX_REPORT_DESC, Probed};
 use kvm_core::output::Report;
-use kvm_core::usbdesc::{DeviceDesc, decode_string, parse_config};
+use kvm_core::usbdesc::{DeviceDesc, decode_string, dt, parse_config};
 use kvm_proto::ctrl::{Pc, PortState, Speed};
 
 use crate::kvm;
@@ -287,6 +287,14 @@ async fn probe(ctl: &mut ControlPipe, info: &EnumerationInfo, out: &mut Probed) 
     out.manufacturer = read_string(ctl, out.device.i_manufacturer, lang).await;
     out.product = read_string(ctl, out.device.i_product, lang).await;
     out.serial = read_string(ctl, out.device.i_serial, lang).await;
+
+    // Hub-0 runs at full speed, so a high-speed device is probed at full speed. Only a high-speed device has a device
+    // qualifier; a full-speed one stalls (USB 2.0 §9.6.2). Linux and Windows ask the same, to say "could run faster".
+    if out.speed == Some(Speed::Full) && out.device.usb >= 0x0200 {
+        let mut q = [0u8; 10];
+        let got = get_descriptor(ctl, dt::DEVICE_QUALIFIER, 0, 0, &mut q).await;
+        out.high_speed = matches!(got, Ok(10) if q[1] == dt::DEVICE_QUALIFIER);
+    }
 
     let Some(parsed) = parse_config(&cfg[..n]) else { return Ok(()) };
     for iface in parsed.interfaces.iter().filter(|i| i.is_hid()) {

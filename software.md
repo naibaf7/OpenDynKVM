@@ -155,6 +155,10 @@ Empty ─attach─► Probing ─descriptors read─► decide mode ─┬─►
 
 - **Probing** reads the device, configuration, string and HID report descriptors, and the Microsoft OS descriptors of
   an XInput pad. The result is a `DeviceSummary` (`kvm-core::policy`).
+  - Hub-0 runs at full speed, so a high-speed device is probed at full speed; only a high-speed device answers
+    GET_DESCRIPTOR(DEVICE_QUALIFIER) there. A port in passthrough reports the speed on the PC's hub instead: high for
+    such a device, unless that hub's own link to the PC (the AT32F405's) is full speed. Until 0.1.11 it showed
+    Hub-0's full speed (first board, 2026-11-12, a USB 2.0 flash drive on Other).
 - **Auto policy** is design.md §4 verbatim, as a pure function with unit tests.
 - **Profiles** (`kvm-core::config::Profile`, design.md §4): the mode settings in force are the active profile's, and
   the `PortMode` setting and `SetPortMode` change that profile. Any change of the settings in force (a port's mode, the
@@ -163,7 +167,8 @@ Empty ─attach─► Probing ─descriptors read─► decide mode ─┬─►
 - **Passthrough:** the router (TS3USB3031) is flipped to Hub-1 or Hub-2 and the device re-enumerates on that PC.
   - On a PC switch, a port that follows the active PC is routed straight to the new PC (it re-enumerates there anyway).
   - The KVM can no longer see the device, so it doesn't notice an unplug. Swapping devices on a passthrough port
-    therefore needs a re-probe: `odkvmctl port other redetect`, or a mode change.
+    therefore needs a re-probe: `odkvmctl port other redetect`, or a mode change. When no device comes on Hub-0
+    within 2 s of it (`REPROBE_MS`), the port is empty; until 0.1.11 it stayed probing (blinking yellow) for good.
   - A re-probe unplugs the device on its data lines (the router off for 250 ms) and plugs it into Hub-0, whose port
     reset restarts it; VBUS stays on. Until 0.1.6 it cycled VBUS for 300 ms, which is no power-off: the port's 220 µF
     has no discharge path but the device, so a receiver browned out without a reset and stayed stuck until it was

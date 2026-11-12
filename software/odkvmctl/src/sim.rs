@@ -132,6 +132,7 @@ fn probed(
             ..Default::default()
         },
         speed: Some(Speed::Full),
+        high_speed: false,
         config,
         report_descs,
         manufacturer: hs(manufacturer),
@@ -190,21 +191,25 @@ fn device_for(port: Port) -> Probed {
             ),
             &[(0, GAMING_MOUSE), (1, HIDPP)],
         ),
-        Port::Other => probed(
-            0x046D,
-            0x085E,
-            "Simulated",
-            "Webcam",
-            config_descriptor(
-                &[
-                    Iface { class: (0x0E, 1, 0), report_len: None, eps: &[(0x83, 16, 8)], alt_with_iso: false },
-                    Iface { class: (0x0E, 2, 0), report_len: None, eps: &[], alt_with_iso: true },
-                    Iface { class: (0x01, 1, 0), report_len: None, eps: &[], alt_with_iso: false },
-                ],
-                500,
-            ),
-            &[],
-        ),
+        // A high-speed device: it answers the device qualifier on Hub-0.
+        Port::Other => Probed {
+            high_speed: true,
+            ..probed(
+                0x046D,
+                0x085E,
+                "Simulated",
+                "Webcam",
+                config_descriptor(
+                    &[
+                        Iface { class: (0x0E, 1, 0), report_len: None, eps: &[(0x83, 16, 8)], alt_with_iso: false },
+                        Iface { class: (0x0E, 2, 0), report_len: None, eps: &[], alt_with_iso: true },
+                        Iface { class: (0x01, 1, 0), report_len: None, eps: &[], alt_with_iso: false },
+                    ],
+                    500,
+                ),
+                &[],
+            )
+        },
     }
 }
 

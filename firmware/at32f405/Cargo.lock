@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-proto"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "defmt",
  "heapless",
@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-usbdev"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "defmt",
  "embassy-futures",

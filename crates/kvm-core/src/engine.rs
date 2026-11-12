@@ -60,7 +60,11 @@ pub type CtrlData = Vec<u8, MAX_CTRL_DATA>;
 #[derive(Debug, Clone)]
 pub struct Probed {
     pub device: DeviceDesc,
+    /// The speed on Hub-0, which runs at full speed: a high-speed device is probed at full speed.
     pub speed: Option<Speed>,
+    /// The device answered GET_DESCRIPTOR(DEVICE_QUALIFIER) at full speed, which only a high-speed device does
+    /// (USB 2.0 §9.6.2): on a PC's hub, in passthrough, it runs at high speed.
+    pub high_speed: bool,
     pub config: Vec<u8, MAX_CONFIG_DESC>,
     /// HID report descriptor per interface number.
     pub report_descs: Vec<(u8, Vec<u8, MAX_REPORT_DESC>), MAX_HID_IFACES>,
@@ -73,6 +77,7 @@ impl Probed {
     pub const EMPTY: Probed = Probed {
         device: DeviceDesc::EMPTY,
         speed: None,
+        high_speed: false,
         config: Vec::new(),
         report_descs: Vec::new(),
         manufacturer: String::new(),
@@ -198,6 +203,8 @@ struct PortSlot {
     effective: PortMode,
     reason: AutoReason,
     dev: Option<Hosted>,
+    /// Plugged into Hub-0 anew: empty at this time unless Hub-0 sees a device by then ([`REPROBE_MS`]).
+    probe_until: Option<u32>,
     reports: u32,
     rate_hz: u16,
     faults: u16,
@@ -210,6 +217,7 @@ impl PortSlot {
             effective: PortMode::Auto,
             reason: AutoReason::NotAuto,
             dev: None,
+            probe_until: None,
             reports: 0,
             rate_hz: 0,
             faults: 0,
@@ -321,6 +329,9 @@ const PROFILE_SHOW_MS: u32 = 1500;
 pub const UNLOCK_WAIT_MS: u32 = 30_000;
 /// How long learning a hotkey waits for the keys.
 pub const LEARN_MS: u32 = 10_000;
+/// How long a port plugged into Hub-0 anew (`Output::Reprobe`) waits for its device before it is empty: the replug
+/// takes 250 ms and Hub-0's debounce 100 ms. A device unplugged in passthrough, where the KVM can't see it, never comes.
+pub const REPROBE_MS: u32 = 2000;
 
 /// A hotkey being learned: for which PC (None: the service port), until when.
 struct Learning {
@@ -473,6 +484,16 @@ impl Engine {
             p.vid = d.summary.vid;
             p.pid = d.summary.pid;
             p.speed = d.summary.speed.unwrap_or(Speed::Unknown);
+            // In passthrough the device is on the PC's hub, not on Hub-0 where it was probed (at full speed at most).
+            // A high-speed device runs at high speed there unless the hub's own link to the PC is full speed: the
+            // AT32F405 on that hub shows it.
+            if s.state == PortState::Passthrough && d.probed.high_speed {
+                let pc = self.passthrough_pc(s.effective);
+                p.speed = match self.pcs[pc.index()].status.map(|st| st.speed) {
+                    Some(UsbSpeed::Full) => Speed::Full,
+                    _ => Speed::High,
+                };
+            }
             p.classes = d.summary.classes();
             p.interfaces = d.summary.interfaces.len() as u8;
             p.max_power_ma = d.summary.max_power_ma;
@@ -944,7 +965,16 @@ impl Engine {
         let s = &mut self.ports[port.index()];
         s.state = PortState::Probing;
         s.dev = None;
+        s.probe_until = None;
         self.event(Event::PortChanged(port));
+    }
+
+    /// Plugs `port` into Hub-0 anew, to probe its device again (re-detect, back from passthrough).
+    fn reprobe(&mut self, port: Port) {
+        let s = &mut self.ports[port.index()];
+        s.state = PortState::Probing;
+        s.probe_until = Some(self.now.wrapping_add(REPROBE_MS));
+        self.emit(Output::Reprobe(port));
     }
 
     pub fn port_attached(&mut self, port: Port, probed: &Probed) {
@@ -963,6 +993,7 @@ impl Engine {
         let unsupported = summary.interfaces.is_empty();
         let s = &mut self.ports[port.index()];
         s.dev = Some(Hosted { probed: probed.clone(), translators, summary, last_len: Vec::new() });
+        s.probe_until = None;
         s.reports = 0;
         s.rate_hz = 0;
         if unsupported {
@@ -1007,11 +1038,7 @@ impl Engine {
             self.ports[i].effective = eff;
             self.ports[i].reason = reason;
             if eff.is_passthrough() {
-                let target = match eff {
-                    PortMode::PassthroughPc1 => Pc::Pc1,
-                    PortMode::PassthroughPc2 => Pc::Pc2,
-                    _ => self.active,
-                };
+                let target = self.passthrough_pc(eff);
                 self.ports[i].state = PortState::Passthrough;
                 self.release_port(port);
                 if was.0 != PortState::Passthrough || was.1 != eff {
@@ -1019,8 +1046,7 @@ impl Engine {
                 }
             } else if was.0 == PortState::Passthrough {
                 // Coming back from passthrough: the KVM has to see the device again first.
-                self.ports[i].state = PortState::Probing;
-                self.emit(Output::Reprobe(port));
+                self.reprobe(port);
             }
             changed[i] = was != (self.ports[i].state, eff, reason);
         }
@@ -1032,6 +1058,15 @@ impl Engine {
             if changed[port.index()] || touched[port.index()] {
                 self.event(Event::PortChanged(port));
             }
+        }
+    }
+
+    /// The PC a port in passthrough mode `eff` is routed to: pinned, or the active one.
+    fn passthrough_pc(&self, eff: PortMode) -> Pc {
+        match eff {
+            PortMode::PassthroughPc1 => Pc::Pc1,
+            PortMode::PassthroughPc2 => Pc::Pc2,
+            _ => self.active,
         }
     }
 
@@ -1973,6 +2008,15 @@ impl Engine {
             // Nobody pressed the key: the locks stay.
             self.unlock = None;
         }
+        for &port in Port::ALL {
+            let s = &self.ports[port.index()];
+            if s.state == PortState::Probing && s.probe_until.is_some_and(|t| now.wrapping_sub(t) as i32 >= 0) {
+                // Nothing came on Hub-0: the device was unplugged in passthrough, where the KVM couldn't see it. Until
+                // 0.1.11 the port stayed probing (blinking yellow) until a device was plugged in (first board,
+                // 2026-11-12, a flash drive on Other).
+                self.port_detached(port);
+            }
+        }
         if let Some(l) = self.learning.as_mut() {
             if let Some(h) = l.learner.tick(now) {
                 self.end_learning(LearnEnd::Learned, h);
@@ -2205,8 +2249,7 @@ impl Engine {
             }
             Request::Redetect(p) => {
                 self.release_port(*p);
-                self.ports[p.index()].state = PortState::Probing;
-                self.emit(Output::Reprobe(*p));
+                self.reprobe(*p);
                 self.event(Event::PortChanged(*p));
                 Response::Ok
             }
@@ -2815,6 +2858,71 @@ mod tests {
         }));
         e.switch(Target::Toggle, SwitchSource::Key);
         assert!(!drain(&mut e).iter().any(|o| matches!(o, Output::Route { .. })));
+    }
+
+    #[test]
+    fn a_high_speed_device_in_passthrough_shows_the_speed_it_runs_at_on_the_pc() {
+        // First board, 2026-11-12: a USB 2.0 flash drive in passthrough showed as full speed, Hub-0's speed.
+        let mut e = engine();
+        e.pc_status(Pc::Pc1, usb(UsbState::Configured, true));
+        e.pc_status(Pc::Pc2, AtStatus { speed: UsbSpeed::Full, ..usb(UsbState::Configured, true) });
+        let webcam = |high_speed| Probed {
+            speed: Some(Speed::Full),
+            high_speed,
+            config: Vec::from_slice(crate::usbdesc::fixtures::WEBCAM_CONFIG).unwrap(),
+            ..Default::default()
+        };
+        e.port_attached(Port::Other, &webcam(true));
+        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        assert_eq!(e.port_info(Port::Other).speed, Speed::High);
+        // PC2's hub runs at full speed, and so does everything on it.
+        e.switch(Target::Toggle, SwitchSource::Key);
+        assert_eq!(e.port_info(Port::Other).speed, Speed::Full);
+        e.set_config(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc1), Origin::Software).unwrap();
+        assert_eq!(e.port_info(Port::Other).speed, Speed::High, "pinned to PC1");
+        // A full-speed device stays at full speed.
+        e.port_attached(Port::Other, &webcam(false));
+        assert_eq!(e.port_info(Port::Other).speed, Speed::Full);
+        // Hosted, a high-speed device runs at Hub-0's full speed.
+        e.port_attached(Port::Mouse, &Probed { high_speed: true, ..keyboard_and_mouse() });
+        assert_eq!(e.port_info(Port::Mouse).state, PortState::Hosted);
+        assert_eq!(e.port_info(Port::Mouse).speed, Speed::Full);
+    }
+
+    #[test]
+    fn a_device_unplugged_in_passthrough_leaves_the_port_empty_on_redetect() {
+        // First board, 2026-11-12: a flash drive unplugged in passthrough; re-detect left the port probing (blinking
+        // yellow) until a device was plugged in again.
+        let mut e = engine();
+        e.tick(T0);
+        let drive =
+            Probed { config: Vec::from_slice(crate::usbdesc::fixtures::WEBCAM_CONFIG).unwrap(), ..Default::default() };
+        e.port_attached(Port::Other, &drive);
+        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        // Unplugged at the PC's hub, which the KVM can't see; then re-detect.
+        assert_eq!(ask(&mut e, Request::Redetect(Port::Other)), Response::Ok);
+        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Other)));
+        e.tick(T0 + REPROBE_MS - 1);
+        assert_eq!(e.port_info(Port::Other).state, PortState::Probing);
+        e.tick(T0 + REPROBE_MS);
+        assert_eq!(e.port_info(Port::Other), PortInfo::empty(Port::Other, PortMode::Auto));
+        assert!(events_to(&drain(&mut e), Pc::Pc1).contains(&Event::PortChanged(Port::Other)));
+        // A device that is there comes on Hub-0 in time and is probed as usual, however long that takes.
+        assert_eq!(ask(&mut e, Request::Redetect(Port::Other)), Response::Ok);
+        e.tick(T0 + REPROBE_MS + 300);
+        e.port_probing(Port::Other);
+        e.tick(T0 + 3 * REPROBE_MS);
+        assert_eq!(e.port_info(Port::Other).state, PortState::Probing);
+        e.port_attached(Port::Other, &drive);
+        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        // Back from passthrough with the device gone: empty as well.
+        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Passthrough), Origin::Software).unwrap();
+        e.port_attached(Port::Mouse, &keyboard_and_mouse());
+        assert_eq!(e.port_info(Port::Mouse).state, PortState::Passthrough);
+        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Auto), Origin::Software).unwrap();
+        assert_eq!(e.port_info(Port::Mouse).state, PortState::Probing);
+        e.tick(T0 + 4 * REPROBE_MS);
+        assert_eq!(e.port_info(Port::Mouse).state, PortState::Empty);
     }
 
     /// Sends a Vial request from `pc` and returns the reply on the Vial endpoint.

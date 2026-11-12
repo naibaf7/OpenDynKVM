@@ -1176,6 +1176,8 @@ pub struct PortInfo {
     pub reason: AutoReason,
     pub vid: u16,
     pub pid: u16,
+    /// The device's speed on Hub-0 (full speed at most). In passthrough: on the PC's hub, where a high-speed device
+    /// runs at high speed unless that hub's link to the PC is full speed (since firmware 0.1.12).
     pub speed: Speed,
     pub classes: u16,
     pub interfaces: u8,
