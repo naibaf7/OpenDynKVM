@@ -16,7 +16,7 @@
 //! one: that is switched off for hop ([`Screen::off`]) and dragged onto the other PC's screen, and still counts for its
 //! PC's desktop. Detected places on the computer are kept ([`Screen::fixed`]) wherever a screen is dragged.
 
-use kvm_proto::ctrl::{MAX_SCREENS, Mapping, Pc, SCREEN_PX, SCREEN_SCALE, Screen, Units};
+use kvm_proto::ctrl::{Host, MAX_SCREENS, Mapping, SCREEN_PX, SCREEN_SCALE, Screen, Units};
 
 use crate::fl;
 
@@ -53,17 +53,18 @@ pub fn detect() -> Result<Detection, String> {
     Ok(Detection { screens, units })
 }
 
-/// `pc`'s screens with their place on their own computer (`desk`) taken from the arrangement where it isn't fixed
+/// `host`'s screens with their place on their own computer (`desk`) taken from the arrangement where it isn't fixed
 /// ([`Screen::fixed`]: detected or typed in), the inverse of [`place`]: a screen touching one already done sits against
 /// the same edge there, and one touching none keeps its offset from the main screen. The arrangement page calls it
 /// whenever a screen is dropped, resized, rescaled or added. Before, a screen added by hand kept the place it was given
 /// ("right of the PC's others"), whichever side it was dragged to: the KVM then moved that PC's cursor towards the wrong
 /// side (2026-11-12). A fixed place stays: where a screen stands on the desk needn't be where its PC has it (a monitor
 /// cabled to both PCs lies where the other PC's screen is). With no fixed place at all, the main screen is at 0,0.
-pub fn desks(screens: &[Screen; MAX_SCREENS], pc: Pc, units: Units) -> [Screen; MAX_SCREENS] {
+pub fn desks(screens: &[Screen; MAX_SCREENS], host: Host, units: Units) -> [Screen; MAX_SCREENS] {
     let mut out = *screens;
-    let Some(main) = kvm_core::hop::main_screen(screens, pc) else { return out };
-    let mine: Vec<usize> = (0..MAX_SCREENS).filter(|i| screens[*i].pc == Some(pc) && screens[*i].is_valid()).collect();
+    let Some(main) = kvm_core::hop::main_screen(screens, host) else { return out };
+    let mine: Vec<usize> =
+        (0..MAX_SCREENS).filter(|i| screens[*i].host == Some(host) && screens[*i].is_valid()).collect();
     let mut done: Vec<usize> = mine.iter().copied().filter(|&i| screens[i].fixed).collect();
     if done.is_empty() {
         out[main].desk = [0, 0];
@@ -142,14 +143,14 @@ fn i16_of(v: i32) -> i16 {
 }
 
 /// A screen of `pc` as the system reports it: its place on the computer fixed.
-fn screen_of(pc: Pc, d: &Detected) -> Screen {
+fn screen_of(host: Host, d: &Detected) -> Screen {
     Screen {
         w: d.w.clamp(*SCREEN_PX.start(), *SCREEN_PX.end()),
         h: d.h.clamp(*SCREEN_PX.start(), *SCREEN_PX.end()),
         scale: d.scale.clamp(*SCREEN_SCALE.start(), *SCREEN_SCALE.end()),
         desk: d.desk.map(i16_of),
         fixed: true,
-        ..Screen::new(pc, 0, 0, [0, 0])
+        ..Screen::new(host, 0, 0, [0, 0])
     }
 }
 
@@ -176,22 +177,22 @@ fn beside(s: &Screen, t: &Screen, units: Units) -> Option<[i16; 2]> {
     Some(at.map(|v| v.round().clamp(-30_000.0, 30_000.0) as i16))
 }
 
-/// `found` (this computer's screens, the main one first) in place of the screens `pc` had: where those were, or right
+/// `found` (this computer's screens, the main one first) in place of the screens `host` had: where those were, or right
 /// of the others. Screens that touch in the PC's own arrangement touch here too: Windows' pixels are physical and each
 /// screen has its own scaling, so a screen's place follows from the neighbour it touches, not from its position alone.
-pub fn place(screens: &[Screen; MAX_SCREENS], pc: Pc, found: &Detection) -> [Screen; MAX_SCREENS] {
+pub fn place(screens: &[Screen; MAX_SCREENS], host: Host, found: &Detection) -> [Screen; MAX_SCREENS] {
     let units = found.units;
     let mut out = *screens;
-    let origin = match bbox(screens.iter().filter(|s| s.pc == Some(pc)).map(world)) {
+    let origin = match bbox(screens.iter().filter(|s| s.host == Some(host)).map(world)) {
         Some((min, _)) => min,
         None => {
-            bbox(screens.iter().filter(|s| s.pc.is_some()).map(world)).map_or([0.0; 2], |(min, max)| [max[0], min[1]])
+            bbox(screens.iter().filter(|s| s.host.is_some()).map(world)).map_or([0.0; 2], |(min, max)| [max[0], min[1]])
         }
     };
-    for s in out.iter_mut().filter(|s| s.pc == Some(pc)) {
+    for s in out.iter_mut().filter(|s| s.host == Some(host)) {
         *s = Screen::NONE;
     }
-    let mut placed: Vec<Screen> = found.screens.iter().map(|d| screen_of(pc, d)).collect();
+    let mut placed: Vec<Screen> = found.screens.iter().map(|d| screen_of(host, d)).collect();
     // From the first (the main screen) on, each next to one already placed that it touches.
     let mut done = vec![false; placed.len()];
     if let Some(d) = done.first_mut() {
@@ -217,7 +218,7 @@ pub fn place(screens: &[Screen; MAX_SCREENS], pc: Pc, found: &Detection) -> [Scr
         }
     }
     let min = placed.iter().fold([i16::MAX; 2], |m, s| [m[0].min(s.at[0]), m[1].min(s.at[1])]);
-    let free: Vec<usize> = (0..MAX_SCREENS).filter(|i| out[*i].pc.is_none()).collect();
+    let free: Vec<usize> = (0..MAX_SCREENS).filter(|i| out[*i].host.is_none()).collect();
     for (mut s, slot) in placed.into_iter().zip(free) {
         let at = |a: usize| (origin[a] + (s.at[a] as i32 - min[a] as i32) as f32).round().clamp(-30_000.0, 30_000.0);
         s.at = [at(0) as i16, at(1) as i16];
@@ -226,7 +227,7 @@ pub fn place(screens: &[Screen; MAX_SCREENS], pc: Pc, found: &Detection) -> [Scr
     out
 }
 
-/// `pc`'s screens in the arrangement made what this computer's system reports (`now`), the arrangement otherwise left
+/// `host`'s screens in the arrangement made what this computer's system reports (`now`), the arrangement otherwise left
 /// as it is ("Detect" on the page):
 /// - A screen that is there already (the same resolution and scaling; the one at the same place on the computer first)
 ///   keeps its place here and whether screen hop uses it, and takes the system's place on the computer.
@@ -234,8 +235,8 @@ pub fn place(screens: &[Screen; MAX_SCREENS], pc: Pc, found: &Detection) -> [Scr
 /// - One the system no longer reports goes.
 ///
 /// With none of them there yet, they are placed afresh ([`place`]).
-pub fn merge(screens: &[Screen; MAX_SCREENS], pc: Pc, now: &Detection) -> [Screen; MAX_SCREENS] {
-    let mine: Vec<usize> = (0..MAX_SCREENS).filter(|&i| screens[i].pc == Some(pc)).collect();
+pub fn merge(screens: &[Screen; MAX_SCREENS], host: Host, now: &Detection) -> [Screen; MAX_SCREENS] {
+    let mine: Vec<usize> = (0..MAX_SCREENS).filter(|&i| screens[i].host == Some(host)).collect();
     let same = |s: &Screen, d: &Detected| (s.w, s.h, s.scale) == (d.w, d.h, d.scale);
     let mut slot_of: Vec<Option<usize>> = vec![None; now.screens.len()];
     let mut taken: Vec<usize> = Vec::new();
@@ -254,7 +255,7 @@ pub fn merge(screens: &[Screen; MAX_SCREENS], pc: Pc, now: &Detection) -> [Scree
         }
     }
     if taken.is_empty() {
-        return place(screens, pc, now);
+        return place(screens, host, now);
     }
     let mut out = *screens;
     for &i in mine.iter().filter(|i| !taken.contains(i)) {
@@ -267,31 +268,34 @@ pub fn merge(screens: &[Screen; MAX_SCREENS], pc: Pc, now: &Detection) -> [Scree
     }
     // The new ones, each beside one of the PC's screens it touches on the computer, or right of the others.
     let mut pending: Vec<Screen> =
-        (0..now.screens.len()).filter(|&j| slot_of[j].is_none()).map(|j| screen_of(pc, &now.screens[j])).collect();
+        (0..now.screens.len()).filter(|&j| slot_of[j].is_none()).map(|j| screen_of(host, &now.screens[j])).collect();
     while !pending.is_empty() {
-        let placed: Vec<Screen> = out.iter().copied().filter(|s| s.pc == Some(pc)).collect();
+        let placed: Vec<Screen> = out.iter().copied().filter(|s| s.host == Some(host)).collect();
         let next = pending.iter().position(|s| placed.iter().any(|t| beside(s, t, now.units).is_some()));
         let (k, at) = match next {
             Some(k) => (k, placed.iter().find_map(|t| beside(&pending[k], t, now.units)).unwrap_or_default()),
             None => {
-                let right = bbox(out.iter().filter(|s| s.pc.is_some()).map(world))
+                let right = bbox(out.iter().filter(|s| s.host.is_some()).map(world))
                     .map_or([0.0; 2], |(min, max)| [max[0], min[1]]);
                 (0, right.map(|v| v.round().clamp(-30_000.0, 30_000.0) as i16))
             }
         };
         let s = Screen { at, ..pending.remove(k) };
-        let Some(slot) = out.iter().position(|x| x.pc.is_none()) else { break };
+        let Some(slot) = out.iter().position(|x| x.host.is_none()) else { break };
         out[slot] = s;
     }
     out
 }
 
-/// Whether the KVM's copy of `pc`'s screens (their resolution, scaling and place on the computer) or of its units
+/// Whether the KVM's copy of `host`'s screens (their resolution, scaling and place on the computer) or of its units
 /// (`units`) differs from what this computer's system reports now.
-pub fn differs(screens: &[Screen; MAX_SCREENS], pc: Pc, units: Units, now: &Detection) -> bool {
+pub fn differs(screens: &[Screen; MAX_SCREENS], host: Host, units: Units, now: &Detection) -> bool {
     let key = |w: u16, h: u16, scale: u16, desk: [i16; 2]| (w, h, scale, desk);
-    let mut have: Vec<_> =
-        screens.iter().filter(|s| s.pc == Some(pc) && s.is_valid()).map(|s| key(s.w, s.h, s.scale, s.desk)).collect();
+    let mut have: Vec<_> = screens
+        .iter()
+        .filter(|s| s.host == Some(host) && s.is_valid())
+        .map(|s| key(s.w, s.h, s.scale, s.desk))
+        .collect();
     let mut want: Vec<_> = now.screens.iter().map(|d| key(d.w, d.h, d.scale, d.desk.map(i16_of))).collect();
     have.sort();
     want.sort();
@@ -502,7 +506,7 @@ mod tests {
     #[test]
     fn detected_screens_go_where_the_pcs_were_and_touch_as_they_do_there() {
         let mut l = [Screen::NONE; MAX_SCREENS];
-        l[0] = Screen::new(Pc::Pc1, 1920, 1080, [0, 0]);
+        l[0] = Screen::new(Host::Pc1, 1920, 1080, [0, 0]);
         let found = detection(
             &[
                 Detected { name: "a".into(), w: 3840, h: 2160, scale: 150, desk: [0, 0], main: true },
@@ -510,15 +514,15 @@ mod tests {
             ],
             Units::Physical,
         );
-        let placed = merge(&l, Pc::Pc2, &found);
+        let placed = merge(&l, Host::Pc2, &found);
         // PC2's second screen right of PC1's, its main screen (2560 logical pixels wide at 150 %) touching it; both with
         // their places on PC2 fixed.
         assert_eq!((placed[2].at, placed[2].desk, placed[2].fixed), ([1920, 0], [-1920, 0], true));
         assert_eq!((placed[1].at, placed[1].desk, placed[1].scale), ([3840, 0], [0, 0], 150));
         assert_eq!(placed[0], l[0], "PC1's screen stays");
         // Detected again: where they are now.
-        assert_eq!(merge(&placed, Pc::Pc2, &found), placed);
-        assert!(!differs(&placed, Pc::Pc2, Units::Physical, &found));
+        assert_eq!(merge(&placed, Host::Pc2, &found), placed);
+        assert!(!differs(&placed, Host::Pc2, Units::Physical, &found));
     }
 
     #[test]
@@ -526,29 +530,29 @@ mod tests {
         // The first board's arrangement (2026-11-12): PC2's second screen dragged left of its main screen, but still
         // recorded where it was added, right of a 1920-wide main screen.
         let mut l = [Screen::NONE; MAX_SCREENS];
-        l[0] = Screen::new(Pc::Pc1, 1920, 1080, [0, 0]);
-        l[1] = Screen::new(Pc::Pc2, 3840, 2160, [-3840, -440]);
-        l[2] = Screen { desk: [1920, 0], ..Screen::new(Pc::Pc2, 2880, 1800, [-6720, -265]) };
-        let d = desks(&l, Pc::Pc2, Units::Physical);
+        l[0] = Screen::new(Host::Pc1, 1920, 1080, [0, 0]);
+        l[1] = Screen::new(Host::Pc2, 3840, 2160, [-3840, -440]);
+        l[2] = Screen { desk: [1920, 0], ..Screen::new(Host::Pc2, 2880, 1800, [-6720, -265]) };
+        let d = desks(&l, Host::Pc2, Units::Physical);
         assert_eq!((d[1].desk, d[2].desk), ([0, 0], [-2880, 175]));
         assert_eq!(d[0], l[0], "PC1's screen stays");
         // Below the main screen, at 150 %: its x along the main screen's top edge, in the main screen's pixels.
         let mut l2 = l;
         l2[1].scale = 150;
         l2[2].at = [-3840 + 100, -440 + 1440];
-        assert_eq!(desks(&l2, Pc::Pc2, Units::Physical)[2].desk, [150, 2160]);
+        assert_eq!(desks(&l2, Host::Pc2, Units::Physical)[2].desk, [150, 2160]);
         // Away from every other screen of its PC: its offset from the main screen.
         l2[2].at = [5000, 0];
-        assert_eq!(desks(&l2, Pc::Pc2, Units::Physical)[2].desk, [13260, 660]);
+        assert_eq!(desks(&l2, Host::Pc2, Units::Physical)[2].desk, [13260, 660]);
         // A place fixed (detected or typed in) stays where it is, wherever the screen is dragged.
         l2[2].fixed = true;
-        assert_eq!(desks(&l2, Pc::Pc2, Units::Physical)[2].desk, [1920, 0]);
+        assert_eq!(desks(&l2, Host::Pc2, Units::Physical)[2].desk, [1920, 0]);
     }
 
     #[test]
     fn detected_screens_keep_their_places_on_their_computer() {
         let mut l = [Screen::NONE; MAX_SCREENS];
-        l[0] = Screen::new(Pc::Pc1, 1920, 1080, [0, 0]);
+        l[0] = Screen::new(Host::Pc1, 1920, 1080, [0, 0]);
         let found = detection(
             &[
                 Detected { name: "a".into(), w: 3840, h: 2160, scale: 200, desk: [0, 0], main: true },
@@ -557,12 +561,12 @@ mod tests {
             ],
             Units::Physical,
         );
-        let placed = merge(&l, Pc::Pc2, &found);
-        assert_eq!(desks(&placed, Pc::Pc2, Units::Physical), placed);
+        let placed = merge(&l, Host::Pc2, &found);
+        assert_eq!(desks(&placed, Host::Pc2, Units::Physical), placed);
         // Without the fixed places, the arrangement gives the same ones back.
         let mut loose = placed;
         loose.iter_mut().for_each(|s| s.fixed = false);
-        assert_eq!(desks(&loose, Pc::Pc2, Units::Physical), loose);
+        assert_eq!(desks(&loose, Host::Pc2, Units::Physical), loose);
     }
 
     /// `kscreen-doctor -j` on the first board's PC1 (KDE Plasma 6.8 on Wayland, 2026-11-12), cut to what is read: the
@@ -602,40 +606,40 @@ mod tests {
         // As on the first board's desk before (2026-11-12): PC1 had the HD monitor alone, at 0,0 on PC1; PC2 its 4K
         // monitor.
         let mut l = [Screen::NONE; MAX_SCREENS];
-        l[0] = Screen::new(Pc::Pc1, 1920, 1080, [0, 720]);
-        l[1] = Screen { scale: 150, ..Screen::new(Pc::Pc2, 3840, 2160, [-2560, 360]) };
+        l[0] = Screen::new(Host::Pc1, 1920, 1080, [0, 720]);
+        l[1] = Screen { scale: 150, ..Screen::new(Host::Pc2, 3840, 2160, [-2560, 360]) };
         let now = pc1_now();
-        assert!(differs(&l, Pc::Pc1, Units::Physical, &now));
+        assert!(differs(&l, Host::Pc1, Units::Physical, &now));
         // Detect: the HD monitor stays where it stands and takes KDE's place; the 4K monitor goes in left of it, as on
         // PC1 (2560 logical pixels wide, its top 270 higher), on PC2's screen.
-        let next = merge(&l, Pc::Pc1, &now);
+        let next = merge(&l, Host::Pc1, &now);
         assert_eq!(next[0], Screen { desk: [2560, 270], fixed: true, ..l[0] });
         assert_eq!(next[1], l[1]);
         let g = next[2];
         assert_eq!(
-            (g.pc, g.w, g.scale, g.at, g.desk, g.fixed, g.off),
-            (Some(Pc::Pc1), 3840, 150, [-2560, 450], [0, 0], true, false)
+            (g.host, g.w, g.scale, g.at, g.desk, g.fixed, g.off),
+            (Some(Host::Pc1), 3840, 150, [-2560, 450], [0, 0], true, false)
         );
-        assert!(!differs(&next, Pc::Pc1, Units::Logical, &now));
+        assert!(!differs(&next, Host::Pc1, Units::Logical, &now));
         // Turned off for hop and laid exactly on PC2's: its place on PC1 stays, and so does the HD monitor's.
         let mut laid = next;
         laid[2] = Screen { off: true, at: l[1].at, ..g };
-        assert_eq!(desks(&laid, Pc::Pc1, Units::Logical), laid);
+        assert_eq!(desks(&laid, Host::Pc1, Units::Logical), laid);
         // Detected again later: nothing moves, nothing comes back on.
-        assert_eq!(merge(&laid, Pc::Pc1, &now), laid);
+        assert_eq!(merge(&laid, Host::Pc1, &now), laid);
         // The 4K monitor unplugged from PC1: it goes, the HD monitor takes its new place on PC1.
         let mut alone = now.clone();
         alone.screens = vec![Detected { desk: [0, 0], ..now.screens[0].clone() }];
-        let after = merge(&laid, Pc::Pc1, &alone);
-        assert_eq!((after[0].desk, after[0].at, after[2].pc), ([0, 0], [0, 720], None));
+        let after = merge(&laid, Host::Pc1, &alone);
+        assert_eq!((after[0].desk, after[0].at, after[2].host), ([0, 0], [0, 720], None));
     }
 
     #[test]
     fn a_screen_added_by_hand_takes_its_place_on_its_computer_from_the_arrangement() {
         let mut l = [Screen::NONE; MAX_SCREENS];
-        l[0] = Screen { desk: [2560, 270], fixed: true, ..Screen::new(Pc::Pc1, 1920, 1080, [0, 720]) };
+        l[0] = Screen { desk: [2560, 270], fixed: true, ..Screen::new(Host::Pc1, 1920, 1080, [0, 720]) };
         // Right of the HD monitor here: right of it on PC1 too, in logical pixels.
-        l[1] = Screen { desk: [4480, 0], ..Screen::new(Pc::Pc1, 1280, 1024, [1920, 720]) };
-        assert_eq!(desks(&l, Pc::Pc1, Units::Logical)[1].desk, [4480, 270]);
+        l[1] = Screen { desk: [4480, 0], ..Screen::new(Host::Pc1, 1280, 1024, [1920, 720]) };
+        assert_eq!(desks(&l, Host::Pc1, Units::Logical)[1].desk, [4480, 270]);
     }
 }

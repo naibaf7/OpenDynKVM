@@ -25,6 +25,7 @@ mod link;
 mod log;
 
 use embassy_executor::Spawner;
+use esp_rtos::embassy::InterruptExecutor;
 use esp_hal::clock::CpuClock;
 use esp_hal::timer::timg::TimerGroup;
 
@@ -51,6 +52,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     esp_hal::system::software_reset()
 }
 
+static LINK_EXECUTOR: static_cell::StaticCell<InterruptExecutor<1>> = static_cell::StaticCell::new();
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -59,18 +62,17 @@ async fn main(spawner: Spawner) {
     esp_alloc::heap_allocator!(size: 72 * 1024);
     let timg0 = TimerGroup::new(p.TIMG0);
     esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
-    log::init(p.UART1, p.GPIO3);
+    // Kept until the link says where the module is (`log`): printed on IO3 only on the KVM's board.
     log::line(format_args!("OpenDynKVM Bluetooth module, firmware {FW_VERSION:#08x}"));
 
-    let uart = esp_hal::uart::Uart::new(
-        p.UART0,
-        esp_hal::uart::Config::default().with_baudrate(kvm_proto::link::bt::BAUD),
-    )
-    .expect("UART0")
-    .with_rx(p.GPIO20)
-    .with_tx(p.GPIO21)
-    .into_async();
-    spawner.spawn(link::run(uart).expect("link task"));
+    // The link: UART0 on the KVM's board, or the chip's USB serial port on a front port (software.md §4.13).
+    // It runs one interrupt level above the Bluetooth side: pairing's P-256 maths and a bond being written can
+    // keep the main executor busy for long stretches, and the RP2354B takes a link that doesn't answer for gone (first
+    // dongle, 2026-11-14: pairing broke off with the module restarted).
+    let link_executor = LINK_EXECUTOR.init(InterruptExecutor::new(p.FROM_CPU_INTR1));
+    let link_spawner = link_executor.start(esp_hal::interrupt::Priority::Priority1);
+    let lines = link::Lines { uart: p.UART0, rx: p.GPIO20, tx: p.GPIO21, usb: p.USB_DEVICE, log: p.UART1, log_pin: p.GPIO3 };
+    link_spawner.spawn(link::run(lines).expect("link task"));
 
     let bonds = bonds::Bonds::load(esp_storage::FlashStorage::new(p.FLASH));
     ble::run(spawner, p.BT, bonds).await

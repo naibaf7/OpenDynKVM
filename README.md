@@ -23,7 +23,7 @@ without their own remapping can be remapped on the KVM with the Vial app.
 - **Inside:** an RP2354B (USB host for the front ports, all switching logic), two AT32F405 (one High-Speed USB device per
   PC), three USB 2.0 hubs and a 1:3 analog USB switch per front port.
 
-**Status (2026-11-12):** the first boards, hardware 0.12.0, run firmware 0.1.10. Hardware 0.17.0, with the fixes from
+**Status (2026-11-14):** the first boards, hardware 0.12.0, run firmware 0.1.17. Hardware 0.17.0, with the fixes from
 their bring-up, is designed but not ordered yet. What has been verified on a board and what has not:
 [DEVELOPMENT.md](DEVELOPMENT.md#bring-up-status).
 
@@ -42,7 +42,10 @@ their bring-up, is designed but not ordered yet. What has been verified on a boa
 
 There are no boards for sale. The board is ordered assembled from JLCPCB with the files in [`hardware/`](hardware/):
 [hardware/jlcpcb.md](hardware/jlcpcb.md) lists every setting of the quote form. Only the MX key switch is plugged into
-its socket by hand. The Bluetooth module is optional (boards from 0.16.0): a BOM without it is included.
+its socket by hand. The Bluetooth module is optional (boards from 0.16.0): a BOM without it is included. A board
+without it can use a small ESP32-C3 board with a USB port (the chip's own, as most have) on a front port instead: the
+KVM programs it with the module's firmware when it is new or erased, and that port then serves the wireless hosts
+rather than a PC ([software.md §4.13](software.md)).
 
 A 3D-printable case (a tray, a lid with the logo, four spacers and four M3 screws) is in
 [`hardware/case/`](hardware/case/), with how to print and assemble it.
@@ -199,31 +202,40 @@ from that PC.
 scripts. On Linux the monitors are found through `/sys/class/drm` (DisplayPort AUX or the connector's DDC bus), on
 Windows through the monitor API (dxva2); laptop panels have no DDC/CI.
 
-### Screen hop: one mouse across both PCs' screens
+### Screen hop: one mouse across all the screens
 
-With screen hop the KVM moves the pointer itself, across both PCs' screens as they stand on the desk, and switches to
-the other PC (keyboard and all) when you push the pointer across an edge onto one of its screens. No software is
-needed on the PCs; the KVM's mouse gets an absolute pointer for it.
+With screen hop the KVM moves the pointer itself, across the screens as they stand on the desk, and switches to another
+computer (keyboard and all) when you push the pointer across an edge onto one of its screens: the other PC, or a host
+paired with the Bluetooth module. No software is needed on any of them; the KVM's mouse gets an absolute pointer for
+it.
 
 1. In the GUI's *Screen hop* page, turn on **Absolute pointer** (`odkvmctl config set abs-pointer on`). Both PCs
    reconnect the KVM's devices once.
 2. Arrange the screens: on each PC, *Detect this computer's screens* (`odkvmctl screens detect`) puts its screens in
    with their resolution, scaling and place in its display settings; then drag them where they stand. Or add them by
-   hand (`odkvmctl config set screen0 "pc1 2560x1440 at 0,0"`).
+   hand (`odkvmctl config set arrangement0-screen0 "pc1 2560x1440 at 0,0"`); a paired host's screens always are
+   (`host1 2388x1668 200% at 2560,0`).
    A monitor cabled to both PCs appears for each of them. On the PC that doesn't show it, untick **Screen hop goes
    onto it** and lay it on the other PC's screen: the pointer then passes to the other PC there, and its own PC still
    counts it, so the pointer lands in the right place on that PC's other screens. When a PC's display settings
    change, the page says so; detect its screens again (screens already there keep their place).
-3. Tick screen hop in the profiles that should use it (`odkvmctl config set profile0-hop on`). It needs the Mouse port
-   in Normalized mode (Auto picks it for most mice); a profile without it gives games the ordinary relative mouse.
+3. Choose the arrangement each profile uses (`odkvmctl profile work arrangement 0`). The KVM keeps four, each with a
+   name: one for the desk, one for the sofa with a laptop and a tablet. Switching profiles switches the arrangement at
+   once. Screen hop needs the Mouse port in Normalized mode (Auto picks it for most mice); a profile without an
+   arrangement gives games the ordinary relative mouse.
+4. A paired host gets an absolute pointer, as the PCs do. A tablet or phone whose system takes none: set its pointer
+   to *Relative* (`odkvmctl config set host1-pointer relative`). The KVM then parks its cursor in a corner when the
+   pointer comes onto it and steers it from there; its own acceleration makes that close, not exact, until the
+   pointer is pushed against an edge.
 
-The pointer passes where the same PC's screens meet. Toward the other PC an edge holds it until it is pushed about
-100 pixels further (*Edge resistance*), never in the corners, never while a button is held. The PCs don't accelerate an
-absolute pointer, so the KVM does: Windows' precision curve, libinput's adaptive curve, or flat, with a speed setting.
+The pointer passes where the same computer's screens meet. Toward another computer an edge holds it until it is pushed
+about 100 pixels further (*Edge resistance*), never in the corners, never while a button is held. The PCs don't
+accelerate an absolute pointer, so the KVM does: Windows' precision curve, libinput's adaptive curve, or flat, with a
+speed setting.
 
 Windows puts an absolute pointer on its main screen only. The KVM reaches its other screens with relative motion, which
 Windows accelerates: turn off "Enhance pointer precision" on such a PC for exact edges, or keep `opendyn-kvm` running
-there (it tells the KVM where the cursor came to rest). `odkvmctl screens` shows the arrangement and the settings.
+there (it tells the KVM where the cursor came to rest). `odkvmctl screens` shows the arrangements and the settings.
 
 ### Keymap with Vial
 
@@ -252,9 +264,10 @@ Board faults with a workaround are listed in [hardware/errata.md](hardware/errat
   the 0.17.0 design.
 - **E3:** the five side LEDs shine into the board instead of out of the front edge. Fixed in the 0.17.0 design.
 
-Not yet tried on a board: the Bluetooth module, standby with remote wakeup, switching monitor inputs over DDC/CI, and
-the AT32F405 recovery paths; the full list is in [DEVELOPMENT.md](DEVELOPMENT.md#bring-up-status). The Windows installer
-and the Linux packages are not signed yet.
+Bluetooth works on the first board with an ESP32-C3 board on a front port (pairing, switching, screen hop onto a
+wireless host). Not yet tried on a board: the Bluetooth module on the board, standby with remote wakeup, switching
+monitor inputs over DDC/CI, and the AT32F405 recovery paths; the full list is in
+[DEVELOPMENT.md](DEVELOPMENT.md#bring-up-status). The Windows installer and the Linux packages are not signed yet.
 
 ## Licensing
 

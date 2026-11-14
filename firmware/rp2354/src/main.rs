@@ -10,6 +10,7 @@ mod at32isp;
 mod board;
 mod bt;
 mod diag;
+mod dongle;
 mod espisp;
 mod flash;
 mod host;
@@ -233,6 +234,7 @@ async fn main(spawner: Spawner) {
         rx.set_pull(Pull::None);
         high
     };
+    kvm::with(|e| e.set_bt_fitted(bt_fitted));
     if bt_fitted {
         storage::load_bt_record(&store, bt::image_crc(), held);
     }
@@ -248,6 +250,8 @@ async fn main(spawner: Spawner) {
         bt_cfg,
     );
     spawner.spawn(unwrap!(bt::run(bt_uart, bt_fitted, (seed >> 16) as u8)));
+    // Without it on the board: an ESP32-C3 board on a front port can be the module (software.md §4.13).
+    spawner.spawn(unwrap!(bt::dongle_task((seed >> 24) as u8)));
 
     let (root, handle) = host::start(usbh::RpHost::new(p.USB));
     spawner.spawn(unwrap!(host::hub_task(root, handle.clone())));

@@ -10,7 +10,8 @@
 //! in slot 2, bonded and away (connect-when-selected). Pairing finds a "Laptop" that asks for a passkey (any six digits
 //! do), selecting the phone connects it after a moment. With `OPENDYN_SIM_BT=gave-up` the module is fitted, but
 //! programming it gave up after 5 attempts; `reboot bt-retry` (the GUI's Try again) acts out programming it, and then
-//! it is up as above. Without either the module isn't fitted, as on most boards.
+//! it is up as above. With `OPENDYN_SIM_BT=dongle` the board has no module, and an ESP32-C3 board on the Other port is
+//! it (software.md §4.13), with the same hosts. Without any of these there is no module, as on most boards.
 //!
 //! With `OPENDYN_SIM_HOP=1` screen hop is set up and on in the first profile: the absolute pointer, PC1 with a
 //! 2560×1440 main screen and a 1920×1080 one left of it, PC2 with a 3840×2160 screen at 150 % to the right. That
@@ -241,6 +242,39 @@ pub struct SimTransport {
     keys: (Sender<[u8; 8]>, Receiver<[u8; 8]>),
     /// The simulated Bluetooth module's host slots, when it is fitted (`OPENDYN_SIM_BT`).
     bt: Option<[HostState; 4]>,
+    /// The module is an ESP32-C3 board on the Other port (`OPENDYN_SIM_BT=dongle`).
+    dongle: bool,
+}
+
+/// An ESP32-C3 board's USB serial port (303A:1001: IAD, CDC-ACM, CDC data with bulk endpoints, the JTAG interface).
+fn esp_board() -> Probed {
+    #[rustfmt::skip]
+    const CONFIG: &[u8] = &[
+        9, 2, 98, 0, 3, 1, 0, 0xC0, 250,
+        8, 0x0B, 0, 2, 0x02, 0x02, 0, 0,
+        9, 4, 0, 0, 1, 0x02, 0x02, 0, 0,
+        5, 0x24, 0x00, 0x10, 0x01,
+        5, 0x24, 0x01, 0x03, 0x01,
+        4, 0x24, 0x02, 0x06,
+        5, 0x24, 0x06, 0x00, 0x01,
+        7, 5, 0x82, 3, 64, 0, 1,
+        9, 4, 1, 0, 2, 0x0A, 0, 0, 0,
+        7, 5, 0x01, 2, 64, 0, 0,
+        7, 5, 0x81, 2, 64, 0, 0,
+        9, 4, 2, 0, 2, 0xFF, 0xFF, 0x01, 0,
+        7, 5, 0x02, 2, 64, 0, 0,
+        7, 5, 0x83, 2, 64, 0, 0,
+    ];
+    let mut p = probed(
+        kvm_core::bt::DONGLE_VID,
+        kvm_core::bt::DONGLE_PID,
+        "Simulated",
+        "ESP32-C3 board",
+        HVec::from_slice(CONFIG).unwrap_or_default(),
+        &[],
+    );
+    p.serial = "58:CF:79:00:11:22".try_into().unwrap_or_default();
+    p
 }
 
 const BT_READY: u8 = host_flags::BONDED | host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED;
@@ -272,11 +306,35 @@ impl Default for SimTransport {
 impl SimTransport {
     /// The simulated KVM, with the Bluetooth module if `OPENDYN_SIM_BT=1`, or a module that gave up with `gave-up`.
     pub fn new() -> Self {
-        Self::with_module(match std::env::var("OPENDYN_SIM_BT").as_deref() {
-            Ok("1") => BtModule::Up,
-            Ok("gave-up") => BtModule::GaveUp,
-            _ => BtModule::Absent,
-        })
+        match std::env::var("OPENDYN_SIM_BT").as_deref() {
+            Ok("1") => Self::with_module(BtModule::Up),
+            Ok("gave-up") => Self::with_module(BtModule::GaveUp),
+            Ok("dongle") => Self::with_dongle(),
+            _ => Self::with_module(BtModule::Absent),
+        }
+    }
+
+    /// The simulated KVM without the module on its board, and an ESP32-C3 board on the Other port as the module.
+    pub fn with_dongle() -> Self {
+        let mut sim = Self::with_module(BtModule::Absent);
+        sim.dongle = true;
+        sim.engine.port_detached(Port::Other);
+        sim.attach(Port::Other);
+        while sim.engine.poll_output().is_some() {}
+        sim
+    }
+
+    /// What the simulated device on `p` does on attaching; the dongle is found to be the module and says hello.
+    fn attach(&mut self, p: Port) {
+        if self.dongle && p == Port::Other {
+            self.engine.port_attached(p, &esp_board());
+            if self.engine.dongle_wanted(p) {
+                self.engine.dongle_claimed(p);
+                self.bt = Some(Self::module_up(&mut self.engine));
+            }
+        } else {
+            self.engine.port_attached(p, &device_for(p));
+        }
     }
 
     pub fn with_bluetooth(fitted: bool) -> Self {
@@ -326,21 +384,37 @@ impl SimTransport {
             timeline: Vec::new(),
             keys: channel(),
             bt,
+            dongle: false,
         }
     }
 
-    /// Screen hop set up (`OPENDYN_SIM_HOP=1`).
+    /// Screen hop set up (`OPENDYN_SIM_HOP=1`): the desk in arrangement 0, used by profile 0, with the tablet of
+    /// wireless host 1 below PC1's main screen; arrangement 1, PC2 with the tablet beside it, used by no profile yet.
     fn hop_demo(engine: &mut Engine) {
-        use kvm_proto::ctrl::{ConfigValue, Screen};
-        let pc2 = Screen { scale: 150, ..Screen::new(Pc::Pc2, 3840, 2160, [2560, -120]) };
+        use kvm_proto::ctrl::{ConfigValue, Host, ProfileName, Screen};
+        let pc2 = Screen { scale: 150, ..Screen::new(Host::Pc2, 3840, 2160, [2560, -120]) };
+        let tablet = Screen { scale: 200, ..Screen::new(Host::Bt1, 2388, 1668, [683, 1440]) };
         for v in [
             ConfigValue::AbsPointer(true),
-            ConfigValue::ProfileHop(0, true),
-            ConfigValue::Screen(0, Screen::new(Pc::Pc1, 2560, 1440, [0, 0])),
-            ConfigValue::Screen(1, Screen { desk: [-1920, 360], ..Screen::new(Pc::Pc1, 1920, 1080, [-1920, 360]) }),
-            ConfigValue::Screen(2, pc2),
+            ConfigValue::ProfileArrangement(0, Some(0)),
+            ConfigValue::ArrangementName(0, ProfileName::new("desk")),
+            ConfigValue::Screen(0, 0, Screen::new(Host::Pc1, 2560, 1440, [0, 0])),
+            ConfigValue::Screen(
+                0,
+                1,
+                Screen { desk: [-1920, 360], ..Screen::new(Host::Pc1, 1920, 1080, [-1920, 360]) },
+            ),
+            ConfigValue::Screen(0, 2, pc2),
             // A monitor cabled to both: PC1 has it too, off for hop, laid on PC2's screen.
-            ConfigValue::Screen(3, Screen { pc: Some(Pc::Pc1), desk: [2560, -120], off: true, fixed: true, ..pc2 }),
+            ConfigValue::Screen(
+                0,
+                3,
+                Screen { host: Some(Host::Pc1), desk: [2560, -120], off: true, fixed: true, ..pc2 },
+            ),
+            ConfigValue::Screen(0, 4, tablet),
+            ConfigValue::ArrangementName(1, ProfileName::new("sofa")),
+            ConfigValue::Screen(1, 0, Screen { at: [0, 0], ..pc2 }),
+            ConfigValue::Screen(1, 1, Screen { at: [2560, 300], ..tablet }),
         ] {
             let _ = engine.set_config(v, kvm_core::config::Origin::Device);
         }
@@ -449,7 +523,7 @@ impl SimTransport {
         };
         for d in due {
             match d {
-                Delayed::Attach(p) => self.engine.port_attached(p, &device_for(p)),
+                Delayed::Attach(p) => self.attach(p),
                 Delayed::BtFound => {
                     if let Some(free) = self.bt.and_then(|hs| hs.iter().find(|h| !h.bonded()).map(|h| h.host)) {
                         let _ = self.engine.set_config(
@@ -487,6 +561,11 @@ impl SimTransport {
                     self.inbox.push_back(r);
                 }
                 Output::Reprobe(p) => {
+                    if self.dongle && p == Port::Other {
+                        // Replugged, it leaves Hub-0 first (the real KVM sees it go).
+                        self.engine.port_detached(p);
+                        self.bt = None;
+                    }
                     self.engine.port_probing(p);
                     self.later(700, Delayed::Attach(p));
                 }
@@ -651,6 +730,27 @@ mod tests {
         c.switch(kvm_proto::ctrl::Target::Toggle).unwrap();
         let st = c.status().unwrap();
         assert_eq!((st.bt_active, st.active), (0, Pc::Pc1));
+    }
+
+    #[test]
+    fn an_esp32_board_on_the_other_port_is_the_module() {
+        let mut c = Client::new(Box::new(SimTransport::with_dongle()));
+        let s = c.snapshot().unwrap();
+        assert_eq!(s.ports[Port::Other.index()].state, PortState::Module);
+        assert_eq!(s.module_port(), Some(Port::Other));
+        assert!(s.has_bluetooth());
+        assert_eq!(s.bt_bonded().count(), 2);
+        // Re-detected, it leaves and comes back as the module.
+        c.redetect(Port::Other).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while c.port(Port::Other).unwrap().state != PortState::Module {
+            assert!(Instant::now() < deadline, "the board didn't come back as the module");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(c.snapshot().unwrap().has_bluetooth());
+        // Without a board there is no module.
+        let mut c = Client::new(Box::new(SimTransport::with_bluetooth(false)));
+        assert_eq!(c.snapshot().unwrap().module_port(), None);
     }
 
     #[test]

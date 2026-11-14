@@ -2,7 +2,8 @@
 //!
 //! The hub task enumerates whatever appears on Hub-0 ports 1–3 (Keyboard, Mouse, Other) and hands it to that port's
 //! task, which reads every descriptor the engine needs, then streams the device's interrupt reports into the engine
-//! and executes the engine's requests for the device (LED reports, forwarded control requests, OUT data).
+//! and executes the engine's requests for the device (LED reports, forwarded control requests, OUT data). An ESP32-C3
+//! board the engine wants as the Bluetooth module goes to `bt::dongle_task` instead (software.md §4.13).
 
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
@@ -23,9 +24,10 @@ use kvm_core::output::Report;
 use kvm_core::usbdesc::{DeviceDesc, decode_string, dt, parse_config};
 use kvm_proto::ctrl::{Pc, PortState, Speed};
 
-use crate::kvm;
+use crate::dongle::{Dongle, UsbLine};
 use crate::uartlog::uart_log;
 use crate::usbh::{RpAlloc, RpHost};
+use crate::{bt, kvm};
 
 pub type Handle = BusHandle<'static, RpAlloc>;
 type ControlPipe = <RpAlloc as UsbHostAllocator<'static>>::Pipe<pipe::Control, pipe::InOut>;
@@ -353,6 +355,21 @@ async fn run_device(index: usize, handle: &Handle, info: &EnumerationInfo) {
         }
         PROBE_FAILS[index].store(0, Ordering::Relaxed);
         kvm::with(|e| e.port_attached(port, &probed));
+        if kvm::with(|e| e.dongle_wanted(port)) {
+            let serial = heapless::String::try_from(probed.serial.as_str()).unwrap_or_default();
+            let line = kvm_core::bt::dongle_endpoints(&probed.device, &probed.config)
+                .and_then(|eps| open_dongle(handle, info, eps));
+            drop(probed);
+            let handed = line.is_some_and(|line| bt::DONGLE.try_send(Dongle { port, line, serial }).is_ok());
+            if !handed {
+                kvm::with(|e| e.dongle_declined(port));
+            }
+            // The module, or (declined) an ordinary device the engine routed or left: nothing more to run here. Its
+            // serial port has no HID interfaces.
+            DETACH[index].wait().await;
+            bt::DONGLE_GONE[index].signal(());
+            return;
+        }
         probed.config.clone()
     };
     if kvm::with(|e| e.port_info(port).state) != PortState::Hosted {
@@ -445,6 +462,30 @@ async fn run_device(index: usize, handle: &Handle, info: &EnumerationInfo) {
             }
         }
     }
+}
+
+/// Pipes to an ESP32-C3's USB serial port: its own control pipe (DTR/RTS) and the CDC data interface's bulk endpoints.
+fn open_dongle(handle: &Handle, info: &EnumerationInfo, eps: kvm_core::bt::DongleEps) -> Option<UsbLine> {
+    let ep0 = EndpointInfo {
+        addr: EndpointAddress::from_parts(0, Direction::In),
+        ep_type: EndpointType::Control,
+        max_packet_size: info.device_desc.max_packet_size0 as u16,
+        interval_ms: 0,
+    };
+    // The bulk endpoints on interrupt slots, polled every millisecond (`usbh`: EPX stays for control transfers).
+    let data = |n: u8, dir| EndpointInfo {
+        addr: EndpointAddress::from_parts(n as usize, dir),
+        ep_type: EndpointType::Interrupt,
+        max_packet_size: eps.mps,
+        interval_ms: 1,
+    };
+    let addr = info.device_address;
+    let ctl = handle.alloc_pipe::<pipe::Control, pipe::InOut>(addr, &ep0, info.split()).ok()?;
+    let rx =
+        handle.alloc_pipe::<pipe::Interrupt, pipe::In>(addr, &data(eps.ep_in, Direction::In), info.split()).ok()?;
+    let tx =
+        handle.alloc_pipe::<pipe::Interrupt, pipe::Out>(addr, &data(eps.ep_out, Direction::Out), info.split()).ok()?;
+    Some(UsbLine::new(ctl, rx, tx, eps.comm))
 }
 
 // One per loop iteration on the stack; boxing isn't available and the size is harmless.

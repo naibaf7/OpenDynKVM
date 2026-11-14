@@ -28,9 +28,10 @@
 //!   and kept in RAM. The sector header is written once per erase, together with the sector's first use.
 //! - **Unchanged values cost nothing:** writing the value already stored programs nothing ([`Store::write`]).
 //!
-//! The cost of a save is its item's size: about 0.6 KB for the config. With everything the firmware stores at its
-//! largest (5.9 KB of keymap, macros and records, carried around the ring), each sector is erased once per about 90
-//! config saves, which makes about 9 million saves before the first sector reaches its rated cycles
+//! The cost of a save is its item's size: at most 0.6 KB for the config. With everything the firmware stores at its
+//! largest (6.6 KB of keymap, macros, records and the four screen-hop arrangements, carried around the ring), each
+//! sector is erased once per about 90 config saves, which makes about 9 million saves before the first sector reaches
+//! its rated cycles
 //! (`endurance_with_the_firmware_items`). How often saves come is the engine's business: it saves 5 s after the last
 //! change and caps the rate of saves (`kvm_core::engine`, `SAVE_BURST`), so even a host script that changes a setting
 //! every few seconds for years cannot wear the flash out.
@@ -529,9 +530,12 @@ mod tests {
     const RATED_ERASES: u64 = 100_000;
 
     /// Stores everything the firmware keeps, at its largest: 8 keymap layers, a full macro buffer, the keymap
-    /// settings, both programming records. Returns the bytes it takes in flash.
+    /// settings, both programming records, the four screen-hop arrangements. Returns the bytes it takes in flash.
     fn firmware_items(s: &mut Store, f: &mut Ram) -> usize {
         use kvm_vial::keymap::{LAYER_ITEM_LEN, MACRO_BUFFER};
+        for a in 0..kvm_proto::ctrl::MAX_ARRANGEMENTS as u16 {
+            s.write(f, crate::config::ARRANGEMENT_ITEM + a, &[a as u8; crate::config::ARRANGEMENT_ITEM_MAX]).unwrap();
+        }
         for l in 0..kvm_vial::LAYERS as u16 {
             s.write(f, 0x0110 + l, &[l as u8 + 1; LAYER_ITEM_LEN]).unwrap();
         }
@@ -549,7 +553,7 @@ mod tests {
         let mut f = Ram::new(FIRMWARE_SECTORS);
         let mut s = Store::mount(&mut f, FIRMWARE_SECTORS).unwrap();
         let cold = firmware_items(&mut s, &mut f);
-        assert!((5_500..6_500).contains(&cold), "{cold} bytes besides the config");
+        assert!((6_000..7_000).contains(&cold), "{cold} bytes besides the config");
         let saves = 20_000u32;
         for k in 0..saves {
             // A different config every time, so each one is written.

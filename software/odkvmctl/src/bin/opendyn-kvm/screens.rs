@@ -1,17 +1,18 @@
-//! The Screens page (screen hop, software.md §4.14 and §9): whether screen hop runs and what it needs, which profiles
-//! use it, the arrangement of both PCs' screens (dragged into place on a canvas, each screen's resolution, scaling and
-//! place on its own PC), and how the pointer moves.
+//! The Screens page (screen hop, software.md §4.14 and §9): whether screen hop runs and what it needs, which arrangement
+//! each profile uses, the arrangements of the hosts' screens (both PCs' and the wireless hosts'; dragged into place on a
+//! canvas, each screen's resolution, scaling and place on its own computer), and how the pointer moves.
 //!
-//! The arrangement is the KVM's. The page edits a draft of it (screens, each PC's mapping and units): drags, screens
-//! added, removed or edited, and detection all go there, and to the KVM only with Apply, all of it at once. After Apply
-//! the draft stays until the KVM's copy has it, so that a refusal keeps the edits.
+//! The arrangements are the KVM's. The page edits a draft of one of them (its screens, and each host's mapping, units
+//! and pointer): drags, screens added, removed or edited, and detection all go there, and to the KVM only with Apply,
+//! all of it at once. After Apply the draft stays until the KVM's copy has it, so that a refusal keeps the edits; while
+//! there is one, the page stays on its arrangement.
 
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use kvm_proto::ctrl::{
-    Accel, ConfigValue, HOP_CORNER_MAX, HOP_SPEED, HopState, MAX_SCREENS, Mapping, Pc, Port, PortMode, SCREEN_PX,
-    Screen, Units,
+    Accel, BT_HOSTS, BtPointer, ConfigValue, HOP_CORNER_MAX, HOP_SPEED, HOSTS, HopState, Host, MAX_ARRANGEMENTS,
+    MAX_SCREENS, Mapping, Pc, Port, PortMode, ProfileName, SCREEN_PX, Screen, Units,
 };
 use odkvmctl::client::{HopView, Snapshot};
 use odkvmctl::screens::Detection;
@@ -58,24 +59,31 @@ const RECHECK: Duration = Duration::from_secs(3);
 /// as soon as it is sent, before the KVM answered (and it may refuse).
 const APPLY_GRACE: Duration = Duration::from_secs(2);
 
-/// The arrangement as the page edits it: the screens, and each PC's mapping and units. Edits go to a draft of it, and
-/// to the KVM only with Apply, all at once.
+/// An arrangement as the page edits it: its screens, and each host's mapping, units and (a wireless host's) pointer.
+/// Edits go to a draft of it, and to the KVM only with Apply, all at once.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Arrangement {
     screens: [Screen; MAX_SCREENS],
-    mapping: [Mapping; 2],
-    units: [Units; 2],
+    mapping: [Mapping; HOSTS],
+    units: [Units; HOSTS],
+    bt_pointer: [BtPointer; BT_HOSTS],
 }
 
 impl Arrangement {
-    fn of(hop: &HopView) -> Arrangement {
-        Arrangement { screens: hop.screens, mapping: hop.mapping, units: hop.units }
+    fn of(hop: &HopView, a: u8) -> Arrangement {
+        Arrangement {
+            screens: hop.arrangements[a as usize].screens,
+            mapping: hop.mapping,
+            units: hop.units,
+            bt_pointer: hop.bt_pointer,
+        }
     }
 }
 
-/// Edits not yet applied, or applied and not yet confirmed by the KVM's copy.
+/// Edits of arrangement `a` not yet applied, or applied and not yet confirmed by the KVM's copy.
 #[derive(Debug, Clone, Copy)]
 struct Draft {
+    a: u8,
     edit: Arrangement,
     applied: Option<Instant>,
 }
@@ -83,6 +91,10 @@ struct Draft {
 /// What the page keeps between frames.
 #[derive(Default)]
 pub struct Editor {
+    /// The arrangement picked on the page; None: the active profile's (or the first).
+    pick: Option<u8>,
+    /// Its name while being typed.
+    name: Option<String>,
     selected: Option<usize>,
     /// The screen being dragged: its slot, the arrangement as it is being changed, the canvas's mapping frozen at the
     /// start of the drag, and where in the screen it was grabbed (arrangement pixels).
@@ -101,15 +113,20 @@ pub struct Editor {
 }
 
 impl Editor {
+    /// The arrangement shown: the draft's, the one picked, or the active profile's.
+    fn arrangement(&self, hop: &HopView) -> u8 {
+        self.draft.map(|d| d.a).or(self.pick).unwrap_or(hop.current())
+    }
+
     /// The arrangement as shown and edited: the draft, or the KVM's.
     fn current(&self, hop: &HopView) -> Arrangement {
-        self.draft.map_or_else(|| Arrangement::of(hop), |d| d.edit)
+        self.draft.map_or_else(|| Arrangement::of(hop, self.arrangement(hop)), |d| d.edit)
     }
 
     /// Drops the draft once the KVM's copy is what it says (after Apply, and its grace).
     fn settle(&mut self, hop: &HopView) {
         let Some(d) = self.draft else { return };
-        let same = d.edit == Arrangement::of(hop);
+        let same = d.edit == Arrangement::of(hop, d.a);
         let settled = match d.applied {
             None => same,
             Some(at) => same && at.elapsed() > APPLY_GRACE,
@@ -122,6 +139,11 @@ impl Editor {
 
 #[cfg(test)]
 impl Editor {
+    /// Shows arrangement `a` (the tests edit others than the active profile's).
+    pub fn pick(&mut self, a: u8) {
+        self.pick = Some(a);
+    }
+
     /// Edits wait for Apply, or for the KVM to confirm them.
     pub fn has_draft(&self) -> bool {
         self.draft.is_some()
@@ -163,7 +185,7 @@ struct View {
 fn shown(screens: &[Screen]) -> (Vec2, Vec2) {
     let (min, max) = screens
         .iter()
-        .filter(|s| s.pc.is_some())
+        .filter(|s| s.host.is_some())
         .map(world)
         .reduce(|(a0, a1), (b0, b1)| (a0.min(b0), a1.max(b1)))
         .unwrap_or((Vec2::ZERO, Vec2::new(3840.0, 1080.0)));
@@ -199,7 +221,7 @@ fn world(s: &Screen) -> (Vec2, Vec2) {
 
 /// A screen in use that screen hop goes onto.
 fn on_for_hop(s: &Screen) -> bool {
-    s.pc.is_some() && !s.off
+    s.host.is_some() && !s.off
 }
 
 fn overlaps(a: &Screen, b: &Screen) -> bool {
@@ -214,7 +236,7 @@ fn snap(screens: &[Screen; MAX_SCREENS], slot: usize, want: Vec2, tol: f32) -> [
     let size = Vec2::new(w as f32, h as f32);
     let mut best = [(tol, want.x), (tol, want.y)];
     for (i, o) in screens.iter().enumerate() {
-        if i == slot || o.pc.is_none() {
+        if i == slot || o.host.is_none() {
             continue;
         }
         let (o0, o1) = world(o);
@@ -231,17 +253,58 @@ fn snap(screens: &[Screen; MAX_SCREENS], slot: usize, want: Vec2, tol: f32) -> [
     [clamp(best[0].1), clamp(best[1].1)]
 }
 
-/// A screen added by hand: right of all the others here, and on its PC right of its other screens; its place there
-/// then follows from where it is dragged ([`odkvmctl::screens::desks`]).
-fn new_screen(screens: &[Screen; MAX_SCREENS], pc: Pc, units: Units, w: u16, h: u16) -> Screen {
-    let right = screens.iter().filter(|s| s.pc.is_some()).map(|s| world(s).1.x as i32).max().unwrap_or(0);
-    let top = screens.iter().filter(|s| s.pc.is_some()).map(|s| s.at[1] as i32).min().unwrap_or(0);
+/// A screen added by hand: right of all the others here, and on its computer right of its other screens; its place
+/// there then follows from where it is dragged ([`odkvmctl::screens::desks`]).
+fn new_screen(screens: &[Screen; MAX_SCREENS], host: Host, units: Units, w: u16, h: u16) -> Screen {
+    let right = screens.iter().filter(|s| s.host.is_some()).map(|s| world(s).1.x as i32).max().unwrap_or(0);
+    let top = screens.iter().filter(|s| s.host.is_some()).map(|s| s.at[1] as i32).min().unwrap_or(0);
     let desk_right =
-        screens.iter().filter(|s| s.pc == Some(pc)).map(|s| s.desk[0] as i32 + s.desk_size(units)[0]).max();
+        screens.iter().filter(|s| s.host == Some(host)).map(|s| s.desk[0] as i32 + s.desk_size(units)[0]).max();
     Screen {
         desk: [desk_right.unwrap_or(0).clamp(i16::MIN as i32, i16::MAX as i32) as i16, 0],
-        ..Screen::new(pc, w, h, [right.min(30_000) as i16, top as i16])
+        ..Screen::new(host, w, h, [right.min(30_000) as i16, top as i16])
     }
+}
+
+/// A host as the page names it: PC1, PC2, or a wireless host's name.
+pub(crate) fn host_label(s: &Snapshot, h: Host) -> String {
+    match h.bt_slot() {
+        None => h.name().to_uppercase(),
+        Some(n) => s.bt.iter().find(|b| b.slot == n).map_or_else(|| fl!("host-n", n = n), |b| b.name.clone()),
+    }
+}
+
+/// The hosts a screen can belong to here: both PCs, the wireless hosts paired now, and any other with a screen in
+/// `screens`.
+fn hosts_offered(s: &Snapshot, screens: &[Screen; MAX_SCREENS]) -> Vec<Host> {
+    let paired = |n: u8| s.bt.iter().any(|b| b.slot == n && b.bonded());
+    Host::ALL
+        .iter()
+        .copied()
+        .filter(|h| match h.bt_slot() {
+            None => true,
+            Some(n) => paired(n) || screens.iter().any(|x| x.host == Some(*h)),
+        })
+        .collect()
+}
+
+/// Every host's colour: the PCs', and violet for the wireless hosts, as elsewhere.
+fn host_colors(s: &Snapshot) -> [Color32; HOSTS] {
+    let pcs = pc_colors(s).map(look::color32);
+    core::array::from_fn(|i| if i < 2 { pcs[i] } else { crate::bluetooth::violet() })
+}
+
+/// A picker for a profile's arrangement: none (screen hop off) or one of them. Returns the choice if it changed.
+pub(crate) fn arrangement_picker(ui: &mut Ui, id: egui::IdSalt, now: Option<u8>, hop: &HopView) -> Option<Option<u8>> {
+    let title =
+        |a: Option<u8>| a.map_or_else(|| fl!("hop-arrangement-none"), |a| hop.arrangements[a as usize].title(a));
+    let mut pick = now;
+    egui::ComboBox::from_id_salt(id).selected_text(title(now)).width(130.0).show_ui(ui, |ui| {
+        for a in std::iter::once(None).chain((0..MAX_ARRANGEMENTS as u8).map(Some)) {
+            ui.selectable_value(&mut pick, a, title(a));
+        }
+    });
+    (pick != now).then_some(pick)
 }
 
 fn state_color(s: HopState) -> Color32 {
@@ -255,31 +318,33 @@ fn state_color(s: HopState) -> Color32 {
 impl App {
     /// Changes the draft (made from the KVM's arrangement if there is none); a draft no different from the KVM's goes.
     fn edit(&mut self, hop: &HopView, f: impl FnOnce(&mut Arrangement)) {
+        let n = self.screens.arrangement(hop);
         let mut a = self.screens.current(hop);
         f(&mut a);
-        self.screens.draft = (a != Arrangement::of(hop)).then_some(Draft { edit: a, applied: None });
+        self.screens.draft = (a != Arrangement::of(hop, n)).then_some(Draft { a: n, edit: a, applied: None });
     }
 
-    /// `next` as the draft's screens, after giving `pcs`' screens their place on their own computer from the
-    /// arrangement where it isn't fixed (`odkvmctl::screens::desks`): where a screen is dragged is where it is on its PC.
-    fn arrange(&mut self, hop: &HopView, next: [Screen; MAX_SCREENS], pcs: &[Pc]) {
+    /// `next` as the draft's screens, after giving `hosts`' screens their place on their own computer from the
+    /// arrangement where it isn't fixed (`odkvmctl::screens::desks`): where a screen is dragged is where it is on its
+    /// computer.
+    fn arrange(&mut self, hop: &HopView, next: [Screen; MAX_SCREENS], hosts: &[Host]) {
         self.edit(hop, |a| {
             a.screens = next;
-            for pc in pcs {
-                a.screens = odkvmctl::screens::desks(&a.screens, *pc, a.units[pc.index()]);
+            for h in hosts {
+                a.screens = odkvmctl::screens::desks(&a.screens, *h, a.units[h.index()]);
             }
         });
     }
 
-    /// Screen `slot` as edited (`was`: the PC it belonged to), with the places on their computers derived again unless
-    /// the edit typed one in.
+    /// Screen `slot` as edited (`was`: the host it belonged to), with the places on their computers derived again
+    /// unless the edit typed one in.
     fn edit_screen(
         &mut self,
         hop: &HopView,
         screens: &[Screen; MAX_SCREENS],
         slot: usize,
         sc: Screen,
-        was: Option<Pc>,
+        was: Option<Host>,
     ) {
         let mut next = *screens;
         next[slot] = sc;
@@ -287,28 +352,33 @@ impl App {
             self.edit(hop, |a| a.screens = next);
             return;
         }
-        let pcs: Vec<Pc> = [was, sc.pc].into_iter().flatten().collect();
-        self.arrange(hop, next, &pcs);
+        let hosts: Vec<Host> = [was, sc.host].into_iter().flatten().collect();
+        self.arrange(hop, next, &hosts);
     }
 
-    /// Sends the draft: every screen slot, mapping and units that differ from the KVM's. It stays until the KVM's copy
-    /// has it all, so that a refusal leaves the edits to try again.
+    /// Sends the draft: every screen slot of its arrangement, and every host's mapping, units and pointer, that differ
+    /// from the KVM's. It stays until the KVM's copy has it all, so that a refusal leaves the edits to try again.
     pub(crate) fn apply(&mut self, hop: &HopView) {
         let Some(d) = self.screens.draft.as_mut() else { return };
-        let sent = d.edit;
+        let (n, sent) = (d.a, d.edit);
         d.applied = Some(Instant::now());
-        let kvm = Arrangement::of(hop);
+        let kvm = Arrangement::of(hop, n);
         for (i, (a, b)) in kvm.screens.iter().zip(sent.screens.iter()).enumerate() {
             if a != b {
-                self.set(ConfigValue::Screen(i as u8, *b));
+                self.set(ConfigValue::Screen(n, i as u8, *b));
             }
         }
-        for pc in [Pc::Pc1, Pc::Pc2] {
-            if kvm.mapping[pc.index()] != sent.mapping[pc.index()] {
-                self.set(ConfigValue::HopMapping(pc, sent.mapping[pc.index()]));
+        for h in Host::ALL.iter().copied() {
+            if kvm.mapping[h.index()] != sent.mapping[h.index()] {
+                self.set(ConfigValue::HopMapping(h, sent.mapping[h.index()]));
             }
-            if kvm.units[pc.index()] != sent.units[pc.index()] {
-                self.set(ConfigValue::HopUnits(pc, sent.units[pc.index()]));
+            if kvm.units[h.index()] != sent.units[h.index()] {
+                self.set(ConfigValue::HopUnits(h, sent.units[h.index()]));
+            }
+        }
+        for i in 0..BT_HOSTS {
+            if kvm.bt_pointer[i] != sent.bt_pointer[i] {
+                self.set(ConfigValue::BtPointer(i as u8, sent.bt_pointer[i]));
             }
         }
     }
@@ -352,17 +422,20 @@ impl App {
             ui.add_space(4.0);
             if let Some((active, count, list)) = s.profiles() {
                 ui.label(RichText::new(fl!("hop-in-profiles")).strong());
-                ui.horizontal_wrapped(|ui| {
+                egui::Grid::new("hop-profiles").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                     for (i, p) in list.iter().enumerate().take(count as usize) {
-                        let mut on = p.hop;
                         let label = if i as u8 == active {
                             fl!("hop-profile-active", name = p.name.as_str())
                         } else {
                             p.name.clone()
                         };
-                        if ui.checkbox(&mut on, label).changed() {
-                            self.set(ConfigValue::ProfileHop(i as u8, on));
+                        ui.label(label);
+                        if let Some(a) =
+                            arrangement_picker(ui, egui::IdSalt::new(("hop-profile", i)), p.arrangement, hop)
+                        {
+                            self.set(ConfigValue::ProfileArrangement(i as u8, a));
                         }
+                        ui.end_row();
                     }
                 });
             }
@@ -375,12 +448,58 @@ impl App {
         });
     }
 
+    /// Which arrangement the page shows (not while a draft of one waits), and its name.
+    fn arrangement_choice(&mut self, ui: &mut Ui, hop: &HopView) {
+        let n = self.screens.arrangement(hop);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(self.screens.draft.is_none(), |ui| {
+                let title = |a: u8| {
+                    let t = hop.arrangements[a as usize].title(a);
+                    if hop.in_use == Some(a) { fl!("hop-arrangement-in-use", name = t) } else { t }
+                };
+                let mut pick = n;
+                egui::ComboBox::from_id_salt("hop-arrangement-pick").selected_text(title(n)).width(170.0).show_ui(
+                    ui,
+                    |ui| {
+                        for a in 0..MAX_ARRANGEMENTS as u8 {
+                            ui.selectable_value(&mut pick, a, title(a));
+                        }
+                    },
+                );
+                if pick != n {
+                    self.screens.pick = Some(pick);
+                    self.screens.selected = None;
+                    self.screens.name = None;
+                }
+            });
+            ui.label(fl!("hop-arrangement-name"));
+            let kvm = hop.arrangements[n as usize].name.clone();
+            let mut text = self.screens.name.clone().unwrap_or_else(|| kvm.clone());
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text(hop.arrangements[n as usize].title(n))
+                    .char_limit(kvm_proto::ctrl::PROFILE_NAME_MAX)
+                    .desired_width(130.0),
+            );
+            if r.has_focus() {
+                self.screens.name = Some(text);
+            } else if r.lost_focus() {
+                self.screens.name = None;
+                let t = text.trim();
+                if t != kvm {
+                    self.set(ConfigValue::ArrangementName(n, ProfileName::new(t)));
+                }
+            }
+        });
+    }
+
     fn arrangement_card(&mut self, ui: &mut Ui, s: &Snapshot, hop: &HopView) {
-        let colors = pc_colors(s).map(look::color32);
+        let colors = host_colors(s);
         let cur = self.screens.current(hop);
         let screens = self.screens.drag.as_ref().map_or(cur.screens, |d| d.screens);
         card(ui, &fl!("hop-arrangement"), |ui| {
             note(ui, fl!("hop-arrangement-note"));
+            self.arrangement_choice(ui, hop);
             self.canvas(ui, s, hop, &screens, cur.mapping, colors);
             let overlap = (0..MAX_SCREENS).any(|i| {
                 (i + 1..MAX_SCREENS)
@@ -389,16 +508,16 @@ impl App {
             if overlap {
                 ui.label(RichText::new(fl!("hop-overlap")).color(ink(ui, WARN)));
             }
-            let free = screens.iter().any(|x| x.pc.is_none());
+            let free = screens.iter().any(|x| x.host.is_none());
             ui.horizontal_wrapped(|ui| {
-                for pc in [Pc::Pc1, Pc::Pc2] {
-                    let label = fl!("hop-add-screen", pc = pc.name().to_uppercase());
+                for h in hosts_offered(s, &screens) {
+                    let label = fl!("hop-add-screen", pc = host_label(s, h));
                     if ui.add_enabled(free, egui::Button::new(label)).clicked()
-                        && let Some(slot) = screens.iter().position(|x| x.pc.is_none())
+                        && let Some(slot) = screens.iter().position(|x| x.host.is_none())
                     {
                         let mut next = screens;
-                        next[slot] = new_screen(&screens, pc, cur.units[pc.index()], 1920, 1080);
-                        self.arrange(hop, next, &[pc]);
+                        next[slot] = new_screen(&screens, h, cur.units[h.index()], 1920, 1080);
+                        self.arrange(hop, next, &[h]);
                         self.screens.selected = Some(slot);
                     }
                 }
@@ -408,13 +527,13 @@ impl App {
                         self.detect(hop, pc);
                     }
                 }
-                if let Some(i) = self.screens.selected.filter(|i| screens[*i].pc.is_some())
+                if let Some(i) = self.screens.selected.filter(|i| screens[*i].host.is_some())
                     && ui.button(fl!("hop-remove-screen")).clicked()
                 {
                     let mut next = screens;
                     next[i] = Screen::NONE;
-                    let pcs: Vec<Pc> = screens[i].pc.into_iter().collect();
-                    self.arrange(hop, next, &pcs);
+                    let hosts: Vec<Host> = screens[i].host.into_iter().collect();
+                    self.arrange(hop, next, &hosts);
                     self.screens.selected = None;
                 }
             });
@@ -442,16 +561,23 @@ impl App {
                 }
                 None => {}
             }
-            if let Some(i) = self.screens.selected.filter(|i| screens[*i].pc.is_some()) {
+            if let Some(i) = self.screens.selected.filter(|i| screens[*i].host.is_some()) {
                 ui.separator();
-                self.screen_editor(ui, hop, &screens, i);
+                self.screen_editor(ui, s, hop, &screens, i);
             }
             ui.separator();
+            // PC1 and PC2, and the wireless hosts with a screen here.
+            let hosts: Vec<Host> = Host::ALL
+                .iter()
+                .copied()
+                .filter(|h| h.as_pc().is_some() || screens.iter().any(|x| x.host == Some(*h)))
+                .collect();
             egui::Grid::new("hop-mapping").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-                for pc in [Pc::Pc1, Pc::Pc2] {
-                    ui.label(fl!("hop-mapping-of", pc = pc.name().to_uppercase()));
-                    let mut m = cur.mapping[pc.index()];
-                    egui::ComboBox::from_id_salt(("hop-mapping", pc.index()))
+                for h in hosts {
+                    let label = host_label(s, h);
+                    ui.label(fl!("hop-mapping-of", pc = label.as_str()));
+                    let mut m = cur.mapping[h.index()];
+                    egui::ComboBox::from_id_salt(("hop-mapping", h.index()))
                         .selected_text(names::mapping(m))
                         .width(260.0)
                         .show_ui(ui, |ui| {
@@ -459,13 +585,13 @@ impl App {
                                 ui.selectable_value(&mut m, *x, names::mapping(*x));
                             }
                         });
-                    if m != cur.mapping[pc.index()] {
-                        self.edit(hop, |a| a.mapping[pc.index()] = m);
+                    if m != cur.mapping[h.index()] {
+                        self.edit(hop, |a| a.mapping[h.index()] = m);
                     }
                     ui.end_row();
-                    ui.label(fl!("hop-units-of", pc = pc.name().to_uppercase()));
-                    let mut u = cur.units[pc.index()];
-                    egui::ComboBox::from_id_salt(("hop-units", pc.index()))
+                    ui.label(fl!("hop-units-of", pc = label.as_str()));
+                    let mut u = cur.units[h.index()];
+                    egui::ComboBox::from_id_salt(("hop-units", h.index()))
                         .selected_text(names::units(u))
                         .width(260.0)
                         .show_ui(ui, |ui| {
@@ -473,13 +599,31 @@ impl App {
                                 ui.selectable_value(&mut u, *x, names::units(*x));
                             }
                         });
-                    if u != cur.units[pc.index()] {
-                        self.edit(hop, |a| a.units[pc.index()] = u);
+                    if u != cur.units[h.index()] {
+                        self.edit(hop, |a| a.units[h.index()] = u);
                     }
                     ui.end_row();
+                    // A wireless host takes the absolute pointer, or only relative motion.
+                    if let Some(n) = h.bt_slot() {
+                        let k = n as usize - 1;
+                        ui.label(fl!("hop-bt-pointer-of", host = label.as_str()));
+                        let mut p = cur.bt_pointer[k];
+                        egui::ComboBox::from_id_salt(("hop-bt-pointer", k))
+                            .selected_text(names::bt_pointer(p))
+                            .width(260.0)
+                            .show_ui(ui, |ui| {
+                                for x in BtPointer::ALL {
+                                    ui.selectable_value(&mut p, *x, names::bt_pointer(*x));
+                                }
+                            });
+                        if p != cur.bt_pointer[k] {
+                            self.edit(hop, |a| a.bt_pointer[k] = p);
+                        }
+                        ui.end_row();
+                    }
                     // This computer runs Windows, which puts the absolute pointer on its main screen alone: across all
                     // screens, every position lands off and the other screens can't be reached (2026-11-12).
-                    if cfg!(windows) && s.this_pc() == Some(pc) && m == Mapping::Desktop {
+                    if cfg!(windows) && s.this_pc().map(Host::pc) == Some(h) && m == Mapping::Desktop {
                         ui.label("");
                         ui.label(RichText::new(fl!("hop-mapping-windows")).color(ink(ui, WARN)));
                         ui.end_row();
@@ -487,6 +631,9 @@ impl App {
                 }
             });
             note(ui, fl!("hop-mapping-note"));
+            if screens.iter().any(|x| x.host.is_some_and(|h| h.bt_slot().is_some())) {
+                note(ui, fl!("hop-bt-pointer-note"));
+            }
         });
     }
 
@@ -498,8 +645,8 @@ impl App {
         s: &Snapshot,
         hop: &HopView,
         screens: &[Screen; MAX_SCREENS],
-        mapping: [Mapping; 2],
-        colors: [Color32; 2],
+        mapping: [Mapping; HOSTS],
+        colors: [Color32; HOSTS],
     ) {
         let width = ui.available_width();
         let height = match &self.screens.drag {
@@ -514,7 +661,7 @@ impl App {
         let dark = ui.visuals().dark_mode;
         painter.rect_filled(canvas, CornerRadius::same(8), ui.visuals().extreme_bg_color);
         let view = self.screens.drag.as_ref().map_or_else(|| View::fit(canvas, screens), |d| d.view);
-        if screens.iter().all(|x| x.pc.is_none()) {
+        if screens.iter().all(|x| x.host.is_none()) {
             painter.text(
                 canvas.center(),
                 egui::Align2::CENTER_CENTER,
@@ -526,15 +673,16 @@ impl App {
         if bg.clicked() {
             self.screens.selected = None;
         }
-        // The main screen matters (and is marked) only on a PC that maps the pointer onto it alone.
-        let mains = [Pc::Pc1, Pc::Pc2].map(|pc| {
-            let only_main = mapping[pc.index()] == Mapping::MainScreen;
-            only_main.then(|| kvm_core::hop::main_screen(screens, pc)).flatten()
+        // The main screen matters (and is marked) only on a host that maps the pointer onto it alone.
+        let mains: [Option<usize>; HOSTS] = core::array::from_fn(|i| {
+            let h = Host::from_index(i)?;
+            let only_main = mapping[i] == Mapping::MainScreen;
+            only_main.then(|| kvm_core::hop::main_screen(screens, h)).flatten()
         });
         // Screens off for hop on top (they lie on another PC's screen), drawn see-through.
         let order: Vec<usize> = (0..MAX_SCREENS)
             .filter(|i| on_for_hop(&screens[*i]))
-            .chain((0..MAX_SCREENS).filter(|i| screens[*i].pc.is_some() && screens[*i].off))
+            .chain((0..MAX_SCREENS).filter(|i| screens[*i].host.is_some() && screens[*i].off))
             .collect();
         let rect_of = |sc: &Screen| {
             let (min, max) = world(sc);
@@ -594,31 +742,32 @@ impl App {
                 if d.screens[d.slot] != d.from {
                     let mut before = d.screens;
                     before[d.slot] = d.from;
-                    released = Some((before, d.screens, d.from.pc));
+                    released = Some((before, d.screens, d.from.host));
                 }
             }
             resp.on_hover_text(fl!("hop-screen-hover"));
         }
         let mut paint = self.screens.drag.as_ref().map_or(*screens, |d| d.screens);
-        if let Some((_, next, pc)) = released {
-            let pcs: Vec<Pc> = pc.into_iter().collect();
-            self.arrange(hop, next, &pcs);
+        if let Some((_, next, host)) = released {
+            let hosts: Vec<Host> = host.into_iter().collect();
+            self.arrange(hop, next, &hosts);
             paint = self.screens.current(hop).screens;
         }
         #[cfg(test)]
         self.screens.drawn.clear();
         let paint_order: Vec<usize> = (0..MAX_SCREENS)
             .filter(|i| on_for_hop(&paint[*i]))
-            .chain((0..MAX_SCREENS).filter(|i| paint[*i].pc.is_some() && paint[*i].off))
+            .chain((0..MAX_SCREENS).filter(|i| paint[*i].host.is_some() && paint[*i].off))
             .collect();
         for i in paint_order {
             let sc = &paint[i];
-            let Some(pc) = sc.pc else { continue };
+            let Some(host) = sc.host else { continue };
+            let label = host_label(s, host);
             let (min, max) = world(sc);
             let r = Rect::from_min_max(view.canvas(min), view.canvas(max)).shrink(1.0);
             #[cfg(test)]
             self.screens.drawn.push((i, r, *sc));
-            let c = colors[pc.index()];
+            let c = colors[host.index()];
             let selected = self.screens.selected == Some(i);
             let stroke =
                 if selected { Stroke::new(2.5, ui.visuals().strong_text_color()) } else { Stroke::new(1.5, c) };
@@ -634,15 +783,15 @@ impl App {
                 painter.rect_filled(r, CornerRadius::same(4), c.gamma_multiply(if dark { 0.30 } else { 0.22 }));
                 painter.rect_stroke(r, CornerRadius::same(4), stroke, StrokeKind::Inside);
             }
-            let mut text = format!("{}\n{}×{}", pc.name().to_uppercase(), sc.w, sc.h);
+            let mut text = format!("{label}\n{}×{}", sc.w, sc.h);
             if sc.scale != 100 {
                 text += &format!(" · {}%", sc.scale);
             }
             if sc.off {
                 // One line along its bottom edge, clear of the label of the screen it lies on.
-                text = format!("{} · {}", pc.name().to_uppercase(), fl!("hop-screen-off-short"));
+                text = format!("{label} · {}", fl!("hop-screen-off-short"));
             }
-            if mains[pc.index()] == Some(i) {
+            if mains[host.index()] == Some(i) {
                 text += &format!("\n{}", fl!("hop-main-screen"));
             }
             let (anchor, align) = if sc.off {
@@ -669,15 +818,15 @@ impl App {
         }
     }
 
-    fn screen_editor(&mut self, ui: &mut Ui, hop: &HopView, screens: &[Screen; MAX_SCREENS], i: usize) {
+    fn screen_editor(&mut self, ui: &mut Ui, s: &Snapshot, hop: &HopView, screens: &[Screen; MAX_SCREENS], i: usize) {
         let before = screens[i];
         let mut sc = before;
         egui::Grid::new("hop-screen").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
             ui.label(fl!("hop-screen-pc"));
-            ui.horizontal(|ui| {
-                for pc in [Pc::Pc1, Pc::Pc2] {
-                    if ui.radio(sc.pc == Some(pc), pc.name().to_uppercase()).clicked() {
-                        sc.pc = Some(pc);
+            ui.horizontal_wrapped(|ui| {
+                for h in hosts_offered(s, screens) {
+                    if ui.radio(sc.host == Some(h), host_label(s, h)).clicked() {
+                        sc.host = Some(h);
                     }
                 }
             });
@@ -738,19 +887,20 @@ impl App {
                 self.screens.desk_typed = true;
                 sc.fixed = true;
             }
-            self.edit_screen(hop, screens, i, sc, before.pc);
+            self.edit_screen(hop, screens, i, sc, before.host);
         }
     }
 
     /// This computer's screens into the draft (`odkvmctl::screens::merge`), with its mapping and units: applied with
     /// the rest of the arrangement.
     fn detect(&mut self, hop: &HopView, pc: Pc) {
+        let host = Host::pc(pc);
         match odkvmctl::screens::detect() {
             Ok(found) => {
                 self.edit(hop, |a| {
-                    a.screens = odkvmctl::screens::merge(&a.screens, pc, &found);
-                    a.mapping[pc.index()] = odkvmctl::screens::MAPPING;
-                    a.units[pc.index()] = found.units;
+                    a.screens = odkvmctl::screens::merge(&a.screens, host, &found);
+                    a.mapping[host.index()] = odkvmctl::screens::MAPPING;
+                    a.units[host.index()] = found.units;
                 });
                 self.screens.detect_note = Some(Ok(fl!(
                     "hop-detected",
@@ -769,15 +919,16 @@ impl App {
     /// Detect button puts it right).
     fn freshness(&mut self, ui: &mut Ui, cur: &Arrangement, hop: &HopView, pc: Pc) {
         let screens = &cur.screens;
+        let host = Host::pc(pc);
         // The simulator's screens aren't this computer's.
-        if !screens.iter().any(|s| s.pc == Some(pc)) || hop.simulated {
+        if !screens.iter().any(|s| s.host == Some(host)) || hop.simulated {
             return;
         }
         if self.screens.now.as_ref().is_none_or(|(at, _)| at.elapsed() > RECHECK) {
             self.screens.now = Some((Instant::now(), odkvmctl::screens::detect()));
         }
         let Some((_, Ok(now))) = &self.screens.now else { return };
-        if odkvmctl::screens::differs(screens, pc, cur.units[pc.index()], now) {
+        if odkvmctl::screens::differs(screens, host, cur.units[host.index()], now) {
             ui.label(RichText::new(fl!("hop-out-of-date")).color(ink(ui, WARN)));
         }
     }
@@ -839,8 +990,8 @@ mod tests {
     #[test]
     fn a_dragged_screen_snaps_to_its_neighbours_edges() {
         let mut l = [Screen::NONE; MAX_SCREENS];
-        l[0] = Screen::new(Pc::Pc1, 1920, 1080, [0, 0]);
-        l[1] = Screen::new(Pc::Pc2, 2560, 1440, [3000, 500]);
+        l[0] = Screen::new(Host::Pc1, 1920, 1080, [0, 0]);
+        l[1] = Screen::new(Host::Pc2, 2560, 1440, [3000, 500]);
         // Dropped 30 right of PC1's right edge and 20 below its top: snapped to touch it, tops aligned.
         assert_eq!(snap(&l, 1, Vec2::new(1950.0, 20.0), 40.0), [1920, 0]);
         // Far from everything: where it was dropped.
@@ -852,10 +1003,10 @@ mod tests {
     #[test]
     fn new_and_detected_screens_go_right_of_the_others() {
         let mut l = [Screen::NONE; MAX_SCREENS];
-        l[0] = Screen::new(Pc::Pc1, 1920, 1080, [0, 0]);
-        let n = new_screen(&l, Pc::Pc1, Units::Physical, 2560, 1440);
+        l[0] = Screen::new(Host::Pc1, 1920, 1080, [0, 0]);
+        let n = new_screen(&l, Host::Pc1, Units::Physical, 2560, 1440);
         assert_eq!((n.at, n.desk), ([1920, 0], [1920, 0]));
-        let n = new_screen(&l, Pc::Pc2, Units::Physical, 1920, 1080);
+        let n = new_screen(&l, Host::Pc2, Units::Physical, 1920, 1080);
         assert_eq!((n.at, n.desk), ([1920, 0], [0, 0]));
     }
 }

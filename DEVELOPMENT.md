@@ -77,6 +77,7 @@ cargo build -p odkvmctl --release                      # odkvmctl and opendyn-kv
 cargo build -p odkvmctl --release --target x86_64-pc-windows-gnu
 OPENDYN_SHOTS=/tmp/shots cargo test -p odkvmctl --bin opendyn-kvm -- --ignored screenshots   # every GUI page as an image
 OPENDYN_SIM_BT=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim   # the same with the Bluetooth module (0.16.0)
+OPENDYN_SIM_BT=dongle cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the module as an ESP32-C3 board on Other
 OPENDYN_SIM_HOP=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the same with screen hop set up
 OPENDYN_LANG=de cargo run -p odkvmctl --bin odkvmctl -- --sim       # in German (en, fr, de, nb, zh; or Settings → Language)
 ```
@@ -118,8 +119,8 @@ Hardware, firmware and host software each carry a `major.minor.patch` version.
 | What | Now | Where it is set |
 |---|---|---|
 | Hardware | **0.17.0** in design, not ordered yet (0.13.0 to 0.16.0 were designed and never ordered). **0.12.0** is the board ordered as revision 12 | `HW_VERSION` in `hardware/tools/gen_pcb.py` (printed on the board: the design's version) and `kvm_proto::HARDWARE_VERSION` (what the firmware reports: the newest board that was ordered, still 0.12.0) |
-| Firmware, RP2354B and both AT32F405s alike | **0.1.12** | `kvm_proto::FIRMWARE_VERSION` |
-| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.12** | `version` in the root `Cargo.toml` |
+| Firmware, RP2354B and both AT32F405s alike | **0.1.17** | `kvm_proto::FIRMWARE_VERSION` |
+| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.17** | `version` in the root `Cargo.toml` |
 
 - **Hardware:** a new major version is a different board: 1.0.0 will be the mass-production board, 2.0.0 a new design.
   Minor versions are revisions of the same board. When a board is ordered:
@@ -170,7 +171,7 @@ Always route with `--live` and run the checks after every routing run; the route
 
 ## Bring-up status
 
-The first board, a 0.12.0, runs firmware 0.1.10. Faults of the board itself, with their workarounds, are in
+The first board, a 0.12.0, runs firmware 0.1.17. Faults of the board itself, with their workarounds, are in
 [hardware/errata.md](hardware/errata.md).
 
 **Verified on that board:**
@@ -198,3 +199,6 @@ The first board, a 0.12.0, runs firmware 0.1.10. Faults of the board itself, wit
   - the current actually saved.
 - **DDC/CI** switching inputs, and the Windows path.
 - **The Bluetooth module** (boards from 0.16.0) and the **0.17.0** board with the fixes for errata E2 and E3.
+- **The module as an ESP32-C3 board on a front port** works on the first 0.12.0 board (2026-11-14): found, programmed
+  over USB from blank and updated, paired, switched to, and used in screen hop; mouse to host 5–10 ms at the host's
+  15 ms connection interval (1 ms over USB). Still to see: a host that takes 7.5 ms, and several hosts at once.

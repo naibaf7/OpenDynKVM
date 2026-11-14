@@ -18,7 +18,13 @@ pub const PAYLOAD_LEN: usize = REPORT_LEN - 2;
 /// 8: screen hop: each PC's units (`HopUnits`, config keys 0x00AC–0x00AD: whether its desktop counts logical
 /// pixels), and a screen's flags in its slot's PC byte: off for hop (`Screen::off`, bit 7) and a fixed place on its
 /// PC (`Screen::fixed`, bit 6).
-pub const PROTOCOL_VERSION: u8 = 8;
+/// 9: screen hop with arrangements and Bluetooth hosts: four named arrangements (`MAX_ARRANGEMENTS`; their screens at
+/// config keys 0x00B0–0x00CF, arrangement 0's where the one arrangement was, their names at 0x00D0–0x00D3), each
+/// profile's arrangement instead of its switch (`ProfileArrangement`, 0x00A8–0x00AB: 0 none, n + 1 arrangement n), a
+/// screen's owner a [`Host`] (a PC or a Bluetooth host slot, in the slot's PC byte), each Bluetooth host's mapping,
+/// units and pointer (`HopMapping`, `HopUnits` 0x00D8–0x00DF, `BtPointer` 0x00E0–0x00E3); and a front port can hold the
+/// Bluetooth module, an ESP32-C3 board on USB (`PortState::Module`); `Status` carries the passkey typed so far.
+pub const PROTOCOL_VERSION: u8 = 9;
 
 /// Vendor usage page and usage of the control interface; hosts discover it by these, not by VID/PID.
 pub const USAGE_PAGE: u16 = 0xFF4B;
@@ -149,6 +155,9 @@ wire_enum! {
         Fault = 5,
         /// Enumerated but nothing usable (e.g. a hub on a front port).
         Unsupported = 6,
+        /// The KVM's Bluetooth module: an ESP32-C3 board with the module's firmware on this port, for a KVM without the
+        /// module on board (protocol 9, software.md §4.13). `Status.bt_module` says how it is doing.
+        Module = 7,
     }
 }
 
@@ -287,6 +296,101 @@ impl Target {
 
 /// Bluetooth host slots (`Target::Bt1`–`Bt4`, `kvm_proto::link::bt::MAX_HOSTS`).
 pub const BT_HOSTS: usize = 4;
+
+wire_enum! {
+    /// A computer the KVM serves (protocol 9): a PC on its USB port, or a Bluetooth host slot. Its values are
+    /// [`Target`]'s.
+    pub enum Host { Pc1 = 1, Pc2 = 2, Bt1 = 0x11, Bt2 = 0x12, Bt3 = 0x13, Bt4 = 0x14 }
+}
+
+/// The hosts there are ([`Host::index`]): PC1, PC2 and the Bluetooth host slots.
+pub const HOSTS: usize = 2 + BT_HOSTS;
+
+impl Host {
+    pub const fn pc(pc: Pc) -> Host {
+        match pc {
+            Pc::Pc1 => Host::Pc1,
+            Pc::Pc2 => Host::Pc2,
+        }
+    }
+
+    /// Bluetooth host slot `slot` (1–[`BT_HOSTS`]).
+    pub const fn bt(slot: u8) -> Option<Host> {
+        match slot {
+            1 => Some(Host::Bt1),
+            2 => Some(Host::Bt2),
+            3 => Some(Host::Bt3),
+            4 => Some(Host::Bt4),
+            _ => None,
+        }
+    }
+
+    /// The PC, if it is one.
+    pub const fn as_pc(self) -> Option<Pc> {
+        match self {
+            Host::Pc1 => Some(Pc::Pc1),
+            Host::Pc2 => Some(Pc::Pc2),
+            _ => None,
+        }
+    }
+
+    /// The Bluetooth host slot (1–4), if it is one.
+    pub const fn bt_slot(self) -> Option<u8> {
+        match self {
+            Host::Pc1 | Host::Pc2 => None,
+            _ => Some(self as u8 - 0x10),
+        }
+    }
+
+    /// 0–5: PC1, PC2, Bluetooth host slots 1–4.
+    pub const fn index(self) -> usize {
+        match self.bt_slot() {
+            None => self as usize - 1,
+            Some(n) => 1 + n as usize,
+        }
+    }
+
+    pub const fn from_index(i: usize) -> Option<Host> {
+        match i {
+            0 => Some(Host::Pc1),
+            1 => Some(Host::Pc2),
+            _ if i < HOSTS => Host::bt(i as u8 - 1),
+            _ => None,
+        }
+    }
+
+    pub const fn target(self) -> Target {
+        match self {
+            Host::Pc1 => Target::Pc1,
+            Host::Pc2 => Target::Pc2,
+            Host::Bt1 => Target::Bt1,
+            Host::Bt2 => Target::Bt2,
+            Host::Bt3 => Target::Bt3,
+            Host::Bt4 => Target::Bt4,
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Host::Pc1 => "pc1",
+            Host::Pc2 => "pc2",
+            Host::Bt1 => "bt1",
+            Host::Bt2 => "bt2",
+            Host::Bt3 => "bt3",
+            Host::Bt4 => "bt4",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Host> {
+        Host::ALL.iter().copied().find(|h| h.name() == s)
+    }
+}
+
+impl From<Pc> for Host {
+    fn from(pc: Pc) -> Host {
+        Host::pc(pc)
+    }
+}
 
 wire_enum! {
     pub enum StringKind { Manufacturer = 0, Product = 1, Serial = 2 }
@@ -452,7 +556,10 @@ impl ProfileName {
     }
 }
 
-/// Screen slots of the screen-hop arrangement (`ConfigValue::Screen`).
+/// Screen-hop arrangements the KVM keeps (protocol 9): each a name and [`MAX_SCREENS`] screens; a profile uses one of
+/// them or none (`ConfigValue::ProfileArrangement`).
+pub const MAX_ARRANGEMENTS: usize = 4;
+/// Screen slots of an arrangement (`ConfigValue::Screen`).
 pub const MAX_SCREENS: usize = 8;
 /// Screen sizes the KVM accepts, in the PC's pixels, and display scaling in percent.
 pub const SCREEN_PX: core::ops::RangeInclusive<u16> = 160..=16384;
@@ -546,6 +653,32 @@ impl Default for Units {
 }
 
 wire_enum! {
+    /// How screen hop moves a Bluetooth host's pointer (protocol 9).
+    pub enum BtPointer {
+        /// The absolute pointer (report 4 of the module's HID service): exactly where the KVM's pointer is, as on the
+        /// PCs (most desktop systems).
+        Absolute = 0,
+        /// The relative mouse only, for a host that takes no absolute pointer (some tablets and phones): pushed into
+        /// its top-left corner when the pointer comes onto it, then moved by the difference. The host accelerates that
+        /// motion, so its cursor drifts from the KVM's pointer until it is pushed against an edge again.
+        Relative = 1,
+    }
+}
+
+impl BtPointer {
+    pub const fn name(self) -> &'static str {
+        match self {
+            BtPointer::Absolute => "absolute",
+            BtPointer::Relative => "relative",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<BtPointer> {
+        BtPointer::ALL.iter().copied().find(|p| p.name() == s)
+    }
+}
+
+wire_enum! {
     /// Whether screen hop moves the pointer now (`Status.hop`), and if not, why not.
     pub enum HopState {
         /// Not on in the active profile.
@@ -555,11 +688,11 @@ wire_enum! {
         NoAbsolute = 2,
         /// The device on the Mouse port doesn't run Normalized.
         NotNormalized = 3,
-        /// The active PC has no screen in the arrangement.
+        /// The active host (a PC or a Bluetooth host) has no screen in the active profile's arrangement.
         NoScreens = 4,
         /// The active PC uses the boot protocol (its firmware setup, before the OS runs).
         BootProtocol = 5,
-        /// A Bluetooth host has the input.
+        /// A Bluetooth host had the input (until protocol 8; since 9 a Bluetooth host takes part in screen hop).
         Wireless = 6,
     }
 }
@@ -568,8 +701,8 @@ wire_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Screen {
-    /// The PC it belongs to; None: the slot is free.
-    pub pc: Option<Pc>,
+    /// The host it belongs to, a PC or a Bluetooth host (protocol 9); None: the slot is free.
+    pub host: Option<Host>,
     /// Resolution, in the PC's pixels.
     pub w: u16,
     pub h: u16,
@@ -590,10 +723,10 @@ pub struct Screen {
 
 impl Screen {
     pub const NONE: Screen =
-        Screen { pc: None, w: 0, h: 0, scale: 100, desk: [0, 0], at: [0, 0], off: false, fixed: false };
+        Screen { host: None, w: 0, h: 0, scale: 100, desk: [0, 0], at: [0, 0], off: false, fixed: false };
 
-    pub const fn new(pc: Pc, w: u16, h: u16, at: [i16; 2]) -> Screen {
-        Screen { pc: Some(pc), w, h, scale: 100, desk: [0, 0], at, off: false, fixed: false }
+    pub const fn new(host: Host, w: u16, h: u16, at: [i16; 2]) -> Screen {
+        Screen { host: Some(host), w, h, scale: 100, desk: [0, 0], at, off: false, fixed: false }
     }
 
     /// Its size in the arrangement (logical pixels).
@@ -620,9 +753,9 @@ impl Screen {
         }
     }
 
-    /// A screen of a PC with a size and scaling the KVM accepts, or a free slot.
+    /// A screen of a host with a size and scaling the KVM accepts, or a free slot.
     pub fn is_valid(&self) -> bool {
-        self.pc.is_none()
+        self.host.is_none()
             || (SCREEN_PX.contains(&self.w) && SCREEN_PX.contains(&self.h) && SCREEN_SCALE.contains(&self.scale))
     }
 }
@@ -646,7 +779,7 @@ pub mod class {
     pub const OTHER_HID: u16 = 1 << 12;
 }
 
-/// Bits of a screen slot's PC byte above the PC (protocol 8).
+/// Bits of a screen slot's host byte above the host (protocol 8; the host, a [`Host`](super::Host), in bits 0–5).
 pub mod screen_flags {
     /// [`Screen::off`](super::Screen::off).
     pub const OFF: u8 = 1 << 7;
@@ -761,8 +894,8 @@ pub mod diag {
     pub const PER_PAGE: usize = 9;
     // A page is one report: type, request id, page, pages, count, and the items.
     const _: () = assert!(5 + 6 * PER_PAGE <= super::REPORT_LEN);
-    /// Most items the firmware sends: 6 pages.
-    pub const MAX_ITEMS: usize = 6 * PER_PAGE;
+    /// Most items the firmware sends: 8 pages.
+    pub const MAX_ITEMS: usize = 8 * PER_PAGE;
 
     wire_enum! {
         /// Why the RP2354B last started (POWMAN `CHIP_RESET`).
@@ -891,6 +1024,21 @@ pub mod diag {
         pub const BT_LINK_ERRORS: u8 = 0x52;
         pub const BT_HOSTS: u8 = 0x53;
 
+        /// The module as a board on a front port (software.md §4.13), once one was seen since start: for bring-up.
+        pub const BOARD_SESSIONS: u8 = 0x58;
+        /// The last steps it went through, a hexadecimal digit each, the newest last (`bt::step` in the firmware).
+        pub const BOARD_STEPS: u8 = 0x59;
+        /// The ROM bootloader's last error (`espisp::Error`, coded as `espisp::code`).
+        pub const BOARD_ROM_ERROR: u8 = 0x5A;
+        /// Bulk transactions with it: packets in and out, NAKs each way, and failed transfers.
+        pub const BOARD_BULK_IN: u8 = 0x5B;
+        pub const BOARD_BULK_OUT: u8 = 0x5C;
+        pub const BOARD_NAKS: u8 = 0x5D;
+        pub const BOARD_ERRORS: u8 = 0x5E;
+        pub const BOARD_OUT_NAKS: u8 = 0x5F;
+        /// The last failed transfer with it: `where << 8 | kind` (`usbh::error_code` in the firmware).
+        pub const BOARD_LAST_ERROR: u8 = 0x60;
+
         pub const AT_CLOCK: [u8; 2] = [AT1_CLOCK, AT2_CLOCK];
         pub const PORT_SPEED: [u8; 3] = [KB_SPEED, MS_SPEED, OT_SPEED];
         pub const PC_SPEED: [u8; 2] = [PC1_SPEED, PC2_SPEED];
@@ -975,6 +1123,8 @@ pub mod diag {
         BtModule,
         /// Low byte [`FwUpdates`], the bits above what the check read (hexadecimal, for a bug report).
         FwUpdates,
+        /// A code, in hexadecimal (for a bug report).
+        Hex,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1043,6 +1193,15 @@ pub mod diag {
             id::BT_FW => m("ESP32-C3 firmware", Version),
             id::BT_LINK_ERRORS => m("ESP32-C3 UART errors", Count),
             id::BT_HOSTS => m("Bluetooth hosts connected", Count),
+            id::BOARD_SESSIONS => m("Module board: sessions", Count),
+            id::BOARD_STEPS => m("Module board: last steps", Hex),
+            id::BOARD_ROM_ERROR => m("Module board: last ROM error", Hex),
+            id::BOARD_BULK_IN => m("Module board: packets in", Count),
+            id::BOARD_BULK_OUT => m("Module board: packets out", Count),
+            id::BOARD_NAKS => m("Module board: NAKs in", Count),
+            id::BOARD_OUT_NAKS => m("Module board: NAKs out", Count),
+            id::BOARD_ERRORS => m("Module board: transfer errors", Count),
+            id::BOARD_LAST_ERROR => m("Module board: last transfer error", Hex),
             _ => None,
         }
     }
@@ -1163,6 +1322,10 @@ pub struct Status {
     /// arrangement (logical pixels).
     pub hop: HopState,
     pub pointer: [i16; 2],
+    /// The passkey typed so far on the KVM's keyboard for the host in `bt_passkey` (protocol 9): how many digits, and
+    /// their value, so that the window can show them while they are typed.
+    pub bt_passkey_digits: u8,
+    pub bt_passkey_typed: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1250,19 +1413,61 @@ pub mod key {
     /// What the module does with host slot 1–4 while another target is active ([`Policy`](super::BtPolicy)).
     pub const BT_POLICY_BASE: u16 = 0x0098;
     /// Screen hop (protocol 7): the absolute pointer on the KVM's mouse, the acceleration, speed, edge resistance and
-    /// corner, each PC's mapping, each profile's switch, the screen slots.
+    /// corner, PC1's and PC2's mapping.
     pub const ABS_POINTER: u16 = 0x00A0;
     pub const HOP_ACCEL: u16 = 0x00A1;
     pub const HOP_SPEED: u16 = 0x00A2;
     pub const HOP_RESISTANCE: u16 = 0x00A3;
     pub const HOP_CORNER: u16 = 0x00A4;
     pub const HOP_MAPPING_BASE: u16 = 0x00A6;
-    pub const PROFILE_HOP_BASE: u16 = 0x00A8;
-    /// Each PC's [`Units`](super::Units) for screen hop, protocol 8.
+    /// Profile 0–3's arrangement (protocol 9; until 8 its screen-hop switch, whose "on" is now arrangement 0).
+    pub const PROFILE_ARRANGEMENT_BASE: u16 = 0x00A8;
+    /// PC1's and PC2's [`Units`](super::Units) for screen hop, protocol 8.
     pub const HOP_UNITS_BASE: u16 = 0x00AC;
+    /// Screen slot s of arrangement a at `SCREEN_BASE + a × MAX_SCREENS + s` (arrangement 0's slots are protocol 8's
+    /// one arrangement).
     pub const SCREEN_BASE: u16 = 0x00B0;
+    /// Name of arrangement 0–3 (protocol 9).
+    pub const ARRANGEMENT_NAME_BASE: u16 = 0x00D0;
+    /// Bluetooth host slot 1–4's mapping and units (protocol 9).
+    pub const HOP_MAPPING_BT_BASE: u16 = 0x00D8;
+    pub const HOP_UNITS_BT_BASE: u16 = 0x00DC;
+    /// Bluetooth host slot 1–4's pointer for screen hop (protocol 9, [`BtPointer`](super::BtPointer)).
+    pub const BT_POINTER_BASE: u16 = 0x00E0;
 
-    pub const ALL: &[u16] = &[
+    use super::{Host, MAX_ARRANGEMENTS, MAX_SCREENS};
+
+    pub const fn hop_mapping(h: Host) -> u16 {
+        match h.bt_slot() {
+            None => HOP_MAPPING_BASE + h.index() as u16,
+            Some(n) => HOP_MAPPING_BT_BASE + n as u16 - 1,
+        }
+    }
+
+    pub const fn hop_units(h: Host) -> u16 {
+        match h.bt_slot() {
+            None => HOP_UNITS_BASE + h.index() as u16,
+            Some(n) => HOP_UNITS_BT_BASE + n as u16 - 1,
+        }
+    }
+
+    pub const fn screen(arrangement: u8, slot: u8) -> u16 {
+        SCREEN_BASE + (arrangement as usize * MAX_SCREENS + slot as usize) as u16
+    }
+
+    /// The arrangement a key belongs to (its screens and its name): these are stored in the arrangement's own item,
+    /// not in the config item.
+    pub const fn arrangement_of(k: u16) -> Option<u8> {
+        if k >= SCREEN_BASE && k < SCREEN_BASE + (MAX_ARRANGEMENTS * MAX_SCREENS) as u16 {
+            Some(((k - SCREEN_BASE) as usize / MAX_SCREENS) as u8)
+        } else if k >= ARRANGEMENT_NAME_BASE && k < ARRANGEMENT_NAME_BASE + MAX_ARRANGEMENTS as u16 {
+            Some((k - ARRANGEMENT_NAME_BASE) as u8)
+        } else {
+            None
+        }
+    }
+
+    const BASE: &[u16] = &[
         HOTKEY_TOGGLE,
         HOTKEY_PC1,
         HOTKEY_PC2,
@@ -1314,21 +1519,49 @@ pub mod key {
         HOP_CORNER,
         HOP_MAPPING_BASE,
         HOP_MAPPING_BASE + 1,
+        HOP_MAPPING_BT_BASE,
+        HOP_MAPPING_BT_BASE + 1,
+        HOP_MAPPING_BT_BASE + 2,
+        HOP_MAPPING_BT_BASE + 3,
         HOP_UNITS_BASE,
         HOP_UNITS_BASE + 1,
-        PROFILE_HOP_BASE,
-        PROFILE_HOP_BASE + 1,
-        PROFILE_HOP_BASE + 2,
-        PROFILE_HOP_BASE + 3,
-        SCREEN_BASE,
-        SCREEN_BASE + 1,
-        SCREEN_BASE + 2,
-        SCREEN_BASE + 3,
-        SCREEN_BASE + 4,
-        SCREEN_BASE + 5,
-        SCREEN_BASE + 6,
-        SCREEN_BASE + 7,
+        HOP_UNITS_BT_BASE,
+        HOP_UNITS_BT_BASE + 1,
+        HOP_UNITS_BT_BASE + 2,
+        HOP_UNITS_BT_BASE + 3,
+        BT_POINTER_BASE,
+        BT_POINTER_BASE + 1,
+        BT_POINTER_BASE + 2,
+        BT_POINTER_BASE + 3,
+        PROFILE_ARRANGEMENT_BASE,
+        PROFILE_ARRANGEMENT_BASE + 1,
+        PROFILE_ARRANGEMENT_BASE + 2,
+        PROFILE_ARRANGEMENT_BASE + 3,
     ];
+    const ALL_LEN: usize = BASE.len() + MAX_ARRANGEMENTS * (1 + MAX_SCREENS);
+    const ALL_KEYS: [u16; ALL_LEN] = {
+        let mut out = [0u16; ALL_LEN];
+        let mut i = 0;
+        while i < BASE.len() {
+            out[i] = BASE[i];
+            i += 1;
+        }
+        let mut a = 0;
+        while a < MAX_ARRANGEMENTS {
+            out[i] = ARRANGEMENT_NAME_BASE + a as u16;
+            i += 1;
+            let mut slot = 0;
+            while slot < MAX_SCREENS {
+                out[i] = screen(a as u8, slot as u8);
+                i += 1;
+                slot += 1;
+            }
+            a += 1;
+        }
+        out
+    };
+    /// Every key, in the order a config is listed and stored; each arrangement's name before its screens.
+    pub const ALL: &[u16] = &ALL_KEYS;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1375,14 +1608,19 @@ pub enum ConfigValue {
     /// The stretch at each end of such an edge where the pointer never hops (logical pixels), so a corner stays easy to
     /// hit.
     HopCorner(u16),
-    /// How the PC maps the absolute pointer onto its screens.
-    HopMapping(Pc, Mapping),
-    /// What the PC's desktop coordinates count (protocol 8).
-    HopUnits(Pc, Units),
-    /// Profile index, and whether screen hop is on in it.
-    ProfileHop(u8, bool),
-    /// Screen slot 0–7.
-    Screen(u8, Screen),
+    /// How the host maps the absolute pointer onto its screens (a Bluetooth host's since protocol 9).
+    HopMapping(Host, Mapping),
+    /// What the host's desktop coordinates count (protocol 8; a Bluetooth host's since 9).
+    HopUnits(Host, Units),
+    /// Profile index, and the arrangement screen hop uses in it (None: screen hop is off there). Protocol 9; until 8 a
+    /// switch, whose "on" reads as arrangement 0.
+    ProfileArrangement(u8, Option<u8>),
+    /// Arrangement 0–3, screen slot 0–7.
+    Screen(u8, u8, Screen),
+    /// Arrangement 0–3 and its name (protocol 9).
+    ArrangementName(u8, ProfileName),
+    /// Bluetooth host slot 0–3 (slot n = index n−1) and how screen hop moves its pointer (protocol 9).
+    BtPointer(u8, BtPointer),
 }
 
 pub use crate::link::bt::Policy as BtPolicy;
@@ -1423,10 +1661,12 @@ impl ConfigValue {
             ConfigValue::HopSpeed(_) => key::HOP_SPEED,
             ConfigValue::HopResistance(_) => key::HOP_RESISTANCE,
             ConfigValue::HopCorner(_) => key::HOP_CORNER,
-            ConfigValue::HopMapping(pc, _) => key::HOP_MAPPING_BASE + pc.index() as u16,
-            ConfigValue::HopUnits(pc, _) => key::HOP_UNITS_BASE + pc.index() as u16,
-            ConfigValue::ProfileHop(i, _) => key::PROFILE_HOP_BASE + *i as u16,
-            ConfigValue::Screen(i, _) => key::SCREEN_BASE + *i as u16,
+            ConfigValue::HopMapping(h, _) => key::hop_mapping(*h),
+            ConfigValue::HopUnits(h, _) => key::hop_units(*h),
+            ConfigValue::ProfileArrangement(i, _) => key::PROFILE_ARRANGEMENT_BASE + *i as u16,
+            ConfigValue::Screen(a, i, _) => key::screen(*a, *i),
+            ConfigValue::ArrangementName(a, _) => key::ARRANGEMENT_NAME_BASE + *a as u16,
+            ConfigValue::BtPointer(i, _) => key::BT_POINTER_BASE + *i as u16,
         }
     }
 
@@ -1451,16 +1691,20 @@ impl ConfigValue {
             ConfigValue::KeyTap(a) | ConfigValue::KeyLong(a) => w.u8(a as u8),
             ConfigValue::Profile(i) | ConfigValue::ProfileCount(i) => w.u8(i),
             ConfigValue::ProfileModes(_, m) => w.bytes(&m.map(|m| m as u8)),
-            ConfigValue::ProfileName(_, n) | ConfigValue::BtName(_, n) => w.lv(n.as_str().as_bytes()),
+            ConfigValue::ProfileName(_, n) | ConfigValue::BtName(_, n) | ConfigValue::ArrangementName(_, n) => {
+                w.lv(n.as_str().as_bytes())
+            }
+            ConfigValue::ProfileArrangement(_, a) => w.u8(a.map_or(0, |a| a + 1)),
+            ConfigValue::BtPointer(_, p) => w.u8(p as u8),
             ConfigValue::BtPolicy(_, p) => w.u8(p as u8),
             ConfigValue::HopAccel(a) => w.u8(a as u8),
             ConfigValue::HopSpeed(v) => w.u8(v as u8),
             ConfigValue::HopResistance(v) | ConfigValue::HopCorner(v) => w.u16(v),
             ConfigValue::HopMapping(_, m) => w.u8(m as u8),
             ConfigValue::HopUnits(_, u) => w.u8(u as u8),
-            ConfigValue::Screen(_, s) => {
+            ConfigValue::Screen(_, _, s) => {
                 let flags = if s.off { screen_flags::OFF } else { 0 } | if s.fixed { screen_flags::FIXED } else { 0 };
-                w.u8(s.pc.map_or(0, |p| p as u8 | flags))?;
+                w.u8(s.host.map_or(0, |h| h as u8 | flags))?;
                 w.u16(s.w)?;
                 w.u16(s.h)?;
                 w.u16(s.scale)?;
@@ -1477,8 +1721,7 @@ impl ConfigValue {
             | ConfigValue::StandbyWake(b)
             | ConfigValue::StandbyGlow(b)
             | ConfigValue::RememberProfile(b)
-            | ConfigValue::AbsPointer(b)
-            | ConfigValue::ProfileHop(_, b) => w.bool(b),
+            | ConfigValue::AbsPointer(b) => w.bool(b),
         }
     }
 
@@ -1490,6 +1733,7 @@ impl ConfigValue {
         let rgb = |r: &mut Reader| -> Result<Rgb, WireError> { Ok(Rgb { r: r.u8()?, g: r.u8()?, b: r.u8()? }) };
         let profiles = |base: u16| base..base + MAX_PROFILES as u16;
         let bt_slots = |base: u16| base..base + BT_HOSTS as u16;
+        let arrangements = |base: u16| base..base + MAX_ARRANGEMENTS as u16;
         Ok(match k {
             key::HOTKEY_TOGGLE => ConfigValue::HotkeyToggle(hotkey(r)?),
             key::HOTKEY_PC1 => ConfigValue::HotkeyPc1(hotkey(r)?),
@@ -1521,13 +1765,18 @@ impl ConfigValue {
                 (k - key::PROFILE_MODES_BASE) as u8,
                 [r.u8()?.try_into()?, r.u8()?.try_into()?, r.u8()?.try_into()?],
             ),
-            k if profiles(key::PROFILE_NAME_BASE).contains(&k) || bt_slots(key::BT_NAME_BASE).contains(&k) => {
+            k if profiles(key::PROFILE_NAME_BASE).contains(&k)
+                || bt_slots(key::BT_NAME_BASE).contains(&k)
+                || arrangements(key::ARRANGEMENT_NAME_BASE).contains(&k) =>
+            {
                 let b = r.lv()?;
                 let s = core::str::from_utf8(b).map_err(|_| WireError::Invalid)?;
                 if b.len() > PROFILE_NAME_MAX {
                     return Err(WireError::Invalid);
                 }
-                if k >= key::BT_NAME_BASE {
+                if k >= key::ARRANGEMENT_NAME_BASE {
+                    ConfigValue::ArrangementName((k - key::ARRANGEMENT_NAME_BASE) as u8, ProfileName::new(s))
+                } else if k >= key::BT_NAME_BASE {
                     ConfigValue::BtName((k - key::BT_NAME_BASE) as u8, ProfileName::new(s))
                 } else {
                     ConfigValue::ProfileName((k - key::PROFILE_NAME_BASE) as u8, ProfileName::new(s))
@@ -1542,20 +1791,34 @@ impl ConfigValue {
             key::HOP_SPEED => ConfigValue::HopSpeed(r.u8()? as i8),
             key::HOP_RESISTANCE => ConfigValue::HopResistance(r.u16()?),
             key::HOP_CORNER => ConfigValue::HopCorner(r.u16()?),
-            k if (key::HOP_MAPPING_BASE..key::HOP_MAPPING_BASE + 2).contains(&k) => {
-                ConfigValue::HopMapping(Pc::from_index((k - key::HOP_MAPPING_BASE) as usize), r.u8()?.try_into()?)
+            k if (key::HOP_MAPPING_BASE..key::HOP_MAPPING_BASE + 2).contains(&k) => ConfigValue::HopMapping(
+                Host::from_index((k - key::HOP_MAPPING_BASE) as usize).ok_or(WireError::Invalid)?,
+                r.u8()?.try_into()?,
+            ),
+            k if bt_slots(key::HOP_MAPPING_BT_BASE).contains(&k) => ConfigValue::HopMapping(
+                Host::bt((k - key::HOP_MAPPING_BT_BASE) as u8 + 1).ok_or(WireError::Invalid)?,
+                r.u8()?.try_into()?,
+            ),
+            k if profiles(key::PROFILE_ARRANGEMENT_BASE).contains(&k) => {
+                let i = (k - key::PROFILE_ARRANGEMENT_BASE) as u8;
+                ConfigValue::ProfileArrangement(i, r.u8()?.checked_sub(1))
             }
-            k if profiles(key::PROFILE_HOP_BASE).contains(&k) => {
-                ConfigValue::ProfileHop((k - key::PROFILE_HOP_BASE) as u8, r.bool()?)
+            k if (key::HOP_UNITS_BASE..key::HOP_UNITS_BASE + 2).contains(&k) => ConfigValue::HopUnits(
+                Host::from_index((k - key::HOP_UNITS_BASE) as usize).ok_or(WireError::Invalid)?,
+                r.u8()?.try_into()?,
+            ),
+            k if bt_slots(key::HOP_UNITS_BT_BASE).contains(&k) => ConfigValue::HopUnits(
+                Host::bt((k - key::HOP_UNITS_BT_BASE) as u8 + 1).ok_or(WireError::Invalid)?,
+                r.u8()?.try_into()?,
+            ),
+            k if bt_slots(key::BT_POINTER_BASE).contains(&k) => {
+                ConfigValue::BtPointer((k - key::BT_POINTER_BASE) as u8, r.u8()?.try_into()?)
             }
-            k if (key::HOP_UNITS_BASE..key::HOP_UNITS_BASE + 2).contains(&k) => {
-                ConfigValue::HopUnits(Pc::from_index((k - key::HOP_UNITS_BASE) as usize), r.u8()?.try_into()?)
-            }
-            k if (key::SCREEN_BASE..key::SCREEN_BASE + MAX_SCREENS as u16).contains(&k) => {
+            k if (key::SCREEN_BASE..key::SCREEN_BASE + (MAX_ARRANGEMENTS * MAX_SCREENS) as u16).contains(&k) => {
                 let b = r.u8()?;
-                let pc = match b & !(screen_flags::OFF | screen_flags::FIXED) {
+                let host = match b & !(screen_flags::OFF | screen_flags::FIXED) {
                     0 => None,
-                    p => Some(p.try_into()?),
+                    h => Some(h.try_into()?),
                 };
                 let (w, h, scale) = (r.u16()?, r.u16()?, r.u16()?);
                 let mut v = [0i16; 4];
@@ -1563,9 +1826,10 @@ impl ConfigValue {
                     *x = r.u16()? as i16;
                 }
                 let (off, fixed) =
-                    (pc.is_some() && b & screen_flags::OFF != 0, pc.is_some() && b & screen_flags::FIXED != 0);
-                let s = Screen { pc, w, h, scale, desk: [v[0], v[1]], at: [v[2], v[3]], off, fixed };
-                ConfigValue::Screen((k - key::SCREEN_BASE) as u8, s)
+                    (host.is_some() && b & screen_flags::OFF != 0, host.is_some() && b & screen_flags::FIXED != 0);
+                let s = Screen { host, w, h, scale, desk: [v[0], v[1]], at: [v[2], v[3]], off, fixed };
+                let n = (k - key::SCREEN_BASE) as usize;
+                ConfigValue::Screen((n / MAX_SCREENS) as u8, (n % MAX_SCREENS) as u8, s)
             }
             _ => return Err(WireError::Invalid),
         })
@@ -1907,6 +2171,8 @@ impl Response {
                 w.u8(s.hop as u8)?;
                 w.u16(s.pointer[0] as u16)?;
                 w.u16(s.pointer[1] as u16)?;
+                w.u8(s.bt_passkey_digits)?;
+                w.u32(s.bt_passkey_typed)?;
             }
             Response::Port(p) => {
                 w.u8(p.port as u8)?;
@@ -2083,6 +2349,8 @@ impl DeviceMsg {
                     },
                     hop: HopState::Off,
                     pointer: [0, 0],
+                    bt_passkey_digits: 0,
+                    bt_passkey_typed: 0,
                 };
                 if r.remaining() >= 2 {
                     st.selftest |= (r.u16()? as u32) << 16;
@@ -2091,6 +2359,11 @@ impl DeviceMsg {
                 if r.remaining() >= 5 {
                     st.hop = HopState::from_u8(r.u8()?).unwrap_or(HopState::Off);
                     st.pointer = [r.u16()? as i16, r.u16()? as i16];
+                }
+                // Protocol 9.
+                if r.remaining() >= 5 {
+                    st.bt_passkey_digits = r.u8()?;
+                    st.bt_passkey_typed = r.u32()?;
                 }
                 Response::Status(st)
             }
@@ -2159,22 +2432,54 @@ mod tests {
 
     #[test]
     fn a_screens_flags_are_in_its_pc_byte() {
-        let s = Screen { scale: 150, desk: [0, 0], ..Screen::new(Pc::Pc1, 3840, 2160, [-2560, 360]) };
+        let s = Screen { scale: 150, desk: [0, 0], ..Screen::new(Host::Pc1, 3840, 2160, [-2560, 360]) };
         let enc = |s: Screen| {
             let mut b = [0u8; 32];
             let mut w = Writer::new(&mut b);
-            ConfigValue::Screen(3, s).encode(&mut w).unwrap();
+            ConfigValue::Screen(0, 3, s).encode(&mut w).unwrap();
             w.finish().to_vec()
         };
-        // A slot stored before protocol 8 has neither.
-        assert_eq!(enc(s)[2], 1);
+        // A slot stored before protocol 8 has neither, at protocol 8's key for slot 3.
+        let plain = enc(s);
+        assert_eq!((u16::from_le_bytes([plain[0], plain[1]]), plain[2]), (0x00B3, 1));
         assert_eq!(enc(Screen { off: true, ..s })[2], 0x81);
         assert_eq!(enc(Screen { fixed: true, ..s })[2], 0x41);
         let both = enc(Screen { off: true, fixed: true, ..s });
         assert_eq!(
             ConfigValue::decode(&mut Reader::new(&both)),
-            Ok(ConfigValue::Screen(3, Screen { off: true, fixed: true, ..s }))
+            Ok(ConfigValue::Screen(0, 3, Screen { off: true, fixed: true, ..s }))
         );
+        // A Bluetooth host's screen, with both flags (protocol 9).
+        let bt = Screen { host: Some(Host::Bt3), off: true, fixed: true, ..s };
+        assert_eq!(enc(bt)[2], 0x13 | 0x80 | 0x40);
+        assert_eq!(ConfigValue::decode(&mut Reader::new(&enc(bt))), Ok(ConfigValue::Screen(0, 3, bt)));
+    }
+
+    #[test]
+    fn arrangement_keys_follow_protocol_8s_one_arrangement() {
+        assert_eq!(key::screen(0, 0), 0x00B0);
+        assert_eq!(key::screen(3, 7), 0x00CF);
+        assert_eq!(key::arrangement_of(0x00B7), Some(0));
+        assert_eq!(key::arrangement_of(0x00B8), Some(1));
+        assert_eq!(key::arrangement_of(0x00D3), Some(3));
+        assert_eq!((key::arrangement_of(0x00D4), key::arrangement_of(key::PROFILE_ARRANGEMENT_BASE)), (None, None));
+        // Every key once.
+        let mut keys = key::ALL.to_vec();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), key::ALL.len());
+        // Protocol 8's switch: off is no arrangement, on is arrangement 0.
+        let k = key::PROFILE_ARRANGEMENT_BASE + 2;
+        for (stored, want) in [(0u8, None), (1, Some(0))] {
+            let raw = [k as u8, (k >> 8) as u8, stored];
+            assert_eq!(ConfigValue::decode(&mut Reader::new(&raw)), Ok(ConfigValue::ProfileArrangement(2, want)));
+        }
+        assert_eq!(key::hop_mapping(Host::Pc2), 0x00A7);
+        assert_eq!(key::hop_units(Host::Bt4), 0x00DF);
+        for h in Host::ALL {
+            assert_eq!(Host::from_index(h.index()), Some(*h));
+            assert_eq!(Host::from_name(h.name()), Some(*h));
+        }
     }
 
     #[test]
@@ -2217,19 +2522,27 @@ mod tests {
             Request::SetConfig(ConfigValue::HopSpeed(-7)),
             Request::SetConfig(ConfigValue::HopResistance(250)),
             Request::SetConfig(ConfigValue::HopCorner(30)),
-            Request::SetConfig(ConfigValue::HopMapping(Pc::Pc2, Mapping::MainScreen)),
-            Request::SetConfig(ConfigValue::HopUnits(Pc::Pc1, Units::Logical)),
-            Request::SetConfig(ConfigValue::HopUnits(Pc::Pc2, Units::Physical)),
-            Request::SetConfig(ConfigValue::ProfileHop(3, true)),
+            Request::SetConfig(ConfigValue::HopMapping(Host::Pc2, Mapping::MainScreen)),
+            Request::SetConfig(ConfigValue::HopMapping(Host::Bt1, Mapping::MainScreen)),
+            Request::SetConfig(ConfigValue::HopUnits(Host::Pc1, Units::Logical)),
+            Request::SetConfig(ConfigValue::HopUnits(Host::Pc2, Units::Physical)),
+            Request::SetConfig(ConfigValue::HopUnits(Host::Bt4, Units::Logical)),
+            Request::SetConfig(ConfigValue::ProfileArrangement(3, Some(2))),
+            Request::SetConfig(ConfigValue::ProfileArrangement(1, None)),
             Request::SetConfig(ConfigValue::Screen(
+                3,
                 7,
-                Screen { scale: 150, desk: [-2560, 0], ..Screen::new(Pc::Pc2, 3840, 2160, [-30000, 400]) },
+                Screen { scale: 150, desk: [-2560, 0], ..Screen::new(Host::Pc2, 3840, 2160, [-30000, 400]) },
             )),
             Request::SetConfig(ConfigValue::Screen(
+                0,
                 2,
-                Screen { off: true, fixed: true, ..Screen::new(Pc::Pc1, 1920, 1080, [0, 0]) },
+                Screen { off: true, fixed: true, ..Screen::new(Host::Pc1, 1920, 1080, [0, 0]) },
             )),
-            Request::SetConfig(ConfigValue::Screen(0, Screen::NONE)),
+            Request::SetConfig(ConfigValue::Screen(1, 4, Screen::new(Host::Bt2, 2388, 1668, [1920, 0]))),
+            Request::SetConfig(ConfigValue::Screen(2, 0, Screen::NONE)),
+            Request::SetConfig(ConfigValue::ArrangementName(3, ProfileName::new("couch"))),
+            Request::SetConfig(ConfigValue::BtPointer(2, BtPointer::Relative)),
         ];
         for (i, req) in reqs.iter().enumerate() {
             let raw = req.encode(i as u8 + 1).unwrap();
@@ -2270,6 +2583,8 @@ mod tests {
             bt_module: diag::BtModule::GaveUp,
             hop: HopState::NotNormalized,
             pointer: [-1920, 1079],
+            bt_passkey_digits: 4,
+            bt_passkey_typed: 4242,
         };
         let port = PortInfo {
             port: Port::Mouse,

@@ -43,6 +43,8 @@ hardware/debug/swap-attempt-*/
 
 # Router experiments that did not make it into tools/: kept locally, not published
 hardware/experimental/
+# Bench experiments and prototypes (notes, variant builds, logs): kept locally, not published
+/experiments/
 
 # Fabrication archive (tools/make_fab.py: gerbers, drill, the JLC upload zip).  The JLC BOM / CPL stay tracked
 # (hardware/bom/), like the schematic PDF: they are the record of what was ordered

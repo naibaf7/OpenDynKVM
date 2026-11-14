@@ -45,16 +45,22 @@ pub mod report {
     pub const KEYBOARD: u8 = 1;
     pub const MOUSE: u8 = 2;
     pub const CONSUMER: u8 = 3;
+    /// The absolute pointer of screen hop (protocol 9), for a host whose pointer is `BtPointer::Absolute`.
+    pub const POINTER: u8 = 4;
     /// Keyboard: modifiers, reserved, 6 key usages (the boot layout; more than 6 keys → 6 × ErrorRollOver).
     pub const KEYBOARD_LEN: usize = 8;
     /// Mouse: buttons (16 bits), X, Y (16 bits, signed), wheel, pan (8 bits, signed).
     pub const MOUSE_LEN: usize = 8;
     /// Consumer: one 16-bit usage (0 = none).
     pub const CONSUMER_LEN: usize = 2;
+    /// Absolute pointer: buttons (16 bits), X, Y (0–32767), wheel, pan (8 bits, signed).
+    pub const POINTER_LEN: usize = 8;
     /// Keyboard output report (LEDs: Num, Caps, Scroll, Compose, Kana).
     pub const LEDS_LEN: usize = 1;
 
-    /// The HID report map (descriptor) of the Bluetooth keyboard and mouse, 161 bytes.
+    /// The HID report map (descriptor) of the Bluetooth keyboard and mouse, 229 bytes. The absolute pointer is a
+    /// top-level collection of its own, of usage Pointer rather than Mouse, as on the PCs' USB interface: a host makes
+    /// it a device of its own, and one that takes no absolute pointer leaves it alone.
     #[rustfmt::skip]
     pub const MAP: &[u8] = &[
         // Keyboard, report 1
@@ -75,10 +81,18 @@ pub mod report {
         0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, CONSUMER,
         0x15, 0x00, 0x26, 0xFF, 0x03, 0x19, 0x00, 0x2A, 0xFF, 0x03, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00,
         0xC0,
+        // Absolute pointer, report 4: 16 buttons, X/Y 0–32767, wheel, AC pan
+        0x05, 0x01, 0x09, 0x01, 0xA1, 0x01, 0x85, POINTER, 0x09, 0x01, 0xA1, 0x00,
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x02, 0x81, 0x02,
+        0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+        0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06,
+        0xC0, 0xC0,
     ];
 
     /// The input report IDs and their lengths, in the order of the report map.
-    pub const INPUTS: [(u8, usize); 3] = [(KEYBOARD, KEYBOARD_LEN), (MOUSE, MOUSE_LEN), (CONSUMER, CONSUMER_LEN)];
+    pub const INPUTS: [(u8, usize); 4] =
+        [(KEYBOARD, KEYBOARD_LEN), (MOUSE, MOUSE_LEN), (CONSUMER, CONSUMER_LEN), (POINTER, POINTER_LEN)];
 
     /// Length of input report `id`, if it is one.
     pub fn input_len(id: u8) -> Option<usize> {
@@ -342,9 +356,151 @@ pub fn mouse_report(buttons: u16, x: i32, y: i32, wheel: i32, pan: i32) -> [u8; 
     [b[0], b[1], xb[0], xb[1], yb[0], yb[1], wheel.clamp(-127, 127) as i8 as u8, pan.clamp(-127, 127) as i8 as u8]
 }
 
+/// The absolute pointer's report ([`report::POINTER`]): `x`, `y` 0–32767.
+pub fn pointer_report(buttons: u16, x: u16, y: u16, wheel: i32, pan: i32) -> [u8; report::POINTER_LEN] {
+    let b = buttons.to_le_bytes();
+    let (xb, yb) = (x.min(0x7FFF).to_le_bytes(), y.min(0x7FFF).to_le_bytes());
+    [b[0], b[1], xb[0], xb[1], yb[0], yb[1], wheel.clamp(-127, 127) as i8 as u8, pan.clamp(-127, 127) as i8 as u8]
+}
+
+/// Motion for a host not sent yet, coalesced: a mouse reports up to 1000 times a second, more than the link to a
+/// module on a front port carries and far more than a host takes at its connection events, and a report that waits
+/// in a queue is late while one that is dropped loses its motion (first dongle, 2026-11-14: the pointer crawled). So
+/// one report waits at a time: relative moves (and wheels) add up, an absolute position replaces the one before. A
+/// report with other buttons, or for another host, sends the waiting one first, so that no click is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Motion {
+    waiting: Option<Waiting>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Waiting {
+    host: u8,
+    id: u8,
+    buttons: u16,
+    /// Relative: the sum of the moves; absolute: the position.
+    x: i32,
+    y: i32,
+    wheel: i32,
+    pan: i32,
+}
+
+/// A report for a host: its host slot, its report ID and its bytes.
+pub type Out = (u8, u8, [u8; 8]);
+
+impl Motion {
+    pub const fn new() -> Self {
+        Motion { waiting: None }
+    }
+
+    /// Whether report `id` is motion (the mouse, the absolute pointer).
+    pub const fn is_motion(id: u8) -> bool {
+        id == report::MOUSE || id == report::POINTER
+    }
+
+    /// Adds a motion report `data` (`id` [`report::MOUSE`] or [`report::POINTER`]) for `host`. Returns the report that
+    /// has to go out before it, if one waited that can't take it in.
+    pub fn add(&mut self, host: u8, id: u8, data: &[u8]) -> Option<Out> {
+        let mut d = [0u8; 8];
+        d[..data.len().min(8)].copy_from_slice(&data[..data.len().min(8)]);
+        let buttons = u16::from_le_bytes([d[0], d[1]]);
+        let (x, y) = if id == report::POINTER {
+            (u16::from_le_bytes([d[2], d[3]]) as i32, u16::from_le_bytes([d[4], d[5]]) as i32)
+        } else {
+            (i16::from_le_bytes([d[2], d[3]]) as i32, i16::from_le_bytes([d[4], d[5]]) as i32)
+        };
+        let (wheel, pan) = (d[6] as i8 as i32, d[7] as i8 as i32);
+        if let Some(w) = self.waiting.as_mut()
+            && (w.host, w.id, w.buttons) == (host, id, buttons)
+        {
+            if id == report::POINTER {
+                (w.x, w.y) = (x, y);
+            } else {
+                (w.x, w.y) = (w.x.saturating_add(x), w.y.saturating_add(y));
+            }
+            (w.wheel, w.pan) = (w.wheel.saturating_add(wheel), w.pan.saturating_add(pan));
+            return None;
+        }
+        let before = self.take_all();
+        self.waiting = Some(Waiting { host, id, buttons, x, y, wheel, pan });
+        before
+    }
+
+    /// The waiting report to send now, if there is one. A relative move longer than one report carries comes out in
+    /// steps: what doesn't fit keeps waiting.
+    pub fn take(&mut self) -> Option<Out> {
+        let w = self.waiting.as_mut()?;
+        let out = if w.id == report::POINTER {
+            let r = pointer_report(w.buttons, w.x.clamp(0, 0x7FFF) as u16, w.y.clamp(0, 0x7FFF) as u16, w.wheel, w.pan);
+            let (wheel, pan) = (w.wheel.clamp(-127, 127), w.pan.clamp(-127, 127));
+            (w.wheel, w.pan) = (w.wheel - wheel, w.pan - pan);
+            (w.host, w.id, r)
+        } else {
+            let (x, y) = (w.x.clamp(-32767, 32767), w.y.clamp(-32767, 32767));
+            let (wheel, pan) = (w.wheel.clamp(-127, 127), w.pan.clamp(-127, 127));
+            let r = mouse_report(w.buttons, x, y, wheel, pan);
+            (w.x, w.y, w.wheel, w.pan) = (w.x - x, w.y - y, w.wheel - wheel, w.pan - pan);
+            (w.host, w.id, r)
+        };
+        // A position is sent once; a move keeps waiting while some of it is left.
+        if w.id == report::POINTER && w.wheel == 0 && w.pan == 0
+            || w.id == report::MOUSE && w.x == 0 && w.y == 0 && w.wheel == 0 && w.pan == 0
+        {
+            self.waiting = None;
+        }
+        Some(out)
+    }
+
+    /// Everything waiting, in one report (a move longer than one report carries is cut: it only happens with motion
+    /// that has waited for a very long time).
+    fn take_all(&mut self) -> Option<Out> {
+        let out = self.take();
+        self.waiting = None;
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_none()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn motion_adds_up_moves_keeps_positions_and_clicks() {
+        let mut m = Motion::default();
+        // Moves add up into one report.
+        for _ in 0..10 {
+            assert_eq!(m.add(1, report::MOUSE, &mouse_report(0, 3, -2, 1, 0)), None);
+        }
+        assert_eq!(m.take(), Some((1, report::MOUSE, mouse_report(0, 30, -20, 10, 0))));
+        assert_eq!(m.take(), None);
+        // A press goes out after the move before it, and is not merged into it.
+        m.add(1, report::MOUSE, &mouse_report(0, 5, 0, 0, 0));
+        assert_eq!(
+            m.add(1, report::MOUSE, &mouse_report(1, 0, 0, 0, 0)),
+            Some((1, report::MOUSE, mouse_report(0, 5, 0, 0, 0)))
+        );
+        assert_eq!(m.add(1, report::MOUSE, &mouse_report(1, 2, 2, 0, 0)), None);
+        assert_eq!(
+            m.add(1, report::MOUSE, &mouse_report(0, 0, 0, 0, 0)),
+            Some((1, report::MOUSE, mouse_report(1, 2, 2, 0, 0)))
+        );
+        assert_eq!(m.take(), Some((1, report::MOUSE, mouse_report(0, 0, 0, 0, 0))));
+        // Positions: the latest counts.
+        m.add(2, report::POINTER, &pointer_report(0, 100, 100, 0, 0));
+        m.add(2, report::POINTER, &pointer_report(0, 200, 300, 1, 0));
+        assert_eq!(m.take(), Some((2, report::POINTER, pointer_report(0, 200, 300, 1, 0))));
+        assert!(m.is_empty());
+        // A move longer than a report carries comes out in steps.
+        m.add(1, report::MOUSE, &mouse_report(0, 30000, 0, 0, 0));
+        m.add(1, report::MOUSE, &mouse_report(0, 30000, 0, 0, 0));
+        assert_eq!(m.take(), Some((1, report::MOUSE, mouse_report(0, 32767, 0, 0, 0))));
+        assert_eq!(m.take(), Some((1, report::MOUSE, mouse_report(0, 27233, 0, 0, 0))));
+        assert!(m.is_empty());
+    }
 
     fn roundtrip(m: BtMsg) {
         let mut buf = [0u8; MAX_MSG];
@@ -408,9 +564,9 @@ mod tests {
         }
         assert_eq!(depth, 0);
         assert_eq!(i, report::MAP.len());
-        assert_eq!(ids.as_slice(), &[report::KEYBOARD, report::MOUSE, report::CONSUMER]);
+        assert_eq!(ids.as_slice(), &[report::KEYBOARD, report::MOUSE, report::CONSUMER, report::POINTER]);
         assert!(report::MAP.len() <= 512, "a GATT attribute holds at most 512 bytes");
-        assert_eq!(report::MAP.len(), 161, "the length software.md §4.13 gives");
+        assert_eq!(report::MAP.len(), 229, "the length software.md §4.13 gives");
     }
 
     #[test]
@@ -418,5 +574,6 @@ mod tests {
         assert_eq!(keyboard_report(0x02, [4u8, 5].into_iter()), [0x02, 0, 4, 5, 0, 0, 0, 0]);
         assert_eq!(keyboard_report(0, 4u8..11), [0, 0, 1, 1, 1, 1, 1, 1]);
         assert_eq!(mouse_report(1, -40000, 3, 200, -1), [1, 0, 0x01, 0x80, 3, 0, 127, 0xFF]);
+        assert_eq!(pointer_report(0x8001, 40000, 300, -2, 0), [1, 0x80, 0xFF, 0x7F, 0x2C, 1, 0xFE, 0]);
     }
 }

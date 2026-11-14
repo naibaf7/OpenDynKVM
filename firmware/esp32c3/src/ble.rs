@@ -17,14 +17,14 @@
 use core::cell::RefCell;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either3, Either4, select, select3, select4};
+use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use esp_radio::ble::controller::BleConnector;
-use kvm_proto::link::bt::{BtMsg, EventKind, HostState, MAX_HOSTS, Policy, host_flags, report};
+use kvm_proto::link::bt::{BtMsg, EventKind, HostState, MAX_HOSTS, Motion, Policy, host_flags, report};
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 
@@ -82,6 +82,10 @@ struct HidService {
     #[descriptor(uuid = descriptors::REPORT_REFERENCE, read, value = [report::CONSUMER, 1])]
     #[characteristic(uuid = characteristic::REPORT, read, notify, value = [0; report::CONSUMER_LEN])]
     consumer: [u8; report::CONSUMER_LEN],
+    /// Screen hop's absolute pointer (report 4), for a host set to take it.
+    #[descriptor(uuid = descriptors::REPORT_REFERENCE, read, value = [report::POINTER, 1])]
+    #[characteristic(uuid = characteristic::REPORT, read, notify, value = [0; report::POINTER_LEN])]
+    pointer: [u8; report::POINTER_LEN],
 }
 
 #[gatt_service(uuid = service::DEVICE_INFORMATION)]
@@ -117,6 +121,16 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
 /// Input reports for each slot's connection task: (report id, data, length).
 static REPORTS: [Channel<CriticalSectionRawMutex, (u8, [u8; 8], u8), 16>; MAX_HOSTS] =
     [const { Channel::new() }; MAX_HOSTS];
+/// Each slot's motion, coalesced until the host takes it at a connection event ([`Motion`]): a mouse reports far more
+/// often than a host takes notifications, and a queue of them was late and then dropped motion (first dongle,
+/// 2026-11-14: the pointer crawled).
+static MOTION: [Mutex<CriticalSectionRawMutex, RefCell<Motion>>; MAX_HOSTS] =
+    [const { Mutex::new(RefCell::new(Motion::new())) }; MAX_HOSTS];
+static MOTION_READY: [Signal<CriticalSectionRawMutex, ()>; MAX_HOSTS] = [const { Signal::new() }; MAX_HOSTS];
+
+fn take_motion(slot: usize) -> Option<(u8, [u8; 8], u8)> {
+    MOTION[slot].lock(|m| m.borrow_mut().take()).map(|(_, id, d)| (id, d, 8))
+}
 /// Each slot's connection task: let the host go (forgotten, or not selected under `ConnectWhenSelected`), or ask it
 /// for other connection parameters (selection changed).
 static CTL: [Signal<CriticalSectionRawMutex, Ctl>; MAX_HOSTS] = [const { Signal::new() }; MAX_HOSTS];
@@ -350,6 +364,8 @@ async fn connection(
         h.addr = conn.raw().peer_address().to_bytes();
     });
     while REPORTS[slot].try_receive().is_ok() {}
+    MOTION[slot].lock(|m| *m.borrow_mut() = Motion::new());
+    MOTION_READY[slot].reset();
     CTL[slot].reset();
     // Bonded: encrypt with the stored key. New: pair and bond (trouble-host's connections start not bondable), the
     // host asking for the passkey it shows.
@@ -363,7 +379,8 @@ async fn connection(
         let passkey = async {
             if waiting_passkey { PASSKEY.wait().await } else { core::future::pending().await }
         };
-        match select4(conn.next(), REPORTS[slot].receive(), CTL[slot].wait(), passkey).await {
+        let input = select(REPORTS[slot].receive(), MOTION_READY[slot].wait());
+        match select4(conn.next(), input, CTL[slot].wait(), passkey).await {
             Either4::First(ev) => match ev {
                 GattConnectionEvent::Disconnected { reason } => {
                     log::line(format_args!("host {host}: disconnected ({reason:?})"));
@@ -438,7 +455,18 @@ async fn connection(
                 }
                 _ => {}
             },
-            Either4::Second((id, data, len)) => {
+            Either4::Second(input) => {
+                // Queued reports first (motion before them was moved into the queue), then the motion so far: what
+                // comes while it goes out waits for the next one.
+                let Some((id, data, len)) = (match input {
+                    Either::First(r) => Some(r),
+                    Either::Second(()) => take_motion(slot),
+                }) else {
+                    continue;
+                };
+                if !MOTION[slot].lock(|m| m.borrow().is_empty()) {
+                    MOTION_READY[slot].signal(());
+                }
                 let encrypted = with(|s| s.hosts[slot].flags & host_flags::ENCRYPTED != 0);
                 if !encrypted {
                     continue;
@@ -459,6 +487,11 @@ async fn connection(
                         let mut v = [0u8; report::CONSUMER_LEN];
                         v[..d.len().min(2)].copy_from_slice(&d[..d.len().min(2)]);
                         server.hid.consumer.notify(&conn, &v, false).await
+                    }
+                    report::POINTER => {
+                        let mut v = [0u8; report::POINTER_LEN];
+                        v[..d.len().min(8)].copy_from_slice(&d[..d.len().min(8)]);
+                        server.hid.pointer.notify(&conn, &v, false).await
                     }
                     _ => Ok(()),
                 };
@@ -495,10 +528,22 @@ async fn control(stack: &'static St) {
             BtMsg::Input { host, id, data } => {
                 let slot = host as usize;
                 if (1..=MAX_HOSTS).contains(&slot) && with(|s| s.selected == host) {
-                    let mut d = [0u8; 8];
-                    let n = data.len().min(8);
-                    d[..n].copy_from_slice(&data[..n]);
-                    let _ = REPORTS[slot - 1].try_send((id, d, n as u8));
+                    let i = slot - 1;
+                    if Motion::is_motion(id) {
+                        if let Some((_, id, d)) = MOTION[i].lock(|m| m.borrow_mut().add(host, id, data)) {
+                            let _ = REPORTS[i].try_send((id, d, 8));
+                        }
+                        MOTION_READY[i].signal(());
+                    } else {
+                        // After the motion before it.
+                        while let Some(r) = take_motion(i) {
+                            let _ = REPORTS[i].try_send(r);
+                        }
+                        let mut d = [0u8; 8];
+                        let n = data.len().min(8);
+                        d[..n].copy_from_slice(&data[..n]);
+                        let _ = REPORTS[i].try_send((id, d, n as u8));
+                    }
                 }
             }
             BtMsg::Select { host } => {

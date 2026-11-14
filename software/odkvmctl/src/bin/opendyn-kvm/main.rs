@@ -104,6 +104,8 @@ struct App {
     hotkey_error: [Option<String>; 4],
     /// The Bluetooth page: a passkey typed in the window, and the host names being edited.
     bt_passkey: String,
+    /// The page that was open when it went away for a moment (`Page::shown`), to go back to.
+    hidden_page: Option<Page>,
     bt_names: [Option<String>; 4],
     hotkeys_loaded: bool,
     /// The hotkey row being learned from the KVM's keyboard, since when; how learning one last ended (Err: not learned).
@@ -215,6 +217,7 @@ impl App {
             hotkeys: Default::default(),
             hotkey_error: Default::default(),
             bt_passkey: String::new(),
+            hidden_page: None,
             bt_names: Default::default(),
             hotkeys_loaded: false,
             learning: None,
@@ -349,13 +352,20 @@ impl App {
             ui.add(egui::Image::new((word, size)).tint(ui.visuals().strong_text_color()));
         });
         ui.add_space(14.0);
+        // A page that goes away for a moment (the wireless module restarting) comes back by itself: the window shows the
+        // Overview meanwhile, and doesn't forget where you were.
         if !self.page.shown(snap) {
+            self.hidden_page.get_or_insert(self.page);
             self.page = Page::Overview;
+        } else if let Some(p) = self.hidden_page.filter(|p| p.shown(snap)) {
+            self.page = p;
+            self.hidden_page = None;
         }
         for page in Page::ALL.into_iter().filter(|p| p.shown(snap)) {
             let (glyph, color) = page.icon();
             if look::nav_item(ui, glyph, color, &page.title(), self.page == page, accent) {
                 self.page = page;
+                self.hidden_page = None;
             }
         }
         // Quick controls at the foot, as the Creative App keeps its output switch and volume there.
@@ -457,7 +467,7 @@ impl App {
             }
             ui.add_space(8.0);
             if snap.as_ref().is_some_and(|s| s.status.bt_passkey != 0) && self.page != Page::Bluetooth {
-                self.passkey_banner(ui);
+                self.passkey_banner(ui, snap.as_ref().map(|s| &s.status));
             }
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match (self.page, snap.as_ref()) {
                 (Page::Displays, s) => {
@@ -664,21 +674,23 @@ mod tests {
     }
 
     /// A screen dragged on the Screen hop page's canvas stays where it was dropped, in the page's draft: the KVM keeps
-    /// its arrangement until Apply, then has the screen there, and the draft goes once the KVM's copy confirms it.
+    /// its arrangement until Apply, then has the screen there, and the draft goes once the KVM's copy confirms it. The
+    /// arrangement is picked on the page (arrangement 2, which no profile uses).
     #[test]
     fn a_screen_dragged_on_the_canvas_stays_where_it_is_dropped() {
-        use kvm_proto::ctrl::Screen;
+        use kvm_proto::ctrl::{Host, Screen};
         let (ctx, mut app, shared) = simulated();
         let mut frame = eframe::Frame::_new_kittest();
         for v in [
             ConfigValue::AbsPointer(true),
-            ConfigValue::Screen(0, Screen::new(Pc::Pc1, 1920, 1080, [0, 0])),
-            ConfigValue::Screen(1, Screen::new(Pc::Pc2, 1920, 1080, [1920, 0])),
+            ConfigValue::Screen(2, 0, Screen::new(Host::Pc1, 1920, 1080, [0, 0])),
+            ConfigValue::Screen(2, 1, Screen::new(Host::Pc2, 1920, 1080, [1920, 0])),
         ] {
             app.send(UiCmd::Config(v));
         }
+        app.screens.pick(2);
         let kvm_at = |shared: &Mutex<Shared>| {
-            shared.lock().unwrap().snap.as_ref().and_then(|s| s.hop()).map(|h| h.screens[1].at)
+            shared.lock().unwrap().snap.as_ref().and_then(|s| s.hop()).map(|h| h.arrangements[2].screens[1].at)
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while kvm_at(&shared) != Some([1920, 0]) {
@@ -917,6 +929,9 @@ mod tests {
             app.screens.select(Some(1));
             shot(&mut app, format!("{theme_name}-screens-full.ppm"), 1300);
             app.screens.select(None);
+            // The Ports page down to the Other port (OPENDYN_SIM_BT=dongle: the wireless module on it).
+            app.page = Page::Ports;
+            shot(&mut app, format!("{theme_name}-ports-full.ppm"), 1300);
             // The "are you sure" before a software lock.
             app.page = Page::Settings;
             app.confirm_lock = Some(ConfigValue::SwConfigAllowed(false));

@@ -21,6 +21,7 @@ embassy-time = "0.5.1"
 embassy-sync = "0.8"
 embassy-futures = "0.1.2"
 heapless = "0.9"
+embedded-io-async = "0.7"
 static_cell = "2.1"
 
 [profile.release]

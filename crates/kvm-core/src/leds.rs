@@ -163,6 +163,8 @@ pub fn render(i: &LedInputs, now_ms: u32) -> [Rgb; COUNT] {
             }
             PortState::Unpowered => scale(RED, 40),
             PortState::Unsupported => scale(AMBER, 80),
+            // The Bluetooth module on this port (a dongle): the Bluetooth hosts' colour.
+            PortState::Module => scale(BT_VIOLET, 160),
             PortState::Hosted | PortState::Passthrough => match mode {
                 PortMode::Normalized | PortMode::Auto => GREEN,
                 PortMode::Mirrored => CYAN,

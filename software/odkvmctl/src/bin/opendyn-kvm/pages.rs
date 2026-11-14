@@ -262,7 +262,15 @@ impl App {
                     } else {
                         product.clone()
                     });
-                    note(ui, names::mode(p.effective));
+                    // The wireless module on this port (an ESP32-C3 board): it serves the wireless hosts, not the PCs.
+                    note(
+                        ui,
+                        if p.state == PortState::Module {
+                            fl!("port-module-summary")
+                        } else {
+                            names::mode(p.effective)
+                        },
+                    );
                     ui.end_row();
                 }
             });
@@ -308,11 +316,12 @@ impl App {
         let locked = s.status.flags & status_flags::SW_CONFIG_ALLOWED == 0;
         card(ui, &names::port_title(port), |ui| {
             ui.horizontal(|ui| {
-                chip(
-                    ui,
-                    &names::port_state(p.state),
-                    if p.state == PortState::Empty { look::palette(ui).weak } else { GOOD },
-                );
+                let color = match p.state {
+                    PortState::Empty => look::palette(ui).weak,
+                    PortState::Module => crate::bluetooth::violet(),
+                    _ => GOOD,
+                };
+                chip(ui, &names::port_state(p.state), color);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(!locked && p.state != PortState::Empty, egui::Button::new(fl!("redetect")))
@@ -346,6 +355,11 @@ impl App {
             let product = if product.is_empty() { fl!("unnamed-device") } else { product.clone() };
             ui.label(RichText::new(product).size(15.0));
             note(ui, format!("{:04x}:{:04x} · {}", p.vid, p.pid, names::speed(p.speed)));
+            if p.state == PortState::Module {
+                // Not a device for the PCs: say so, and how to get the port back (software.md §4.13).
+                ui.label(RichText::new(fl!("port-module-note")).color(ink(ui, crate::bluetooth::violet())));
+                return;
+            }
             let mut line = fl!("running-mode", mode = names::mode(p.effective));
             if p.mode == PortMode::Auto || p.mode != p.effective {
                 line += &format!(" ({})", names::reason(p.reason));
@@ -371,61 +385,71 @@ impl App {
         let locked = s.status.flags & status_flags::SW_CONFIG_ALLOWED == 0;
         card(ui, &fl!("profiles"), |ui| {
             note(ui, fl!("profiles-note"));
-            let hop = s.has_hop();
+            let hop = s.hop();
             ui.add_enabled_ui(!locked, |ui| {
-                egui::Grid::new("profiles").num_columns(if hop { 6 } else { 5 }).spacing([10.0, 6.0]).show(ui, |ui| {
-                    ui.label("");
-                    note(ui, fl!("name"));
-                    for port in Port::ALL {
-                        note(ui, names::port_short(*port));
-                    }
-                    if hop {
-                        note(ui, fl!("profile-hop"));
-                    }
-                    ui.end_row();
-                    for (i, p) in list.iter().enumerate().take(count as usize) {
-                        let n = i as u8;
-                        if ui.radio(n == active, "").clicked() && n != active {
-                            self.set(ConfigValue::Profile(n));
-                        }
-                        // The name follows the KVM except while it is being edited.
-                        if self.profile_editing != Some(i) {
-                            self.profile_names[i] = p.name.clone();
-                        }
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut self.profile_names[i]).min_size(egui::vec2(110.0, 0.0)),
-                        );
-                        if r.has_focus() {
-                            self.profile_editing = Some(i);
-                        } else if r.lost_focus() {
-                            self.profile_editing = None;
-                            let name = self.profile_names[i].trim();
-                            if !name.is_empty() && name != p.name {
-                                self.set(ConfigValue::ProfileName(n, ProfileName::new(name)));
-                            }
-                        }
-                        let mut modes = p.modes;
+                egui::Grid::new("profiles").num_columns(if hop.is_some() { 6 } else { 5 }).spacing([10.0, 6.0]).show(
+                    ui,
+                    |ui| {
+                        ui.label("");
+                        note(ui, fl!("name"));
                         for port in Port::ALL {
-                            let m = &mut modes[port.index()];
-                            egui::ComboBox::from_id_salt(("profile-mode", i, port.index()))
-                                .selected_text(names::mode_short(*m))
-                                .width(110.0)
-                                .show_ui(ui, |ui| {
-                                    for mode in PortMode::ALL {
-                                        ui.selectable_value(m, *mode, names::mode(*mode));
-                                    }
-                                });
+                            note(ui, names::port_short(*port));
                         }
-                        if modes != p.modes {
-                            self.set(ConfigValue::ProfileModes(n, modes));
-                        }
-                        let mut on = p.hop;
-                        if hop && ui.checkbox(&mut on, "").on_hover_text(fl!("profile-hop-hover")).changed() {
-                            self.set(ConfigValue::ProfileHop(n, on));
+                        if hop.is_some() {
+                            note(ui, fl!("profile-hop"));
                         }
                         ui.end_row();
-                    }
-                });
+                        for (i, p) in list.iter().enumerate().take(count as usize) {
+                            let n = i as u8;
+                            if ui.radio(n == active, "").clicked() && n != active {
+                                self.set(ConfigValue::Profile(n));
+                            }
+                            // The name follows the KVM except while it is being edited.
+                            if self.profile_editing != Some(i) {
+                                self.profile_names[i] = p.name.clone();
+                            }
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.profile_names[i]).min_size(egui::vec2(110.0, 0.0)),
+                            );
+                            if r.has_focus() {
+                                self.profile_editing = Some(i);
+                            } else if r.lost_focus() {
+                                self.profile_editing = None;
+                                let name = self.profile_names[i].trim();
+                                if !name.is_empty() && name != p.name {
+                                    self.set(ConfigValue::ProfileName(n, ProfileName::new(name)));
+                                }
+                            }
+                            let mut modes = p.modes;
+                            for port in Port::ALL {
+                                let m = &mut modes[port.index()];
+                                egui::ComboBox::from_id_salt(("profile-mode", i, port.index()))
+                                    .selected_text(names::mode_short(*m))
+                                    .width(110.0)
+                                    .show_ui(ui, |ui| {
+                                        for mode in PortMode::ALL {
+                                            ui.selectable_value(m, *mode, names::mode(*mode));
+                                        }
+                                    });
+                            }
+                            if modes != p.modes {
+                                self.set(ConfigValue::ProfileModes(n, modes));
+                            }
+                            // Screen hop's arrangement in this profile (none: off).
+                            if let Some(h) = &hop
+                                && let Some(a) = crate::screens::arrangement_picker(
+                                    ui,
+                                    egui::IdSalt::new(("profile-hop", i)),
+                                    p.arrangement,
+                                    h,
+                                )
+                            {
+                                self.set(ConfigValue::ProfileArrangement(n, a));
+                            }
+                            ui.end_row();
+                        }
+                    },
+                );
                 ui.horizontal(|ui| {
                     ui.label(fl!("profiles-in-use"));
                     let mut n = count;

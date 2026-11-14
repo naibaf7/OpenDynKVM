@@ -11,9 +11,9 @@ use kvm_hid::{KeyState, Layout, MouseInput, Translator};
 use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::diag::{self as cdiag, BtModule, ClockSource, Grade, Item, id};
 use kvm_proto::ctrl::{
-    self, Advertised, AutoReason, ConfigValue, ErrorCode, Event, FaultKind, FwState, HopState, Hotkey, Info, KeyAction,
-    LearnEnd, LinkState, Pc, Port, PortInfo, PortMode, PortState, PowerSource, RebootTarget, Request, Response, Speed,
-    StringKind, SwitchSource, Target, VialMode, status_flags,
+    self, Advertised, AutoReason, BtPointer, ConfigValue, ErrorCode, Event, FaultKind, FwState, HopState, Host, Hotkey,
+    Info, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, Pc, Port, PortInfo, PortMode, PortState, PowerSource,
+    RebootTarget, Request, Response, Speed, StringKind, SwitchSource, Target, VialMode, status_flags,
 };
 use kvm_proto::link::bt::{EventKind as BtEventKind, HostState as BtHostState, report as btreport};
 use kvm_proto::link::msg::{Status as AtStatus, UsbSpeed, UsbState};
@@ -198,6 +198,16 @@ impl Hosted {
     }
 }
 
+/// A front port's ESP32-C3 board as the Bluetooth module (software.md §4.13): being found out, or taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dongle {
+    None,
+    /// The firmware talks to it: the module's `Hello`, or a blank flash it may program.
+    Probing(Port),
+    /// It is the module: the port shows `PortState::Module`.
+    Claimed(Port),
+}
+
 struct PortSlot {
     state: PortState,
     effective: PortMode,
@@ -264,6 +274,10 @@ pub struct Engine {
     /// Unsaved changes (config or keymap) since then; saved [`AUTOSAVE_MS`] after the last one.
     dirty_since: Option<u32>,
     config_dirty: bool,
+    /// Arrangements to write (bit n: arrangement n's item).
+    arrangements_dirty: u8,
+    /// Where screen hop last put the active Bluetooth host's absolute pointer: released there when it is left.
+    bt_pointer_at: Option<[u16; 2]>,
     /// Saves that may go ahead now, up to [`SAVE_BURST`]; one more each [`SAVE_PACE_MS`] after `save_paced`.
     save_allowance: u8,
     save_paced: u32,
@@ -298,6 +312,10 @@ pub struct Engine {
     selftest: u32,
     /// The Bluetooth module as the firmware sees it (`set_bt_module`): absent, up, being programmed, failed.
     bt_module: BtModule,
+    /// The module is on the board (`set_bt_fitted`, from what the firmware read at boot): then no dongle is taken.
+    bt_fitted: bool,
+    /// A front port's ESP32-C3 board that is, or may be, the module (software.md §4.13).
+    dongle: Dongle,
     selftest_done_at: Option<u32>,
     /// When the active profile last changed (its number shows on the LEDs for a while).
     profile_changed_at: Option<u32>,
@@ -377,6 +395,8 @@ impl Engine {
             config: Config::DEFAULT,
             dirty_since: None,
             config_dirty: false,
+            arrangements_dirty: 0,
+            bt_pointer_at: None,
             save_allowance: SAVE_BURST,
             save_paced: 0,
             vial: kvm_vial::Vial::new(),
@@ -404,6 +424,8 @@ impl Engine {
             identify_until: 0,
             selftest: ctrl::selftest::RUNNING,
             bt_module: BtModule::Absent,
+            bt_fitted: false,
+            dongle: Dongle::None,
             selftest_done_at: None,
             profile_changed_at: None,
             unlock: None,
@@ -424,6 +446,9 @@ impl Engine {
     /// bits) and the serial number, and builds the descriptor set.
     pub fn start(&mut self, config: Config, info: Info, serial: &str) {
         self.config = config;
+        // A config item from firmware up to 0.1.12 brought its one arrangement as arrangement 0: it gets an item of its
+        // own at the next save, before the config item without it, unless that item is there (`restore_item`).
+        self.arrangements_dirty = (self.config.arrangements[0] != config::Arrangement::EMPTY) as u8;
         self.hotkeys.configure(&self.config);
         self.info = info;
         self.serial = String::try_from(&serial[..serial.len().min(16)]).unwrap_or_default();
@@ -509,8 +534,10 @@ impl Engine {
             PowerSource::PwrPort => self.power.adv_pwr.milliamps(),
             PowerSource::PcBus => adv[0].milliamps().max(adv[1].milliamps()),
         };
-        // A fitted module draws its current whether it answers or not (starting, being programmed, failed).
-        let own = SELF_CURRENT_MA + if self.bt_module != BtModule::Absent { BT_CURRENT_MA } else { 0 };
+        // A fitted module draws its current whether it answers or not (starting, being programmed, failed); a dongle
+        // draws it from its port, which counts it as the port's device.
+        let on_board = self.bt_module != BtModule::Absent && self.dongle == Dongle::None;
+        let own = SELF_CURRENT_MA + if on_board { BT_CURRENT_MA } else { 0 };
         let budget = available.saturating_sub(own);
         let mut flags = 0;
         if self.config.sw_switch_allowed {
@@ -553,28 +580,35 @@ impl Engine {
             bt_bonded: self.bt.mask(|h| h.bonded()),
             bt_pairing: self.bt.pairing_seconds(self.now),
             bt_passkey: self.bt.passkey.map_or(0, |p| p.host),
+            bt_passkey_digits: self.bt.passkey.map_or(0, |p| p.digits),
+            bt_passkey_typed: self.bt.passkey.map_or(0, |p| p.value),
             bt_module: self.bt_module,
             hop: self.hop_state(),
-            pointer: self.hop.position_on(&self.config.screens, self.active),
+            pointer: self.hop.position_on(self.config.layout(), self.active_host()),
         }
     }
 
-    /// Whether screen hop moves the pointer now, and if not, why not (`Status.hop`).
+    /// The host that has the input: a Bluetooth host, or the active PC.
+    pub fn active_host(&self) -> Host {
+        self.bt.active.and_then(Host::bt).unwrap_or(Host::pc(self.active))
+    }
+
+    /// Whether screen hop moves the pointer now, and if not, why not (`Status.hop`). A Bluetooth host takes part like
+    /// a PC (protocol 9).
     pub fn hop_state(&self) -> HopState {
         let mouse = &self.ports[Port::Mouse.index()];
         let mouse_elsewhere =
             matches!(mouse.state, PortState::Hosted | PortState::Passthrough) && !mouse.is_normalized();
+        let host = self.active_host();
         if !self.config.hop_on() {
             HopState::Off
-        } else if self.bt.active.is_some() {
-            HopState::Wireless
         } else if !self.config.abs_pointer {
             HopState::NoAbsolute
         } else if mouse_elsewhere || !self.presentation.mouse_abs {
             HopState::NotNormalized
-        } else if self.pcs[self.active.index()].out.boot_mouse {
+        } else if host.as_pc().is_some_and(|pc| self.pcs[pc.index()].out.boot_mouse) {
             HopState::BootProtocol
-        } else if !hop::has_screens(&self.config.screens, self.active) {
+        } else if !hop::has_screens(self.config.layout(), host) {
             HopState::NoScreens
         } else {
             HopState::Active
@@ -660,8 +694,12 @@ impl Engine {
     }
 
     fn config_changed(&mut self, key: u16) {
-        // A profile that isn't remembered across power cycles needs no flash write.
-        if key != ctrl::key::PROFILE || self.config.remember_profile {
+        if let Some(a) = ctrl::key::arrangement_of(key) {
+            // An arrangement's screens and name: its own item.
+            self.dirty_since = Some(self.now);
+            self.arrangements_dirty |= 1 << a;
+        } else if key != ctrl::key::PROFILE || self.config.remember_profile {
+            // A profile that isn't remembered across power cycles needs no flash write.
             self.dirty_since = Some(self.now);
             self.config_dirty = true;
         }
@@ -774,7 +812,26 @@ impl Engine {
 
     // ── switching ────────────────────────────────────────────────────────────
 
+    /// Switches the input to `target`; screen hop's pointer follows it.
     pub fn switch(&mut self, target: Target, source: SwitchSource) {
+        let from = self.active_host();
+        self.switch_input(target, source);
+        let to = self.active_host();
+        if to != from {
+            // Screen hop's pointer is found where it was left on that host (a hop put it at the edge already). A host
+            // that takes relative motion only gets its cursor parked again on the way in.
+            let layout = *self.config.layout();
+            self.hop.leave(&layout, from);
+            if self.config.bt_pointer(to) == BtPointer::Relative {
+                self.hop.forget_cursor(to);
+            }
+            if source != SwitchSource::Edge {
+                self.hop.enter(&layout, to);
+            }
+        }
+    }
+
+    fn switch_input(&mut self, target: Target, source: SwitchSource) {
         let from_bt = self.bt.active;
         let pc = match target {
             Target::Pc1 => Pc::Pc1,
@@ -811,11 +868,7 @@ impl Engine {
             self.release_pc(old);
         }
         self.active = pc;
-        // Screen hop's pointer is found where it was left on that PC (a hop put it at the edge already).
-        self.hop.leave(&self.config.screens, old);
-        if source != SwitchSource::Edge {
-            self.hop.enter(&self.config.screens, pc);
-        }
+        let _ = old;
         // 3. The keyboard shows the new PC's lock LEDs.
         self.apply_leds();
         // 4. Passthrough ports that follow the active PC move along.
@@ -893,6 +946,9 @@ impl Engine {
         let Some(n) = self.bt.active.take() else { return };
         self.bt_input(n, btreport::KEYBOARD, &[0; btreport::KEYBOARD_LEN]);
         self.bt_input(n, btreport::MOUSE, &[0; btreport::MOUSE_LEN]);
+        if let Some([x, y]) = self.bt_pointer_at.take() {
+            self.bt_input(n, btreport::POINTER, &kvm_proto::link::bt::pointer_report(0, x, y, 0, 0));
+        }
         self.bt_input(n, btreport::CONSUMER, &[0; btreport::CONSUMER_LEN]);
         self.hold_over();
         self.emit(Output::Bt(BtOut::Select(0)));
@@ -990,13 +1046,26 @@ impl Engine {
             }),
             None => DeviceSummary::default(),
         };
-        let unsupported = summary.interfaces.is_empty();
+        let dongle = self.takes_dongle(port, probed);
         let s = &mut self.ports[port.index()];
         s.dev = Some(Hosted { probed: probed.clone(), translators, summary, last_len: Vec::new() });
         s.probe_until = None;
         s.reports = 0;
         s.rate_hz = 0;
-        if unsupported {
+        if dongle {
+            // The firmware talks to it first (`dongle_wanted`); the port stays probing until it says what it is.
+            s.state = PortState::Probing;
+            self.dongle = Dongle::Probing(port);
+            self.event(Event::PortChanged(port));
+            return;
+        }
+        self.settle(port);
+    }
+
+    /// A probed device becomes what its interfaces make it: Hosted (and every port is decided again) or Unsupported.
+    fn settle(&mut self, port: Port) {
+        let s = &mut self.ports[port.index()];
+        if s.dev.as_ref().is_none_or(|d| d.summary.interfaces.is_empty()) {
             s.state = PortState::Unsupported;
             self.event(Event::PortChanged(port));
             return;
@@ -1005,6 +1074,62 @@ impl Engine {
         let mut touched = [false; 3];
         touched[port.index()] = true;
         self.redecide(touched);
+    }
+
+    /// Whether the device just probed on `port` is tried as the Bluetooth module (software.md §4.13): an ESP32-C3's
+    /// USB serial port ([`bt::dongle_endpoints`]), on a KVM without the module on board and without another dongle,
+    /// on a port not set to passthrough (that keeps an ESP32 board of one's own reachable from a PC as it is).
+    fn takes_dongle(&self, port: Port, probed: &Probed) -> bool {
+        !self.bt_fitted
+            && self.dongle == Dongle::None
+            && !self.config.port_modes()[port.index()].is_passthrough()
+            && bt::dongle_endpoints(&probed.device, &probed.config).is_some()
+    }
+
+    /// The KVM has the module on its board (what the firmware read at boot): ESP32 boards on the front ports are then
+    /// ordinary devices.
+    pub fn set_bt_fitted(&mut self, fitted: bool) {
+        self.bt_fitted = fitted;
+    }
+
+    /// The firmware is to find out whether the device on `port` is the Bluetooth module (`port_attached` took it).
+    pub fn dongle_wanted(&self, port: Port) -> bool {
+        self.dongle == Dongle::Probing(port)
+    }
+
+    /// The device on `port` is the module: it answered as the module, or it was blank and is being programmed.
+    pub fn dongle_claimed(&mut self, port: Port) {
+        if self.dongle == Dongle::Probing(port) {
+            self.dongle = Dongle::Claimed(port);
+            self.ports[port.index()].state = PortState::Module;
+            self.event(Event::PortChanged(port));
+        }
+    }
+
+    /// The device on `port` is not the module (another firmware, another chip): an ordinary device from now on.
+    pub fn dongle_declined(&mut self, port: Port) {
+        if self.dongle == Dongle::Probing(port) {
+            self.dongle = Dongle::None;
+            self.settle(port);
+        }
+    }
+
+    /// The front port with the module on it, if there is one.
+    pub fn dongle_port(&self) -> Option<Port> {
+        match self.dongle {
+            Dongle::Claimed(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The dongle's port was just set to passthrough: plug it in anew, so that it attaches as the ordinary device the
+    /// setting asks for (`takes_dongle` leaves it alone then).
+    fn release_dongle_for_passthrough(&mut self) {
+        if let Dongle::Probing(p) | Dongle::Claimed(p) = self.dongle
+            && self.config.port_modes()[p.index()].is_passthrough()
+        {
+            self.reprobe(p);
+        }
     }
 
     /// Decides every port's mode again (attach, unplug, a mode or Vial change). The ports compete for the mirror
@@ -1078,6 +1203,17 @@ impl Engine {
 
     pub fn port_detached(&mut self, port: Port) {
         let i = port.index();
+        if matches!(self.dongle, Dongle::Probing(p) | Dongle::Claimed(p) if p == port) {
+            let claimed = self.dongle == Dongle::Claimed(port);
+            self.dongle = Dongle::None;
+            if claimed {
+                self.bt_link_down();
+                self.set_bt_module(BtModule::Absent);
+            }
+            self.ports[i] = PortSlot { faults: self.ports[i].faults, ..PortSlot::new() };
+            self.event(Event::PortChanged(port));
+            return;
+        }
         if self.ports[i].state == PortState::Passthrough {
             // We routed it away ourselves; Hub-0 just saw it leave.
             return;
@@ -1201,8 +1337,15 @@ impl Engine {
         let keys = self.norm.keys().union(&self.mirr.keys());
         let Some(entry) = self.bt.passkey.as_mut() else { return };
         let host = entry.host;
+        let typed = (entry.digits, entry.value);
         let value = match entry.feed(&keys) {
-            PasskeyStep::Typing => return,
+            PasskeyStep::Typing => {
+                // Hosts show the digits as they are typed (`Status.bt_passkey_digits`): tell them of each one.
+                if self.bt.passkey.is_some_and(|e| (e.digits, e.value) != typed) {
+                    self.event(Event::BtChanged(0));
+                }
+                return;
+            }
             PasskeyStep::Done(v) => Some(v),
             PasskeyStep::Cancel => None,
         };
@@ -1412,18 +1555,52 @@ impl Engine {
     /// other PC) and the keymap's. With screen hop the KVM moves the pointer itself (`accelerate`: as a mouse moves it).
     fn send_pointer(&mut self, m: MouseInput, accelerate: bool) {
         let pc = self.active;
-        let buttons = (self.norm.buttons() & !self.suppressed_buttons) | self.keymap_buttons as u16;
-        if let Some(n) = self.bt.active {
-            let buttons = buttons | (self.mirr.buttons() & !self.suppressed_buttons);
-            let r = kvm_proto::link::bt::mouse_report(buttons, m.x, m.y, m.wheel, m.pan);
-            self.bt_input(n, btreport::MOUSE, &r);
-            return;
+        let mut buttons = (self.norm.buttons() & !self.suppressed_buttons) | self.keymap_buttons as u16;
+        if self.bt.active.is_some() {
+            // A Bluetooth host's mouse also carries a mirrored device's buttons.
+            buttons |= self.mirr.buttons() & !self.suppressed_buttons;
         }
         if self.hop_state() == HopState::Active {
             self.hop_motion(MouseInput { buttons, ..m }, accelerate);
             return;
         }
+        if let Some(n) = self.bt.active {
+            let r = kvm_proto::link::bt::mouse_report(buttons, m.x, m.y, m.wheel, m.pan);
+            self.bt_input(n, btreport::MOUSE, &r);
+            return;
+        }
         self.send_pointer_report(pc, hop::Report::Rel([m.x, m.y]), buttons, m.wheel, m.pan);
+    }
+
+    /// Screen hop's report for `host`: a PC's through its pointer interfaces, a Bluetooth host's as its absolute
+    /// pointer or its mouse.
+    fn send_host_pointer(&mut self, host: Host, motion: hop::Report, buttons: u16, wheel: i32, pan: i32) {
+        let n = match (host.as_pc(), host.bt_slot()) {
+            (Some(pc), _) => return self.send_pointer_report(pc, motion, buttons, wheel, pan),
+            (None, Some(n)) => n,
+            (None, None) => return,
+        };
+        match motion {
+            hop::Report::Abs([x, y]) => {
+                self.bt_pointer_at = Some([x, y]);
+                let r = kvm_proto::link::bt::pointer_report(buttons, x, y, wheel, pan);
+                self.bt_input(n, btreport::POINTER, &r);
+            }
+            hop::Report::Rel(mut d) => {
+                // The mouse report carries ±32767 each way: a longer move (a park) takes several.
+                let (mut wheel, mut pan) = (wheel, pan);
+                loop {
+                    let step = d.map(|v| v.clamp(-32767, 32767));
+                    let r = kvm_proto::link::bt::mouse_report(buttons, step[0], step[1], wheel, pan);
+                    self.bt_input(n, btreport::MOUSE, &r);
+                    d = [d[0] - step[0], d[1] - step[1]];
+                    (wheel, pan) = (0, 0);
+                    if d == [0, 0] {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     fn send_pointer_report(&mut self, pc: Pc, motion: hop::Report, buttons: u16, wheel: i32, pan: i32) {
@@ -1433,49 +1610,61 @@ impl Engine {
         }
     }
 
-    /// How `pc` takes the absolute pointer: its mapping and its desktop.
-    fn hop_map(&self, pc: Pc) -> hop::Map {
-        hop::Map { mapping: self.config.mapping(pc), units: self.config.units(pc) }
+    /// How `host` takes the pointer: its mapping, its desktop, and for a Bluetooth host whether it is absolute.
+    fn hop_map(&self, host: Host) -> hop::Map {
+        hop::Map {
+            mapping: self.config.mapping(host),
+            units: self.config.units(host),
+            relative: self.config.bt_pointer(host) == BtPointer::Relative,
+        }
     }
 
-    /// Whether the pointer may hop onto `pc`: it is connected, awake and past its firmware setup.
-    fn hop_open(&self, pc: Pc) -> bool {
-        let s = &self.pcs[pc.index()];
-        s.link == LinkState::Connected && !s.out.boot_mouse
+    /// Whether the pointer may hop onto `host`: a PC connected, awake and past its firmware setup; a Bluetooth host
+    /// bonded, connected, encrypted and subscribed.
+    fn hop_open(&self, host: Host) -> bool {
+        match (host.as_pc(), host.bt_slot()) {
+            (Some(pc), _) => {
+                let s = &self.pcs[pc.index()];
+                s.link == LinkState::Connected && !s.out.boot_mouse
+            }
+            (None, Some(n)) => self.bt.selectable(n) && self.bt.host(n).is_some_and(|h| h.ready()),
+            (None, None) => false,
+        }
     }
 
-    /// Screen hop (software.md §4.14): the motion moves the KVM's pointer across the arrangement; the active PC gets
-    /// where it is, and a push across an edge onto the other PC's screen switches to that PC.
+    /// Screen hop (software.md §4.14): the motion moves the KVM's pointer across the active profile's arrangement; the
+    /// active host gets where it is, and a push across an edge onto another host's screen switches to that host.
     fn hop_motion(&mut self, m: MouseInput, accelerate: bool) {
-        let pc = self.active;
+        let host = self.active_host();
         let h = self.config.hop;
         let d = if accelerate {
             self.hop.accel.apply(m.x, m.y, self.now, h.accel, h.speed)
         } else {
             [m.x as f32, m.y as f32]
         };
+        let host_at = |i: usize| Host::from_index(i).unwrap_or(Host::Pc1);
         let rules = hop::Rules {
             resistance: h.resistance,
             corner: h.corner,
             buttons: m.buttons != 0,
-            open: [self.hop_open(Pc::Pc1), self.hop_open(Pc::Pc2)],
-            maps: [self.hop_map(Pc::Pc1), self.hop_map(Pc::Pc2)],
+            open: core::array::from_fn(|i| self.hop_open(host_at(i))),
+            maps: core::array::from_fn(|i| self.hop_map(host_at(i))),
         };
-        let screens = self.config.screens;
-        let step = self.hop.motion(&screens, pc, d, self.now, &rules);
+        let layout = *self.config.layout();
+        let step = self.hop.motion(&layout, host, d, self.now, &rules);
         let reports =
-            if step.reports.is_empty() { self.hop.here(&screens, pc, self.hop_map(pc)) } else { step.reports };
+            if step.reports.is_empty() { self.hop.here(&layout, host, self.hop_map(host)) } else { step.reports };
         // The wheel goes with the first report.
         let mut scroll = (m.wheel, m.pan);
         for r in reports {
-            self.send_pointer_report(pc, r, m.buttons, scroll.0, scroll.1);
+            self.send_host_pointer(host, r, m.buttons, scroll.0, scroll.1);
             scroll = (0, 0);
         }
         if let Some(to) = step.hop {
-            self.switch(if to == Pc::Pc1 { Target::Pc1 } else { Target::Pc2 }, SwitchSource::Edge);
-            if self.active == to && self.bt.active.is_none() {
-                for r in self.hop.here(&screens, to, self.hop_map(to)) {
-                    self.send_pointer_report(to, r, 0, 0, 0);
+            self.switch(to.target(), SwitchSource::Edge);
+            if self.active_host() == to {
+                for r in self.hop.here(&layout, to, self.hop_map(to)) {
+                    self.send_host_pointer(to, r, 0, 0, 0);
                 }
             }
         }
@@ -1543,7 +1732,7 @@ impl Engine {
         if matches!(st.usb_state, UsbState::Default | UsbState::Unpowered | UsbState::Detached) {
             // A bus reset or unplug: the PC starts over in report protocol without multipliers, its cursor anywhere.
             s.out.reset();
-            self.hop.forget_cursor(pc);
+            self.hop.forget_cursor(Host::pc(pc));
         }
         s.link = link;
         s.status = Some(st);
@@ -1944,6 +2133,19 @@ impl Engine {
             let ready = self.bt.mask(|h| h.ready()).count_ones();
             add(id::BT_HOSTS, Grade::Info, ready as i32);
         }
+        // A board on a front port as the module, once one was seen: what its sessions did (bring-up).
+        if let Some(m) = b.map(|b| b.board).filter(|m| m.sessions > 0) {
+            let n = |v: u32| v.min(i32::MAX as u32) as i32;
+            add(id::BOARD_SESSIONS, Grade::Info, n(m.sessions));
+            add(id::BOARD_STEPS, Grade::Info, m.steps as i32);
+            add(id::BOARD_ROM_ERROR, Grade::Info, m.rom_error as i32);
+            add(id::BOARD_BULK_IN, Grade::Info, n(m.bulk_in));
+            add(id::BOARD_BULK_OUT, Grade::Info, n(m.bulk_out));
+            add(id::BOARD_NAKS, Grade::Info, n(m.naks));
+            add(id::BOARD_OUT_NAKS, Grade::Info, n(m.out_naks));
+            add(id::BOARD_ERRORS, Grade::Info, n(m.errors));
+            add(id::BOARD_LAST_ERROR, Grade::Info, m.last_error as i32);
+        }
         v
     }
 
@@ -2068,14 +2270,24 @@ impl Engine {
     /// The firmware wrote everything [`Engine::take_save_item`] gave it. A change made since then is still to save, and
     /// keeps its autosave.
     pub fn config_saved(&mut self) {
-        if !self.config_dirty && !self.vial.keymap.is_dirty() {
+        if !self.config_dirty && self.arrangements_dirty == 0 && !self.vial.keymap.is_dirty() {
             self.dirty_since = None;
         }
     }
 
-    /// After [`Output::Save`]: the next changed item to write (config first, then the keymap's), encoded into `buf`
-    /// (at least [`SAVE_ITEM_MAX`] bytes). It counts as written from here.
+    /// After [`Output::Save`]: the next changed item to write (the arrangements first, then the config, then the
+    /// keymap's), encoded into `buf` (at least [`SAVE_ITEM_MAX`] bytes). It counts as written from here. An
+    /// arrangement goes before the config so that one moved out of an old config item is in flash before the config
+    /// item that no longer holds it.
     pub fn take_save_item(&mut self, buf: &mut [u8]) -> Option<(u16, usize)> {
+        if self.arrangements_dirty != 0 {
+            let a = self.arrangements_dirty.trailing_zeros() as u8;
+            self.arrangements_dirty &= !(1 << a);
+            let mut item = [0u8; config::ARRANGEMENT_ITEM_MAX];
+            let n = self.config.encode_arrangement(a, &mut item);
+            buf[..n].copy_from_slice(&item[..n]);
+            return Some((config::ARRANGEMENT_ITEM + a as u16, n));
+        }
         if core::mem::take(&mut self.config_dirty) {
             let mut item = [0u8; config::ITEM_MAX];
             let n = self.config.encode(&mut item);
@@ -2085,15 +2297,20 @@ impl Engine {
         self.vial.keymap.take_dirty(buf)
     }
 
-    /// At boot: an item read from flash that is not the config (keymap, macros, keymap settings).
+    /// At boot: an item read from flash that is not the config (an arrangement, keymap, macros, keymap settings).
     pub fn restore_item(&mut self, key: u16, data: &[u8]) {
+        if let Some(a) = key.checked_sub(config::ARRANGEMENT_ITEM).filter(|a| (*a as usize) < MAX_ARRANGEMENTS) {
+            self.config.restore_arrangement(a as u8, data);
+            self.arrangements_dirty &= !(1 << a);
+            return;
+        }
         self.vial.keymap.restore(key, data);
         self.keymap_changes = self.vial.keymap.changes();
     }
 
     /// Store keys [`Engine::restore_item`] takes.
     pub fn item_keys() -> impl Iterator<Item = u16> {
-        kvm_vial::Keymap::item_keys()
+        (0..MAX_ARRANGEMENTS as u16).map(|a| config::ARRANGEMENT_ITEM + a).chain(kvm_vial::Keymap::item_keys())
     }
 
     pub fn set_config(&mut self, v: ConfigValue, origin: Origin) -> Result<ConfigValue, ErrorCode> {
@@ -2130,6 +2347,11 @@ impl Engine {
         let (was, now) = (before.port_modes(), self.config.port_modes());
         if was != now {
             self.redecide(core::array::from_fn(|i| was[i] != now[i]));
+            self.release_dongle_for_passthrough();
+        }
+        if self.config.arrangement() != before.arrangement() {
+            // Another arrangement: the pointer starts over on the active host's main screen there.
+            self.hop.forget_all();
         }
         if self.config.profile != before.profile {
             self.profile_changed_at = Some(self.now);
@@ -2235,7 +2457,10 @@ impl Engine {
                 let now = self.config.port_modes();
                 self.redecide(core::array::from_fn(|i| was[i] != now[i]));
                 self.rebuild_presentation();
+                self.hop.forget_all();
                 self.config_dirty = true;
+                // Every arrangement's item goes too (empty now), or the old ones would come back at the next boot.
+                self.arrangements_dirty = (1 << MAX_ARRANGEMENTS) - 1;
                 self.save_now();
                 Response::Ok
             }
@@ -2364,9 +2589,11 @@ impl Engine {
                 // Only a PC has a cursor (not the service port).
                 let pc = pc.ok_or(ErrorCode::NotActive)?;
                 if self.config.hop_on() {
-                    let active = pc == self.active && self.bt.active.is_none();
-                    let map = self.hop_map(pc);
-                    self.hop.sync(&self.config.screens, pc, map, *at, self.now, active);
+                    let host = Host::pc(pc);
+                    let active = host == self.active_host();
+                    let map = self.hop_map(host);
+                    let layout = *self.config.layout();
+                    self.hop.sync(&layout, host, map, *at, self.now, active);
                 }
                 Response::Ok
             }
@@ -3413,6 +3640,91 @@ mod tests {
         assert_eq!(budget(&plain) - budget(&silent), BT_CURRENT_MA);
     }
 
+    /// An ESP32-C3 board's USB serial port, as Hub-0 probes it.
+    fn esp_board() -> Probed {
+        use crate::usbdesc::fixtures::{USB_SERIAL_JTAG_CONFIG, USB_SERIAL_JTAG_DEVICE};
+        Probed {
+            device: DeviceDesc::parse(&USB_SERIAL_JTAG_DEVICE).unwrap(),
+            speed: Some(Speed::Full),
+            config: Vec::from_slice(USB_SERIAL_JTAG_CONFIG).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_esp32_board_on_a_kvm_without_the_module_becomes_the_module() {
+        let mut e = engine();
+        drain(&mut e);
+        e.port_attached(Port::Other, &esp_board());
+        // Probing while the firmware finds out; nothing routed away meanwhile.
+        assert_eq!(e.port_info(Port::Other).state, PortState::Probing);
+        assert!(e.dongle_wanted(Port::Other));
+        assert!(!drain(&mut e).iter().any(|o| matches!(o, Output::Route { .. })));
+        e.dongle_claimed(Port::Other);
+        assert_eq!(e.port_info(Port::Other).state, PortState::Module);
+        assert_eq!(e.dongle_port(), Some(Port::Other));
+        assert_eq!(e.led_inputs().ports[Port::Other.index()].0, PortState::Module);
+        e.set_bt_module(BtModule::Up);
+        e.bt_hello(0x000100);
+        let Response::Info(i) = ask(&mut e, Request::GetInfo) else { panic!() };
+        assert_ne!(i.caps & ctrl::caps::BLUETOOTH, 0);
+        // Its current comes from its port: the KVM's own draw stays that of a board without the module.
+        let pwr = PowerInfo { source: PowerSource::PwrPort, adv_pwr: Advertised::A3_0, vbus_pwr_mv: 5100 };
+        let mut plain = engine();
+        plain.set_power(pwr);
+        e.set_power(pwr);
+        assert_eq!(e.status(None).budget_ma, plain.status(None).budget_ma);
+        // A second board while it is there: an ordinary device.
+        e.port_attached(Port::Mouse, &esp_board());
+        assert!(!e.dongle_wanted(Port::Mouse));
+        assert_eq!(e.port_info(Port::Mouse).state, PortState::Passthrough);
+        // Unplugged: the port is empty, Bluetooth is gone, and the next board may be the module.
+        e.port_detached(Port::Other);
+        assert_eq!(e.port_info(Port::Other).state, PortState::Empty);
+        assert_eq!(e.status(None).bt_module, BtModule::Absent);
+        let Response::Info(i) = ask(&mut e, Request::GetInfo) else { panic!() };
+        assert_eq!(i.caps & ctrl::caps::BLUETOOTH, 0);
+        e.port_attached(Port::Other, &esp_board());
+        assert!(e.dongle_wanted(Port::Other));
+    }
+
+    #[test]
+    fn an_esp32_board_that_is_not_the_module_is_an_ordinary_device() {
+        // Another firmware: declined, then decided as any device (a non-HID device goes to the active PC).
+        let mut e = engine();
+        drain(&mut e);
+        e.port_attached(Port::Other, &esp_board());
+        e.dongle_declined(Port::Other);
+        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        assert!(drain(&mut e).contains(&Output::Route {
+            port: Port::Other,
+            route: Route::Pc(Pc::Pc1),
+            power_cycle: false
+        }));
+        // A KVM with the module on board never takes one.
+        let mut fitted = engine();
+        fitted.set_bt_fitted(true);
+        fitted.port_attached(Port::Other, &esp_board());
+        assert!(!fitted.dongle_wanted(Port::Other));
+        assert_eq!(fitted.port_info(Port::Other).state, PortState::Passthrough);
+        // Nor a port set to passthrough: one's own ESP32 board stays reachable from a PC.
+        let mut pinned = engine();
+        pinned.set_config(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc2), Origin::Software).unwrap();
+        pinned.port_attached(Port::Other, &esp_board());
+        assert!(!pinned.dongle_wanted(Port::Other));
+        // Setting the module's port to passthrough plugs it in anew, as the ordinary device it then is.
+        let mut e = engine();
+        e.port_attached(Port::Other, &esp_board());
+        e.dongle_claimed(Port::Other);
+        drain(&mut e);
+        e.set_config(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc1), Origin::Software).unwrap();
+        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Other)));
+        e.port_detached(Port::Other);
+        e.port_attached(Port::Other, &esp_board());
+        assert!(!e.dongle_wanted(Port::Other));
+        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+    }
+
     #[test]
     fn module_hello_sends_policies_and_selection() {
         let mut e = engine();
@@ -3518,6 +3830,12 @@ mod tests {
         for (k, t) in [0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23].into_iter().zip(10u32..) {
             e.device_report(Port::Keyboard, 0, &[0, 0, k, 0, 0, 0, 0, 0], t * 10);
             e.device_report(Port::Keyboard, 0, &[0; 8], t * 10 + 5);
+            if t == 12 {
+                // Hosts see the digits so far, and hear of each one.
+                let Response::Status(st) = ask(&mut e, Request::GetStatus) else { panic!() };
+                assert_eq!((st.bt_passkey, st.bt_passkey_digits, st.bt_passkey_typed), (1, 3, 123));
+                assert_eq!(events_to(&drain(&mut e), Pc::Pc1).iter().filter(|e| **e == Event::BtChanged(0)).count(), 3);
+            }
         }
         let out = drain(&mut e);
         assert!(reports(&out).is_empty(), "the digits reach no PC");
@@ -3693,11 +4011,11 @@ mod tests {
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
         for v in [
             ConfigValue::AbsPointer(true),
-            ConfigValue::ProfileHop(0, true),
+            ConfigValue::ProfileArrangement(0, Some(0)),
             ConfigValue::HopAccel(ctrl::Accel::Flat),
             ConfigValue::HopResistance(50),
-            ConfigValue::Screen(0, ctrl::Screen::new(Pc::Pc1, 1920, 1080, [0, 0])),
-            ConfigValue::Screen(1, ctrl::Screen::new(Pc::Pc2, 1920, 1080, [1920, 0])),
+            ConfigValue::Screen(0, 0, ctrl::Screen::new(Host::Pc1, 1920, 1080, [0, 0])),
+            ConfigValue::Screen(0, 1, ctrl::Screen::new(Host::Pc2, 1920, 1080, [1920, 0])),
         ] {
             e.set_config(v, Origin::Software).unwrap();
         }
@@ -3761,7 +4079,7 @@ mod tests {
         e.pc_status(Pc::Pc1, usb(UsbState::Configured, false));
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
         assert_eq!(e.hop_state(), HopState::Off);
-        e.set_config(ConfigValue::ProfileHop(0, true), Origin::Software).unwrap();
+        e.set_config(ConfigValue::ProfileArrangement(0, Some(0)), Origin::Software).unwrap();
         assert_eq!(e.hop_state(), HopState::NoAbsolute);
         // Without the absolute pointer the mouse stays relative, without report IDs.
         drain(&mut e);
@@ -3776,7 +4094,8 @@ mod tests {
         e.device_report(Port::Mouse, 1, &[0x00, 5, 0], T0 + 2);
         let with_id = normalized::mouse_rel_report(&MouseInput { x: 5, ..Default::default() }, false, false);
         assert_eq!(reports(&drain(&mut e)), [(Pc::Pc1, 0x82, with_id.to_vec())]);
-        e.set_config(ConfigValue::Screen(3, ctrl::Screen::new(Pc::Pc1, 2560, 1440, [0, 0])), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Screen(0, 3, ctrl::Screen::new(Host::Pc1, 2560, 1440, [0, 0])), Origin::Software)
+            .unwrap();
         assert_eq!(e.hop_state(), HopState::Active);
         e.pc_protocol(Pc::Pc1, 1, 0);
         assert_eq!(e.hop_state(), HopState::BootProtocol);
@@ -3802,5 +4121,138 @@ mod tests {
         assert_eq!(reports(&drain(&mut e)), [(Pc::Pc1, 0x82, abs(0, [3432, 9110]))]);
         // Not from the service port: it has no cursor.
         assert_eq!(ask_from(&mut e, None, Request::PointerAt([0, 0])), Response::Error(ErrorCode::NotActive));
+    }
+
+    /// Pushes the mouse (`dx` a report) until `done`, at most 60 reports; returns what came out.
+    fn push_until(e: &mut Engine, dx: i8, t0: u32, done: impl Fn(&Engine) -> bool) -> std::vec::Vec<Output> {
+        let mut out = std::vec::Vec::new();
+        for t in 0..60 {
+            e.device_report(Port::Mouse, 1, &[0x00, dx as u8, 0], t0 + t);
+            out.extend(drain(e));
+            if done(e) {
+                return out;
+            }
+        }
+        panic!("never got there");
+    }
+
+    /// `hopping()` with Bluetooth host 2 ready, and its 1024×768 tablet screen left of PC1's.
+    fn hopping_with_a_tablet(pointer: ctrl::BtPointer) -> Engine {
+        let mut e = hopping();
+        e.bt_hello(0x000100);
+        e.bt_host(bt_host(2, BT_READY));
+        let tablet = ctrl::Screen::new(Host::Bt2, 1024, 768, [-1024, 0]);
+        e.set_config(ConfigValue::Screen(0, 2, tablet), Origin::Software).unwrap();
+        e.set_config(ConfigValue::BtPointer(1, pointer), Origin::Software).unwrap();
+        drain(&mut e);
+        e
+    }
+
+    #[test]
+    fn screen_hop_takes_the_pointer_onto_a_bluetooth_host_and_back() {
+        let mut e = hopping_with_a_tablet(ctrl::BtPointer::Absolute);
+        assert_eq!(e.hop_state(), HopState::Active);
+        let out = push_until(&mut e, -100, T0 + 1, |e| e.bt_active() == Some(2));
+        assert!(out.contains(&Output::Bt(BtOut::Select(2))));
+        assert_eq!(events_to(&out, Pc::Pc1).last(), Some(&Event::BtActive(2)));
+        // The tablet gets its absolute pointer at its right edge, at the same height: 540 of its 768 lines.
+        let to_tablet = bt_inputs(&out);
+        let at = (540.0f32 / 767.0 * 32767.0 + 0.5) as u16;
+        assert_eq!(
+            to_tablet.last(),
+            Some(&(2, btreport::POINTER, kvm_proto::link::bt::pointer_report(0, 32767, at, 0, 0).to_vec()))
+        );
+        assert_eq!((e.status(None).pointer, e.hop_state()), ([-1, 540], HopState::Active));
+        // On the tablet the pointer moves as on a PC: 100 to the left.
+        e.device_report(Port::Mouse, 1, &[0x00, (-100i8) as u8, 0], T0 + 100);
+        let x = (923.0f32 / 1023.0 * 32767.0 + 0.5) as u16;
+        let want = (2, btreport::POINTER, kvm_proto::link::bt::pointer_report(0, x, at, 0, 0).to_vec());
+        assert_eq!(bt_inputs(&drain(&mut e)), [want]);
+        // Back to PC1: the tablet's pointer is released where it is, PC1 gets the pointer at its left edge.
+        let out = push_until(&mut e, 100, T0 + 200, |e| e.bt_active().is_none());
+        assert_eq!(e.active(), Pc::Pc1);
+        assert!(bt_inputs(&out).contains(&(
+            2,
+            btreport::POINTER,
+            kvm_proto::link::bt::pointer_report(0, 32767, at, 0, 0).to_vec()
+        )));
+        assert_eq!(reports(&out).last(), Some(&(Pc::Pc1, 0x82, abs(0, [0, 16399]))));
+    }
+
+    #[test]
+    fn a_bluetooth_host_without_an_absolute_pointer_gets_its_cursor_parked_and_moved() {
+        let mut e = hopping_with_a_tablet(ctrl::BtPointer::Relative);
+        let out = push_until(&mut e, -100, T0 + 1, |e| e.bt_active() == Some(2));
+        let mouse =
+            |dx: i32, dy: i32| (2, btreport::MOUSE, kvm_proto::link::bt::mouse_report(0, dx, dy, 0, 0).to_vec());
+        // Pushed into its top-left corner, then to the pointer: its right edge (1023), 540 down.
+        let to_tablet = bt_inputs(&out);
+        assert_eq!(to_tablet[to_tablet.len() - 2..], [mouse(-hop::PARK, -hop::PARK), mouse(1023, 540)]);
+        assert!(to_tablet.iter().all(|(_, id, _)| *id == btreport::MOUSE), "no absolute report");
+        // Against the tablet's left edge, a wall: the push goes on to the tablet, so its cursor meets that edge too.
+        for t in 0..20 {
+            e.device_report(Port::Mouse, 1, &[0x00, (-100i8) as u8, 0], T0 + 100 + t);
+        }
+        let moved: i32 =
+            bt_inputs(&drain(&mut e)).iter().map(|(_, _, d)| i16::from_le_bytes([d[2], d[3]]) as i32).sum();
+        assert_eq!((moved, e.status(None).pointer), (-2000, [-1024, 540]));
+        // Away and back again: parked anew.
+        push_until(&mut e, 100, T0 + 200, |e| e.bt_active().is_none());
+        let out = push_until(&mut e, -100, T0 + 300, |e| e.bt_active() == Some(2));
+        assert!(bt_inputs(&out).contains(&mouse(-hop::PARK, -hop::PARK)));
+    }
+
+    #[test]
+    fn each_profile_hops_across_its_own_arrangement_and_switching_writes_nothing() {
+        let mut e = hopping();
+        // Arrangement 1, for profile 1: PC2 left of PC1.
+        for v in [
+            ConfigValue::Screen(1, 0, ctrl::Screen::new(Host::Pc1, 1920, 1080, [0, 0])),
+            ConfigValue::Screen(1, 1, ctrl::Screen::new(Host::Pc2, 1920, 1080, [-1920, 0])),
+            ConfigValue::ArrangementName(1, ctrl::ProfileName::new("left")),
+            ConfigValue::ProfileArrangement(1, Some(1)),
+            ConfigValue::ProfileModes(1, [PortMode::Auto; 3]),
+        ] {
+            e.set_config(v, Origin::Software).unwrap();
+        }
+        assert_eq!(ask(&mut e, Request::SaveConfig), Response::Ok);
+        let mut buf = [0u8; SAVE_ITEM_MAX];
+        let mut keys = std::vec::Vec::new();
+        while let Some((k, _)) = e.take_save_item(&mut buf) {
+            keys.push(k);
+        }
+        // The arrangements first, each its own item, then the config.
+        assert_eq!(keys, [config::ARRANGEMENT_ITEM, config::ARRANGEMENT_ITEM + 1, config::ITEM]);
+        e.config_saved();
+        drain(&mut e);
+        e.set_config(ConfigValue::Profile(1), Origin::Device).unwrap();
+        e.tick(T0 + 2 * AUTOSAVE_MS);
+        assert!(!drain(&mut e).contains(&Output::Save));
+        assert!(e.take_save_item(&mut buf).is_none(), "a profile change writes nothing");
+        // Profile 1's arrangement: PC2 is to the left now.
+        assert_eq!(e.status(None).pointer, [960, 540]);
+        push_until(&mut e, -100, T0 + 3 * AUTOSAVE_MS, |e| e.active() == Pc::Pc2);
+        // Profile 0's again: PC2 to the right.
+        e.set_config(ConfigValue::Profile(0), Origin::Device).unwrap();
+        e.switch(Target::Pc1, SwitchSource::Hotkey);
+        push_until(&mut e, 100, T0 + 4 * AUTOSAVE_MS, |e| e.active() == Pc::Pc2);
+    }
+
+    #[test]
+    fn an_arrangement_from_an_old_config_item_gets_its_own_item_unless_it_has_one() {
+        let info =
+            Info { proto: 1, rp_fw: 0x000100, at_fw: [0; 2], hw: 0x000C00, serial: *b"TEST0001", caps: 0, bt_fw: 0 };
+        let mut old = Config::default();
+        old.arrangements[0].screens[0] = ctrl::Screen::new(Host::Pc1, 1920, 1080, [0, 0]);
+        let mut buf = [0u8; SAVE_ITEM_MAX];
+        let mut e = Engine::new(old, info, "TEST0001");
+        assert_eq!(e.take_save_item(&mut buf).map(|(k, _)| k), Some(config::ARRANGEMENT_ITEM));
+        // Its item is in flash already: nothing to write.
+        let mut item = [0u8; config::ARRANGEMENT_ITEM_MAX];
+        let n = old.encode_arrangement(0, &mut item);
+        let mut e = Engine::new(old, info, "TEST0001");
+        e.restore_item(config::ARRANGEMENT_ITEM, &item[..n]);
+        assert!(e.take_save_item(&mut buf).is_none());
+        assert_eq!(Engine::item_keys().filter(|k| (0x0010..0x0014).contains(k)).count(), MAX_ARRANGEMENTS);
     }
 }

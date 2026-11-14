@@ -4,6 +4,10 @@
 //! - **EPX** (the one software-scheduled endpoint) carries every control transfer, one packet per transaction:
 //!   SETUP, each data packet, then the status packet. Control pipes share it through [`EPX_LOCK`].
 //! - **Interrupt pipes** each own one of the 15 hardware-polled slots (`ADDR_ENDP1..15`, `INT_EP_CTRL`).
+//! - **The Bluetooth module on a front port** (software.md §4.13): its bulk endpoints are polled by interrupt slots too,
+//!   every millisecond (a device answers IN and OUT tokens the same whatever the host's schedule), so that EPX carries
+//!   control transfers only. Bulk over EPX, which stops on the device's NAK (`NAK_POLL.STOP_EPX_ON_NAK`), left control
+//!   transfers failing after it on the first dongle (2026-11-14).
 //! - **Low-speed devices behind Hub-0** get the `PRE` preamble (`SIE_CTRL.PREAMBLE_EN`, `ADDR_ENDPn.INTEP_PREAMBLE`).
 //! - **D+/D− polarity** (hardware/errata.md E1): boards 0.8–0.12 cross the pair between the RP2354B and Hub-0, so the
 //!   PHY swaps it back (`USB_MUXING.SWAP_DPDM`). The root port works out which board it is on: see [`CROSSED_AT_START`].
@@ -173,6 +177,13 @@ impl Drop for AbortOnDrop {
         let mut c = base_sie_ctrl();
         c.set_stop_trans(true);
         pac::USB.sie_ctrl().write_value(c);
+        // Until the controller has stopped (TinyUSB's `sie_stop_xfer` waits the same way): a transaction started
+        // before that goes wrong.
+        for _ in 0..10_000 {
+            if !pac::USB.sie_ctrl().read().stop_trans() {
+                break;
+            }
+        }
         wr(EPX_CTRL, 0);
     }
 }
@@ -185,7 +196,7 @@ struct Target {
     mps: u16,
 }
 
-/// One EPX transaction. Returns the number of bytes received (IN) or 0.
+/// One EPX transaction. Returns the number of bytes received (IN) or 0. A NAK is retried by the controller.
 async fn epx(
     t: &Target,
     stage: Stage,
@@ -604,6 +615,66 @@ impl<T: pipe::Type, D: pipe::Direction> RpPipe<T, D> {
             epx(&self.target, Stage::In, true, &[], &mut none, timeout).await?;
         }
         Ok(done)
+    }
+}
+
+/// Bulk transactions since start (the module as a board on a front port; diagnostics): packets and NAKs each way,
+/// failed transactions, and the last failure ([`error_code`]).
+pub static BULK_IN: AtomicU32 = AtomicU32::new(0);
+pub static BULK_IN_NAKS: AtomicU32 = AtomicU32::new(0);
+pub static BULK_OUT: AtomicU32 = AtomicU32::new(0);
+pub static BULK_OUT_NAKS: AtomicU32 = AtomicU32::new(0);
+pub static BULK_ERRORS: AtomicU32 = AtomicU32::new(0);
+pub static LAST_ERROR: AtomicU32 = AtomicU32::new(0);
+
+/// Where a transfer failed (1 bulk IN, 2 bulk OUT, 3 control) and how, as one number: `where << 8 | kind`, kind 1
+/// buffer overflow, 2 bad response, 3 babble, 4 data toggle, 5 canceled, 6 stall, 7 timeout, 8 disconnected.
+pub fn error_code(place: u32, e: PipeError) -> u32 {
+    let kind = match e {
+        PipeError::BufferOverflow => 1,
+        PipeError::BadResponse => 2,
+        PipeError::Babble => 3,
+        PipeError::DataToggleError => 4,
+        PipeError::Canceled => 5,
+        PipeError::Stall => 6,
+        PipeError::Timeout => 7,
+        PipeError::Disconnected => 8,
+        #[allow(unreachable_patterns)]
+        _ => 9,
+    };
+    place << 8 | kind
+}
+
+impl RpPipe<pipe::Interrupt, pipe::Out> {
+    pub fn max_packet(&self) -> usize {
+        self.target.mps as usize
+    }
+
+    /// One OUT packet on an interrupt slot, which the controller sends at the next poll and again while the device
+    /// NAKs: `Ok(false)` if it wasn't taken within `timeout`, and then it is taken back (not sent later).
+    pub async fn out_within(&mut self, data: &[u8], timeout: Duration) -> Result<bool, PipeError> {
+        let n = self.slot;
+        let data = &data[..data.len().min(self.target.mps as usize)];
+        copy_to_dpram(slot_data_offset(n), data);
+        let mut bc = EpBufferControl(0);
+        bc.set_length(0, data.len() as u16);
+        bc.set_pid(0, self.toggle);
+        bc.set_last(0, true);
+        bc.set_full(0, true);
+        arm_buffer(slot_buf_ctrl(n), bc);
+        let sent = poll_fn(|cx| {
+            SLOT_WAKERS[n - 1].register(cx.waker());
+            let v = EpBufferControl(rd(slot_buf_ctrl(n)));
+            if v.available(0) { Poll::Pending } else { Poll::Ready(()) }
+        });
+        if with_timeout(timeout, sent).await.is_err() {
+            // Taken back. Had the controller sent it just now, the next try repeats its data toggle, and the device
+            // takes that for a retry: it acknowledges and drops it (USB 2.0 §8.6.2), so nothing arrives twice.
+            wr(slot_buf_ctrl(n), 0);
+            return Ok(false);
+        }
+        self.toggle = !self.toggle;
+        Ok(true)
     }
 }
 

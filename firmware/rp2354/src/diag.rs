@@ -109,6 +109,17 @@ pub async fn run() -> ! {
             fw_updates: update::FOUND.load(Ordering::Relaxed),
             hub0_errors: host::HUB0_ERRORS.load(Ordering::Relaxed),
             enum_fails: host::ENUM_FAILS.load(Ordering::Relaxed),
+            board: kvm_core::diag::BoardModule {
+                sessions: bt::SESSIONS.load(Ordering::Relaxed),
+                steps: bt::STEPS.load(Ordering::Relaxed),
+                rom_error: crate::espisp::LAST_ERROR.load(Ordering::Relaxed),
+                bulk_in: crate::usbh::BULK_IN.load(Ordering::Relaxed),
+                bulk_out: crate::usbh::BULK_OUT.load(Ordering::Relaxed),
+                naks: crate::usbh::BULK_IN_NAKS.load(Ordering::Relaxed),
+                out_naks: crate::usbh::BULK_OUT_NAKS.load(Ordering::Relaxed),
+                errors: crate::usbh::BULK_ERRORS.load(Ordering::Relaxed),
+                last_error: crate::usbh::LAST_ERROR.load(Ordering::Relaxed),
+            },
         };
         kvm::with(|e| e.set_board_diag(d));
         Timer::after_secs(PERIOD_S).await;

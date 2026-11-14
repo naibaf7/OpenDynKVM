@@ -24,6 +24,7 @@ pub mod class {
     pub const PRINTER: u8 = 0x07;
     pub const MASS_STORAGE: u8 = 0x08;
     pub const HUB: u8 = 0x09;
+    pub const CDC_DATA: u8 = 0x0A;
     pub const VIDEO: u8 = 0x0E;
     pub const VENDOR: u8 = 0xFF;
 }
@@ -136,6 +137,10 @@ impl EndpointDesc {
 
     pub fn is_interrupt(&self) -> bool {
         self.attributes & 0x03 == 3
+    }
+
+    pub fn is_bulk(&self) -> bool {
+        self.attributes & 0x03 == 2
     }
 }
 
@@ -329,6 +334,30 @@ pub(crate) mod fixtures {
         7, 5, 0x81, 5, 0x00, 0x14, 1,
         9, 4, 2, 0, 0, 0x01, 1, 0, 0,
     ];
+
+    /// An ESP32-C3's built-in USB serial port (USB-Serial-JTAG, 303A:1001): IAD, CDC-ACM (interrupt EP 0x82), CDC
+    /// data (bulk EP 0x01 OUT, 0x81 IN), the JTAG vendor interface (bulk EP 0x02, 0x83).
+    #[rustfmt::skip]
+    pub const USB_SERIAL_JTAG_CONFIG: &[u8] = &[
+        9, 2, 98, 0, 3, 1, 0, 0xC0, 250,
+        8, 0x0B, 0, 2, 0x02, 0x02, 0, 0,
+        9, 4, 0, 0, 1, 0x02, 0x02, 0, 0,
+        5, 0x24, 0x00, 0x10, 0x01,
+        5, 0x24, 0x01, 0x03, 0x01,
+        4, 0x24, 0x02, 0x06,
+        5, 0x24, 0x06, 0x00, 0x01,
+        7, 5, 0x82, 3, 64, 0, 1,
+        9, 4, 1, 0, 2, 0x0A, 0, 0, 0,
+        7, 5, 0x01, 2, 64, 0, 0,
+        7, 5, 0x81, 2, 64, 0, 0,
+        9, 4, 2, 0, 2, 0xFF, 0xFF, 0x01, 0,
+        7, 5, 0x02, 2, 64, 0, 0,
+        7, 5, 0x83, 2, 64, 0, 0,
+    ];
+
+    /// Its device descriptor: misc class (IAD), 303A:1001.
+    pub const USB_SERIAL_JTAG_DEVICE: [u8; 18] =
+        [18, 1, 0x00, 0x02, 0xEF, 0x02, 0x01, 64, 0x3A, 0x30, 0x01, 0x10, 0x01, 0x01, 1, 2, 3, 1];
 
     /// Wired Xbox 360 pad: one XInput interface with its vendor class descriptor.
     #[rustfmt::skip]

@@ -112,8 +112,23 @@ impl App {
         });
     }
 
+    /// What has been typed on the KVM's keyboard so far, `4 2 1 _ _ _`: the KVM takes the keyboard while a host waits
+    /// for its passkey, so nothing shows anywhere else.
+    fn passkey_typed(ui: &mut Ui, st: &kvm_proto::ctrl::Status) {
+        // The digits typed so far, leading zeros included (the value of "042" is 42).
+        let n = (st.bt_passkey_digits as usize).min(6);
+        let typed = if n == 0 { String::new() } else { format!("{:0n$}", st.bt_passkey_typed) };
+        let mut digits: Vec<String> = typed.chars().map(String::from).collect();
+        digits.resize(6, "_".into());
+        let text = fl!("passkey-typed", digits = digits.join(" "));
+        ui.label(RichText::new(text).monospace().strong().color(ink(ui, violet())));
+    }
+
     /// The six digits a pairing host shows, typed in the window instead of on the KVM's keyboard.
-    fn passkey_field(&mut self, ui: &mut Ui) {
+    fn passkey_field(&mut self, ui: &mut Ui, st: Option<&kvm_proto::ctrl::Status>) {
+        if let Some(st) = st {
+            Self::passkey_typed(ui, st);
+        }
         ui.horizontal(|ui| {
             let r = ui.add(egui::TextEdit::singleline(&mut self.bt_passkey).desired_width(90.0).hint_text("123456"));
             let digits = self.bt_passkey.trim();
@@ -134,7 +149,7 @@ impl App {
 
     /// On every page but Bluetooth, while a pairing host waits for its passkey: the KVM's keyboard goes to nobody else
     /// until it is typed, which would otherwise look like a stuck keyboard.
-    pub(crate) fn passkey_banner(&mut self, ui: &mut Ui) {
+    pub(crate) fn passkey_banner(&mut self, ui: &mut Ui, st: Option<&kvm_proto::ctrl::Status>) {
         let c = violet();
         egui::Frame::new()
             .fill(c.gamma_multiply(0.14))
@@ -145,7 +160,7 @@ impl App {
                 ui.set_min_width(ui.available_width());
                 ui.label(RichText::new(fl!("host-pairing")).strong().color(ink(ui, c)));
                 ui.label(fl!("passkey-text"));
-                self.passkey_field(ui);
+                self.passkey_field(ui, st);
             });
         ui.add_space(8.0);
     }
@@ -157,6 +172,8 @@ impl App {
         if matches!(m, BtModule::Absent | BtModule::Up) {
             return;
         }
+        // An ESP32-C3 board on a front port (software.md §4.13): it comes back when plugged in again.
+        let board = s.module_port();
         ui.add_space(8.0);
         card(ui, &fl!("wireless-module"), |ui| match m {
             BtModule::Starting | BtModule::Programming => {
@@ -169,11 +186,19 @@ impl App {
             }
             BtModule::Failed => {
                 ui.label(RichText::new(names::selftest(selftest::BT_FW)).color(ink(ui, BAD)));
-                note(ui, fl!("module-failed-note"));
+                if board.is_some() {
+                    // A board stays off until the KVM restarts, which *Try again* does.
+                    note(ui, fl!("module-failed-note-board"));
+                    if ui.button(fl!("try-again")).clicked() {
+                        self.send(UiCmd::RetryBt);
+                    }
+                } else {
+                    note(ui, fl!("module-failed-note"));
+                }
             }
             _ => {
                 ui.label(RichText::new(names::selftest(selftest::BT_GAVE_UP)).color(ink(ui, BAD)));
-                note(ui, fl!("gave-up-note-module"));
+                note(ui, if board.is_some() { fl!("gave-up-note-board") } else { fl!("gave-up-note-module") });
                 if ui.button(fl!("try-again")).clicked() {
                     self.send(UiCmd::RetryBt);
                 }
@@ -183,6 +208,9 @@ impl App {
 
     /// The Bluetooth page: pairing, and each of the four host slots (name, state, policy, forget).
     pub(crate) fn bluetooth(&mut self, ui: &mut Ui, s: &Snapshot) {
+        if let Some(p) = s.module_port() {
+            note(ui, fl!("module-on-port", port = names::port_title(p)));
+        }
         if !s.has_bluetooth() {
             // Fitted, but not up (starting, being updated, failed): no hosts to show.
             self.bt_module_card(ui, s);
@@ -214,7 +242,7 @@ impl App {
             if st.bt_passkey != 0 {
                 ui.add_space(4.0);
                 ui.label(RichText::new(fl!("passkey-text")).color(ink(ui, WARN)));
-                self.passkey_field(ui);
+                self.passkey_field(ui, Some(st));
             }
         });
         ui.add_space(8.0);

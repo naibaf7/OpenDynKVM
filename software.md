@@ -128,6 +128,12 @@ in host mode (RP2350 datasheet §12.7).
   double-buffered multi-packet transactions). EPX is shared by every control pipe, so the driver serializes transfers
   with an async mutex. Hardware NAK retries are bounded with the pipe's timeout; an abandoned transaction is stopped
   with `SIE_CTRL.STOP_TRANS`.
+- **The Bluetooth module as a board on a front port** (§4.13): its bulk endpoints are polled by interrupt slots, every
+  millisecond (a device answers IN and OUT tokens the same whatever the host's schedule), so that EPX carries control
+  transfers only. A slot read that gives up leaves the slot armed for the next; an OUT packet not taken in time is
+  taken back (`RpPipe::out_within`). Bulk over EPX, one transaction at a time with `NAK_POLL.STOP_EPX_ON_NAK`, was
+  tried first: on the first dongle (2026-11-14) control transfers failed after it (the DTR/RTS that restart the chip),
+  and writes broke off in the middle of programming.
 - **Known limitation:** `SIE_STATUS` error flags are global, so an error on a hardware-polled interrupt slot (e.g. a
   device just unplugged) can fail a concurrent EPX transfer. Enumeration retries absorb it; RP2350's per-endpoint
   `EP_RX_ERROR`/`EP_TX_ERROR` registers could separate them if M1 shows it matters.
@@ -278,7 +284,8 @@ The config, the keymap layers, the macros and the keymap settings are items in a
   short leaves an item whose CRC fails; reading stops there and the value before it stays in force. A cut garbage
   collection leaves two copies, and the newer wins. A host test cuts the power after every byte and erase of a run of
   writes and checks that no committed value is lost (`power_cuts_never_lose_a_committed_value`).
-- **What is written, when:** the engine marks what changed (config, each of the 8 layers, macros, keymap settings) and
+- **What is written, when:** the engine marks what changed (config, each screen-hop arrangement, each of the 8 layers,
+  macros, keymap settings) and
   emits `Save` 5 s after the last change, or at once on `odkvmctl config save`. The storage task then writes only the
   changed items (`Engine::take_save_item`). Switching PCs, Bluetooth hosts or screens never writes flash; changing
   profile does only with "power up in the profile last active". A change made while the storage task writes keeps its
@@ -287,12 +294,14 @@ The config, the keymap layers, the macros and the keymap settings are items in a
   allowance comes back (`SAVE_BURST`, `SAVE_PACE_MS`). Setting the KVM up never meets it. It holds a host script that
   changes a setting every few seconds, or saves in a loop, to 1 440 saves a day; a `SaveConfig` held back leaves
   `CONFIG_DIRTY` set until it is written.
-- **Endurance** (W25Q16JV in the RP2354: 100 000 erase cycles per sector), measured by `endurance_with_the_firmware_items`
-  with everything the firmware stores at its largest (8 layers, a full macro buffer and the records, 5.9 KB carried
-  around the ring) and the config at its largest (576 bytes; 412 with the defaults): each sector is erased once per 92
-  config saves, the 17 within one cycle of each other, so 9.3 million saves before the first sector reaches its rated
-  cycles. Paced, that is at least 17 years of a script saving once a minute day and night; set up by hand, it doesn't
-  wear out. The two alternating 4 KB slots used before erased a sector on every save: 200 000 saves.
+- **Endurance** (W25Q16JV in the RP2354: 100 000 erase cycles per sector), measured by
+  `endurance_with_the_firmware_items` with everything the firmware stores at its largest (8 layers, a full macro buffer,
+  the records and the four arrangements with every screen slot used, 6.6 KB carried around the ring) and the config at
+  its largest (576 bytes, `config::ITEM_MAX`; 324 with the defaults since the arrangements have items of their own):
+  each sector is erased once per 91 config saves, the 17 within one cycle of each other, so 9.2 million saves before the
+  first sector reaches its rated cycles. Paced, that is at least 17 years of a script saving once a minute day and
+  night; set up by hand, it doesn't wear out. The two alternating 4 KB slots used before erased a sector on every save:
+  200 000 saves.
 - **Erase counts** are in each sector's header, for the boot log (`at most N erases per sector`). The spare sector has
   no header, so at mount it takes the highest count of the others (`erase_counts_survive_remounts`).
 - **Stalls:** flash writes stall XIP for both cores, so core 1 parks in RAM (`embassy-rp` `multicore::pause_core1`)
@@ -514,7 +523,8 @@ saved: after a power loss the KVM finds the running PC again from the PCs' state
 ### 4.13 Bluetooth hosts (boards 0.16.0 on, `bt.rs`, `espisp.rs`, `kvm-core::bt`, `firmware/esp32c3`)
 
 Up to four extra hosts (PCs, tablets, phones) connect over Bluetooth LE to an ESP32-C3-MINI-1 on the board, which the
-RP2354B treats as a third, lesser target: the hosts get the KVM's own keyboard, mouse and media reports, never a
+RP2354B treats as a third, lesser target: the hosts get the KVM's own keyboard, mouse and media reports (and screen
+hop's absolute pointer, §4.14), never a
 mirrored device's descriptor, and the front ports in passthrough stay with the PC that was active before (the *home*
 PC). Everything below is off on a board without the module, and on boards before 0.16.0: the control protocol then
 reports no `BLUETOOTH` capability and the window shows the two PCs only (design.md §16).
@@ -536,7 +546,7 @@ The RP2354B side runs on core 0 (`bt::run`); core 1 keeps to the AT32F405 links.
 | Type | Direction | Message |
 |---|---|---|
 | 0x01 | both | `Hello` (the module's role is 3) |
-| 0x60 | RP → BT | `Input`: host, report ID (1 keyboard, 2 mouse, 3 consumer), data |
+| 0x60 | RP → BT | `Input`: host, report ID (1 keyboard, 2 mouse, 3 consumer, 4 absolute pointer), data |
 | 0x61 | RP → BT | `Select`: the host that gets input, 0 = a PC |
 | 0x62 | RP → BT | `Pair`: open or close pairing, seconds |
 | 0x63 | RP → BT | `Forget`: a host's bond, 0xFF = all |
@@ -548,9 +558,20 @@ The RP2354B side runs on core 0 (`bt::run`); core 1 keeps to the AT32F405 links.
 | 0x71 | BT → RP | `Host`: a slot's flags (bonded, connected, encrypted, subscribed), interval, latency, address, RSSI |
 | 0x72 | BT → RP | `Event`: pairing open / closed, passkey wanted, paired, pairing failed, bond lost |
 
-**Reports.** One HID service with a fixed report map (`kvm_proto::link::bt::report::MAP`, 161 bytes): keyboard (boot
+**Reports.** One HID service with a fixed report map (`kvm_proto::link::bt::report::MAP`, 229 bytes): keyboard (boot
 layout, ID 1, with the LED output report), mouse (16 buttons, 16-bit X/Y, wheel, AC pan, ID 2), consumer (one 16-bit
-usage, ID 3). Desktop and mobile systems take it without a driver: HID over GATT is built into them.
+usage, ID 3), and screen hop's absolute pointer (protocol 9: 16 buttons, X/Y 0–32767, wheel, AC pan, ID 4). The
+pointer is a top-level collection of usage Pointer of its own, as on the PCs' USB interface, so a host that takes no
+absolute pointer leaves it alone; the engine sends it nothing unless screen hop puts that host's pointer there
+(§4.14). Desktop and mobile systems take it without a driver: HID over GATT is built into them. Motion is coalesced
+on its way (`link::bt::Motion`, on the RP2354B before the link and in the module before each notification): a mouse
+reports up to 1000 times a second, the link to a module on a front port carries about 200 messages a second, and a
+host takes notifications at its connection events (7.5–15 ms for the selected one). So one motion report waits at a
+time, relative moves adding up and an absolute position replacing the one before; a report with other buttons sends
+the waiting one first, so no click is lost. Queued one by one, as at first, the reports came late, and those that
+didn't fit were dropped with their motion: on the first dongle (2026-11-14) the pointer crawled. Up to 0.1.12 the map
+was 161 bytes, without the pointer; no host had bonded with it yet (no module was on a board), so none holds a stale
+copy of the GATT database.
 
 **Engine** (`kvm-core::bt`, `Engine::switch`):
 - **Targets:** PC1, PC2 and the bonded hosts 1–4. `Target::Bt1`–`Bt4` select a host; `Toggle` from a host goes back
@@ -564,7 +585,9 @@ usage, ID 3). Desktop and mobile systems take it without a driver: HID over GATT
   ErrorRollOver; system control (power, sleep) stays with the PCs.
 - **Pairing:** `BtPair` opens it for 60 s (`BT_PAIR_SECONDS`). LE Secure Connections, IO capability KeyboardOnly: the
   host shows six digits, and while it waits the KVM's keyboard goes to nobody else: digits on the top row or keypad,
-  Backspace, Enter sends them, Escape cancels. What is held when it ends stays hidden until released. `BtPasskey` does
+  Backspace, Enter sends them, Escape cancels. `Status.bt_passkey_digits` / `bt_passkey_typed` (protocol 9) carry
+  what is typed so far, and each digit is a `BtChanged(0)`, so the window shows them as they come (the KVM has the
+  keyboard, so nothing else does). What is held when it ends stays hidden until released. `BtPasskey` does
   the same from software. No Just Works, so a host in range can't pair unnoticed.
 - **Standby and auto-select:** a host in use, or pairing, keeps the KVM awake (its keyboard is on the front ports);
   auto-select never moves the input off a host because a PC was switched off. The LEDs: the key glows violet with a
@@ -581,16 +604,23 @@ the RP2354B never writes (A/B records with a CRC). A save erases one of them, so
 really changes (paired with new keys, forgotten here or by the host; forgetting several is one save): reconnecting
 writes nothing, and 200 000 saves at the flash's rated 100 000 cycles last decades (`bonds.rs`, "Wear"). A forgotten
 host's keys also leave the Bluetooth stack at once, so it can't come back in encrypted, without a passkey, while
-pairing is open. IO3 carries a plain-text log (UART1, 115200) to test pad TP1601.
+pairing is open. The link task runs on an interrupt executor one level above the Bluetooth side (`esp_rtos`'s
+`InterruptExecutor`), so that pairing's P-256 maths and a bond being written never keep it from answering: on the
+first dongle (2026-11-14) they did, the RP2354B took the link for lost and restarted the board in mid-pairing. The
+RP2354B takes the link for lost after 3 s without a good exchange. IO3 carries a plain-text log (UART1, 115200) to test pad TP1601, once the link has come over the
+UART (on a dev board IO3 may be wired to anything); the first 1 KB from before is kept and printed then.
 
 **Programming** (`espisp.rs`, like `at32isp.rs` for the AT32F405s). `cargo xtask dist` builds the module's firmware and
 its flash image from offset 0 (bootloader, partition table, application, with espflash), and the RP2354B firmware
-embeds it zlib-compressed (`build.rs`: 289 KB of the 685 KB image; its version from a `KVMESP32` marker, its MD5).
+embeds it zlib-compressed (`build.rs`: 283 KB of the 523 KB image; its version from a `KVMESP32` marker, its MD5),
+in two parts: the first 4 KB sector, and the rest. The ROM erases that sector first and writes it last, so a module
+whose programming broke off (power, unplugged) is left with it erased, which is how a blank chip looks (below).
 When the module's `Hello` carries another version, the RP2354B sends `EnterRom` and the module restarts into its ROM
 bootloader; when it says nothing within 4 s (blank, or a firmware that doesn't come up and keeps resetting), the
-RP2354B holds TX low for 3 s (a UART break) so that one of those resets starts the ROM. Then SYNC, 921 600 baud,
-FLASH_DEFL_* in 1 KB blocks, SPI_FLASH_MD5 against the image's, and FLASH_BEGIN(0) + FLASH_END(reboot): with TX idle
-the module boots the new firmware. A module found in its ROM after an unplanned reset (TX low at that moment) is
+RP2354B holds TX low for 3 s (a UART break) so that one of those resets starts the ROM. Then SYNC, the chip checked
+(an ESP32-C3: `GET_SECURITY_INFO`'s chip ID, or the magic value at 0x4000_1000 on older ROMs), 921 600 baud, the
+first sector erased, FLASH_DEFL_* in 1 KB blocks for the rest and then for that sector, SPI_FLASH_MD5 against the
+image's, and FLASH_BEGIN(0) + FLASH_END(reboot): with TX idle the module boots the new firmware. A module found in its ROM after an unplanned reset (TX low at that moment) is
 restarted the same way.
 - **Limits:** as for the AT32F405s (§4.9, `kvm-core::at32prog`), with the module's own record in the store (item
   0x0003: CRC-32 of the embedded image's MD5, one count). Each attempt is counted in flash before it starts, and the
@@ -606,23 +636,79 @@ restarted the same way.
   the self-test's verdict waits for it until its 12 s deadline, and the bits follow the module after that.
 - **Power:** the budget counts `BT_CURRENT_MA` whenever the module is fitted, also while it doesn't answer.
 
+**On a front port** (a *dongle*, for a KVM without the module on its board: 0.12–0.15, or 0.16+ built without it).
+Any ESP32-C3 board with the chip's own USB port (its USB-Serial-JTAG, 303A:1001, a CDC-ACM port in silicon: most
+small C3 boards) runs the same module firmware, and the RP2354B reaches it on a front port instead of the UART
+(`dongle.rs`, `bt::dongle_task`). Above the line everything is the same: the link, `Hello`, the engine, the hosts.
+- **One firmware:** the module listens on UART0 and on its USB serial port, and answers, for good, on the one the
+  first valid frame came over (`firmware/esp32c3/src/link.rs`). The image a dongle runs is byte for byte the one on a
+  board, so testing with a dongle tests that firmware.
+- **Which board is taken** (`Engine::port_attached`, `takes_dongle`): a device with the USB-Serial-JTAG's IDs and its
+  CDC data interface (`kvm_core::bt::dongle_endpoints`), on a KVM without the module on its board, when no other
+  dongle is in use, on a port not set to a passthrough mode. The port stays *probing* while the RP2354B finds out:
+  - it says `Hello` as the module (any version) within 4 s: it is the module (`PortState::Module`);
+  - it doesn't, and its ROM bootloader (it may be in it already, else DTR/RTS put it there) says it is an ESP32-C3
+    whose first flash sector is erased: new, erased (`espflash erase-flash`), or the module after a programming that
+    broke off. It is the module, and is programmed;
+  - else it is someone's own ESP32 board, restarted into its own firmware if the RP2354B put it into its ROM, and then
+    an ordinary device (`dongle_declined`: a non-HID device goes to the active PC in Auto). Its firmware is never
+    touched. A port set to a passthrough mode leaves such a board alone from the start, and setting the dongle's port
+    to one plugs it in anew as an ordinary device.
+- **Programming:** as on the board (`espisp.rs`), with the ROM reached through the port's DTR/RTS (SET_CONTROL_LINE_STATE
+  on its CDC interface, espflash 4.7's `UsbJtagSerialReset`): no EnterRom, no UART break, no speed change. The RTC
+  watchdog goes off before the write (the ROM leaves it running in USB download mode), and the chip leaves the ROM by
+  a restart through it, FORCE_DOWNLOAD_BOOT cleared first (espflash's `WatchdogReset` for this chip and port): a
+  restart by RTS from the ROM brought the first dongle back in its ROM (2026-11-14), the new firmware written and
+  verified but not started until the board was powered off. Attempts are counted per board, the same 5 in a row.
+- **Restarts:** every restart takes the chip off USB, and it comes back as a new device: its own (an erased chip's ROM
+  finds no firmware and restarts every 2.5 s or so, first board 2026-11-14) and the RP2354B's (into the ROM, out of
+  it). So each session ends with a restart, and what it found out stays with the board in RAM (by its USB serial
+  number, the chip's MAC, since power-up; `bt::Board`): the next session carries on. A new board gets 4 s in all to
+  say `Hello`, counted from when it was first seen, so an erased chip that restarts sooner still gets to its ROM; a
+  board restarted into its ROM on purpose goes straight there. A restart that Hub-0 doesn't see within 1.5 s is
+  followed by a replug of the port (`REPLUG`: data lines off and on, VBUS stays). A board is only declined while it is
+  attached and has answered (its ROM: not a blank ESP32-C3), or when 5 restarts into its ROM in a row missed; then it
+  is restarted into its own firmware and declined again at once when it comes back (for 10 s). A board that doesn't
+  run the firmware after its attempts stays off until the KVM restarts (*Try again* restarts it).
+- **The port:** `PortState::Module` (protocol 9): the LED glows violet, the window and `odkvmctl` say the port holds
+  the wireless module and is attached to no PC, and how to get the port back (unplug the board, or a passthrough
+  mode). Its current comes from the port, so the budget doesn't count `BT_CURRENT_MA` for it. Unplugged, Bluetooth goes
+  as for a module that stops answering, and the next board may be the module.
+- **Link:** the same 72-byte frames, a full USB packet and a short one each way, one packet per millisecond: a reply
+  may take 10 ms (`REPLY_TIMEOUT_USB`).
+
 **Diagnostics** (§8.4): a *Bluetooth* group, only with the module fitted: its state (as `Status.bt_module`),
 the version from its `Hello`, the UART exchanges that failed (`bt::LINK_ERRORS`) and the hosts connected.
 
-**Unverified on hardware** (no module on the bench yet): the UART break as a way into the ROM of a blank module, the
-ROM's FLASH_END reboot, multi-host HID over GATT with desktop, tablet and phone hosts, and the passkey flow. Host
-side and engine are tested on the PC (`kvm-core` engine tests, the simulator with `OPENDYN_SIM_BT=1`).
+**On hardware** (2026-11-14, the first 0.12.0 board with an ESP32-C3 board on its Other port): the dongle is found,
+programmed from blank and updated over USB (interrupt slots, DTR/RTS into the ROM, the watchdog restart out of it),
+pairs with the passkey typed on the KVM's keyboard, takes input when switched to, and takes part in screen hop. Mouse
+to host 5–10 ms at the host's 15 ms connection interval, against 1 ms over USB. **Unverified** (no module on a board
+yet): the UART link at 3 Mbaud, the UART break as a way into the ROM of a blank module, the ROM's FLASH_END reboot;
+and several hosts at once. Host side and engine are tested on the PC
+(`kvm-core` engine tests, the simulator with `OPENDYN_SIM_BT=1`, or `OPENDYN_SIM_BT=dongle` for a board on the Other
+port).
 
 ### 4.14 Screen hop (`kvm-core::hop`)
 
-The KVM moves the pointer itself, across an arrangement of both PCs' screens, and switches to the other PC when the
-pointer is pushed across an edge onto one of its screens (design.md §4, "Screen hop"). It runs on the RP2354B, in the
-engine, on the motion of the normalized pointing devices; the PCs get an absolute pointer.
+The KVM moves the pointer itself, across an arrangement of its hosts' screens (both PCs', and since protocol 9 the
+Bluetooth hosts'), and switches to another host when the pointer is pushed across an edge onto one of its screens
+(design.md §4, "Screen hop"). It runs on the RP2354B, in the engine, on the motion of the normalized pointing devices;
+the hosts get an absolute pointer (a Bluetooth host set so: relative motion, below).
 
-- **Needs:** on in the active profile (`profileN-hop`); the absolute pointer (`abs-pointer`, below); the Mouse port's
-  device running Normalized (an empty port is fine: any normalized pointing device moves the pointer); the active PC
-  in report protocol and with a screen in the arrangement; no Bluetooth host active. `Status.hop` says which is
-  missing, and the hosts offer the fix.
+- **Needs:** an arrangement in the active profile (`profileN-arrangement`); the absolute pointer (`abs-pointer`,
+  below); the Mouse port's device running Normalized (an empty port is fine: any normalized pointing device moves the
+  pointer); the active host (a PC in report protocol, or a Bluetooth host) with a screen in the arrangement.
+  `Status.hop` says which is missing, and the hosts offer the fix. Until 0.1.12 a Bluetooth host with the input
+  turned it off (`HopState::Wireless`, never sent since).
+- **Arrangements** (protocol 9): the KVM keeps four (`MAX_ARRANGEMENTS`), each a name (`arrangementN-name`, empty:
+  "Arrangement n") and 8 screen slots, and each profile uses one of them or none (`profileN-arrangement`). Each is a
+  store item of its own (0x0010–0x0013, §4.8, at most 160 bytes: its name and the slots in use): editing one writes
+  only it, and switching profiles, which switches the arrangement in use, writes nothing (unless the profile itself is
+  remembered). Another arrangement in use starts the pointer over in the middle of the active host's main screen.
+  Firmware up to 0.1.12 had one arrangement, in the config item, at the keys that are arrangement 0's now: such an
+  item loads it as arrangement 0, which gets its own item at the first save, written before the config item that no
+  longer holds it; a profile's switch "on" (1) reads as arrangement 0.
 - **Absolute pointer:** with `abs-pointer` on, interface 1 carries report IDs: ID 1 is the relative mouse as before
   (the resolution-multiplier feature report with it), ID 2 an absolute pointer, a top-level collection of usage
   Pointer: 16 buttons, X/Y 0–32767, wheel and AC Pan in detents (`normalized::MOUSE_ABS_DESC`). A collection of its
@@ -630,11 +716,12 @@ engine, on the motion of the normalized pointing devices; the PCs get an absolut
   machine's tablet), and Windows a second mouse. Changing the setting re-enumerates both PCs once; a profile change
   never does, so a profile without hop (gaming) gets the relative mouse at once. In boot protocol everything is
   relative.
-- **Arrangement:** 8 screen slots (`screen0`–`screen7`), each a PC's: resolution, display scaling (100–400 %), its
-  top-left in that PC's own display arrangement (`desk`, in the PC's units, below), and its top-left in the
-  arrangement (`at`, logical pixels: a screen at 150 % takes two thirds of its pixels each way, so screens of the same
-  physical size line up). The pointer lives in the arrangement, in logical pixels with sub-pixel precision. Two flags
-  per screen (protocol 8, in the slot's PC byte):
+- **Arrangement:** 8 screen slots (`arrangementN-screen0`–`7`), each a host's (PC1, PC2, or a Bluetooth host slot:
+  its `Host` value, protocol 9, in the slot's host byte): resolution, display scaling (100–400 %), its top-left in that
+  host's own display arrangement (`desk`, in its units, below), and its top-left in the arrangement (`at`, logical
+  pixels: a screen at 150 % takes two thirds of its pixels each way, so screens of the same physical size line up).
+  The pointer lives in the arrangement, in logical pixels with sub-pixel precision. Two flags per screen (protocol 8,
+  in the slot's host byte):
   - **Off for hop** (`off`): a screen of a monitor cabled to both PCs, on the PC it doesn't show. It lies where the
     other PC's screen is; the pointer never goes onto it, but it still counts for its PC's desktop (mapping, below).
     Measured on the first board's desk (2026-11-12): PC1 (KDE) had the shared 4K monitor left of its HD monitor, and
@@ -642,27 +729,28 @@ engine, on the motion of the normalized pointing devices; the PCs get an absolut
     before every hop.
   - **Fixed** (`fixed`): its `desk` is the PC's own (detected, or typed in); the app doesn't derive it from where the
     screen is dragged. The KVM only stores it.
-- **Units** (`hop-units-pc1/-pc2`, protocol 8): what a PC's `desk` coordinates count. `physical` (Windows, X11): a
+- **Units** (`hop-units-pc1/-pc2`, protocol 8; `hop-units-host1`–`4`, protocol 9): what a host's `desk` coordinates
+  count. `physical` (Windows, X11): a
   screen covers its resolution there. `logical` (Wayland desktops: KDE Plasma, GNOME): it covers its arrangement
   size, its resolution over its scaling, and an absolute pointer is spread in those units.
 - **Edges**, axis by axis: past a screen's edge, the next screen in that direction among those spanning the pointer's
   other coordinate (the nearest, however far: a gap is jumped; up to 8 pixels of overlap still count).
-  - The same PC's: the pointer goes on, by what is left of the motion.
-  - The other PC's: a wall until pushed `hop-resistance` pixels further (default 100; a pause of 400 ms starts the
+  - The same host's: the pointer goes on, by what is left of the motion.
+  - Another host's: a wall until pushed `hop-resistance` pixels further (default 100; a pause of 400 ms starts the
     push over, a motion back from the edge too). Never within `hop-corner` pixels of either end of the current
-    screen's edge (default 20, so corners stay easy to hit), never while a button is held (a drag stays on its PC),
-    and only to a PC that is connected, awake and in report protocol. Then the PC left gets the pointer at its edge,
-    released (a switch like any other, `SwitchSource::Edge`), and the other PC the pointer at the same place along
-    its screen's edge.
+    screen's edge (default 20, so corners stay easy to hit), never while a button is held (a drag stays on its host),
+    and only to a host that is ready: a PC connected, awake and in report protocol, a Bluetooth host bonded,
+    connected, encrypted and subscribed. Then the host left gets the pointer at its edge, released (a switch like any
+    other, `SwitchSource::Edge`), and the other host the pointer at the same place along its screen's edge.
   - Nothing there: a wall.
-- **Mapping** (`hop-mapping-pc1/-pc2`): where a PC puts 0–32767. `desktop`: across the bounding box of all its
-  screens' `desk` rectangles, those off for hop included (Linux: X11, GNOME, KDE). `main-screen`: on its main screen
-  only, the one at `desk` 0,0 (Windows
-  10 and later map an absolute HID mouse onto the primary monitor). Its other screens get relative motion instead: the
-  KVM knows where it last put the cursor (an absolute report puts it exactly there) and sends the difference to where
-  the pointer is, in the PC's pixels; back on the main screen, the next absolute report puts it exactly in place again.
-  Windows accelerates that relative motion ("Enhance pointer precision"), so with it on the cursor drifts from the
-  KVM's pointer on those screens until it rests (cursor sync, below) or returns to the main screen.
+- **Mapping** (`hop-mapping-pc1/-pc2`; `hop-mapping-host1`–`4`, protocol 9): where a host puts 0–32767. `desktop`:
+  across the bounding box of all its screens' `desk` rectangles, those off for hop included (Linux: X11, GNOME, KDE).
+  `main-screen`: on its main screen only, the one at `desk` 0,0 (Windows 10 and later map an absolute HID mouse onto the
+  primary monitor). Its other screens get relative motion instead: the KVM knows where it last put the cursor (an
+  absolute report puts it exactly there) and sends the difference to where the pointer is, in the PC's pixels; back on
+  the main screen, the next absolute report puts it exactly in place again. Windows accelerates that relative motion
+  ("Enhance pointer precision"), so with it on the cursor drifts from the KVM's pointer on those screens until it rests
+  (cursor sync, below) or returns to the main screen.
 - **Two pointers, one button:** to a PC the relative and the absolute pointer are two devices, and Linux keeps a
   button down on the device it was pressed on. A button stays on the pointer it was pressed on and is released there
   (`PcOutput::held`); switching away releases both, the absolute one where it is.
@@ -685,8 +773,20 @@ engine, on the motion of the normalized pointing devices; the PCs get an absolut
   isn't needed: the whole desktop is absolute).
 - **Switching otherwise** (hotkey, key, software, auto-select): the pointer is found where it was left on that PC, or
   in the middle of its main screen.
-- Costs: the engine grows by ~500 bytes (the pointer, the speed tracker), the config item by up to 194 bytes
-  (`config::ITEM_MAX` 576). The arithmetic is single-precision float (the RP2354B's FPU); no `libm`.
+- **Bluetooth hosts** (protocol 9) take the module's absolute pointer (report 4, §4.13), or with `hostN-pointer
+  relative` the relative mouse only (`BtPointer`; for systems that take no absolute pointer, some tablets and phones).
+  A relative host's cursor isn't known when the pointer comes onto it (a hop, or any switch to it): the KVM first
+  pushes it into the top-left corner of the host's desktop (`hop::PARK`, 30 000 counts each way, further than any
+  desktop before the host's own acceleration), then moves it to the pointer by the difference, and goes on with
+  differences. Wherever the KVM holds the pointer at an edge (a wall, a push toward another host short of its
+  resistance, a corner, a held button), the push goes on to the host as well, so its cursor meets that edge too: the
+  host's acceleration, which the KVM can't undo, drifts the cursor from the pointer only until the next edge. Leaving
+  a Bluetooth host releases its buttons on its mouse and on its absolute pointer. A Bluetooth host has no host
+  software: no cursor sync, and its screens are added by hand (`hostN 2388x1668 200% at …`), not detected.
+- Costs (measured 2026-11-13): the pointer with its speed tracker is 504 bytes of the engine (a place and a cursor for
+  each host), and the config in RAM 824 bytes, 632 of them the four arrangements. In flash each arrangement's item is
+  at most 160 bytes (`config::ARRANGEMENT_ITEM_MAX`), the config item at most 344 of `config::ITEM_MAX` 576. The
+  arithmetic is single-precision float (the RP2354B's FPU); no `libm`.
 
 ## 5. AT32F405 firmware
 
@@ -939,9 +1039,13 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x00A3 | edge resistance: how far the pointer is pushed against an edge to the other PC before it hops, 0–2000 logical pixels (default 100) |
 | 0x00A4 | corners: how far from each end of such an edge it never hops, 0–500 (default 20) |
 | 0x00A6 / 0x00A7 | how PC1 / PC2 maps the absolute pointer: across all its screens (default) or onto its main screen only |
-| 0x00A8–0x00AB | screen hop on in profile 0–3 (default off) |
+| 0x00A8–0x00AB | the arrangement profile 0–3 uses: 0 none (default, screen hop off), n + 1 arrangement n (protocol 9; until 8 screen hop on (1) or off, which read as arrangement 0 and none) |
 | 0x00AC / 0x00AD | what PC1's / PC2's desktop coordinates count: physical pixels (default) or logical (protocol 8) |
-| 0x00B0–0x00B7 | screen slot 0–7: PC (0 = free; bit 7 off for hop, bit 6 fixed place, protocol 8), width, height, scaling %, `desk` x, y, `at` x, y (15 bytes) |
+| 0x00B0–0x00CF | arrangement a's screen slot s at 0x00B0 + 8a + s: host (0 = free, 1 PC1, 2 PC2, 0x11–0x14 Bluetooth host 1–4 since protocol 9; bit 7 off for hop, bit 6 fixed place, protocol 8), width, height, scaling %, `desk` x, y, `at` x, y (15 bytes). Arrangement 0's slots are protocol 8's one arrangement. In the arrangement's own item (§4.8), not the config item |
+| 0x00D0–0x00D3 | name of arrangement 0–3, UTF-8, at most 12 bytes (empty: "Arrangement n"); in the arrangement's item (protocol 9) |
+| 0x00D8–0x00DB | how Bluetooth host 1–4 maps the absolute pointer, as 0x00A6 (protocol 9) |
+| 0x00DC–0x00DF | what Bluetooth host 1–4's desktop coordinates count, as 0x00AC (protocol 9) |
+| 0x00E0–0x00E3 | how screen hop moves Bluetooth host 1–4's pointer: its absolute pointer (default) or relative motion only (protocol 9) |
 
 The config item (§4.8) keeps 0x0030–0x0032 too, so firmware from before profiles still finds the active profile's
 modes, and a config saved by it loads its modes into profile 0. Hosts skip keys an older firmware refuses.
@@ -1009,16 +1113,23 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     programming attempts for the AT32F405s, §4.9; `wireless-retry`: the same for the Bluetooth module, §4.13).
     `odkvmctl status` names the Bluetooth module's firmware, or what it is doing instead, where one is fitted.
   - `odkvmctl display [list]`, `odkvmctl display input <id> <value>`: the monitors' inputs over DDC/CI (no KVM needed).
-  - `odkvmctl screens [list]`: screen hop's state, the arrangement slot by slot, each PC's mapping and the pointer
-    settings, with a warning when this computer's display settings no longer match the KVM's copy; `odkvmctl screens
-    detect` brings this computer's screens up to date (as PC1 or PC2, whichever the KVM says this computer is: those
-    already there keep their place and on/off, new ones go beside their neighbours, gone ones go) and sets its mapping
-    and units (§4.14). The settings themselves are `config set abs-pointer`, `hop-accel`, `hop-speed`,
-    `hop-resistance`, `hop-corner`, `hop-mapping-pc1/2`, `hop-units-pc1/2`, `profileN-hop`, and `screenN` as
-    `pc1 2560x1440 150% at 1920,0 desk 0,0` (scaling and positions may be left out; `no-hop` for a screen off for hop,
-    `fixed` for a place on its computer that dragging doesn't change) or `off`. `odkvmctl status` has a screen-hop
-    line.
-  - `--sim` runs any command against a built-in simulated device (`OPENDYN_SIM_HOP=1`: with screen hop set up).
+  - `odkvmctl screens [--arrangement <n|name>] [list]`: screen hop's state, the arrangements (those with screens or a
+    profile using them, `*` the one in use, or the one named) slot by slot with the profiles using each, each host's
+    mapping, units and (a Bluetooth host's) pointer, and the pointer settings, with a warning naming the arrangements
+    where this computer's display settings no longer match the KVM's copy; `odkvmctl screens [--arrangement …]
+    detect` brings this computer's screens up to date in that arrangement (the active profile's by default; as PC1 or
+    PC2, whichever the KVM says this computer is: those already there keep their place and on/off, new ones go beside
+    their neighbours, gone ones go) and sets its mapping and units (§4.14). `odkvmctl profile <which> arrangement
+    <n|name|none>` picks a profile's arrangement, and `odkvmctl profile` lists them. The settings themselves are
+    `config set abs-pointer`, `hop-accel`, `hop-speed`, `hop-resistance`, `hop-corner`, `hop-mapping-pc1/2`,
+    `hop-mapping-host1`–`4`, `hop-units-pc1/2`, `hop-units-host1`–`4`, `host1`–`4-pointer` (`absolute`, `relative`),
+    `profileN-arrangement` (`none`, 0–3), `arrangementN-name`, and `arrangementN-screenS` as
+    `pc1 2560x1440 150% at 1920,0 desk 0,0` (`pc1`, `pc2` or `host1`–`host4`; scaling and positions may be left out;
+    `no-hop` for a screen off for hop, `fixed` for a place on its computer that dragging doesn't change) or `off`. The
+    names of protocol 8, `screenN` (arrangement 0's) and `profileN-hop` (`on` is arrangement 0), still work.
+    `odkvmctl status` has a screen-hop line.
+  - `--sim` runs any command against a built-in simulated device (`OPENDYN_SIM_HOP=1`: with screen hop set up, two
+    arrangements and, with `OPENDYN_SIM_BT=1`, the tablet of host 1 in both).
 - **GUI** (`opendyn-kvm`), laid out after Creative's Sound Blaster app: a sidebar with the logo, coloured page icons
   and, at its foot, the quick controls (profile, PC1 / PC2 in the KVM's LED colours, LED brightness, dark / light), and
   the pages as rounded cards. The accent colour is the active PC's. Pages:

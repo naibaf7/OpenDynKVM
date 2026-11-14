@@ -5,12 +5,17 @@
 //! as before) or one Bluetooth host. A Bluetooth host is a lesser target: it gets the KVM's own keyboard, mouse and media
 //! reports ([`kvm_proto::link::bt::report`]), never a mirrored device's descriptor, and the front ports in passthrough
 //! stay with the PC that was active before (the *home* PC, `Engine::active`).
+//!
+//! The module can also be an ESP32-C3 board on a front port (a *dongle*, for a KVM without the module on board): the
+//! same firmware, reached over the chip's built-in USB serial port instead of the board's UART ([`dongle_endpoints`]).
 
 use heapless::Vec;
 use kvm_hid::KeyState;
 use kvm_hid::translate::ConsumerState;
 use kvm_proto::ctrl::{BT_HOSTS, BtHostInfo, BtPolicy};
 use kvm_proto::link::bt::{EventKind, HostState, report};
+
+use crate::usbdesc::{DeviceDesc, class, parse_config};
 
 /// What the engine asks of the Bluetooth module (the firmware sends it as a [`kvm_proto::link::BtMsg`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +28,43 @@ pub enum BtOut {
     Passkey { host: u8, value: Option<u32> },
     Policy { host: u8, policy: BtPolicy },
     RequestState,
+}
+
+/// Espressif's USB serial port in silicon (USB-Serial-JTAG: ESP32-C3 and later chips), which a dongle shows: a CDC-ACM
+/// port whose descriptors the chip fixes, the same in its ROM bootloader as in any firmware.
+pub const DONGLE_VID: u16 = 0x303A;
+pub const DONGLE_PID: u16 = 0x1001;
+
+/// Where a dongle's serial port is: its CDC interfaces and the data interface's bulk endpoints (numbers without the
+/// direction bit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DongleEps {
+    /// The CDC communication interface, which SET_CONTROL_LINE_STATE (DTR, RTS: the chip's reset and boot) goes to.
+    pub comm: u8,
+    pub ep_in: u8,
+    pub ep_out: u8,
+    pub mps: u16,
+}
+
+/// A USB-Serial-JTAG port on `device`: VID/PID, a CDC communication interface and a CDC data interface with a bulk
+/// endpoint each way. Any chip and any firmware look like this; whether it is the module is for the link to find out
+/// (`Hello`), and only an ESP32-C3 with a blank flash is ever programmed without being one.
+pub fn dongle_endpoints(device: &DeviceDesc, config: &[u8]) -> Option<DongleEps> {
+    if (device.vid, device.pid) != (DONGLE_VID, DONGLE_PID) {
+        return None;
+    }
+    let cfg = parse_config(config)?;
+    let comm = cfg.interfaces.iter().find(|i| i.class == class::CDC)?.number;
+    let data = cfg.interfaces.iter().find(|i| i.class == class::CDC_DATA)?;
+    let ep_in = data.endpoints.iter().find(|e| e.is_bulk() && e.is_in())?;
+    let ep_out = data.endpoints.iter().find(|e| e.is_bulk() && !e.is_in())?;
+    Some(DongleEps {
+        comm,
+        ep_in: ep_in.number(),
+        ep_out: ep_out.number(),
+        mps: ep_in.max_packet.min(ep_out.max_packet),
+    })
 }
 
 /// A passkey being typed on the KVM's keyboard for a pairing host (KeyboardOnly pairing: the host shows six digits).
@@ -201,6 +243,20 @@ mod tests {
             k.press(*u);
         }
         k
+    }
+
+    #[test]
+    fn dongle_found_by_ids_and_cdc_endpoints() {
+        use crate::usbdesc::fixtures::{GAMING_MOUSE_CONFIG, USB_SERIAL_JTAG_CONFIG, USB_SERIAL_JTAG_DEVICE};
+        let dev = DeviceDesc::parse(&USB_SERIAL_JTAG_DEVICE).unwrap();
+        assert_eq!(
+            dongle_endpoints(&dev, USB_SERIAL_JTAG_CONFIG),
+            Some(DongleEps { comm: 0, ep_in: 1, ep_out: 1, mps: 64 })
+        );
+        // Other IDs, or the IDs without a CDC data interface: not a dongle.
+        let other = DeviceDesc { pid: 0x1002, ..dev };
+        assert_eq!(dongle_endpoints(&other, USB_SERIAL_JTAG_CONFIG), None);
+        assert_eq!(dongle_endpoints(&dev, GAMING_MOUSE_CONFIG), None);
     }
 
     #[test]

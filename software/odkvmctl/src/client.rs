@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 
 use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::{
-    Accel, BT_HOSTS, BtHostInfo, BtPolicy, ConfigValue, DeviceMsg, ErrorCode, Event, FW_CHUNK, FwState, FwTarget,
-    Hotkey, Info, LearnEnd, MAX_PROFILES, MAX_SCREENS, Mapping, Pc, Port, PortInfo, PortMode, RebootTarget, Request,
-    Response, Screen, Status, StringKind, Target, Units, caps, diag, key, status_flags,
+    Accel, BT_HOSTS, BtHostInfo, BtPointer, BtPolicy, ConfigValue, DeviceMsg, ErrorCode, Event, FW_CHUNK, FwState,
+    FwTarget, HOSTS, Host, Hotkey, Info, LearnEnd, MAX_ARRANGEMENTS, MAX_PROFILES, MAX_SCREENS, Mapping, Pc, Port,
+    PortInfo, PortMode, PortState, RebootTarget, Request, Response, Screen, Status, StringKind, Target, Units, caps,
+    diag, key, status_flags,
 };
 use kvm_proto::link::bt::host_flags;
 
@@ -105,31 +106,74 @@ pub struct ProfileView {
     pub name: String,
     /// Keyboard, Mouse, Other.
     pub modes: [PortMode; 3],
-    /// Screen hop is on in it (false from firmware without screen hop).
-    pub hop: bool,
+    /// The arrangement screen hop uses in it; None: screen hop is off there (and from firmware without it).
+    pub arrangement: Option<u8>,
 }
 
-/// Screen hop's settings and arrangement (software.md §4.14), from firmware with `caps::SCREEN_HOP`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Screen hop's settings and arrangements (software.md §4.14), from firmware with `caps::SCREEN_HOP`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HopView {
     pub abs_pointer: bool,
     pub accel: Accel,
     pub speed: i8,
     pub resistance: u16,
     pub corner: u16,
-    /// PC1, PC2.
-    pub mapping: [Mapping; 2],
-    /// What PC1's and PC2's desktop coordinates count.
-    pub units: [Units; 2],
+    /// Each host's, by `Host::index`: PC1, PC2, the Bluetooth hosts.
+    pub mapping: [Mapping; HOSTS],
+    /// What each host's desktop coordinates count, by `Host::index`.
+    pub units: [Units; HOSTS],
+    /// How screen hop moves each Bluetooth host's pointer.
+    pub bt_pointer: [BtPointer; BT_HOSTS],
     /// The KVM is the built-in simulator: its screens aren't this computer's.
     pub simulated: bool,
+    pub arrangements: [ArrangementView; MAX_ARRANGEMENTS],
+    /// The active profile's arrangement (None: screen hop is off in it).
+    pub in_use: Option<u8>,
+}
+
+/// One stored arrangement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrangementView {
+    /// Its name; empty: "Arrangement n" ([`ArrangementView::title`]).
+    pub name: String,
     pub screens: [Screen; MAX_SCREENS],
+}
+
+impl ArrangementView {
+    /// The name to show for arrangement `a`.
+    pub fn title(&self, a: u8) -> String {
+        if self.name.is_empty() { fl!("arrangement-n", n = a) } else { self.name.clone() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.screens.iter().all(|s| s.host.is_none())
+    }
+}
+
+impl HopView {
+    pub fn mapping(&self, h: Host) -> Mapping {
+        self.mapping[h.index()]
+    }
+
+    pub fn units(&self, h: Host) -> Units {
+        self.units[h.index()]
+    }
+
+    /// The arrangement a command works on when none is named: the active profile's, else the first.
+    pub fn current(&self) -> u8 {
+        self.in_use.unwrap_or(0)
+    }
 }
 
 impl Snapshot {
     /// The KVM has the Bluetooth module, so Bluetooth hosts are targets.
     pub fn has_bluetooth(&self) -> bool {
         self.info.caps & caps::BLUETOOTH != 0
+    }
+
+    /// The front port whose ESP32-C3 board is the Bluetooth module, on a KVM without it on the board.
+    pub fn module_port(&self) -> Option<Port> {
+        self.ports.iter().find(|p| p.state == PortState::Module).map(|p| p.port)
     }
 
     /// The bonded Bluetooth hosts (the slots in use).
@@ -147,16 +191,19 @@ impl Snapshot {
         if !self.has_hop() {
             return None;
         }
+        let empty = ArrangementView { name: String::new(), screens: [Screen::NONE; MAX_SCREENS] };
         let mut v = HopView {
             abs_pointer: false,
             accel: Accel::Precision,
             speed: 0,
             resistance: 0,
             corner: 0,
-            mapping: [Mapping::Desktop; 2],
-            units: [Units::Physical; 2],
+            mapping: [Mapping::Desktop; HOSTS],
+            units: [Units::Physical; HOSTS],
+            bt_pointer: [BtPointer::Absolute; BT_HOSTS],
             simulated: self.info.caps & caps::SIMULATED != 0,
-            screens: [Screen::NONE; MAX_SCREENS],
+            arrangements: core::array::from_fn(|_| empty.clone()),
+            in_use: self.profiles().and_then(|(active, _, list)| list.get(active as usize)?.arrangement),
         };
         for c in &self.config {
             match *c {
@@ -165,9 +212,15 @@ impl Snapshot {
                 ConfigValue::HopSpeed(s) => v.speed = s,
                 ConfigValue::HopResistance(r) => v.resistance = r,
                 ConfigValue::HopCorner(c) => v.corner = c,
-                ConfigValue::HopMapping(pc, m) => v.mapping[pc.index()] = m,
-                ConfigValue::HopUnits(pc, u) => v.units[pc.index()] = u,
-                ConfigValue::Screen(i, s) if (i as usize) < MAX_SCREENS => v.screens[i as usize] = s,
+                ConfigValue::HopMapping(h, m) => v.mapping[h.index()] = m,
+                ConfigValue::HopUnits(h, u) => v.units[h.index()] = u,
+                ConfigValue::BtPointer(i, p) if (i as usize) < BT_HOSTS => v.bt_pointer[i as usize] = p,
+                ConfigValue::ArrangementName(a, n) if (a as usize) < MAX_ARRANGEMENTS => {
+                    v.arrangements[a as usize].name = n.as_str().to_string();
+                }
+                ConfigValue::Screen(a, i, s) if (a as usize) < MAX_ARRANGEMENTS && (i as usize) < MAX_SCREENS => {
+                    v.arrangements[a as usize].screens[i as usize] = s;
+                }
                 _ => {}
             }
         }
@@ -194,8 +247,11 @@ impl Snapshot {
                     Some(ConfigValue::ProfileModes(_, m)) => *m,
                     _ => [PortMode::Auto; 3],
                 };
-                let hop = matches!(find(key::PROFILE_HOP_BASE + i), Some(ConfigValue::ProfileHop(_, true)));
-                ProfileView { name, modes, hop }
+                let arrangement = match find(key::PROFILE_ARRANGEMENT_BASE + i) {
+                    Some(ConfigValue::ProfileArrangement(_, a)) => *a,
+                    _ => None,
+                };
+                ProfileView { name, modes, arrangement }
             })
             .collect();
         Some((*active, *count, list))
@@ -433,7 +489,16 @@ impl Client {
             products[p.index()] = self.port_string(*p, StringKind::Product)?;
         }
         let config = self.all_config()?;
-        let bt = if info.caps & caps::BLUETOOTH != 0 { self.bt_hosts(&config)? } else { Vec::new() };
+        // The module can stop between GetInfo and the host slots (restarting, being updated): the KVM refuses those
+        // then. That is no hosts for now, not a failed snapshot, which would leave the window on an old one (first
+        // dongle, 2026-11-14: no wireless host offered on the Screen hop page).
+        let bt = match info.caps & caps::BLUETOOTH {
+            0 => Vec::new(),
+            _ => match self.bt_hosts(&config) {
+                Err(Error::Device(ErrorCode::Unsupported)) => Vec::new(),
+                other => other?,
+            },
+        };
         Ok(Snapshot { info, status, ports, products, config, bt })
     }
 

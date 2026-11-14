@@ -10,11 +10,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use kvm_core::hop::main_screen;
 use kvm_core::hotkey::format_spec;
 use kvm_proto::ctrl::{
-    ConfigValue, ErrorCode, Event, FwState, LearnEnd, MAX_PROFILES, Mapping, Pc, Port, PortMode, RebootTarget, Target,
-    diag, key, selftest, status_flags,
+    ConfigValue, ErrorCode, Event, FwState, Host, LearnEnd, MAX_ARRANGEMENTS, MAX_PROFILES, Mapping, Pc, Port,
+    PortMode, RebootTarget, Target, diag, key, selftest, status_flags,
 };
 use odkvmctl::bootsel::{self, Board};
-use odkvmctl::client::{BtHostView, ProfileView, Snapshot};
+use odkvmctl::client::{BtHostView, HopView, ProfileView, Snapshot};
 use odkvmctl::ddc::{self, mccs};
 use odkvmctl::{Client, firmware, fl, image, local, names};
 
@@ -96,6 +96,9 @@ enum Cmd {
     },
     #[command(about = fl!("cli-screens"))]
     Screens {
+        /// The arrangement, by number (0–3) or name; the default is the active profile's.
+        #[arg(long, short, help = fl!("cli-screens-arrangement"))]
+        arrangement: Option<String>,
         #[command(subcommand)]
         action: Option<ScreensAction>,
     },
@@ -226,6 +229,11 @@ fn print_port(s: &Snapshot, p: Port) {
         print!(" \"{product}\"");
     }
     println!();
+    if i.state == kvm_proto::ctrl::PortState::Module {
+        // The wireless module: not a device for the PCs (software.md §4.13).
+        println!("            {}", fl!("port-module-summary"));
+        return;
+    }
     print!("            {}", names::mode(i.effective));
     if i.mode == PortMode::Auto {
         print!(" ({})", fl!("cli-port-auto", why = names::reason(i.reason)));
@@ -262,7 +270,10 @@ fn print_status(c: &Client, s: &Snapshot) {
             serial = String::from_utf8_lossy(&s.info.serial).trim_end_matches('\0').to_string()
         )
     );
-    // The wireless module only where one is fitted (boards 0.16.0 on).
+    // The wireless module only where there is one: on the board (0.16.0 on), or an ESP32-C3 board on a front port.
+    if let Some(p) = s.module_port() {
+        println!("{}", fl!("cli-module-port", port = names::port_title(p)));
+    }
     match st.bt_module {
         diag::BtModule::Absent => {}
         diag::BtModule::Up => println!("{}", fl!("cli-module-firmware", version = names::version(s.info.bt_fw))),
@@ -334,33 +345,72 @@ fn print_status(c: &Client, s: &Snapshot) {
     }
 }
 
-/// Screen hop: what it does now, the arrangement slot by slot, each PC's mapping and the pointer settings.
-fn print_screens(s: &Snapshot) {
+/// A host as the CLI shows it: PC1, PC2, or a wireless host's name.
+fn host_label(s: &Snapshot, h: Host) -> String {
+    match h.bt_slot() {
+        None => h.name().to_uppercase(),
+        Some(n) => s.bt.iter().find(|b| b.slot == n).map_or_else(|| fl!("host-n", n = n), |b| b.name.clone()),
+    }
+}
+
+/// An arrangement by number (0–3) or (case-insensitive) name.
+fn find_arrangement(which: &str, hop: &HopView) -> Result<u8> {
+    if let Ok(a) = which.parse::<u8>()
+        && (a as usize) < MAX_ARRANGEMENTS
+    {
+        return Ok(a);
+    }
+    match hop.arrangements.iter().enumerate().position(|(a, v)| v.title(a as u8).eq_ignore_ascii_case(which)) {
+        Some(a) => Ok(a as u8),
+        None => bail!(fl!("cli-no-arrangement", which = which)),
+    }
+}
+
+/// Screen hop: what it does now, the arrangements (those with screens or a profile using them, or `only`), slot by slot,
+/// each host's mapping and the pointer settings.
+fn print_screens(s: &Snapshot, only: Option<u8>) {
     let Some(hop) = s.hop() else {
         println!("{}", fl!("hop-firmware-too-old"));
         return;
     };
     println!("{}", fl!("hop-line", state = names::hop_state(s.status.hop)));
-    // The main screen matters (and is marked) only on a PC that maps the pointer onto it alone.
-    let mains = [Pc::Pc1, Pc::Pc2]
-        .map(|pc| (hop.mapping[pc.index()] == Mapping::MainScreen).then(|| main_screen(&hop.screens, pc)).flatten());
-    for (i, sc) in hop.screens.iter().enumerate().filter(|(_, sc)| sc.pc.is_some()) {
-        let main = sc.pc.is_some_and(|pc| mains[pc.index()] == Some(i));
-        let mark = if main { format!("  ({})", fl!("hop-main-screen")) } else { String::new() };
-        println!("  screen{i}  {}{mark}", names::format_screen(sc));
+    let profiles: Vec<ProfileView> =
+        s.profiles().map(|(_, count, list)| list.into_iter().take(count as usize).collect()).unwrap_or_default();
+    for (a, arr) in hop.arrangements.iter().enumerate() {
+        let a = a as u8;
+        let users: Vec<&str> = profiles.iter().filter(|p| p.arrangement == Some(a)).map(|p| p.name.as_str()).collect();
+        if only.is_some_and(|o| o != a) || (only.is_none() && arr.is_empty() && users.is_empty()) {
+            continue;
+        }
+        let used = if users.is_empty() {
+            fl!("cli-arrangement-unused")
+        } else {
+            fl!("cli-arrangement-used", profiles = users.join(", "))
+        };
+        let mark = if hop.in_use == Some(a) { '*' } else { ' ' };
+        println!("{mark} {a}  {}  ({used})", arr.title(a));
+        // The main screen matters (and is marked) only on a host that maps the pointer onto it alone.
+        for (i, sc) in arr.screens.iter().enumerate().filter(|(_, sc)| sc.host.is_some()) {
+            let main = sc
+                .host
+                .is_some_and(|h| hop.mapping(h) == Mapping::MainScreen && main_screen(&arr.screens, h) == Some(i));
+            let mark = if main { format!("  ({})", fl!("hop-main-screen")) } else { String::new() };
+            println!("     screen{i}  {}{mark}", names::format_screen(sc));
+        }
+        if arr.is_empty() {
+            println!("     {}", fl!("hop-no-screens"));
+        }
     }
-    if hop.screens.iter().all(|sc| sc.pc.is_none()) {
-        println!("  {}", fl!("hop-no-screens"));
-    }
-    for pc in [Pc::Pc1, Pc::Pc2] {
-        println!(
-            "{}",
-            fl!("cli-hop-mapping", pc = pc.name().to_uppercase(), mapping = names::mapping(hop.mapping[pc.index()]))
-        );
-        println!(
-            "  {}",
-            fl!("cli-hop-units", pc = pc.name().to_uppercase(), units = names::units(hop.units[pc.index()]))
-        );
+    // PC1 and PC2, and the wireless hosts that have a screen somewhere.
+    let in_any = |h: Host| hop.arrangements.iter().any(|a| a.screens.iter().any(|sc| sc.host == Some(h)));
+    for h in Host::ALL.iter().copied().filter(|h| h.as_pc().is_some() || in_any(*h)) {
+        let label = host_label(s, h);
+        println!("{}", fl!("cli-hop-mapping", pc = label.as_str(), mapping = names::mapping(hop.mapping(h))));
+        println!("  {}", fl!("cli-hop-units", pc = label.as_str(), units = names::units(hop.units(h))));
+        if let Some(n) = h.bt_slot() {
+            let pointer = names::bt_pointer(hop.bt_pointer[n as usize - 1]);
+            println!("  {}", fl!("cli-hop-bt-pointer", host = label.as_str(), pointer = pointer));
+        }
     }
     println!(
         "{}",
@@ -374,18 +424,26 @@ fn print_screens(s: &Snapshot) {
     );
 }
 
-/// Whether the KVM's copy of this computer's screens and units is what its display settings say (only when the KVM says
-/// which PC this is and has screens for it): a warning if not.
+/// Whether the KVM's copies of this computer's screens and units are what its display settings say (only when the KVM
+/// says which PC this is): a warning naming the arrangements that are not.
 fn check_screens(s: &Snapshot) {
     let (Some(hop), Some(pc)) = (s.hop(), s.this_pc()) else { return };
+    let host = Host::pc(pc);
     // The simulator's screens aren't this computer's.
-    if !hop.screens.iter().any(|x| x.pc == Some(pc)) || hop.simulated {
+    if hop.simulated {
         return;
     }
-    if let Ok(now) = odkvmctl::screens::detect()
-        && odkvmctl::screens::differs(&hop.screens, pc, hop.units[pc.index()], &now)
-    {
-        println!("{}", fl!("cli-hop-out-of-date"));
+    let Ok(now) = odkvmctl::screens::detect() else { return };
+    let stale: Vec<String> = hop
+        .arrangements
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.screens.iter().any(|x| x.host == Some(host)))
+        .filter(|(_, a)| odkvmctl::screens::differs(&a.screens, host, hop.units(host), &now))
+        .map(|(i, a)| a.title(i as u8))
+        .collect();
+    if !stale.is_empty() {
+        println!("{} ({})", fl!("cli-hop-out-of-date"), stale.join(", "));
     }
 }
 
@@ -418,12 +476,18 @@ fn print_hosts(s: &Snapshot) {
     }
 }
 
-fn print_profiles(active: u8, count: u8, list: &[ProfileView]) {
+fn print_profiles(active: u8, count: u8, list: &[ProfileView], hop: Option<&HopView>) {
     for (i, p) in list.iter().enumerate().take(count as usize) {
         let mark = if i == active as usize { '*' } else { ' ' };
         let modes: Vec<String> =
             Port::ALL.iter().map(|port| format!("{} {}", port.name(), p.modes[port.index()].name())).collect();
-        println!("{mark} {i}  {:<12}  {}", p.name, modes.join(", "));
+        // Screen hop: the arrangement the profile uses, where the firmware has it.
+        let hop = match (hop, p.arrangement) {
+            (None, _) => String::new(),
+            (Some(_), None) => format!("; {}", fl!("cli-profile-no-hop")),
+            (Some(h), Some(a)) => format!("; {}", fl!("cli-profile-hop", name = h.arrangements[a as usize].title(a))),
+        };
+        println!("{mark} {i}  {:<12}  {}{hop}", p.name, modes.join(", "));
     }
     if (count as usize) < MAX_PROFILES {
         println!("  ({})", fl!("cli-profiles-in-use", count = count, max = MAX_PROFILES));
@@ -702,21 +766,25 @@ fn main() -> Result<()> {
             print_status(&c, &s);
         }
         Cmd::List | Cmd::Display { .. } | Cmd::Update { .. } => unreachable!(),
-        Cmd::Screens { action } => {
+        Cmd::Screens { arrangement, action } => {
             let s = c.snapshot()?;
+            let Some(hop) = s.hop() else { bail!(fl!("hop-firmware-too-old")) };
+            let named = arrangement.as_deref().map(|w| find_arrangement(w, &hop)).transpose()?;
             match action {
                 Some(ScreensAction::Detect) => {
-                    let Some(hop) = s.hop() else { bail!(fl!("hop-firmware-too-old")) };
                     let Some(pc) = s.this_pc() else { bail!(fl!("cli-screens-which-pc")) };
+                    let host = Host::pc(pc);
+                    let a = named.unwrap_or(hop.current());
                     let found = odkvmctl::screens::detect().map_err(anyhow::Error::msg)?;
-                    let next = odkvmctl::screens::merge(&hop.screens, pc, &found);
-                    for (i, (a, b)) in hop.screens.iter().zip(next.iter()).enumerate() {
-                        if a != b {
-                            c.set_config(ConfigValue::Screen(i as u8, *b))?;
+                    let screens = &hop.arrangements[a as usize].screens;
+                    let next = odkvmctl::screens::merge(screens, host, &found);
+                    for (i, (was, now)) in screens.iter().zip(next.iter()).enumerate() {
+                        if was != now {
+                            c.set_config(ConfigValue::Screen(a, i as u8, *now))?;
                         }
                     }
-                    c.set_config(ConfigValue::HopMapping(pc, odkvmctl::screens::MAPPING))?;
-                    c.set_config(ConfigValue::HopUnits(pc, found.units))?;
+                    c.set_config(ConfigValue::HopMapping(host, odkvmctl::screens::MAPPING))?;
+                    c.set_config(ConfigValue::HopUnits(host, found.units))?;
                     println!(
                         "{}",
                         fl!(
@@ -730,7 +798,7 @@ fn main() -> Result<()> {
                 Some(ScreensAction::List) | None => {}
             }
             let s = c.snapshot()?;
-            print_screens(&s);
+            print_screens(&s, named);
             check_screens(&s);
         }
         Cmd::Diag => {
@@ -856,9 +924,17 @@ fn main() -> Result<()> {
                     let i = find_profile(&w, &list)?;
                     let v = if setting == "name" {
                         ConfigValue::ProfileName(i, names::parse_profile_name(&value).map_err(anyhow::Error::msg)?)
+                    } else if setting == "arrangement" {
+                        let Some(hop) = s.hop() else { bail!(fl!("hop-firmware-too-old")) };
+                        let a = match value.as_str() {
+                            "none" | "off" => None,
+                            v => Some(find_arrangement(v, &hop)?),
+                        };
+                        ConfigValue::ProfileArrangement(i, a)
                     } else {
                         let port = Port::from_name(&setting).with_context(|| {
-                            fl!("parse-one-of", value = setting.as_str(), choices = "name, keyboard, mouse, other")
+                            let choices = "name, keyboard, mouse, other, arrangement";
+                            fl!("parse-one-of", value = setting.as_str(), choices = choices)
                         })?;
                         let m = PortMode::from_name(&value)
                             .with_context(|| fl!("parse-mode", value = value.as_str(), modes = names::mode_names()))?;
@@ -872,7 +948,7 @@ fn main() -> Result<()> {
             }
             let s = c.snapshot()?;
             let (active, count, list) = s.profiles().context("profiles")?;
-            print_profiles(active, count, &list);
+            print_profiles(active, count, &list, s.hop().as_ref());
         }
         Cmd::Hotkey { which, spec } => {
             let k = match which {
@@ -921,7 +997,8 @@ fn main() -> Result<()> {
                     }
                     v => c.set_config(v)?,
                 };
-                println!("{name} = {}", names::format_value(&v));
+                // Under its name now, also when an earlier one was typed (screen0, profile1-hop).
+                println!("{} = {}", names::config_name(k), names::format_value(&v));
             }
             ConfigAction::Save => {
                 c.save()?;

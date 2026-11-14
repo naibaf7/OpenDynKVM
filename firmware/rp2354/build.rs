@@ -4,7 +4,9 @@
 //! The module's image is its whole flash from offset 0 (bootloader, partition table, application), as `cargo xtask
 //! dist` writes it with espflash (`KVM_ESP_IMAGE`, or `../esp32c3/target/.../release/kvm-esp32c3.bin`). It is stored
 //! zlib-compressed, as the module's ROM bootloader takes it (FLASH_DEFL_*), with its length and MD5 for the check
-//! after writing. Without it the RP2354B firmware still builds, and uses a module as it finds it.
+//! after writing. It is split after its first 4 KB, which `espisp` writes last: a module whose programming broke off
+//! still has an erased first sector, and so is still known as blank (software.md §4.13). Without it the RP2354B
+//! firmware still builds, and uses a module as it finds it.
 //!
 //! The AT32F405 image comes from its release ELF: `KVM_AT32_ELF`, or `../at32f405/target/.../release/kvm-at32f405`
 //! by default. Build that first (`cargo xtask dist` does both in order). Without it the RP2354B firmware still builds,
@@ -93,6 +95,8 @@ fn main() {
 }
 
 const ESP_FW_ID_MAGIC: &[u8; 8] = b"KVMESP32";
+/// The module's first flash sector: written last, and erased first.
+const ESP_HEAD: usize = 4096;
 
 /// The module's image, compressed, and what the firmware needs to know of it.
 fn esp_image(out: &std::path::Path) {
@@ -114,19 +118,24 @@ fn esp_image(out: &std::path::Path) {
     if !image.is_empty() && version.is_none() {
         println!("cargo:warning={}: no firmware ID marker", path.display());
     }
-    let zlib = if image.is_empty() {
-        Vec::new()
-    } else {
+    let zlib = |part: &[u8]| {
+        if part.is_empty() {
+            return Vec::new();
+        }
         let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
-        z.write_all(&image).unwrap();
+        z.write_all(part).unwrap();
         z.finish().unwrap()
     };
-    let md5 = {
+    let md5 = |data: &[u8]| {
         use md5::Digest as _;
-        let d = md5::Md5::digest(&image);
+        let d = md5::Md5::digest(data);
         d.iter().map(|b| format!("{b:02x}")).collect::<String>()
     };
-    fs::write(out.join("esp.bin.z"), &zlib).unwrap();
+    let head_len = image.len().min(ESP_HEAD);
+    fs::write(out.join("esp_head.bin.z"), zlib(&image[..head_len])).unwrap();
+    fs::write(out.join("esp_tail.bin.z"), zlib(&image[head_len..])).unwrap();
+    let blank = md5(&[0xFF; ESP_HEAD]);
+    let md5 = md5(&image);
     fs::write(
         out.join("esp_fw.rs"),
         format!(
@@ -134,7 +143,10 @@ fn esp_image(out: &std::path::Path) {
              pub const ESP_FW_VERSION: Option<u32> = {version:?};\n\
              /// Its size uncompressed, and its MD5 as the module's ROM reports it.\n\
              pub const ESP_IMAGE_LEN: u32 = {};\n\
-             pub const ESP_IMAGE_MD5: &[u8; 32] = b\"{md5}\";\n",
+             pub const ESP_IMAGE_MD5: &[u8; 32] = b\"{md5}\";\n\
+             /// Length of the part written last (the first sector), and the MD5 of that sector erased.\n\
+             pub const ESP_HEAD_LEN: u32 = {head_len};\n\
+             pub const ESP_BLANK_MD5: &[u8; 32] = b\"{blank}\";\n",
             image.len()
         ),
     )

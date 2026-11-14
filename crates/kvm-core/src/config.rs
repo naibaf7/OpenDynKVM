@@ -2,15 +2,23 @@
 //!
 //! Item ([`ITEM`] in [`crate::store`], which adds the CRC): a list of entries `key u16 | len u8 | value`. Unknown keys
 //! are skipped, so a newer firmware's item still loads in an older one.
+//!
+//! The screen-hop arrangements (protocol 9) are items of their own ([`ARRANGEMENT_ITEM`] + n, the same entries: the
+//! arrangement's name and its screens), so that editing one writes only it, and switching profiles writes nothing.
+//! Firmware up to 0.1.12 kept its one arrangement in the config item, under the keys that are arrangement 0's now: such
+//! an item loads into arrangement 0, which is written as an item of its own at the next save, before the config item
+//! that no longer holds it.
 
 use core::ops::RangeInclusive;
 
 use kvm_proto::ctrl::{
-    Accel, BT_HOSTS, BtPolicy, ConfigValue, ErrorCode, HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, Hotkey,
-    KeyAction, MAX_PROFILES, MAX_SCREENS, Mapping, Pc, Polling, Port, PortMode, ProfileName, Rgb, Screen, Units,
-    VialMode, key,
+    Accel, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, ErrorCode, HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HOSTS,
+    Host, Hotkey, KeyAction, MAX_ARRANGEMENTS, MAX_PROFILES, MAX_SCREENS, Mapping, PROFILE_NAME_MAX, Polling, Port,
+    PortMode, ProfileName, Rgb, Screen, Units, VialMode, key,
 };
 use kvm_proto::wire::{Reader, Writer};
+
+pub use crate::hop::Layout;
 
 /// Store key of the config.
 pub const ITEM: u16 = 0x0001;
@@ -18,7 +26,14 @@ pub const ITEM: u16 = 0x0001;
 /// 0.16.0 added the Bluetooth settings (a hotkey, four names, four policies): up to 83 bytes more.
 /// Screen hop added the absolute pointer, its settings, four profile switches and eight screens: 194 bytes more.
 /// Each PC's units for screen hop (protocol 8): 8 bytes more.
+/// Arrangements in items of their own (protocol 9): the eight screens out (144 bytes), the Bluetooth hosts' mapping,
+/// units and pointer in (48 bytes).
 pub const ITEM_MAX: usize = 576;
+/// Store key of arrangement 0's item; arrangement n's is this + n.
+pub const ARRANGEMENT_ITEM: u16 = 0x0010;
+/// An arrangement's item at its longest: its name (key, length, then the name with its own length) and every screen
+/// slot used (key, length, 15 bytes).
+pub const ARRANGEMENT_ITEM_MAX: usize = (4 + PROFILE_NAME_MAX) + MAX_SCREENS * (3 + 15);
 /// The longest value of an entry (a screen: 15 bytes).
 const VALUE_MAX: usize = 22;
 /// A press on the KVM's key released before this is a tap.
@@ -65,8 +80,20 @@ pub struct Config {
     /// The KVM's mouse interface also has an absolute pointer (screen hop needs it).
     pub abs_pointer: bool,
     pub hop: HopConfig,
-    /// The screen-hop arrangement.
-    pub screens: [Screen; MAX_SCREENS],
+    /// The screen-hop arrangements; each profile uses one of them or none.
+    pub arrangements: [Arrangement; MAX_ARRANGEMENTS],
+}
+
+/// A screen-hop arrangement: a name (empty: the hosts call it "Arrangement n") and its screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Arrangement {
+    pub name: ProfileName,
+    pub screens: Layout,
+}
+
+impl Arrangement {
+    pub const EMPTY: Arrangement = Arrangement { name: ProfileName::new(""), screens: [Screen::NONE; MAX_SCREENS] };
 }
 
 /// How screen hop moves the pointer (software.md §4.14); each profile turns it on or off.
@@ -77,10 +104,12 @@ pub struct HopConfig {
     pub speed: i8,
     pub resistance: u16,
     pub corner: u16,
-    /// How PC1 and PC2 map the absolute pointer onto their screens.
-    pub mapping: [Mapping; 2],
-    /// What PC1's and PC2's desktop coordinates count.
-    pub units: [Units; 2],
+    /// How each host (`Host::index`) maps the absolute pointer onto its screens.
+    pub mapping: [Mapping; HOSTS],
+    /// What each host's desktop coordinates count.
+    pub units: [Units; HOSTS],
+    /// How screen hop moves each Bluetooth host's pointer.
+    pub bt_pointer: [BtPointer; BT_HOSTS],
 }
 
 /// A set of port modes to switch between with the key, e.g. emulated for work and passthrough for games.
@@ -90,13 +119,13 @@ pub struct Profile {
     pub name: ProfileName,
     /// Keyboard, Mouse, Other.
     pub port_modes: [PortMode; 3],
-    /// Screen hop moves the pointer in this profile.
-    pub hop: bool,
+    /// The arrangement screen hop moves the pointer across in this profile; None: screen hop is off.
+    pub arrangement: Option<u8>,
 }
 
 impl Profile {
     const fn new(name: &str, mode: PortMode) -> Profile {
-        Profile { name: ProfileName::new(name), port_modes: [mode; 3], hop: false }
+        Profile { name: ProfileName::new(name), port_modes: [mode; 3], arrangement: None }
     }
 }
 
@@ -153,10 +182,11 @@ impl Config {
             // A deliberate push, and the corners left for the Start button and window controls.
             resistance: 100,
             corner: 20,
-            mapping: [Mapping::Desktop; 2],
-            units: [Units::Physical; 2],
+            mapping: [Mapping::Desktop; HOSTS],
+            units: [Units::Physical; HOSTS],
+            bt_pointer: [BtPointer::Absolute; BT_HOSTS],
         },
-        screens: [Screen::NONE; MAX_SCREENS],
+        arrangements: [Arrangement::EMPTY; MAX_ARRANGEMENTS],
     };
 
     /// The port modes in force: the active profile's.
@@ -169,17 +199,36 @@ impl Config {
         (self.profile + 1) % self.profile_count
     }
 
+    /// The arrangement of the active profile (None: screen hop is off in it).
+    pub fn arrangement(&self) -> Option<u8> {
+        self.profiles[self.profile as usize].arrangement
+    }
+
     /// Screen hop is on in the active profile.
     pub fn hop_on(&self) -> bool {
-        self.profiles[self.profile as usize].hop
+        self.arrangement().is_some()
     }
 
-    pub fn mapping(&self, pc: Pc) -> Mapping {
-        self.hop.mapping[pc.index()]
+    /// The screens of the active profile's arrangement; none with screen hop off.
+    pub fn layout(&self) -> &Layout {
+        const NONE: Layout = [Screen::NONE; MAX_SCREENS];
+        match self.arrangement() {
+            Some(a) => &self.arrangements[a as usize].screens,
+            None => &NONE,
+        }
     }
 
-    pub fn units(&self, pc: Pc) -> Units {
-        self.hop.units[pc.index()]
+    pub fn mapping(&self, h: Host) -> Mapping {
+        self.hop.mapping[h.index()]
+    }
+
+    pub fn units(&self, h: Host) -> Units {
+        self.hop.units[h.index()]
+    }
+
+    /// How screen hop moves `h`'s pointer: a PC's is always absolute.
+    pub fn bt_pointer(&self, h: Host) -> BtPointer {
+        h.bt_slot().map_or(BtPointer::Absolute, |n| self.hop.bt_pointer[n as usize - 1])
     }
 }
 
@@ -242,21 +291,27 @@ impl Config {
             key::HOP_SPEED => ConfigValue::HopSpeed(self.hop.speed),
             key::HOP_RESISTANCE => ConfigValue::HopResistance(self.hop.resistance),
             key::HOP_CORNER => ConfigValue::HopCorner(self.hop.corner),
-            k if (key::HOP_MAPPING_BASE..key::HOP_MAPPING_BASE + 2).contains(&k) => {
-                let pc = Pc::from_index((k - key::HOP_MAPPING_BASE) as usize);
-                ConfigValue::HopMapping(pc, self.mapping(pc))
+            k if let Some(h) = Host::ALL.iter().copied().find(|h| key::hop_mapping(*h) == k) => {
+                ConfigValue::HopMapping(h, self.mapping(h))
             }
-            k if (key::HOP_UNITS_BASE..key::HOP_UNITS_BASE + 2).contains(&k) => {
-                let pc = Pc::from_index((k - key::HOP_UNITS_BASE) as usize);
-                ConfigValue::HopUnits(pc, self.units(pc))
+            k if let Some(h) = Host::ALL.iter().copied().find(|h| key::hop_units(*h) == k) => {
+                ConfigValue::HopUnits(h, self.units(h))
             }
-            k if (key::PROFILE_HOP_BASE..key::PROFILE_HOP_BASE + MAX_PROFILES as u16).contains(&k) => {
-                let i = k - key::PROFILE_HOP_BASE;
-                ConfigValue::ProfileHop(i as u8, self.profiles[i as usize].hop)
+            k if (key::BT_POINTER_BASE..key::BT_POINTER_BASE + BT_HOSTS as u16).contains(&k) => {
+                let i = k - key::BT_POINTER_BASE;
+                ConfigValue::BtPointer(i as u8, self.hop.bt_pointer[i as usize])
             }
-            k if (key::SCREEN_BASE..key::SCREEN_BASE + MAX_SCREENS as u16).contains(&k) => {
-                let i = k - key::SCREEN_BASE;
-                ConfigValue::Screen(i as u8, self.screens[i as usize])
+            k if (key::PROFILE_ARRANGEMENT_BASE..key::PROFILE_ARRANGEMENT_BASE + MAX_PROFILES as u16).contains(&k) => {
+                let i = k - key::PROFILE_ARRANGEMENT_BASE;
+                ConfigValue::ProfileArrangement(i as u8, self.profiles[i as usize].arrangement)
+            }
+            k if (key::ARRANGEMENT_NAME_BASE..key::ARRANGEMENT_NAME_BASE + MAX_ARRANGEMENTS as u16).contains(&k) => {
+                let a = k - key::ARRANGEMENT_NAME_BASE;
+                ConfigValue::ArrangementName(a as u8, self.arrangements[a as usize].name)
+            }
+            k if let Some(a) = key::arrangement_of(k) => {
+                let i = (k - key::screen(a, 0)) as usize;
+                ConfigValue::Screen(a, i as u8, self.arrangements[a as usize].screens[i])
             }
             _ => return None,
         })
@@ -293,11 +348,21 @@ impl Config {
             ConfigValue::BtName(i, _) | ConfigValue::BtPolicy(i, _) if i as usize >= BT_HOSTS => {
                 return Err(ErrorCode::InvalidValue);
             }
-            ConfigValue::ProfileHop(i, _) if i as usize >= MAX_PROFILES => return Err(ErrorCode::InvalidValue),
+            ConfigValue::ProfileArrangement(i, a)
+                if i as usize >= MAX_PROFILES || a.is_some_and(|a| a as usize >= MAX_ARRANGEMENTS) =>
+            {
+                return Err(ErrorCode::InvalidValue);
+            }
+            ConfigValue::ArrangementName(a, _) if a as usize >= MAX_ARRANGEMENTS => {
+                return Err(ErrorCode::InvalidValue);
+            }
+            ConfigValue::BtPointer(i, _) if i as usize >= BT_HOSTS => return Err(ErrorCode::InvalidValue),
             ConfigValue::HopSpeed(v) if !HOP_SPEED.contains(&v) => return Err(ErrorCode::InvalidValue),
             ConfigValue::HopResistance(v) if v > HOP_RESISTANCE_MAX => return Err(ErrorCode::InvalidValue),
             ConfigValue::HopCorner(v) if v > HOP_CORNER_MAX => return Err(ErrorCode::InvalidValue),
-            ConfigValue::Screen(i, s) if i as usize >= MAX_SCREENS || !s.is_valid() => {
+            ConfigValue::Screen(a, i, s)
+                if a as usize >= MAX_ARRANGEMENTS || i as usize >= MAX_SCREENS || !s.is_valid() =>
+            {
                 return Err(ErrorCode::InvalidValue);
             }
             ConfigValue::SwSwitchAllowed(true) | ConfigValue::SwConfigAllowed(true) if origin == Origin::Software => {
@@ -345,41 +410,68 @@ impl Config {
             ConfigValue::HopSpeed(v) => self.hop.speed = v,
             ConfigValue::HopResistance(v) => self.hop.resistance = v,
             ConfigValue::HopCorner(v) => self.hop.corner = v,
-            ConfigValue::HopMapping(pc, m) => self.hop.mapping[pc.index()] = m,
-            ConfigValue::HopUnits(pc, u) => self.hop.units[pc.index()] = u,
-            ConfigValue::ProfileHop(i, b) => self.profiles[i as usize].hop = b,
-            ConfigValue::Screen(i, s) => {
+            ConfigValue::HopMapping(h, m) => self.hop.mapping[h.index()] = m,
+            ConfigValue::HopUnits(h, u) => self.hop.units[h.index()] = u,
+            ConfigValue::BtPointer(i, p) => self.hop.bt_pointer[i as usize] = p,
+            ConfigValue::ProfileArrangement(i, a) => self.profiles[i as usize].arrangement = a,
+            ConfigValue::ArrangementName(a, n) => self.arrangements[a as usize].name = n,
+            ConfigValue::Screen(a, i, s) => {
                 // A free slot is stored as such, whatever else came with it.
-                let s = if s.pc.is_some() { s } else { Screen::NONE };
-                self.screens[i as usize] = s;
-                return Ok(ConfigValue::Screen(i, s));
+                let s = if s.host.is_some() { s } else { Screen::NONE };
+                self.arrangements[a as usize].screens[i as usize] = s;
+                return Ok(ConfigValue::Screen(a, i, s));
             }
         }
         Ok(v)
     }
 
-    /// Encodes the flash item; returns its length.
+    /// Encodes the flash item, without the arrangements (their own items); returns its length.
     pub fn encode(&self, out: &mut [u8; ITEM_MAX]) -> usize {
         let mut w = Writer::new(out);
-        for v in self.all() {
-            let mut tmp = [0u8; 2 + VALUE_MAX];
-            let mut tw = Writer::new(&mut tmp);
-            // A value is at most a few bytes; these writes cannot overflow.
-            let _ = v.encode(&mut tw);
-            let enc = tw.finish();
-            let _ = w.u16(v.key());
-            let _ = w.lv(&enc[2..]);
+        for v in self.all().filter(|v| key::arrangement_of(v.key()).is_none()) {
+            entry(&mut w, &v);
         }
         w.len()
     }
 
-    /// Decodes an item; entries that don't parse keep their default.
+    /// Decodes an item; entries that don't parse keep their default. An item from firmware up to 0.1.12 brings its
+    /// one arrangement, as arrangement 0.
     pub fn decode(item: &[u8]) -> Config {
         let mut cfg = Config::default();
+        cfg.apply(item, |_| true);
+        if !cfg.remember_profile {
+            cfg.profile = 0;
+        }
+        cfg
+    }
+
+    /// Encodes arrangement `a`'s item: its name and the screen slots in use (a free slot is the default). Returns its
+    /// length.
+    pub fn encode_arrangement(&self, a: u8, out: &mut [u8; ARRANGEMENT_ITEM_MAX]) -> usize {
+        let arr = &self.arrangements[a as usize];
+        let mut w = Writer::new(out);
+        entry(&mut w, &ConfigValue::ArrangementName(a, arr.name));
+        for (i, s) in arr.screens.iter().enumerate().filter(|(_, s)| s.host.is_some()) {
+            entry(&mut w, &ConfigValue::Screen(a, i as u8, *s));
+        }
+        w.len()
+    }
+
+    /// Arrangement `a`'s item, read from flash: it replaces what the config item brought for it.
+    pub fn restore_arrangement(&mut self, a: u8, item: &[u8]) {
+        if a as usize >= MAX_ARRANGEMENTS {
+            return;
+        }
+        self.arrangements[a as usize] = Arrangement::EMPTY;
+        self.apply(item, |k| key::arrangement_of(k) == Some(a));
+    }
+
+    /// Sets every entry of `item` whose key `want`s.
+    fn apply(&mut self, item: &[u8], want: impl Fn(u16) -> bool) {
         let mut er = Reader::new(item);
         while er.remaining() > 0 {
             let (Ok(k), Ok(val)) = (er.u16(), er.lv()) else { break };
-            if val.len() > VALUE_MAX {
+            if val.len() > VALUE_MAX || !want(k) {
                 continue;
             }
             let mut tmp = [0u8; 2 + VALUE_MAX];
@@ -387,14 +479,21 @@ impl Config {
             tmp[2..2 + val.len()].copy_from_slice(val);
             if let Ok(v) = ConfigValue::decode(&mut Reader::new(&tmp[..2 + val.len()])) {
                 // Stored values were validated when set; the device origin keeps the lock bits as stored.
-                let _ = cfg.set(v, Origin::Device);
+                let _ = self.set(v, Origin::Device);
             }
         }
-        if !cfg.remember_profile {
-            cfg.profile = 0;
-        }
-        cfg
     }
+}
+
+/// One item entry: `key u16 | len u8 | value`.
+fn entry(w: &mut Writer, v: &ConfigValue) {
+    let mut tmp = [0u8; 2 + VALUE_MAX];
+    let mut tw = Writer::new(&mut tmp);
+    // A value is at most a few bytes; these writes cannot overflow.
+    let _ = v.encode(&mut tw);
+    let enc = tw.finish();
+    let _ = w.u16(v.key());
+    let _ = w.lv(&enc[2..]);
 }
 
 #[cfg(test)]
@@ -418,46 +517,108 @@ mod tests {
         c.set(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
         for i in 0..4 {
             c.set(ConfigValue::ProfileName(i, ProfileName::new("twelve bytes")), Origin::Software).unwrap();
-            c.set(ConfigValue::ProfileHop(i, i % 2 == 0), Origin::Software).unwrap();
+            c.set(ConfigValue::ProfileArrangement(i, (i % 2 == 0).then_some(3 - i)), Origin::Software).unwrap();
         }
-        // Screen hop, with every screen slot used.
+        // Screen hop, with every host's settings changed and every screen slot of every arrangement used.
         c.set(ConfigValue::AbsPointer(true), Origin::Software).unwrap();
         c.set(ConfigValue::HopAccel(Accel::Adaptive), Origin::Software).unwrap();
         c.set(ConfigValue::HopSpeed(-3), Origin::Software).unwrap();
         c.set(ConfigValue::HopResistance(400), Origin::Software).unwrap();
         c.set(ConfigValue::HopCorner(0), Origin::Software).unwrap();
-        c.set(ConfigValue::HopMapping(Pc::Pc2, Mapping::MainScreen), Origin::Software).unwrap();
-        c.set(ConfigValue::HopUnits(Pc::Pc1, Units::Logical), Origin::Software).unwrap();
-        for i in 0..MAX_SCREENS as u8 {
-            let s = Screen {
-                pc: Some(if i < 4 { Pc::Pc1 } else { Pc::Pc2 }),
-                w: 3840,
-                h: 2160,
-                scale: 150,
-                desk: [-3840 * (i as i16 % 4), 0],
-                at: [-20_000 + 2560 * i as i16, -1440],
-                off: i % 3 == 0,
-                fixed: i % 2 == 0,
-            };
-            c.set(ConfigValue::Screen(i, s), Origin::Software).unwrap();
+        for h in Host::ALL.iter().copied() {
+            c.set(ConfigValue::HopMapping(h, Mapping::MainScreen), Origin::Software).unwrap();
+            c.set(ConfigValue::HopUnits(h, Units::Logical), Origin::Software).unwrap();
+        }
+        for i in 0..BT_HOSTS as u8 {
+            c.set(ConfigValue::BtPointer(i, BtPointer::Relative), Origin::Software).unwrap();
+        }
+        for a in 0..MAX_ARRANGEMENTS as u8 {
+            c.set(ConfigValue::ArrangementName(a, ProfileName::new("twelve bytes")), Origin::Software).unwrap();
+            for i in 0..MAX_SCREENS as u8 {
+                let s = Screen {
+                    host: Some(Host::ALL[(a + i) as usize % HOSTS]),
+                    w: 3840,
+                    h: 2160,
+                    scale: 150,
+                    desk: [-3840 * (i as i16 % 4), 0],
+                    at: [-20_000 + 2560 * i as i16, -1440 * a as i16],
+                    off: i % 3 == 0,
+                    fixed: i % 2 == 0,
+                };
+                c.set(ConfigValue::Screen(a, i, s), Origin::Software).unwrap();
+            }
         }
         let mut buf = [0xFFu8; ITEM_MAX];
         let n = c.encode(&mut buf);
         // Everything at its longest, with room left for what comes next.
         assert!(n + 32 <= ITEM_MAX, "item {n} bytes of {ITEM_MAX}");
-        let d = Config::decode(&buf[..n]);
+        let mut d = Config::decode(&buf[..n]);
+        // The config item holds no arrangement: each comes from its own item.
+        assert_eq!(d.arrangements, [Arrangement::EMPTY; MAX_ARRANGEMENTS]);
+        for a in 0..MAX_ARRANGEMENTS as u8 {
+            let mut item = [0xFFu8; ARRANGEMENT_ITEM_MAX];
+            let m = c.encode_arrangement(a, &mut item);
+            assert_eq!(m, ARRANGEMENT_ITEM_MAX, "every slot used: the item at its longest");
+            d.restore_arrangement(a, &item[..m]);
+        }
         assert_eq!(d, c);
-        assert!(d.screens[3].off && d.screens[4].fixed && !d.screens[4].off);
+        assert!(d.arrangements[2].screens[3].off && d.arrangements[2].screens[4].fixed);
         assert_eq!(d.port_modes(), [PortMode::Auto, PortMode::Mirrored, PortMode::Auto]);
         assert_eq!(d.profiles[0].port_modes[Port::Other.index()], PortMode::PassthroughPc1);
         assert_eq!(Config::decode(&[]), Config::default());
     }
 
     #[test]
+    fn an_arrangement_item_holds_its_name_and_the_slots_in_use_only() {
+        let mut c = Config::default();
+        c.set(ConfigValue::Screen(1, 5, Screen::new(Host::Bt2, 2388, 1668, [1920, 0])), Origin::Software).unwrap();
+        let mut item = [0u8; ARRANGEMENT_ITEM_MAX];
+        let n = c.encode_arrangement(1, &mut item);
+        assert_eq!(n, 4 + (3 + 15), "the empty name and one screen");
+        // Restoring it replaces the arrangement: what was there before is gone, the others stay.
+        let mut d = Config::default();
+        d.set(ConfigValue::Screen(1, 0, Screen::new(Host::Pc1, 1920, 1080, [0, 0])), Origin::Software).unwrap();
+        d.set(ConfigValue::Screen(2, 0, Screen::new(Host::Pc2, 1920, 1080, [0, 0])), Origin::Software).unwrap();
+        d.restore_arrangement(1, &item[..n]);
+        assert_eq!(d.arrangements[1], c.arrangements[1]);
+        assert_eq!(d.arrangements[2].screens[0].host, Some(Host::Pc2));
+        // An arrangement item never sets anything else, whatever it holds.
+        let mut cfg_item = [0u8; ITEM_MAX];
+        let m = Config { led_brightness: 7, ..c }.encode(&mut cfg_item);
+        d.restore_arrangement(0, &cfg_item[..m]);
+        assert_eq!(d.led_brightness, Config::default().led_brightness);
+    }
+
+    #[test]
+    fn a_config_item_with_one_arrangement_loads_it_as_arrangement_0() {
+        // Firmware up to 0.1.12: the screens at 0x00B0–0x00B7 and each profile's switch at 0x00A8–0x00AB.
+        let mut old = [0u8; 64];
+        let mut w = Writer::new(&mut old);
+        w.u16(key::PROFILE_ARRANGEMENT_BASE + 1).unwrap();
+        w.lv(&[1]).unwrap();
+        let s = Screen { scale: 150, ..Screen::new(Host::Pc2, 3840, 2160, [-2560, 0]) };
+        let mut enc = [0u8; 24];
+        let mut ew = Writer::new(&mut enc);
+        ConfigValue::Screen(0, 6, s).encode(&mut ew).unwrap();
+        let enc = ew.finish();
+        assert_eq!(u16::from_le_bytes([enc[0], enc[1]]), 0x00B6);
+        w.u16(0x00B6).unwrap();
+        w.lv(&enc[2..]).unwrap();
+        let n = w.len();
+        let c = Config::decode(&old[..n]);
+        assert_eq!(c.arrangements[0].screens[6], s);
+        assert_eq!(c.profiles[1].arrangement, Some(0));
+        assert_eq!(c.profiles[0].arrangement, None);
+    }
+
+    #[test]
     fn a_freed_screen_slot_has_no_flags() {
         let mut c = Config::default();
-        let off = Screen { pc: None, off: true, fixed: true, ..Screen::new(Pc::Pc1, 3840, 2160, [-2560, 360]) };
-        assert_eq!(c.set(ConfigValue::Screen(3, off), Origin::Software), Ok(ConfigValue::Screen(3, Screen::NONE)));
+        let off = Screen { host: None, off: true, fixed: true, ..Screen::new(Host::Pc1, 3840, 2160, [-2560, 360]) };
+        assert_eq!(
+            c.set(ConfigValue::Screen(2, 3, off), Origin::Software),
+            Ok(ConfigValue::Screen(2, 3, Screen::NONE))
+        );
     }
 
     #[test]
@@ -467,20 +628,32 @@ mod tests {
             ConfigValue::HopSpeed(11),
             ConfigValue::HopResistance(HOP_RESISTANCE_MAX + 1),
             ConfigValue::HopCorner(HOP_CORNER_MAX + 1),
-            ConfigValue::ProfileHop(4, true),
-            ConfigValue::Screen(8, Screen::new(Pc::Pc1, 1920, 1080, [0, 0])),
-            ConfigValue::Screen(0, Screen::new(Pc::Pc1, 100, 1080, [0, 0])),
-            ConfigValue::Screen(0, Screen { scale: 50, ..Screen::new(Pc::Pc1, 1920, 1080, [0, 0]) }),
+            ConfigValue::ProfileArrangement(4, None),
+            ConfigValue::ProfileArrangement(0, Some(4)),
+            ConfigValue::ArrangementName(4, ProfileName::new("x")),
+            ConfigValue::BtPointer(4, BtPointer::Relative),
+            ConfigValue::Screen(0, 8, Screen::new(Host::Pc1, 1920, 1080, [0, 0])),
+            ConfigValue::Screen(4, 0, Screen::new(Host::Pc1, 1920, 1080, [0, 0])),
+            ConfigValue::Screen(0, 0, Screen::new(Host::Pc1, 100, 1080, [0, 0])),
+            ConfigValue::Screen(0, 0, Screen { scale: 50, ..Screen::new(Host::Pc1, 1920, 1080, [0, 0]) }),
         ];
         for v in bad {
             assert_eq!(c.set(v, Origin::Software), Err(ErrorCode::InvalidValue), "{v:?}");
         }
         // A free slot is stored as the free slot, whatever else it had.
-        let freed = Screen { pc: None, ..Screen::new(Pc::Pc1, 1920, 1080, [5, 5]) };
-        assert_eq!(c.set(ConfigValue::Screen(2, freed), Origin::Software), Ok(ConfigValue::Screen(2, Screen::NONE)));
+        let freed = Screen { host: None, ..Screen::new(Host::Pc1, 1920, 1080, [5, 5]) };
+        assert_eq!(
+            c.set(ConfigValue::Screen(0, 2, freed), Origin::Software),
+            Ok(ConfigValue::Screen(0, 2, Screen::NONE))
+        );
         assert!(!c.hop_on());
-        c.set(ConfigValue::ProfileHop(0, true), Origin::Software).unwrap();
+        c.set(ConfigValue::Screen(2, 0, Screen::new(Host::Bt1, 1920, 1080, [0, 0])), Origin::Software).unwrap();
+        c.set(ConfigValue::ProfileArrangement(0, Some(2)), Origin::Software).unwrap();
         assert!(c.hop_on());
+        assert_eq!(c.layout()[0].host, Some(Host::Bt1));
+        // A PC's pointer is absolute whatever the Bluetooth settings say.
+        c.set(ConfigValue::BtPointer(0, BtPointer::Relative), Origin::Software).unwrap();
+        assert_eq!((c.bt_pointer(Host::Bt1), c.bt_pointer(Host::Pc1)), (BtPointer::Relative, BtPointer::Absolute));
     }
 
     #[test]

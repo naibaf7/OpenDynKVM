@@ -4,10 +4,10 @@ use kvm_core::hotkey::{format_spec, parse_spec};
 
 use crate::{fl, i18n};
 use kvm_proto::ctrl::{
-    Accel, Advertised, AutoReason, BT_HOSTS, BtPolicy, ConfigValue, ErrorCode, FaultKind, FwState, HOP_CORNER_MAX,
-    HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Hotkey, HotkeyKind, KeyAction, LearnEnd, LinkState, MAX_PROFILES,
-    MAX_SCREENS, Mapping, PROFILE_NAME_MAX, Pc, Polling, Port, PortMode, PortState, PowerSource, ProfileName, Rgb,
-    Screen, Speed, SwitchSource, Units, VialMode, class, diag, key,
+    Accel, Advertised, AutoReason, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, ErrorCode, FaultKind, FwState,
+    HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Host, Hotkey, HotkeyKind, KeyAction, LearnEnd, LinkState,
+    MAX_ARRANGEMENTS, MAX_PROFILES, Mapping, PROFILE_NAME_MAX, Polling, Port, PortMode, PortState, PowerSource,
+    ProfileName, Rgb, Screen, Speed, SwitchSource, Units, VialMode, class, diag, key,
 };
 
 pub fn error(c: ErrorCode) -> String {
@@ -98,6 +98,7 @@ pub fn port_state(s: PortState) -> String {
         PortState::Unpowered => fl!("port-state-unpowered"),
         PortState::Fault => fl!("port-state-fault"),
         PortState::Unsupported => fl!("port-state-unsupported"),
+        PortState::Module => fl!("port-state-module"),
     }
 }
 
@@ -287,14 +288,32 @@ pub fn mapping(m: Mapping) -> String {
     }
 }
 
+/// A host as the CLI writes it: `pc1`, `pc2`, or `host1`–`host4` for the wireless hosts (as in `switch` and the
+/// `hostN-…` settings).
+pub fn host_name(h: Host) -> String {
+    match h.bt_slot() {
+        None => h.name().into(),
+        Some(n) => format!("host{n}"),
+    }
+}
+
+/// [`host_name`]'s form, or `bt1`–`bt4`, `1`, `2`.
+pub fn parse_host(s: &str) -> Option<Host> {
+    match s {
+        "pc1" | "1" => Some(Host::Pc1),
+        "pc2" | "2" => Some(Host::Pc2),
+        _ => s.strip_prefix("host").or_else(|| s.strip_prefix("bt")).and_then(|n| Host::bt(n.parse().ok()?)),
+    }
+}
+
 /// A screen slot as the CLI writes it: `pc1 2560x1440 150% at 1920,0 desk 0,0`, then `no-hop` when it is off for
 /// screen hop and `fixed` when its place on its computer is; or `off` for a free slot.
 pub fn format_screen(s: &Screen) -> String {
-    match s.pc {
+    match s.host {
         None => "off".into(),
-        Some(pc) => format!(
+        Some(h) => format!(
             "{} {}x{} {}% at {},{} desk {},{}{}{}",
-            pc.name(),
+            host_name(h),
             s.w,
             s.h,
             s.scale,
@@ -305,6 +324,14 @@ pub fn format_screen(s: &Screen) -> String {
             if s.off { " no-hop" } else { "" },
             if s.fixed { " fixed" } else { "" }
         ),
+    }
+}
+
+/// How screen hop moves a wireless host's pointer.
+pub fn bt_pointer(p: BtPointer) -> String {
+    match p {
+        BtPointer::Absolute => fl!("bt-pointer-absolute"),
+        BtPointer::Relative => fl!("bt-pointer-relative"),
     }
 }
 
@@ -319,18 +346,17 @@ pub fn units(u: Units) -> String {
 pub fn parse_screen(text: &str) -> Result<Screen, String> {
     let bad = || fl!("parse-screen", value = text);
     let mut words = text.split_whitespace();
-    let pc = match words.next() {
+    let host = match words.next() {
         Some("off" | "none") => return Ok(Screen::NONE),
-        Some("pc1" | "1") => Pc::Pc1,
-        Some("pc2" | "2") => Pc::Pc2,
-        _ => return Err(bad()),
+        Some(w) => parse_host(w).ok_or_else(bad)?,
+        None => return Err(bad()),
     };
     let point = |w: Option<&str>| -> Result<[i16; 2], String> {
         let (x, y) = w.and_then(|w| w.split_once(',')).ok_or_else(bad)?;
         Ok([x.trim().parse().map_err(|_| bad())?, y.trim().parse().map_err(|_| bad())?])
     };
     let (w, h) = words.next().and_then(|r| r.split_once(['x', '×'])).ok_or_else(bad)?;
-    let mut s = Screen::new(pc, w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?, [0, 0]);
+    let mut s = Screen::new(host, w.parse().map_err(|_| bad())?, h.parse().map_err(|_| bad())?, [0, 0]);
     while let Some(word) = words.next() {
         match word {
             "at" => s.at = point(words.next())?,
@@ -493,6 +519,7 @@ pub fn diag_value(i: &diag::Item) -> String {
         Unit::Version => version(v as u32),
         Unit::BtModule => diag::BtModule::from_u8(v as u8).map_or_else(|| fl!("state-other", state = v), bt_module),
         Unit::FwUpdates => fw_updates(v),
+        Unit::Hex => format!("{:#x}", v as u32),
     }
 }
 
@@ -623,20 +650,60 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("hop-corner", key::HOP_CORNER),
     ("hop-mapping-pc1", key::HOP_MAPPING_BASE),
     ("hop-mapping-pc2", key::HOP_MAPPING_BASE + 1),
+    ("hop-mapping-host1", key::HOP_MAPPING_BT_BASE),
+    ("hop-mapping-host2", key::HOP_MAPPING_BT_BASE + 1),
+    ("hop-mapping-host3", key::HOP_MAPPING_BT_BASE + 2),
+    ("hop-mapping-host4", key::HOP_MAPPING_BT_BASE + 3),
     ("hop-units-pc1", key::HOP_UNITS_BASE),
     ("hop-units-pc2", key::HOP_UNITS_BASE + 1),
-    ("profile0-hop", key::PROFILE_HOP_BASE),
-    ("profile1-hop", key::PROFILE_HOP_BASE + 1),
-    ("profile2-hop", key::PROFILE_HOP_BASE + 2),
-    ("profile3-hop", key::PROFILE_HOP_BASE + 3),
-    ("screen0", key::SCREEN_BASE),
-    ("screen1", key::SCREEN_BASE + 1),
-    ("screen2", key::SCREEN_BASE + 2),
-    ("screen3", key::SCREEN_BASE + 3),
-    ("screen4", key::SCREEN_BASE + 4),
-    ("screen5", key::SCREEN_BASE + 5),
-    ("screen6", key::SCREEN_BASE + 6),
-    ("screen7", key::SCREEN_BASE + 7),
+    ("hop-units-host1", key::HOP_UNITS_BT_BASE),
+    ("hop-units-host2", key::HOP_UNITS_BT_BASE + 1),
+    ("hop-units-host3", key::HOP_UNITS_BT_BASE + 2),
+    ("hop-units-host4", key::HOP_UNITS_BT_BASE + 3),
+    ("host1-pointer", key::BT_POINTER_BASE),
+    ("host2-pointer", key::BT_POINTER_BASE + 1),
+    ("host3-pointer", key::BT_POINTER_BASE + 2),
+    ("host4-pointer", key::BT_POINTER_BASE + 3),
+    ("profile0-arrangement", key::PROFILE_ARRANGEMENT_BASE),
+    ("profile1-arrangement", key::PROFILE_ARRANGEMENT_BASE + 1),
+    ("profile2-arrangement", key::PROFILE_ARRANGEMENT_BASE + 2),
+    ("profile3-arrangement", key::PROFILE_ARRANGEMENT_BASE + 3),
+    ("arrangement0-name", key::ARRANGEMENT_NAME_BASE),
+    ("arrangement0-screen0", key::screen(0, 0)),
+    ("arrangement0-screen1", key::screen(0, 1)),
+    ("arrangement0-screen2", key::screen(0, 2)),
+    ("arrangement0-screen3", key::screen(0, 3)),
+    ("arrangement0-screen4", key::screen(0, 4)),
+    ("arrangement0-screen5", key::screen(0, 5)),
+    ("arrangement0-screen6", key::screen(0, 6)),
+    ("arrangement0-screen7", key::screen(0, 7)),
+    ("arrangement1-name", key::ARRANGEMENT_NAME_BASE + 1),
+    ("arrangement1-screen0", key::screen(1, 0)),
+    ("arrangement1-screen1", key::screen(1, 1)),
+    ("arrangement1-screen2", key::screen(1, 2)),
+    ("arrangement1-screen3", key::screen(1, 3)),
+    ("arrangement1-screen4", key::screen(1, 4)),
+    ("arrangement1-screen5", key::screen(1, 5)),
+    ("arrangement1-screen6", key::screen(1, 6)),
+    ("arrangement1-screen7", key::screen(1, 7)),
+    ("arrangement2-name", key::ARRANGEMENT_NAME_BASE + 2),
+    ("arrangement2-screen0", key::screen(2, 0)),
+    ("arrangement2-screen1", key::screen(2, 1)),
+    ("arrangement2-screen2", key::screen(2, 2)),
+    ("arrangement2-screen3", key::screen(2, 3)),
+    ("arrangement2-screen4", key::screen(2, 4)),
+    ("arrangement2-screen5", key::screen(2, 5)),
+    ("arrangement2-screen6", key::screen(2, 6)),
+    ("arrangement2-screen7", key::screen(2, 7)),
+    ("arrangement3-name", key::ARRANGEMENT_NAME_BASE + 3),
+    ("arrangement3-screen0", key::screen(3, 0)),
+    ("arrangement3-screen1", key::screen(3, 1)),
+    ("arrangement3-screen2", key::screen(3, 2)),
+    ("arrangement3-screen3", key::screen(3, 3)),
+    ("arrangement3-screen4", key::screen(3, 4)),
+    ("arrangement3-screen5", key::screen(3, 5)),
+    ("arrangement3-screen6", key::screen(3, 6)),
+    ("arrangement3-screen7", key::screen(3, 7)),
 ];
 
 pub fn config_name(k: u16) -> &'static str {
@@ -644,10 +711,16 @@ pub fn config_name(k: u16) -> &'static str {
 }
 
 pub fn config_key(name: &str) -> Option<u16> {
-    // The wireless hosts' settings were called bt1-name … bt4-policy before.
+    // The wireless hosts' settings were called bt1-name … bt4-policy before; screen0–screen7 and profileN-hop were the
+    // one arrangement's screens and each profile's switch before there were several (protocol 9).
     let name = match name.strip_prefix("bt") {
         Some(rest) if rest.starts_with(['1', '2', '3', '4']) => format!("host{rest}"),
         _ => name.to_string(),
+    };
+    let name = match (name.strip_prefix("screen"), name.strip_suffix("-hop")) {
+        (Some(slot), _) => format!("arrangement0-screen{slot}"),
+        (_, Some(profile)) if profile.starts_with("profile") => format!("{profile}-arrangement"),
+        _ => name,
     };
     CONFIG_NAMES.iter().find(|(n, _)| *n == name).map(|(_, k)| *k)
 }
@@ -680,8 +753,10 @@ pub fn format_value(v: &ConfigValue) -> String {
         | ConfigValue::HotkeyPc1(h)
         | ConfigValue::HotkeyPc2(h)
         | ConfigValue::HotkeyNext(h) => format_spec(h).to_string(),
-        ConfigValue::BtName(_, n) => n.as_str().into(),
+        ConfigValue::BtName(_, n) | ConfigValue::ArrangementName(_, n) => n.as_str().into(),
         ConfigValue::BtPolicy(_, p) => p.name().into(),
+        ConfigValue::BtPointer(_, p) => p.name().into(),
+        ConfigValue::ProfileArrangement(_, a) => a.map_or("none".into(), |a| a.to_string()),
         ConfigValue::DoubleTapMs(ms) | ConfigValue::LongPressMs(ms) => ms.to_string(),
         ConfigValue::LedBrightness(b) => b.to_string(),
         ConfigValue::ColorPc1(c) | ConfigValue::ColorPc2(c) => color(*c),
@@ -701,14 +776,13 @@ pub fn format_value(v: &ConfigValue) -> String {
         | ConfigValue::StandbyWake(b)
         | ConfigValue::StandbyGlow(b)
         | ConfigValue::RememberProfile(b)
-        | ConfigValue::AbsPointer(b)
-        | ConfigValue::ProfileHop(_, b) => on_off(*b),
+        | ConfigValue::AbsPointer(b) => on_off(*b),
         ConfigValue::HopAccel(a) => a.name().into(),
         ConfigValue::HopSpeed(v) => v.to_string(),
         ConfigValue::HopResistance(v) | ConfigValue::HopCorner(v) => v.to_string(),
         ConfigValue::HopMapping(_, m) => m.name().into(),
         ConfigValue::HopUnits(_, u) => u.name().into(),
-        ConfigValue::Screen(_, s) => format_screen(s),
+        ConfigValue::Screen(_, _, s) => format_screen(s),
     }
 }
 
@@ -784,23 +858,50 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
         }
         key::HOP_RESISTANCE => ConfigValue::HopResistance(num(HOP_RESISTANCE_MAX as u32)? as u16),
         key::HOP_CORNER => ConfigValue::HopCorner(num(HOP_CORNER_MAX as u32)? as u16),
-        k if (key::HOP_MAPPING_BASE..key::HOP_MAPPING_BASE + 2).contains(&k) => ConfigValue::HopMapping(
-            Pc::from_index((k - key::HOP_MAPPING_BASE) as usize),
+        k if let Some(h) = Host::ALL.iter().copied().find(|h| key::hop_mapping(*h) == k) => ConfigValue::HopMapping(
+            h,
             Mapping::from_name(s.trim())
                 .ok_or_else(|| fl!("parse-one-of", value = s, choices = "desktop, main-screen"))?,
         ),
-        k if (key::HOP_UNITS_BASE..key::HOP_UNITS_BASE + 2).contains(&k) => ConfigValue::HopUnits(
-            Pc::from_index((k - key::HOP_UNITS_BASE) as usize),
+        k if let Some(h) = Host::ALL.iter().copied().find(|h| key::hop_units(*h) == k) => ConfigValue::HopUnits(
+            h,
             Units::from_name(s.trim()).ok_or_else(|| fl!("parse-one-of", value = s, choices = "physical, logical"))?,
         ),
-        k if (key::PROFILE_HOP_BASE..key::PROFILE_HOP_BASE + MAX_PROFILES as u16).contains(&k) => {
-            ConfigValue::ProfileHop((k - key::PROFILE_HOP_BASE) as u8, parse_bool(s)?)
+        k if (key::BT_POINTER_BASE..key::BT_POINTER_BASE + BT_HOSTS as u16).contains(&k) => ConfigValue::BtPointer(
+            (k - key::BT_POINTER_BASE) as u8,
+            BtPointer::from_name(s.trim())
+                .ok_or_else(|| fl!("parse-one-of", value = s, choices = "absolute, relative"))?,
+        ),
+        k if (key::PROFILE_ARRANGEMENT_BASE..key::PROFILE_ARRANGEMENT_BASE + MAX_PROFILES as u16).contains(&k) => {
+            ConfigValue::ProfileArrangement((k - key::PROFILE_ARRANGEMENT_BASE) as u8, parse_arrangement(s)?)
         }
-        k if (key::SCREEN_BASE..key::SCREEN_BASE + MAX_SCREENS as u16).contains(&k) => {
-            ConfigValue::Screen((k - key::SCREEN_BASE) as u8, parse_screen(s)?)
+        k if (key::ARRANGEMENT_NAME_BASE..key::ARRANGEMENT_NAME_BASE + MAX_ARRANGEMENTS as u16).contains(&k) => {
+            let s = s.trim();
+            if s.len() > PROFILE_NAME_MAX {
+                return Err(fl!("parse-host-name", value = s, max = PROFILE_NAME_MAX));
+            }
+            ConfigValue::ArrangementName((k - key::ARRANGEMENT_NAME_BASE) as u8, ProfileName::new(s))
+        }
+        k if let Some(a) = key::arrangement_of(k) => {
+            ConfigValue::Screen(a, (k - key::screen(a, 0)) as u8, parse_screen(s)?)
         }
         _ => return Err(fl!("parse-unknown-setting")),
     })
+}
+
+/// A profile's arrangement: `none` (screen hop off), or its number 0–3. `off` and `on` (arrangement 0) are what the
+/// setting `profileN-hop` took before there were several.
+pub fn parse_arrangement(s: &str) -> Result<Option<u8>, String> {
+    match s.trim() {
+        "none" | "off" => Ok(None),
+        "on" => Ok(Some(0)),
+        n => n
+            .parse::<u8>()
+            .ok()
+            .filter(|a| (*a as usize) < MAX_ARRANGEMENTS)
+            .map(Some)
+            .ok_or_else(|| fl!("parse-one-of", value = s, choices = "none, 0, 1, 2, 3")),
+    }
 }
 
 /// Three modes, Keyboard, Mouse and Other: `auto,auto,passthrough`.
@@ -851,14 +952,41 @@ mod tests {
         }
         assert!(parse_value(key::COLOR_PC1, "#12345").is_err());
         assert_eq!(config_key("mode-mouse"), Some(key::PORT_MODE_BASE + 1));
+        // Every key has a name, and the names are distinct.
+        for k in key::ALL {
+            assert_ne!(config_name(*k), "?", "{k:#06x}");
+        }
+        let mut names: Vec<_> = CONFIG_NAMES.iter().map(|(n, _)| *n).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), CONFIG_NAMES.len());
+    }
+
+    #[test]
+    fn arrangement_settings_and_their_old_names() {
+        assert_eq!(config_key("arrangement3-screen7"), Some(0x00CF));
+        assert_eq!(config_key("screen5"), config_key("arrangement0-screen5"));
+        assert_eq!(config_key("profile2-hop"), config_key("profile2-arrangement"));
+        assert_eq!(config_key("bt4-pointer"), config_key("host4-pointer"));
+        let k = config_key("profile1-arrangement").unwrap();
+        assert_eq!(parse_value(k, "on"), Ok(ConfigValue::ProfileArrangement(1, Some(0))));
+        assert_eq!(parse_value(k, "none"), Ok(ConfigValue::ProfileArrangement(1, None)));
+        assert_eq!(parse_value(k, "2"), Ok(ConfigValue::ProfileArrangement(1, Some(2))));
+        assert!(parse_value(k, "4").is_err());
+        let p = config_key("host1-pointer").unwrap();
+        assert_eq!(parse_value(p, "relative"), Ok(ConfigValue::BtPointer(0, BtPointer::Relative)));
     }
 
     #[test]
     fn screens_format_and_parse() {
-        let s = Screen { scale: 150, desk: [-3840, 0], ..Screen::new(Pc::Pc2, 3840, 2160, [-2560, 120]) };
+        let s = Screen { scale: 150, desk: [-3840, 0], ..Screen::new(Host::Pc2, 3840, 2160, [-2560, 120]) };
         assert_eq!(format_screen(&s), "pc2 3840x2160 150% at -2560,120 desk -3840,0");
         assert_eq!(parse_screen(&format_screen(&s)), Ok(s));
-        assert_eq!(parse_screen("pc1 1920x1080"), Ok(Screen::new(Pc::Pc1, 1920, 1080, [0, 0])));
+        assert_eq!(parse_screen("pc1 1920x1080"), Ok(Screen::new(Host::Pc1, 1920, 1080, [0, 0])));
+        // A wireless host's: hostN, as in `switch` (btN too).
+        let tablet = Screen::new(Host::Bt3, 2388, 1668, [1920, 0]);
+        assert_eq!(format_screen(&tablet), "host3 2388x1668 100% at 1920,0 desk 0,0");
+        assert_eq!(parse_screen("bt3 2388x1668 at 1920,0"), Ok(tablet));
         assert_eq!(parse_screen("off"), Ok(Screen::NONE));
         for bad in ["pc3 1920x1080", "pc1 1920", "pc1 10x10", "pc1 1920x1080 at 5", "pc1 1920x1080 50%"] {
             assert!(parse_screen(bad).is_err(), "{bad}");
@@ -868,9 +996,16 @@ mod tests {
         assert_eq!(parse_screen(&format_screen(&off)), Ok(off));
         assert_eq!(
             parse_screen("pc1 1920x1080 no-hop"),
-            Ok(Screen { off: true, ..Screen::new(Pc::Pc1, 1920, 1080, [0, 0]) })
+            Ok(Screen { off: true, ..Screen::new(Host::Pc1, 1920, 1080, [0, 0]) })
         );
-        assert_eq!(parse_value(key::HOP_UNITS_BASE + 1, "logical"), Ok(ConfigValue::HopUnits(Pc::Pc2, Units::Logical)));
+        assert_eq!(
+            parse_value(key::HOP_UNITS_BASE + 1, "logical"),
+            Ok(ConfigValue::HopUnits(Host::Pc2, Units::Logical))
+        );
+        assert_eq!(
+            parse_value(config_key("hop-mapping-host2").unwrap(), "main-screen"),
+            Ok(ConfigValue::HopMapping(Host::Bt2, Mapping::MainScreen))
+        );
         assert!(parse_value(key::HOP_UNITS_BASE, "metric").is_err());
         assert!(parse_value(key::HOP_SPEED, "11").is_err());
         assert_eq!(parse_value(key::HOP_SPEED, "-4"), Ok(ConfigValue::HopSpeed(-4)));

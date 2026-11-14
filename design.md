@@ -384,26 +384,33 @@ A set of modes for all three ports is a profile, and the key on the KVM switches
     held for 3 s), and the matrix tester answers only the active PC.
 
 ### Screen hop
-- **What:** with the PCs' screens arranged as they stand on the desk, the KVM moves the pointer itself across all of
-  them, and switches to the other PC (keyboard and all) when the pointer is pushed across an edge onto one of its
-  screens. One mouse, two PCs, no software needed on either.
+- **What:** with the screens arranged as they stand on the desk, the KVM moves the pointer itself across all of them,
+  and switches to another computer (keyboard and all) when the pointer is pushed across an edge onto one of its
+  screens. The computers are both PCs and, with the Bluetooth module, the paired hosts (a laptop, a tablet). One
+  mouse, several computers, no software needed on any.
 - **How:** the KVM's mouse interface gets an absolute pointer as well (a setting: changing it makes both PCs
   reconnect the KVM's devices once). The RP2354B keeps the pointer in a plane of logical pixels, maps it onto the
-  active PC's screens and sends that PC the absolute position (software.md §4.14).
-- **Needs** the Mouse port in Normalized mode, and is on per profile: a "work" profile with screen hop, a "gaming"
-  profile without it, where games get the relative mouse they need (no re-enumeration on the change).
+  active computer's screens and sends it the absolute position (software.md §4.14). A Bluetooth host gets an absolute
+  pointer of its own in the module's HID service; a host whose system takes none (some tablets and phones) is set to
+  relative motion, and the KVM parks its cursor in a corner when the pointer comes onto it and steers it from there:
+  close, not exact, and back in line at every edge it is pushed against.
+- **Needs** the Mouse port in Normalized mode. The KVM keeps four arrangements, and each profile uses one of them or
+  none: a "work" profile with the desk's, a "sofa" profile with the laptop and the tablet, a "gaming" profile without
+  screen hop, where games get the relative mouse they need. Switching profiles switches the arrangement at once: no
+  re-enumeration, no flash write.
 - **Feel:** an absolute pointer isn't accelerated by the PC, so the KVM accelerates: Windows' "Enhance pointer
   precision" curve (default), libinput's adaptive profile as on Linux desktops, or flat; a speed setting for each.
-- **Edges:** where the same PC's screens meet, the pointer passes (a gap between screens is jumped); toward the other
-  PC an edge holds the pointer until it is pushed further (100 pixels by default), never near the corners (so menus
-  and window controls there stay easy to hit), never while a button is held, and only to a PC that is on and awake. Any other edge is a wall.
+- **Edges:** where the same computer's screens meet, the pointer passes (a gap between screens is jumped); toward
+  another computer an edge holds the pointer until it is pushed further (100 pixels by default), never near the
+  corners (so menus and window controls there stay easy to hit), never while a button is held, and only to a computer
+  that is ready (a PC on and awake, a Bluetooth host connected). Any other edge is a wall.
 - **Windows** maps an absolute pointer onto its main screen only. The KVM reaches such a PC's other screens with
   relative motion from where it last put the cursor; the host software, where it runs, reports the cursor whenever it
   rests, so what Windows' acceleration or a touchpad did is caught up. Linux maps the absolute pointer across all its
   screens.
 - **Set up** in the host software's *Screen hop* page: drag the screens into place, or detect each PC's screens from
-  the software running on it; `odkvmctl screens`.
-- Bluetooth hosts stay relative: screen hop is between PC1 and PC2.
+  the software running on it (a Bluetooth host's are added by hand); `odkvmctl screens`.
+- Until firmware 0.1.12 there was one arrangement and screen hop was between PC1 and PC2 only.
 
 ## 5. Component selection (JLCPCB-checked 2026-10-20)
 
@@ -587,8 +594,8 @@ Alternatives searched:
 
 **What it controls**
 - Per-port mode: Auto, Normalized, Mirrored, Mirrored + identity, Passthrough; profiles of these (§4).
-- Screen hop: the screens' arrangement, the pointer's acceleration and speed, the edges, and which profiles use it
-  (§4).
+- Screen hop: the arrangements of the screens, which one each profile uses, the pointer's acceleration and speed, and
+  the edges (§4).
 - What a tap and a long press on the KVM's key do.
 - Hotkeys and button behaviour.
 - LED colours and brightness.
@@ -978,6 +985,10 @@ software.md §4.13.
 - **Interface:** two wires, UART0 on GPIO28/29. The module's BOOT strap shares the RP2354B's TX line and its EN has
   only its RC, so the RP2354B gets the module into its ROM bootloader with a link command or a UART break across a
   reset, and programs it from its own image as it does the AT32F405s.
+- **Without it on the board:** an ESP32-C3 board with the chip's own USB port, on a front port, can be the module
+  instead (0.12–0.15 boards, the `_nobt` variant): the same firmware over its USB serial port, programmed and kept up
+  to date by the RP2354B as the fitted module is. It takes that port; an ESP32 board with other firmware is never
+  touched (software.md §4.13).
 - **Assembly variants:** the module and its six parts carry `Fit = BT`. `tools/make_fab.py` writes the BOM and CPL with
   them (`jlcpcb_*.csv`) and without them (`jlcpcb_*_nobt.csv`). The same firmware runs both, and boards 0.12–0.15: it
   looks for the module at boot and leaves Bluetooth out when there is none.

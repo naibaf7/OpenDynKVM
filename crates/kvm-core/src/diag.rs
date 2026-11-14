@@ -51,6 +51,24 @@ pub struct BoardDiag {
     pub hub0_errors: u32,
     /// Front-port enumerations or probes that failed, since start.
     pub enum_fails: u32,
+    /// The module as a board on a front port, since start (all 0 until one was seen).
+    pub board: BoardModule,
+}
+
+/// What the firmware counts of the module as a board on a front port (software.md §4.13), for bring-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BoardModule {
+    pub sessions: u32,
+    /// A hexadecimal digit per step, the newest last.
+    pub steps: u32,
+    pub rom_error: u32,
+    pub bulk_in: u32,
+    pub bulk_out: u32,
+    pub naks: u32,
+    pub out_naks: u32,
+    pub errors: u32,
+    pub last_error: u32,
 }
 
 pub const USB_HZ: u32 = 48_000_000;
@@ -79,6 +97,17 @@ impl BoardDiag {
         fw_updates: FwUpdates::PartitionA as i32,
         hub0_errors: 0,
         enum_fails: 0,
+        board: BoardModule {
+            sessions: 0,
+            steps: 0,
+            rom_error: 0,
+            bulk_in: 0,
+            bulk_out: 0,
+            naks: 0,
+            out_naks: 0,
+            errors: 0,
+            last_error: 0,
+        },
     };
 }
 
