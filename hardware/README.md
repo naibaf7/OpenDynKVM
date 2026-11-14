@@ -133,7 +133,10 @@ uv run python -u tools/route.py --live --seed=/tmp/seed.kicad_pcb
   stays unrouted.
 - **Where it stops:** 0.16.0 could not be seeded from 0.15.0.  The module's UART pins (RP2354B pins 36/37) sit
   between the SWD and crystal lines and Hub-0's mouse pair, which 0.15.0 had packed for two unused pins, and every
-  `--reroute` set tried left two to four nets unrouted.  0.16.0 is routed from scratch.
+  `--reroute` set tried left two to four nets unrouted.  0.16.0 is routed from scratch.  0.18.0 met the same wall: its
+  line to the module's EN found no way out of pin 38 (GPIO30), and re-laying the south row's lines with it left one
+  of them unrouted in all of the eight runs tried.  On GPIO9, on the west side, it routed at the first try, in 6 s
+  (debug/v18-esp-en/).  Where a new line may take any free pin, try the pin with room around it first.
 - **Afterwards:** the same checks as after a full run.
 
 ## Conventions

@@ -3,9 +3,9 @@
 //! KVM without it: [`dongle_task`]). Both run the same module firmware, and everything above the line is the same.
 //!
 //! - **Fitted or not:** boards 0.12–0.15 leave GPIO28/29 unconnected, and a 0.16.0 board can be built without the
-//!   module (assembly variant without `Fit = BT`). At boot `main` reads `ESP_TXD` (GPIO29) with the pad's pull-down on:
-//!   only the module's TXD0, idling high, lifts it. Without it [`run`] stops at once, nothing is sent on GPIO28, and
-//!   the KVM looks for a dongle instead.
+//!   module (assembly variant without `Fit = BT`). At boot `main` samples `ESP_TXD` (GPIO29) for up to 0.5 s with the
+//!   pad's pull-down on: only the module's TXD0, idling high, lifts it. Without it [`run`] stops at once, nothing is
+//!   sent on GPIO28, and the KVM looks for a dongle instead.
 //! - **Link:** UART0 (GPIO28 TX → the module's RXD0, GPIO29 RX ← its TXD0) at [`BAUD`], or the dongle's USB serial
 //!   port ([`crate::dongle`]): the AT32F405 links' frames and ARQ ([`kvm_proto::link::bt`]), the RP2354B as master, one
 //!   frame out and one back per exchange.
@@ -14,9 +14,11 @@
 //!   - on the board, it is sent into its ROM bootloader (`EnterRom`), or caught there with a break on TX (blank, or a
 //!     firmware that doesn't come up and resets). Attempts as for the AT32F405s (`kvm_core::at32prog`): 5 failed in a
 //!     row, counted in flash, then no more until the image changes, the key is held at power-up, or
-//!     `RebootTarget::BtRetry`. Two wires only (TX, RX): the module's BOOT strap is on TX, and its EN has no line from
-//!     the RP2354B (hardware/tools/gen_schematic.py block 16).
-//!   - a dongle restarts into its ROM by its DTR/RTS. One that never said `Hello` is someone's ESP32 board, not the
+//!     `RebootTarget::BtRetry`. The module's BOOT strap is on TX; its EN has a line from GPIO9 from 0.18.0 on
+//!     (through 1 kΩ, hardware/tools/gen_schematic.py block 16), with which a reset under a break catches it in its ROM
+//!     at once; before, only its RC, and the break waits for a reset the module makes by itself.
+//!   - a dongle is sent `EnterRom` too, and restarted into its ROM by its DTR/RTS if it doesn't answer (DTR/RTS didn't
+//!     get one whose firmware runs there reliably). One that never said `Hello` is someone's ESP32 board, not the
 //!     module: it is only programmed if it is an ESP32-C3 with a blank first sector ([`espisp::blank_c3`]: new, erased,
 //!     or the module after a programming that broke off), else it is left as it is, an ordinary device. Attempts are
 //!     counted per board in RAM, the same 5.
@@ -28,6 +30,7 @@ use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use defmt::{info, warn};
 use embassy_futures::select::{Either, Either4, select, select4};
+use embassy_rp::gpio::Flex;
 use embassy_rp::uart::BufferedUart;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -337,13 +340,12 @@ async fn link_loop<L: Line>(
                 let current = check.is_none_or(|want| fw_version == want);
                 on_hello(current);
                 if !current {
-                    if L::UART {
-                        push(&mut arq, &BtMsg::EnterRom);
-                        leaving = Some((fw_version, Instant::now()));
-                        continue;
-                    }
-                    // A dongle restarts into its ROM by its DTR/RTS.
-                    return Exit::Outdated(fw_version);
+                    // It restarts into its ROM by itself (FORCE_DOWNLOAD_BOOT), on the board's UART and on a dongle
+                    // alike: DTR/RTS didn't get a dongle whose firmware runs there reliably (first dongle, 2026-11-14),
+                    // and on the board there is no other way.
+                    push(&mut arq, &BtMsg::EnterRom);
+                    leaving = Some((fw_version, Instant::now()));
+                    continue;
                 }
                 check = None;
                 up = true;
@@ -355,9 +357,11 @@ async fn link_loop<L: Line>(
 }
 
 /// The module on the board (core 0; Bluetooth hosts are lesser targets, and core 1 keeps to the AT32F405 links).
-/// `fitted`: what `main` read on GPIO29 before it became the UART's RX.
+/// `fitted`: what `main` read on GPIO29 before it became the UART's RX. `en`: GPIO9, the module's EN through 1 kΩ on
+/// boards from 0.18.0 (open drain, released), unconnected before: pulling it low does nothing there.
 #[embassy_executor::task]
-pub async fn run(mut uart: BufferedUart, fitted: bool, seed: u8) -> ! {
+pub async fn run(mut uart: BufferedUart, fitted: bool, seed: u8, mut en: Flex<'static>) -> ! {
+    release(&mut en);
     if !fitted {
         // No module on the board: the dongle task has the state from here on.
         if state() == State::Unknown {
@@ -393,6 +397,10 @@ pub async fn run(mut uart: BufferedUart, fitted: bool, seed: u8) -> ! {
                 set_state(State::Starting);
                 if espisp::leave_rom(&mut uart).await {
                     uart_log!("Bluetooth module was in its ROM bootloader: restarted");
+                } else {
+                    // Hung in its firmware: restarted by EN where there is one (its watchdog does it within 5 s
+                    // anyway).
+                    reset(&mut en).await;
                 }
                 continue;
             }
@@ -426,8 +434,10 @@ pub async fn run(mut uart: BufferedUart, fitted: bool, seed: u8) -> ! {
         set_state(State::Programming);
         uart_log!("Bluetooth module: programming (attempt {} of {})", fails + 1, at32prog::MAX_FAILS);
         if !in_rom {
-            // Blank or not coming up: it resets over and over; hold its BOOT strap (our TX) low across one of them.
-            espisp::break_into_rom(&mut uart, 3000).await;
+            // Blank or not coming up: hold its BOOT strap (our TX) low across a reset: one by EN where there is one,
+            // else one of those it makes by itself (a ROM that finds no firmware restarts about every 3 s, by its TG0
+            // watchdog; the break lasts 6 s).
+            catch_in_rom(&mut uart, &mut en).await;
         }
         let t = Instant::now();
         match espisp::program(&mut uart, &image()).await {
@@ -444,6 +454,36 @@ pub async fn run(mut uart: BufferedUart, fitted: bool, seed: u8) -> ! {
         }
         // The link now sees whether it answers with the embedded firmware (and clears the count if so).
         set_state(State::Starting);
+    }
+}
+
+/// The module's EN (GPIO9, boards from 0.18.0): released, its 10 kΩ pull-up holds it high.
+fn release(en: &mut Flex<'static>) {
+    en.set_pull(embassy_rp::gpio::Pull::None);
+    en.set_as_input();
+}
+
+/// Restarts the module through EN (boards from 0.18.0; nothing happens before): 20 ms low, then up through its RC.
+async fn reset(en: &mut Flex<'static>) {
+    en.set_low();
+    en.set_as_output();
+    Timer::after_millis(20).await;
+    release(en);
+}
+
+/// Into the module's ROM bootloader: its BOOT strap (IO9, on our TX) held low across a reset. First a short break with
+/// a reset by EN in it (boards from 0.18.0, as BOOT held at power-up); if no ROM answers, the long break that waits for
+/// a reset the module makes by itself.
+async fn catch_in_rom(uart: &mut BufferedUart, en: &mut Flex<'static>) {
+    uart.set_baudrate(espisp::ROM_BAUD);
+    let bits = 300 * espisp::ROM_BAUD / 1000;
+    embassy_futures::join::join(uart.send_break(bits), async {
+        Timer::after_millis(5).await;
+        reset(en).await;
+    })
+    .await;
+    if !espisp::listening(uart).await {
+        espisp::break_into_rom(uart, 6000).await;
     }
 }
 
@@ -697,10 +737,10 @@ async fn serve(d: &mut Dongle, boards: &RefCell<heapless::Vec<Board, BOARDS>>, s
                 return rejoin(index).await;
             }
             Exit::Outdated(found) => {
+                // It restarts into its ROM on EnterRom (DTR/RTS is the way in if it doesn't).
                 step(step::OUTDATED);
                 info!("Bluetooth module (port {}): firmware {=u32:#x}, embedded {:?}", index, found, check);
                 rec(&mut |b| b.want_rom = true);
-                into_rom(line).await;
                 return rejoin(index).await;
             }
             Exit::Silent => step(step::SILENT),

@@ -8,7 +8,8 @@
 //!   should be connected and aren't are let in (an unknown host that connects is dropped).
 //! - **Pairing:** LE Secure Connections, IO capability KeyboardOnly: the host shows six digits, the user types them on
 //!   the KVM's keyboard, the RP2354B passes them here ([`BtMsg::Passkey`]). No Just Works, so a host in range can't
-//!   pair as the KVM's keyboard target unseen.
+//!   pair as the KVM's keyboard target unseen. A new host pairs into a slot that no bond and no connection holds; a
+//!   bonded host that forgot the KVM pairs anew into its own slot, and both only while pairing is open.
 //! - **Connection interval:** the selected host is asked for 7.5–15 ms, the others for 30–50 ms with latency 4, so
 //!   their connection events take little of the radio's time (they may refuse; some hosts only accept multiples of 15 ms).
 //! - **TX power:** +9 dBm at most: 190 mA peaks (datasheet table 6-5) instead of 340 mA at +20 dBm, for the board's
@@ -110,6 +111,24 @@ struct State {
     selected: u8,
     policies: [Policy; MAX_HOSTS],
     pairing_until: Option<Instant>,
+    /// Each slot's current connection, numbered when it is let in. A bonded host that connects anew before the module
+    /// has seen its old connection end gets a task of its own, and the old task's end must not take the slot's state
+    /// with it: it cleared the new connection's flags, and the slot showed "not connected" with the host connected
+    /// (first dongle, 2026-11-14).
+    conn_gen: [u32; MAX_HOSTS],
+    /// A connection holds the slot (from being let in to its task's end): a new host pairs only into a slot that no
+    /// bond and no connection holds. Before, a second host let in while one paired got the same free slot and took it
+    /// over, and the pairing broke off after its passkey (first dongle, 2026-11-14).
+    live: [bool; MAX_HOSTS],
+}
+
+/// A slot a new host may pair into: no bond, no connection.
+fn free_slot(s: &State) -> Option<usize> {
+    (0..MAX_HOSTS).find(|&i| s.bonds.slots[i].is_none() && !s.live[i])
+}
+
+fn pairing_open(s: &State) -> bool {
+    s.pairing_until.is_some_and(|t| Instant::now() < t)
 }
 
 static STATE: Mutex<CriticalSectionRawMutex, RefCell<Option<State>>> = Mutex::new(RefCell::new(None));
@@ -215,6 +234,8 @@ pub async fn run(spawner: Spawner, bt: esp_hal::peripherals::BT<'static>, bonds:
             selected: 0,
             policies: [Policy::StayConnected; MAX_HOSTS],
             pairing_until: None,
+            conn_gen: [0; MAX_HOSTS],
+            live: [false; MAX_HOSTS],
         })
     });
     let server = SERVER.init(
@@ -258,7 +279,7 @@ async fn advertise(
             event(EventKind::PairingClosed, 0, 0);
         }
         let (pairing, reconnect) = with(|s| {
-            let pairing = s.pairing_until.is_some_and(|t| Instant::now() < t) && s.bonds.free_slot().is_some();
+            let pairing = pairing_open(s) && free_slot(s).is_some();
             let reconnect = (0..MAX_HOSTS).any(|i| wanted(s, i) && !s.hosts[i].connected());
             (pairing, reconnect)
         });
@@ -300,30 +321,44 @@ async fn advertise(
             _ => continue,
         };
         let id = conn.peer_identity();
-        let (slot, new) = with(|s| match s.bonds.slot_of(&id) {
-            Some(i) => (Some(i), false),
-            None => {
-                let open = s.pairing_until.is_some_and(|t| Instant::now() < t);
-                (if open { s.bonds.free_slot() } else { None }, true)
-            }
+        // The slot is picked and held in one go: it is this connection's from here on.
+        let picked = with(|s| {
+            let (slot, new) = match s.bonds.slot_of(&id) {
+                // A bonded host that should be connected now (one whose old connection the module still has is
+                // taken to have lost it: the newer one is the slot's).
+                Some(i) if wanted(s, i) => (i, false),
+                Some(_) => return None,
+                // Not a bonded host: only while pairing is open, and into a slot of its own.
+                None if pairing_open(s) => (free_slot(s)?, true),
+                None => return None,
+            };
+            s.live[slot] = true;
+            s.conn_gen[slot] = s.conn_gen[slot].wrapping_add(1);
+            Some((slot, new, s.conn_gen[slot]))
         });
-        let Some(slot) = slot else {
-            // Not a bonded host, and pairing is closed: not let in.
+        let Some((slot, new, mine)) = picked else {
             conn.disconnect();
             continue;
         };
-        if !new && !with(|s| wanted(s, slot)) {
-            conn.disconnect();
-            continue;
-        }
-        match conn.with_attribute_server(server) {
-            Ok(gatt) => {
-                match connection(slot, new, gatt, stack, server) {
-                    Ok(t) => spawner.spawn(t),
-                    Err(_) => log::line(format_args!("no task left for a connection")),
+        let spawned = match conn.with_attribute_server(server) {
+            Ok(gatt) => match connection(slot, new, mine, gatt, stack, server) {
+                Ok(t) => {
+                    spawner.spawn(t);
+                    true
                 }
-            }
-            Err(_) => continue,
+                Err(_) => {
+                    log::line(format_args!("no task left for a connection"));
+                    false
+                }
+            },
+            Err(_) => false,
+        };
+        if !spawned {
+            with(|s| {
+                if s.conn_gen[slot] == mine {
+                    s.live[slot] = false;
+                }
+            });
         }
     }
 }
@@ -353,12 +388,15 @@ fn params(selected: bool) -> RequestedConnParams {
 async fn connection(
     slot: usize,
     new: bool,
+    mine: u32,
     conn: GattConnection<'static, 'static, DefaultPacketPool>,
     stack: &'static St,
     server: &'static Server<'static>,
 ) {
     let host = slot as u8 + 1;
     log::line(format_args!("host {host}: connected{}", if new { " (pairing)" } else { "" }));
+    // This connection is the slot's (`advertise`); an older task still running for it stops at its next event.
+    let current = || with(|s| s.conn_gen[slot] == mine);
     set_flags(slot, |h| {
         h.flags |= host_flags::CONNECTED;
         h.addr = conn.raw().peer_address().to_bytes();
@@ -367,11 +405,11 @@ async fn connection(
     MOTION[slot].lock(|m| *m.borrow_mut() = Motion::new());
     MOTION_READY[slot].reset();
     CTL[slot].reset();
-    // Bonded: encrypt with the stored key. New: pair and bond (trouble-host's connections start not bondable), the
-    // host asking for the passkey it shows.
-    if new {
-        let _ = conn.raw().set_bondable(true);
-    }
+    // Bonded: encrypt with the stored key. New: pair and bond, the host asking for the passkey it shows. Bondable either
+    // way (trouble-host's connections start not bondable): a bonded host that forgot the KVM pairs anew on this
+    // connection, and trouble-host answers its pairing request before this task hears of it (`BondLost`). Not bondable,
+    // that pairing took the passkey and gave no bond (first dongle, 2026-11-14: "it accepts the code, then nothing").
+    let _ = conn.raw().set_bondable(true);
     let _ = conn.raw().request_security();
     let mut waiting_passkey = false;
     let kb_cccd = server.hid.keyboard.cccd_handle;
@@ -380,7 +418,14 @@ async fn connection(
             if waiting_passkey { PASSKEY.wait().await } else { core::future::pending().await }
         };
         let input = select(REPORTS[slot].receive(), MOTION_READY[slot].wait());
-        match select4(conn.next(), input, CTL[slot].wait(), passkey).await {
+        let woke = select4(conn.next(), input, CTL[slot].wait(), passkey).await;
+        // Superseded by a newer connection of this slot: nothing of this one counts any more.
+        if !current() {
+            log::line(format_args!("host {host}: an older connection, superseded"));
+            conn.raw().disconnect();
+            break;
+        }
+        match woke {
             Either4::First(ev) => match ev {
                 GattConnectionEvent::Disconnected { reason } => {
                     log::line(format_args!("host {host}: disconnected ({reason:?})"));
@@ -398,6 +443,7 @@ async fn connection(
                     event(EventKind::PasskeyRequest, host, 0);
                 }
                 GattConnectionEvent::PairingComplete { bond, .. } => {
+                    waiting_passkey = false;
                     if let Some(b) = bond {
                         let s = Slot::from_bond(&b);
                         // Written only if the keys are new (bonds.rs, "Wear").
@@ -408,8 +454,12 @@ async fn connection(
                         set_flags(slot, |h| h.flags |= host_flags::BONDED | host_flags::ENCRYPTED);
                         log::line(format_args!("host {host}: bonded"));
                         event(EventKind::Paired, host, 0);
+                    } else if !with(|s| s.hosts[slot].bonded()) {
+                        // Paired without a bond (the host didn't ask for one): nothing to reconnect with, so not a host.
+                        log::line(format_args!("host {host}: paired without a bond"));
+                        event(EventKind::PairFailed, host, 0);
+                        conn.raw().disconnect();
                     }
-                    waiting_passkey = false;
                 }
                 GattConnectionEvent::PairingFailed(_) => {
                     waiting_passkey = false;
@@ -419,7 +469,7 @@ async fn connection(
                     }
                 }
                 GattConnectionEvent::BondLost => {
-                    // The host forgot the KVM: the slot is free again.
+                    // The host forgot the KVM and pairs anew: its old keys are no good any more.
                     let id = with(|s| s.bonds.slots[slot].map(|b| b.identity()));
                     if let Some(id) = id {
                         let _ = stack.remove_bond_information(id);
@@ -427,6 +477,14 @@ async fn connection(
                     with(|s| s.bonds.set(slot, None));
                     set_flags(slot, |h| h.flags &= !host_flags::BONDED);
                     event(EventKind::BondLost, host, 0);
+                    if with(|s| pairing_open(s)) {
+                        // Into the same slot (this connection holds it), with a passkey as any new host.
+                        log::line(format_args!("host {host}: pairing anew"));
+                    } else {
+                        // Only while pairing is open, as for any host the module doesn't know.
+                        log::line(format_args!("host {host}: forgot the KVM, pairing is closed"));
+                        conn.raw().disconnect();
+                    }
                 }
                 GattConnectionEvent::Encrypted { .. } => {
                     set_flags(slot, |h| h.flags |= host_flags::ENCRYPTED);
@@ -510,11 +568,15 @@ async fn connection(
             }
         }
     }
-    set_flags(slot, |h| {
-        h.flags &= !(host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED);
-        h.interval = 0;
-        h.latency = 0;
-    });
+    // Only the slot's current connection takes its state with it, and lets the slot go.
+    if current() {
+        with(|s| s.live[slot] = false);
+        set_flags(slot, |h| {
+            h.flags &= !(host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED);
+            h.interval = 0;
+            h.latency = 0;
+        });
+    }
     ADVERTISE.signal(());
 }
 

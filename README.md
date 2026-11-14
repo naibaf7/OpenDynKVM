@@ -23,7 +23,7 @@ without their own remapping can be remapped on the KVM with the Vial app.
 - **Inside:** an RP2354B (USB host for the front ports, all switching logic), two AT32F405 (one High-Speed USB device per
   PC), three USB 2.0 hubs and a 1:3 analog USB switch per front port.
 
-**Status (2026-11-14):** the first boards, hardware 0.12.0, run firmware 0.1.17. Hardware 0.17.0, with the fixes from
+**Status (2026-11-14):** the first boards, hardware 0.12.0, run firmware 0.1.19. Hardware 0.18.0, with the fixes from
 their bring-up, is designed but not ordered yet. What has been verified on a board and what has not:
 [DEVELOPMENT.md](DEVELOPMENT.md#bring-up-status).
 

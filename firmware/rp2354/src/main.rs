@@ -132,6 +132,17 @@ static EXECUTOR1: StaticCell<Executor> = StaticCell::new();
 async fn main(spawner: Spawner) {
     let mut p = embassy_rp::init(Default::default());
     vreg_hiz();
+    // The Bluetooth module's EN (GPIO9 through 1 kΩ, boards from 0.18.0) released, and its BOOT strap (IO9, on its RXD0:
+    // GPIO28) driven high until the UART takes the pin, both before anything else. The pads' reset pull-down (36–113 kΩ)
+    // against the module's pull-ups leaves 2.6–3.0 V on them until here: above its 0.75 × VDD, but the module samples IO9
+    // at every power-up, usually while this chip is still booting (hardware/tools/gen_schematic.py block 16). On older
+    // boards both pins are unconnected, or GPIO28 is the same line without the module.
+    let mut esp_en = Flex::new(p.PIN_9);
+    esp_en.set_pull(Pull::None);
+    esp_en.set_as_input();
+    let mut esp_boot = Flex::new(p.PIN_28.reborrow());
+    esp_boot.set_high();
+    esp_boot.set_as_output();
     diag::note_reset_cause();
     info!("OpenDynKVM RP2354B firmware {=u32:#x}", FW_VERSION);
     let mut uart_cfg = uart::Config::default();
@@ -225,12 +236,20 @@ async fn main(spawner: Spawner) {
     // Core 0.
     // The Bluetooth module (boards 0.16.0 on, when fitted; software.md §4.13): UART0 on GPIO28/29. Fitted or not: its
     // TXD0 idles high on GPIO29, which the pad's pull-down holds low on a board without it (or before 0.16.0).
+    // Sampled for up to 0.5 s: a module that is still in reset (its EN on a 10 ms RC) or between the restarts of a
+    // ROM that finds no firmware leaves the line to the pull-down for a moment.
     let bt_fitted = {
         let mut rx = Flex::new(p.PIN_29.reborrow());
         rx.set_as_input();
         rx.set_pull(Pull::Down);
-        embassy_time::Timer::after_millis(20).await;
-        let high = rx.is_high();
+        let mut high = false;
+        for _ in 0..50 {
+            embassy_time::Timer::after_millis(10).await;
+            if rx.is_high() {
+                high = true;
+                break;
+            }
+        }
         rx.set_pull(Pull::None);
         high
     };
@@ -240,6 +259,9 @@ async fn main(spawner: Spawner) {
     }
     let mut bt_cfg = uart::Config::default();
     bt_cfg.baudrate = kvm_proto::link::bt::BAUD;
+    // The UART's TX idles high where `esp_boot` held the line (its drop leaves the pad to its reset value for the moment
+    // between the two).
+    drop(esp_boot);
     let bt_uart = BufferedUart::new(
         p.UART0,
         p.PIN_28,
@@ -249,7 +271,8 @@ async fn main(spawner: Spawner) {
         BT_RX_BUF.init([0; 512]),
         bt_cfg,
     );
-    spawner.spawn(unwrap!(bt::run(bt_uart, bt_fitted, (seed >> 16) as u8)));
+    // `esp_en` (above): open drain, released, pulled low only to restart the module.
+    spawner.spawn(unwrap!(bt::run(bt_uart, bt_fitted, (seed >> 16) as u8, esp_en)));
     // Without it on the board: an ESP32-C3 board on a front port can be the module (software.md §4.13).
     spawner.spawn(unwrap!(bt::dongle_task((seed >> 24) as u8)));
 

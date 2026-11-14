@@ -264,12 +264,19 @@ GPIO = {
     36: 'DBG_TX',                                              # UART1 TX -> spare pin of the SWD pads
     # Bluetooth LE coprocessor (0.16.0, block 16): UART0 on GPIO28/29 (UART0 TX/RX in the RP2350's function table),
     # two of the four free pins on the south side, the one facing the module.  Two wires, not four: the module's
-    # BOOT strap (IO9) shares the RP2354B's TX line, and its EN has only its RC (block 16).  The planned via fan-out
+    # BOOT strap (IO9) shares the RP2354B's TX line, and its EN had only its RC until 0.18.0.  The planned via fan-out
     # of pins 38/39 (GPIO30/31) sits on Hub-0's Mouse pair's corner under the RP2354B, and without vias their lines
     # cut the crystal's off (first full runs of 0.16.0: "PAIR FAIL H0_MS ... blocked by ['ESP_EN']", then RP_XIN
     # unrouted).  Boards 0.12-0.15 leave GPIO28/29 unconnected, and a 0.16.0 board can go without the module: the
     # firmware reads GPIO29 with its pull-down on, and only the module's TXD0, idling high, lifts it (software.md 4.13)
     28: 'ESP_RXD', 29: 'ESP_TXD',
+    # 0.18.0: GPIO9 to the module's EN through 1 k (block 16), driven low only (open drain): the RP2354B resets a
+    # module that hangs, or a blank one with its BOOT strap held low by a UART break, which gets it into its ROM at once.
+    # Before, the firmware could only wait for a restart the module makes by itself.  GPIO9 (pin 7, west side, free
+    # pins either side), not GPIO30/31 beside the UART: seeded from 0.17.0, pin 38's line found no way out under the
+    # crystal's B.Cu run, and re-laying the south row's lines with it (UART, OT_EN, RUN, SWD, six orders and worker
+    # counts) always left one of them unrouted (2026-11-14).
+    9: 'ESP_RST',
 }
 rp = {'81': 'GND'}
 rp_pins = {  # QFN-80 pin -> GPIO number
@@ -486,7 +493,15 @@ fit('BT')
 # the RP2354B drives it), so the module boots its firmware; the RP2354B holds the line low (a UART break) across a
 # reset to get the ROM bootloader - a blank module resets over and over by itself, a programmed one restarts into its
 # ROM on a link command (software.md 4.13).  After reset IO9 is only an input the firmware never drives.
-# EN: Espressif's 10 k / 1 uF delay (datasheet section 9), power-on reset only.
+# EN: Espressif's 10 k / 1 uF delay (datasheet section 9) for power-on, and from 0.18.0 the RP2354B's GPIO9 (ESP_RST)
+# through 1 k: driven low, EN sits at 0.3 V (reset below 0.25 x VDD = 0.83 V), and the pin's current stays at 3.3 mA
+# while it empties the 1 uF (1 ms).
+# The RP2354B's pads come out of reset with a pull-down, 36-113 k at 3.3 V (RP2350 datasheet, pad table), which the
+# firmware turns off at the start of main.  Until then (its boot ROM, BOOTSEL, a debugger holding it in reset):
+# - EN sits at 2.60-2.98 V against the 10 k + 1 k, above the module's reset release (0.75 x VDD = 2.48 V).
+# - IO9 sits at 2.93-3.17 V against R1604 (5.1 k with the chip's own 45 k), above its high level (also 0.75 x VDD).
+#   IO9 is sampled at every power-up, usually while the RP2354B is still booting.  R1604 was 10 k until 0.18.0, which
+#   left 2.69 V at the pull-down's low end; 5.1 k is the board's CC resistor, no new part.
 # Power: 3.3 V from the TLV62569; Bluetooth LE TX at the +9 dBm the firmware allows peaks at 190 mA (table 6-5), so the
 # module gets its 10 uF + 100 nF right at its 3V3 pad (budget: design.md 6.1).
 esp = {'3': '+3V3', '8': 'ESP_EN', '30': 'ESP_RXD', '31': 'ESP_TXD', '5': 'ESP_IO2', '22': 'ESP_IO8', '23': 'ESP_RXD',
@@ -503,7 +518,8 @@ R('10k', '+3V3', 'ESP_EN')
 C('1uF', 'ESP_EN')
 R('10k', '+3V3', 'ESP_IO2')
 R('10k', '+3V3', 'ESP_IO8')
-R('10k', '+3V3', 'ESP_RXD')                           # IO9 high (boot from flash) whatever the RP2354B's pad does
+R('5.1k', '+3V3', 'ESP_RXD')                          # IO9 high (boot from flash) whatever the RP2354B's pad does
+R('1k', 'ESP_RST', 'ESP_EN')                          # 0.18.0: the RP2354B's reset line, at the EN pad's RC
 fit(None)
 # the module's own log (its UART1 TX on IO3) on a test pad beside it, for bring-up without the RP2354B's help
 part('TP', 'Connector:TestPoint', 'ESP LOG', 'TestPoint:TestPoint_Pad_D1.0mm', {'1': 'ESP_LOG'}, in_bom=False)

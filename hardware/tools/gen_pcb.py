@@ -288,6 +288,7 @@ PLACEMENT.update({
     'TP1601': (_ex - 6.4, _ey - 8.6, 180),        # the module's log (IO3)
     'R1604': (_ex - 6.7, _ey + 4.9, 90),          # RXD0 / IO9 pull-up (boot from flash), beside IO9 (pad 23)
     'R1603': (_ex - 6.7, _ey + 2.6, 270),         # IO8 pull-up, west of its pad
+    'R1605': (_ex - 4.0, _ey - 8.35, 90),         # 0.18.0: GPIO9 to EN, between the log pad and the EN RC
 })
 # Antenna keep-out, a board-level rule area on every copper layer (route.py honours it, and the zone filler
 # leaves every plane out of it - GND on F.Cu, In1.Cu and B.Cu, +3V3 on In2.Cu): no track, via or zone fill from the
@@ -436,11 +437,12 @@ SILK_TEXT = [
 # The board's version, printed on it (DEVELOPMENT.md "Versions"): a new major version is a different board, a minor version a
 # revision of this one.  It is the version of the design being worked on: once a board is ordered, its commit is
 # tagged hw-vX.Y.Z and this moves on to the next one.  kvm_proto::HARDWARE_VERSION, what the firmware reports, is the
-# newest board that was ordered (0.12.0 while 0.17.0 is designed).  0.13.0 and 0.14.0 were designed and never ordered:
+# newest board that was ordered (0.12.0 while 0.18.0 is designed).  0.13.0 and 0.14.0 were designed and never ordered:
 # 0.14.0 replaced 0.13.0 (errata.md E1), and 0.15.0 is 0.14.0's netlist routed from scratch.  0.16.0 adds the Bluetooth
 # module (block 16, design.md 16), fitted or not.  0.17.0 fixes what the first 0.12.0 board showed: SVC_SEL's pull-up
-# (errata.md E2) and the side LEDs' direction (E3).
-HW_VERSION = '0.17.0'
+# (errata.md E2) and the side LEDs' direction (E3).  0.18.0 gives the RP2354B a reset line to the module's EN (GPIO9
+# through R1605), routed by a seeded run from 0.17.0.
+HW_VERSION = '0.18.0'
 
 # The logos (2026-11-08: reworked for 0.16.0, whose Bluetooth module took the badge's corner).  Before, one badge
 # bottom right (2026-11-03): the OpenDynKVM logo over the open source hardware logo and the version.  The board has no

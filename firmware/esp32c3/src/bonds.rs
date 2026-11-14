@@ -161,8 +161,4 @@ impl Bonds {
     pub fn slot_of(&self, id: &Identity) -> Option<usize> {
         self.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.identity().match_identity(id)))
     }
-
-    pub fn free_slot(&self) -> Option<usize> {
-        self.slots.iter().position(|s| s.is_none())
-    }
 }

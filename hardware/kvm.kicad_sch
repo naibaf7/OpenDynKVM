@@ -27248,9 +27248,38 @@
 		(at 320.04 81.28)
 		(uuid "2a710de6-db81-5e31-8d74-3bcbc41e0ff1")
 	)
-	(no_connect
-		(at 320.04 83.82)
-		(uuid "9af43161-e077-565c-95ea-0138aeb3f816")
+	(wire
+		(pts
+			(xy 320.04 83.82)
+			(xy 322.58 83.82)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "5f1b3f10-1fb2-5cd0-bd64-973177de86a2")
+	)
+	(global_label "ESP_RST"
+		(shape passive)
+		(at 322.58 83.82 0)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "ec1ce9a3-7b7e-59c2-b81a-aa72e634bbe5")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 322.58 83.82 0)
+			(hide yes)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
 	)
 	(no_connect
 		(at 320.04 86.36)
@@ -88311,7 +88340,7 @@
 				(justify left)
 			)
 		)
-		(property "Value" "10k"
+		(property "Value" "5.1k"
 			(at 357.12 467.36 0)
 			(show_name no)
 			(do_not_autoplace no)
@@ -88355,7 +88384,7 @@
 				)
 			)
 		)
-		(property "LCSC" "C25744"
+		(property "LCSC" "C25905"
 			(at 358.14 462.28 0)
 			(hide yes)
 			(show_name no)
@@ -88366,7 +88395,7 @@
 				)
 			)
 		)
-		(property "MPN" "0402WGF1002TCE"
+		(property "MPN" "0402WGF5101TCE"
 			(at 358.14 462.28 0)
 			(hide yes)
 			(show_name no)
@@ -88525,18 +88554,18 @@
 		)
 	)
 	(symbol
-		(lib_id "Connector:TestPoint")
-		(at 365.76 454.66 0)
+		(lib_id "Device:R")
+		(at 365.76 467.36 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
-		(in_bom no)
+		(in_bom yes)
 		(on_board yes)
-		(in_pos_files no)
+		(in_pos_files yes)
 		(dnp no)
-		(uuid "7add0c53-99b1-565e-8b87-2dfa2d74d81e")
-		(property "Reference" "TP1601"
-			(at 365 449.33 0)
+		(uuid "31ac31fb-9f07-51c4-8274-a39fc07bb823")
+		(property "Reference" "R1605"
+			(at 364.74 463.55 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -88546,8 +88575,8 @@
 				(justify left)
 			)
 		)
-		(property "Value" "ESP LOG"
-			(at 365 454.66 0)
+		(property "Value" "1k"
+			(at 364.74 472.44 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -88557,8 +88586,8 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" "TestPoint:TestPoint_Pad_D1.0mm"
-			(at 365.76 454.66 0)
+		(property "Footprint" "Resistor_SMD:R_0402_1005Metric"
+			(at 365.76 467.36 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -88569,7 +88598,187 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 365.76 454.66 0)
+			(at 365.76 467.36 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Resistor"
+			(at 365.76 467.36 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "LCSC" "C11702"
+			(at 365.76 467.36 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "MPN" "0402WGF1001TCE"
+			(at 365.76 467.36 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Fit" "BT"
+			(at 365.76 467.36 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "5c029a74-b4ee-5685-8bfd-005a100447b4")
+		)
+		(pin "2"
+			(uuid "e40928a1-00e3-5c17-b135-96028dfc38e0")
+		)
+		(instances
+			(project "kvm"
+				(path "/b6b3d0a4-6a51-4c1e-9f0e-6b766d6b766d"
+					(reference "R1605")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(wire
+		(pts
+			(xy 365.76 463.55)
+			(xy 365.76 461.01)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "8285e252-d94e-5d85-ba4d-9619393e64f6")
+	)
+	(global_label "ESP_RST"
+		(shape passive)
+		(at 365.76 461.01 90)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "61ff2ad6-e7f8-5795-bc5f-c4367ebe00ba")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 365.76 461.01 0)
+			(hide yes)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+	)
+	(wire
+		(pts
+			(xy 365.76 471.17)
+			(xy 365.76 473.71)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "6d9bebd3-ed3c-5abb-b976-105b7ed41aaa")
+	)
+	(global_label "ESP_EN"
+		(shape passive)
+		(at 365.76 473.71 270)
+		(fields_autoplaced yes)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify right)
+		)
+		(uuid "c6c02b03-e81f-5c44-9c14-778532dc7d15")
+		(property "Intersheetrefs" "${INTERSHEET_REFS}"
+			(at 365.76 473.71 0)
+			(hide yes)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Connector:TestPoint")
+		(at 373.38 454.66 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom no)
+		(on_board yes)
+		(in_pos_files no)
+		(dnp no)
+		(uuid "7add0c53-99b1-565e-8b87-2dfa2d74d81e")
+		(property "Reference" "TP1601"
+			(at 372.62 449.33 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Value" "ESP LOG"
+			(at 372.62 454.66 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" "TestPoint:TestPoint_Pad_D1.0mm"
+			(at 373.38 454.66 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 373.38 454.66 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -88580,7 +88789,7 @@
 			)
 		)
 		(property "Description" "test point"
-			(at 365.76 454.66 0)
+			(at 373.38 454.66 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -88604,18 +88813,18 @@
 	)
 	(wire
 		(pts
-			(xy 365.76 454.66)
-			(xy 365.76 457.2)
+			(xy 373.38 454.66)
+			(xy 373.38 457.2)
 		)
 		(stroke
 			(width 0)
 			(type default)
 		)
-		(uuid "00bd8d07-0c6e-5946-a9db-a4a5301b91db")
+		(uuid "f04388b1-a6ff-5ebd-8276-823f2b279820")
 	)
 	(global_label "ESP_LOG"
 		(shape passive)
-		(at 365.76 457.2 270)
+		(at 373.38 457.2 270)
 		(fields_autoplaced yes)
 		(effects
 			(font
@@ -88623,9 +88832,9 @@
 			)
 			(justify right)
 		)
-		(uuid "d9eae6f9-ae0d-5626-b9a3-631071bd00fa")
+		(uuid "e233fd5b-2ead-5b87-978a-a746276e8475")
 		(property "Intersheetrefs" "${INTERSHEET_REFS}"
-			(at 365.76 457.2 0)
+			(at 373.38 457.2 0)
 			(hide yes)
 			(effects
 				(font

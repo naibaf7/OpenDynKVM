@@ -118,9 +118,9 @@ Hardware, firmware and host software each carry a `major.minor.patch` version.
 
 | What | Now | Where it is set |
 |---|---|---|
-| Hardware | **0.17.0** in design, not ordered yet (0.13.0 to 0.16.0 were designed and never ordered). **0.12.0** is the board ordered as revision 12 | `HW_VERSION` in `hardware/tools/gen_pcb.py` (printed on the board: the design's version) and `kvm_proto::HARDWARE_VERSION` (what the firmware reports: the newest board that was ordered, still 0.12.0) |
-| Firmware, RP2354B and both AT32F405s alike | **0.1.17** | `kvm_proto::FIRMWARE_VERSION` |
-| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.17** | `version` in the root `Cargo.toml` |
+| Hardware | **0.18.0** in design, not ordered yet (0.13.0 to 0.17.0 were designed and never ordered). **0.12.0** is the board ordered as revision 12 | `HW_VERSION` in `hardware/tools/gen_pcb.py` (printed on the board: the design's version) and `kvm_proto::HARDWARE_VERSION` (what the firmware reports: the newest board that was ordered, still 0.12.0) |
+| Firmware, RP2354B and both AT32F405s alike | **0.1.19** | `kvm_proto::FIRMWARE_VERSION` |
+| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.19** | `version` in the root `Cargo.toml` |
 
 - **Hardware:** a new major version is a different board: 1.0.0 will be the mass-production board, 2.0.0 a new design.
   Minor versions are revisions of the same board. When a board is ordered:
@@ -198,7 +198,7 @@ The first board, a 0.12.0, runs firmware 0.1.17. Faults of the board itself, wit
   - what each PC reports while shut down with standby power (auto-select waits 30 s for a PC with 5 V but no host);
   - the current actually saved.
 - **DDC/CI** switching inputs, and the Windows path.
-- **The Bluetooth module** (boards from 0.16.0) and the **0.17.0** board with the fixes for errata E2 and E3.
+- **The Bluetooth module** (boards from 0.16.0), the fixes for errata E2 and E3 (from 0.17.0), and the module's EN line (0.18.0).
 - **The module as an ESP32-C3 board on a front port** works on the first 0.12.0 board (2026-11-14): found, programmed
   over USB from blank and updated, paired, switched to, and used in screen hop; mouse to host 5–10 ms at the host's
   15 ms connection interval (1 ms over USB). Still to see: a host that takes 7.5 ms, and several hosts at once.

@@ -27,7 +27,7 @@ mod log;
 use embassy_executor::Spawner;
 use esp_rtos::embassy::InterruptExecutor;
 use esp_hal::clock::CpuClock;
-use esp_hal::timer::timg::TimerGroup;
+use esp_hal::timer::timg::{MwdtStage, TimerGroup, Wdt};
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -54,6 +54,19 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 static LINK_EXECUTOR: static_cell::StaticCell<InterruptExecutor<1>> = static_cell::StaticCell::new();
 
+/// A hang this long restarts the module (a system reset); the watchdog is fed every second.
+const WATCHDOG_S: u64 = 5;
+
+/// Feeds the module's watchdog from the main executor, where the Bluetooth side runs: when that executor stops, the
+/// module restarts, and the RP2354B sees it say `Hello` again (or catches it in its ROM with a break on TX).
+#[embassy_executor::task]
+async fn watchdog(mut wdt: Wdt<esp_hal::peripherals::TIMG0<'static>>) {
+    loop {
+        wdt.feed();
+        embassy_time::Timer::after_secs(1).await;
+    }
+}
+
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -61,7 +74,13 @@ async fn main(spawner: Spawner) {
     // The Bluetooth controller's own memory (esp-radio allocates it).
     esp_alloc::heap_allocator!(size: 72 * 1024);
     let timg0 = TimerGroup::new(p.TIMG0);
+    let mut wdt = timg0.wdt;
     esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
+    // The module's own watchdog: on the KVM's board nothing else can restart a module that hangs (its EN has only its
+    // RC; boards before 0.18.0 have no line to it from the RP2354B). esp-hal's init leaves every watchdog off.
+    wdt.set_timeout(MwdtStage::Stage0, esp_hal::time::Duration::from_secs(WATCHDOG_S));
+    wdt.enable();
+    spawner.spawn(watchdog(wdt).expect("watchdog task"));
     // Kept until the link says where the module is (`log`): printed on IO3 only on the KVM's board.
     log::line(format_args!("OpenDynKVM Bluetooth module, firmware {FW_VERSION:#08x}"));
 

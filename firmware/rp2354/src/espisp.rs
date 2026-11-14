@@ -24,8 +24,10 @@
 //! - anything else (blank, or a firmware that doesn't answer) resets over and over: the ROM finds no image, or a
 //!   watchdog bites. [`break_into_rom`] holds TX low (a UART break) across such resets.
 //!
-//! Exit: FLASH_BEGIN (size 0) and FLASH_END "reboot" restart the module, and with TX idle (high) IO9 boots its
-//! firmware. The same gets a module out of the ROM that landed there by chance (TX low at an unplanned reset).
+//! Exit, on both lines: a restart through the RTC watchdog, FORCE_DOWNLOAD_BOOT cleared first (espflash's
+//! `WatchdogReset`); with TX idle (high) IO9 boots the firmware. The ROM's own reboot (FLASH_END) keeps that flag,
+//! which `EnterRom` sets, and a dongle restarted by RTS from its ROM came back in it (first dongle, 2026-11-14). The
+//! same gets a module out of the ROM that landed there by chance (TX low at an unplanned reset).
 
 use defmt::{debug, warn};
 use embassy_rp::uart::BufferedUart;
@@ -70,7 +72,6 @@ mod op {
     pub const SPI_FLASH_MD5: u8 = 0x13;
     pub const GET_SECURITY_INFO: u8 = 0x14;
     pub const FLASH_BEGIN: u8 = 0x02;
-    pub const FLASH_END: u8 = 0x04;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -289,18 +290,6 @@ impl<L: Line> Rom<'_, L> {
         Err(noted(Error::NoSync))
     }
 
-    /// FLASH_BEGIN of nothing, then FLASH_END "reboot": the ROM restarts the module (esptool's soft reset for the ROM
-    /// loader). With TX idle, IO9 reads high and the module boots its firmware.
-    async fn reboot(&mut self) -> Result<(), Error> {
-        let mut begin = [0u8; 20];
-        begin[8..12].copy_from_slice(&(BLOCK as u32).to_le_bytes());
-        self.command(op::FLASH_BEGIN, &[&begin], 0, Duration::from_secs(2)).await?;
-        // 0 = reboot (espflash FlashEnd { reboot: true } sends !reboot).
-        let _ = self.command(op::FLASH_END, &[&0u32.to_le_bytes()], 0, Duration::from_millis(300)).await;
-        self.line.set_baud(ROM_BAUD);
-        Ok(())
-    }
-
     /// WRITE_REG: `value` into the bits of `mask` at `addr`.
     async fn write_reg(&mut self, addr: u32, value: u32, mask: u32) -> Result<(), Error> {
         let mut d = [0u8; 16];
@@ -423,13 +412,16 @@ pub async fn listening<L: Line>(line: &mut L) -> bool {
     connect(line, 3).await.is_ok()
 }
 
-/// A module that sits in its ROM bootloader (it answers SYNC) is restarted into its firmware; false if no ROM answers.
-/// For the board's UART (a dongle restarts with RTS).
+/// A module that sits in its ROM bootloader (it answers SYNC) is restarted into its firmware by the RTC watchdog;
+/// false if no ROM answers. The ROM's own reboot (FLASH_END) keeps FORCE_DOWNLOAD_BOOT, which `EnterRom` sets: the
+/// module would come back in its ROM.
 pub async fn leave_rom<L: Line>(line: &mut L) -> bool {
-    match connect(line, 10).await {
-        Ok(mut rom) => rom.reboot().await.is_ok(),
+    let left = match connect(line, 10).await {
+        Ok(mut rom) => rom.watchdog_restart().await.is_ok(),
         Err(_) => false,
-    }
+    };
+    line.set_baud(ROM_BAUD);
+    left
 }
 
 /// A chip whose ROM bootloader listens is restarted into its firmware by the RTC watchdog (a dongle; the board's UART
@@ -448,8 +440,8 @@ pub async fn blank_c3<L: Line>(line: &mut L, image: &Image) -> Result<bool, Erro
     rom.md5_is(0, image.head_len, image.blank_md5).await
 }
 
-/// Writes `image` to the module's flash from offset 0, verifies it and restarts the module into it (on the UART by the
-/// ROM, a dongle by its RTC watchdog). The module's ROM bootloader must be listening
+/// Writes `image` to the module's flash from offset 0, verifies it and restarts the module into it (by its RTC
+/// watchdog). The module's ROM bootloader must be listening
 /// (`EnterRom`, [`break_into_rom`], or a dongle's DTR/RTS). Leaves the UART at [`ROM_BAUD`]; the caller restores the
 /// link's speed.
 pub async fn program<L: Line>(line: &mut L, image: &Image) -> Result<(), Error> {
@@ -470,9 +462,7 @@ pub async fn program<L: Line>(line: &mut L, image: &Image) -> Result<(), Error> 
         }
     }
     rom.attach_flash().await?;
-    if !L::UART {
-        rom.watchdog_off().await?;
-    }
+    rom.watchdog_off().await?;
     // The first sector goes first (erased, nothing written) and comes back last.
     let mut erase = [0u8; 20];
     for (k, v) in [image.head_len, 0, BLOCK as u32, 0, 0].iter().enumerate() {
@@ -490,10 +480,9 @@ pub async fn program<L: Line>(line: &mut L, image: &Image) -> Result<(), Error> 
         warn!("module: flash differs from the image after writing it");
         return Err(Error::Verify);
     }
-    if L::UART {
-        rom.reboot().await?;
-    } else {
-        rom.watchdog_restart().await?;
-    }
-    Ok(())
+    // Out through the RTC watchdog, FORCE_DOWNLOAD_BOOT cleared: the ROM's own reboot keeps that flag, which
+    // `EnterRom` sets, and a reset by RTS from the ROM brought a dongle back in its ROM (first dongle, 2026-11-14).
+    let restarted = rom.watchdog_restart().await;
+    rom.line.set_baud(ROM_BAUD);
+    restarted
 }

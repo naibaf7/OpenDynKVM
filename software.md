@@ -529,15 +529,25 @@ mirrored device's descriptor, and the front ports in passthrough stay with the P
 PC). Everything below is off on a board without the module, and on boards before 0.16.0: the control protocol then
 reports no `BLUETOOTH` capability and the window shows the two PCs only (design.md §16).
 
-**Wiring and presence** (hardware/tools/gen_schematic.py block 16). Two wires: UART0 TX (GPIO28) into the module's
-RXD0, its TXD0 into UART0 RX (GPIO29), both on the module's ROM bootloader's own pins. The module's BOOT strap (IO9) is
-on the same net as its RXD0, with a 10 kΩ pull-up, and its EN has only Espressif's 10 kΩ / 1 µF power-on delay.
-- **Fitted or not:** `main` reads GPIO29 with the pad's pull-down for 20 ms before handing it to the UART: the
-  module's TXD0 idles high, a bare pad (no module, or a board before 0.16.0) reads low. Without it the Bluetooth task
-  stops at once and nothing is ever sent on GPIO28.
-- **Why two wires:** the four free pins on the RP2354B's south side lie between its SWD pins and its crystal's way
-  east, and in the first full routes of 0.16.0 the planned via fan-out of GPIO30/31 sat on Hub-0's Mouse pair while
-  their lines cut the crystal's off (hardware/tools/route.py `FANOUT_SURFACE`).
+**Wiring and presence** (hardware/tools/gen_schematic.py block 16). Two wires, and a third from 0.18.0:
+- **UART:** UART0 TX (GPIO28) into the module's RXD0, its TXD0 into UART0 RX (GPIO29), both on the module's ROM
+  bootloader's own pins. The module's BOOT strap (IO9) is on the same net as its RXD0, with a 5.1 kΩ pull-up
+  (10 kΩ until 0.18.0).
+- **EN:** Espressif's 10 kΩ / 1 µF power-on delay. From 0.18.0 also the RP2354B's GPIO9 through 1 kΩ (R1605), open
+  drain: driven low to reset the module (EN at 0.3 V), released otherwise. GPIO9 is unconnected on older boards,
+  where pulling it does nothing.
+- **While the RP2354B boots:** its pads come out of reset with a pull-down of 36–113 kΩ. Until `main` turns it off
+  (its first lines release GPIO9 and drive GPIO28 high until the UART takes it), EN sits at 2.60–2.98 V and IO9 at
+  2.93–3.17 V. Both are above the module's 0.75 × VDD (2.48 V), so it boots its firmware even while this chip is
+  in its boot ROM, in BOOTSEL, or held in reset by a debugger. An update of the RP2354B leaves the module running.
+- **Fitted or not:** `main` samples GPIO29 with the pad's pull-down for up to 0.5 s before handing it to the UART:
+  the module's TXD0 idles high, a bare pad (no module, or a board before 0.16.0) stays low. One high sample is enough,
+  as a module still in reset, or between the restarts of a ROM that finds no firmware, leaves the line low for a
+  moment. Without it the Bluetooth task stops at once and nothing is ever sent on GPIO28.
+- **Why these pins:** the four free pins on the RP2354B's south side lie between its SWD pins and its crystal's way
+  east. In the first full routes of 0.16.0 the planned via fan-out of GPIO30/31 sat on Hub-0's Mouse pair while their
+  lines cut the crystal's off (hardware/tools/route.py `FANOUT_SURFACE`). The EN line went to GPIO30 first and found
+  no way out there either (hardware/debug/v18-esp-en/), so it is on GPIO9, on the west side.
 
 **Link** (`kvm-proto::link::bt`). The AT32F405 links' 72-byte frames and go-back-N ARQ, over UART0 at 3 Mbaud
 (0.24 ms a frame), the RP2354B as master: it sends a frame at least every 5 ms and the module answers each with one.
@@ -598,7 +608,18 @@ copy of the GATT database.
 **Module firmware** (`firmware/esp32c3`, Rust on `esp-hal` + `esp-rtos`; Bluetooth: `esp-radio`'s controller and the
 `trouble-host` stack). Up to five connections (four slots plus one pairing). It advertises while pairing is open (then
 discoverable) or while a host that should be connected isn't; an unknown host that connects outside pairing is
-dropped. The selected host is asked for a 7.5–15 ms connection interval, the others for 30–50 ms with latency 4.
+dropped. Each connection has a task of its own and holds its slot from the moment it is let in until its task ends.
+- **New hosts** pair only into a slot that no bond and no connection holds. Before 0.1.19, a second unknown device let
+  in while a host paired got the same free slot and took it over. The first dongle (2026-11-14) showed it two ways: a
+  connected phone shown as "not connected", and a pairing that broke off after its passkey.
+- **A bonded host that forgot the KVM** pairs anew on its connection into its own slot, while pairing is open (outside
+  it, it is let go and its old keys dropped). Every connection is bondable from the start for this: trouble-host answers
+  the host's pairing request before the firmware hears of it, and before 0.1.19 that pairing took the passkey and
+  gave no bond.
+- **A bonded host that reconnects** before the module has seen its old connection end takes the slot over. The old
+  task neither clears the slot's state when it ends nor acts on its connection's events.
+
+The selected host is asked for a 7.5–15 ms connection interval, the others for 30–50 ms with latency 4.
 Transmit power is capped at +9 dBm (190 mA peaks, design.md §6.1). Bonds live in the last two flash sectors, which
 the RP2354B never writes (A/B records with a CRC). A save erases one of them, so the module saves only when a slot
 really changes (paired with new keys, forgotten here or by the host; forgetting several is one save): reconnecting
@@ -616,12 +637,18 @@ embeds it zlib-compressed (`build.rs`: 283 KB of the 523 KB image; its version f
 in two parts: the first 4 KB sector, and the rest. The ROM erases that sector first and writes it last, so a module
 whose programming broke off (power, unplugged) is left with it erased, which is how a blank chip looks (below).
 When the module's `Hello` carries another version, the RP2354B sends `EnterRom` and the module restarts into its ROM
-bootloader; when it says nothing within 4 s (blank, or a firmware that doesn't come up and keeps resetting), the
-RP2354B holds TX low for 3 s (a UART break) so that one of those resets starts the ROM. Then SYNC, the chip checked
-(an ESP32-C3: `GET_SECURITY_INFO`'s chip ID, or the magic value at 0x4000_1000 on older ROMs), 921 600 baud, the
-first sector erased, FLASH_DEFL_* in 1 KB blocks for the rest and then for that sector, SPI_FLASH_MD5 against the
-image's, and FLASH_BEGIN(0) + FLASH_END(reboot): with TX idle the module boots the new firmware. A module found in its ROM after an unplanned reset (TX low at that moment) is
-restarted the same way.
+bootloader (it sets FORCE_DOWNLOAD_BOOT, which every restart but a power-up keeps). When it says nothing within 4 s
+(blank, or a firmware that doesn't come up), the RP2354B holds TX, the module's BOOT strap, low (a UART break) across
+a reset: from 0.18.0 one it makes on the module's EN (GPIO9 through 1 kΩ: 20 ms low under a 300 ms break, as BOOT held
+at power-up), else, or if no ROM answers then, a 6 s break across one of the resets such a module makes by itself (a
+ROM that finds no firmware restarts about every 3 s, by its TG0 watchdog). Then SYNC, the chip checked (an ESP32-C3:
+`GET_SECURITY_INFO`'s chip ID, or the magic value at 0x4000_1000 on older ROMs), 921 600 baud, the RTC watchdog off,
+the first sector erased, FLASH_DEFL_* in 1 KB blocks for the rest and then for that sector, SPI_FLASH_MD5 against the
+image's, and a restart through the RTC watchdog with FORCE_DOWNLOAD_BOOT cleared: the ROM's own reboot (FLASH_END)
+keeps that flag, so a module sent `EnterRom` would come back in its ROM. A module found in its ROM after an unplanned
+reset (TX low at that moment) is restarted the same way; one hung in its firmware is restarted by EN (0.18.0 on), and
+in any case by its own watchdog (TIMG0, 5 s, fed by the main executor, where the Bluetooth side runs: esp-hal's start
+leaves every watchdog off).
 - **Limits:** as for the AT32F405s (§4.9, `kvm-core::at32prog`), with the module's own record in the store (item
   0x0003: CRC-32 of the embedded image's MD5, one count). Each attempt is counted in flash before it starts, and the
   count goes back to 0 when the module says `Hello` with the embedded version. Within one boot it tries again at once
@@ -660,6 +687,9 @@ small C3 boards) runs the same module firmware, and the RP2354B reaches it on a 
   a restart through it, FORCE_DOWNLOAD_BOOT cleared first (espflash's `WatchdogReset` for this chip and port): a
   restart by RTS from the ROM brought the first dongle back in its ROM (2026-11-14), the new firmware written and
   verified but not started until the board was powered off. Attempts are counted per board, the same 5 in a row.
+- **Into the ROM:** a dongle that runs another version is sent `EnterRom`, as the module on the board is; DTR/RTS
+  is the way in when it doesn't answer, or doesn't go (DTR/RTS didn't get the first dongle into its ROM reliably while
+  its firmware ran; from its ROM it did).
 - **Restarts:** every restart takes the chip off USB, and it comes back as a new device: its own (an erased chip's ROM
   finds no firmware and restarts every 2.5 s or so, first board 2026-11-14) and the RP2354B's (into the ROM, out of
   it). So each session ends with a restart, and what it found out stays with the board in RAM (by its USB serial

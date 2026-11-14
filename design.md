@@ -982,14 +982,17 @@ software.md §4.13.
   copper layer, every plane included, out from the antenna's start to the edge and 15 mm along the edge each side
   (Espressif's clearance), as far as H1504. The module's ground pads join the F.Cu ground pour. The logos moved for
   it: the OpenDynKVM logo behind the OTHER port, the OSHW logo and the version at the rear between PC1 and BOOTSEL.
-- **Interface:** two wires, UART0 on GPIO28/29. The module's BOOT strap shares the RP2354B's TX line and its EN has
-  only its RC, so the RP2354B gets the module into its ROM bootloader with a link command or a UART break across a
-  reset, and programs it from its own image as it does the AT32F405s.
+- **Interface:** UART0 on GPIO28/29, and from 0.18.0 GPIO9 to the module's EN through 1 kΩ (R1605, beside the EN
+  pad). The module's BOOT strap shares the RP2354B's TX line, so the RP2354B gets the module into its ROM bootloader
+  with a link command, or with a UART break across a reset. From 0.18.0 it makes that reset itself on EN. Before, it
+  waits for one the module makes by itself. It then programs the module from its own image, as it does the AT32F405s.
+  On 0.16.0 and 0.17.0 EN has only its RC. The line could not leave GPIO30, beside the UART, in a seeded route
+  (hardware/debug/v18-esp-en/).
 - **Without it on the board:** an ESP32-C3 board with the chip's own USB port, on a front port, can be the module
   instead (0.12–0.15 boards, the `_nobt` variant): the same firmware over its USB serial port, programmed and kept up
   to date by the RP2354B as the fitted module is. It takes that port; an ESP32 board with other firmware is never
   touched (software.md §4.13).
-- **Assembly variants:** the module and its six parts carry `Fit = BT`. `tools/make_fab.py` writes the BOM and CPL with
+- **Assembly variants:** the module and its eight parts carry `Fit = BT`. `tools/make_fab.py` writes the BOM and CPL with
   them (`jlcpcb_*.csv`) and without them (`jlcpcb_*_nobt.csv`). The same firmware runs both, and boards 0.12–0.15: it
   looks for the module at boot and leaves Bluetooth out when there is none.
 - **Selling it:** the radio is covered by the module's grants (FCC ID label "Contains FCC ID …", RED declaration with

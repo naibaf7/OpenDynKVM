@@ -5,7 +5,7 @@ members = ["crates/*", "software/odkvmctl", "xtask"]
 exclude = ["firmware/rp2354", "firmware/at32f405", "firmware/esp32c3"]
 
 [workspace.package]
-version = "0.1.17"
+version = "0.1.19"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
