@@ -220,6 +220,7 @@ diag-bt-module = ESP32-C3 模块
 diag-bt-fw = ESP32-C3 固件
 diag-bt-link-errors = ESP32-C3 UART 错误
 diag-bt-hosts = 已连接的{ -wireless }主机
+diag-bt-settings-held = 设置仅保存在 RAM 中的{ -wireless }主机
 diag-unknown = 项目 { $id }
 
 reset-software = 软件重启
@@ -270,6 +271,7 @@ diag-help-bt-module = KVM 烧写它时为橙色（更新后，10 到 20 秒）�
 diag-help-bt-fw = 模块运行 KVM 携带的固件：更新 KVM 也会更新它。
 diag-help-bt-link-errors = 自启动以来与模块交换失败的次数，包括烧写。
 diag-help-bt-hosts = 当前已连接并可接收输入的已配对主机。
+diag-help-bt-settings-held = 橙色：某主机频繁更改其通知设置，模块为保护闪存，在重启前只将其保存在 RAM 中。一切照常工作；设置会在下次配对时写入。若反复出现，请移除该主机并重新配对。
 
 ## 在命令行上输入的设置
 
@@ -545,6 +547,7 @@ fault-enumeration = 枚举失败
 fault-link-down = 链路断开
 fault-power-budget = 电量不足
 fault-hub = 集线器错误
+fault-bt-settings-held = 某{ -wireless }主机更改设置过于频繁；为保护闪存，模块不再保存这些设置
 no-diagnostics = 此 KVM 的固件尚无诊断功能：请更新。
 kvm-refused = KVM 拒绝了：{ $why }。
 

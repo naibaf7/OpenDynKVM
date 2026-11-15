@@ -489,6 +489,12 @@ saved: after a power loss the KVM finds the running PC again from the PCs' state
 - **What a PC does** (`Presence`, from its AT32F405's `Status`, §5.4): *no 5 V* (unpowered); *no host* (5 V, but its
   USB never started: shut down with standby power, or early in its boot); *asleep* (bus suspended), with or without
   remote wakeup allowed; *up* (default, addressed or configured); *unknown* while its link is down.
+  - A suspend before the PC ever reset the AT32F405 (`Status.resets` 0) is *no host*, shown as "connecting"
+    (`standby::host_usb_state`): the AT32F405's core takes an idle bus for a suspend from the moment it connects. Until
+    0.1.19 such a PC showed as asleep, at full speed: on the first board (2026-11-15) PC2, whose Windows was stuck on a
+    Bluetooth device it couldn't remove, never took up its hub again after the AT32F405s were reprogrammed. The
+    self-test's `HUB1`/`HUB2` check still looks for `Powered` only, so it doesn't count such a PC, which may as well be
+    shut down with standby power.
 - **Auto-select** (`auto-select`, default on): the other PC becomes active (event `Switched`, source `Power`, so the
   monitors follow too, §9) when
   - the active PC gives no 5 V for 3 s (a reboot may drop it for less), or has not given any since the KVM started,
@@ -566,7 +572,7 @@ The RP2354B side runs on core 0 (`bt::run`); core 1 keeps to the AT32F405 links.
 | 0x67 | RP → BT | `EnterRom`: restart into the ROM bootloader |
 | 0x70 | BT → RP | `Output`: a host's keyboard LEDs |
 | 0x71 | BT → RP | `Host`: a slot's flags (bonded, connected, encrypted, subscribed), interval, latency, address, RSSI |
-| 0x72 | BT → RP | `Event`: pairing open / closed, passkey wanted, paired, pairing failed, bond lost |
+| 0x72 | BT → RP | `Event`: pairing open / closed, passkey wanted, paired, pairing failed, bond lost, settings held in RAM |
 
 **Reports.** One HID service with a fixed report map (`kvm_proto::link::bt::report::MAP`, 229 bytes): keyboard (boot
 layout, ID 1, with the LED output report), mouse (16 buttons, 16-bit X/Y, wheel, AC pan, ID 2), consumer (one 16-bit
@@ -618,6 +624,44 @@ dropped. Each connection has a task of its own and holds its slot from the momen
   gave no bond.
 - **A bonded host that reconnects** before the module has seen its old connection end takes the slot over. The old
   task neither clears the slot's state when it ends nor acts on its connection's events.
+- **Notification settings** (the CCCDs) are kept with each bond (`Slot::notify`, a byte that was padding) and put
+  back when the host reconnects (`restore_notifications`); *subscribed* is read from them. A GATT server keeps them
+  for a bonded client, which doesn't write them again, and trouble-host keeps them only in RAM, while the module runs.
+  Until 0.1.21 a host back from sleep counted as not subscribed (the window showed it "connecting…" for good), and
+  after a restart of the module a Windows host, which writes them once after pairing, got no input at all (first
+  dongle, 2026-11-15). A bond from before 0.1.22 counts as having the input reports on. They are saved 2 s after the
+  host's last change, as a host switches several on at once and each save erases a sector. Input goes out once the link
+  itself is encrypted, not once the module saw its `Encrypted` event.
+  - **Wear guard:** a real host saves them once, after pairing, and never on a reconnect (it writes the same values, or
+    none). One that kept switching them would save every few seconds, so at most 16 such saves go to flash in a run
+    of the module (`NOTIFY_SAVES`). After that the module holds them in RAM (`Bonds::hold`), they reach flash with the
+    next save there is anyway (a pairing, a host forgotten), and it tells the RP2354B once per host
+    (`EventKind::SettingsHeld`, again after every `RequestState`). The engine raises `FaultKind::BtSettingsHeld` on
+    both PCs (the window's event list and `odkvmctl watch` show it) and the diagnostics an orange
+    `BT_SETTINGS_HELD`, until the module restarts.
+- **The stack's keys** are the slots' bonds and those of pairings under way, nothing else (`tidy_keys`, whenever a
+  connection ends, a host bonds or one is forgotten). trouble-host stores a pairing's keys as soon as it encrypts,
+  whether the module keeps the host or not, and never lets them go. Until 0.1.19 it had room for four, keys of
+  pairings that broke off stayed, and a forgotten host's could too. Once the four were taken, every pairing failed
+  just after its passkey: the host showed it connected for a moment and dropped off, and the KVM never showed it
+  (first dongle, 2026-11-15). Room for nine now: the four slots and one pairing per connection.
+- **Bond addresses** are kept as `Address::to_bytes` gives them, most significant byte first. Until 0.1.19 they were
+  read back reversed, so a host that connects with its public address (a PC) was a stranger after every restart of
+  the module.
+- **Passkeys** go to the slot that asked for them. **When pairing closes** (it ran out, the RP2354B closed it, a host
+  bonded), a connection without a bond that hasn't started pairing is let go. Until 0.1.19 such a connection stayed,
+  holding its slot. One whose passkey was asked for finishes (0.1.20 cut it off): Windows takes long enough over
+  adding a device that the 60 s may run out in the middle, and SMP's own 30 s ends a pairing that stalls.
+- **A connection's event queue** holds 16 (`connection-event-queue-size-16`; trouble-host's default is 2). trouble-host
+  drops an event that finds the queue full, `PairingComplete` too: right after encryption a PC changes PHY, data length
+  and connection interval, and with 2 the bond's event was lost. The host had paired, the module never stored it, and
+  its keys went with the connection, so the PC couldn't reconnect (first dongle, 2026-11-15: a phone paired, a Windows
+  PC "connected" for a moment and then never again, and the KVM didn't show it). A new pairing also asks for its
+  connection parameters only once it is complete, so the connection's task keeps taking events while the keys go
+  across.
+- **A forgotten host** still lists the KVM as paired: Bluetooth LE has no way to make a host let go of a bond, so it is
+  removed on the host too (the app's *Forget* says so). Until then it tries to reconnect with its old keys while the
+  module advertises, and the stack turns it away (no key for it).
 
 The selected host is asked for a 7.5–15 ms connection interval, the others for 30–50 ms with latency 4.
 Transmit power is capped at +9 dBm (190 mA peaks, design.md §6.1). Bonds live in the last two flash sectors, which
@@ -704,11 +748,16 @@ small C3 boards) runs the same module firmware, and the RP2354B reaches it on a 
   the wireless module and is attached to no PC, and how to get the port back (unplug the board, or a passthrough
   mode). Its current comes from the port, so the budget doesn't count `BT_CURRENT_MA` for it. Unplugged, Bluetooth goes
   as for a module that stops answering, and the next board may be the module.
-- **Link:** the same 72-byte frames, a full USB packet and a short one each way, one packet per millisecond: a reply
-  may take 10 ms (`REPLY_TIMEOUT_USB`).
+- **Link:** the same 72-byte frames, a full USB packet and a short one each way, one packet per millisecond: about 4 ms
+  an exchange, more while either side is busy. USB loses no frame, it only delays one, so the RP2354B waits 40 ms for a
+  reply (`REPLY_TIMEOUT_USB`) and the module 30 ms for a frame's second packet (`link::rest_of_frame`; the UART keeps
+  4 ms and 5 ms). Until 0.1.21 those were 10 ms and 5 ms: with the mouse going to a Bluetooth host about 15 exchanges
+  a second ran over (measured on the first dongle, 2026-11-15; next to none while nothing moved), each one was resent,
+  and the late reply broke the next exchange too, so the pointer stuttered.
 
 **Diagnostics** (§8.4): a *Bluetooth* group, only with the module fitted: its state (as `Status.bt_module`),
-the version from its `Hello`, the UART exchanges that failed (`bt::LINK_ERRORS`) and the hosts connected.
+the version from its `Hello`, the UART exchanges that failed (`bt::LINK_ERRORS`) and the hosts connected; while there
+are any, the hosts whose notification settings the module holds in RAM (`BT_SETTINGS_HELD`, orange).
 
 **On hardware** (2026-11-14, the first 0.12.0 board with an ESP32-C3 board on its Other port): the dongle is found,
 programmed from blank and updated over USB (interrupt slots, DTR/RTS into the ROM, the watchdog restart out of it),
@@ -1094,7 +1143,7 @@ context, and a host that doesn't know an item still shows its grade and number. 
 | USB | Hub-0 on the root port (speed, enumerated), the D+/D− swap of errata E1 and whether it was found at run time, Hub-0 status changes the hub class couldn't handle (cleared by `host.rs`), front-port enumerations or probes that failed (retried twice: replugged on the data lines, then with VBUS off for 1 s), each front port's device speed; per PC: USB speed, link state, bus resets, SPI link errors (counted once the AT32F405 has answered) | `usbh.rs`, `host.rs`, engine, AT32F405 `Status` |
 | Power | PWR VBUS and CC, each PC's VBUS and CC, the 3.3 V at each AT32F405, the front-port budget, each port's power-switch faults | ADCs of both chips |
 | PC-side chips | each AT32F405's die temperature and firmware version | AT32F405 `Status`, `Hello` |
-| Bluetooth | only with the module fitted (§4.13): its state (starting, up, being programmed, failed this boot, gave up), its firmware version, the UART exchanges that failed, the hosts connected | `bt.rs`, the module's `Hello`, engine |
+| Bluetooth | only with the module fitted (§4.13): its state (starting, up, being programmed, failed this boot, gave up), its firmware version, the UART exchanges that failed, the hosts connected, and the hosts whose settings it holds in RAM (its wear guard, only while there are any) | `bt.rs`, the module's `Hello`, engine |
 
 The main limits:
 - **Temperatures:** the RP2354B warns from 70 °C, is bad from 85 °C. The AT32F405 warns from 85 °C, is bad from 105 °C,

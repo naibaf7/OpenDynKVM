@@ -74,6 +74,17 @@ impl Wire {
     }
 }
 
+/// How long the rest of a frame may take once its magic is in. On the UART a frame takes 0.24 ms, and a short wait
+/// resynchronises after noise. On USB a frame is two packets, a millisecond or more apart while the RP2354B is busy,
+/// and USB delivers both: until 0.1.21 the UART's 5 ms dropped frames whose second packet came late, and the RP2354B
+/// waited for a reply that never came (it waits 40 ms on USB).
+fn rest_of_frame(wire: &Wire) -> Duration {
+    match wire {
+        Wire::Uart(_) => Duration::from_millis(5),
+        Wire::Usb(_) => Duration::from_millis(30),
+    }
+}
+
 /// Reads one frame: skips to the magic, then reads the rest. A frame whose CRC fails is dropped (the ARQ treats it as
 /// lost), and the next magic resynchronises.
 async fn read_frame(wire: &mut Wire, raw: &mut [u8; FRAME_LEN]) -> bool {
@@ -87,8 +98,9 @@ async fn read_frame(wire: &mut Wire, raw: &mut [u8; FRAME_LEN]) -> bool {
     }
     raw[0] = MAGIC;
     let mut got = 1;
+    let rest = rest_of_frame(wire);
     while got < FRAME_LEN {
-        match with_timeout(Duration::from_millis(5), wire.read(&mut raw[got..])).await {
+        match with_timeout(rest, wire.read(&mut raw[got..])).await {
             Ok(Ok(n)) => got += n,
             _ => return false,
         }

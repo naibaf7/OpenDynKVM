@@ -230,6 +230,7 @@ diag-bt-module = ESP32-C3-modul
 diag-bt-fw = ESP32-C3-fastvare
 diag-bt-link-errors = ESP32-C3 UART-feil
 diag-bt-hosts = Tilkoblede { -wireless(case: "plural") } verter
+diag-bt-settings-held = Verter med innstillinger bare i RAM
 diag-unknown = element { $id }
 
 reset-software = omstart fra programvare
@@ -280,6 +281,7 @@ diag-help-bt-module = Oransje mens KVM-en programmerer den (etter en oppdatering
 diag-help-bt-fw = Modulen kjører fastvaren KVM-en har med seg: en oppdatering av KVM-en oppdaterer den også.
 diag-help-bt-link-errors = Mislykkede utvekslinger med modulen siden oppstart, programmeringen medregnet.
 diag-help-bt-hosts = Sammenkoblede verter som er tilkoblet nå og kan ta imot inndata.
+diag-help-bt-settings-held = Oransje: en vert endrer varslingsinnstillingene sine så ofte at modulen holder dem i RAM til den starter på nytt, for å spare flashminnet. Alt virker fortsatt; de lagres ved neste sammenkobling. Kommer det igjen, fjern verten og koble den til på nytt.
 
 ## Innstillinger på kommandolinjen
 
@@ -564,6 +566,7 @@ fault-enumeration = gjenkjenning mislyktes
 fault-link-down = forbindelsen er brutt
 fault-power-budget = ikke nok strøm
 fault-hub = hubfeil
+fault-bt-settings-held = en { -wireless(case: "prefix") } vert endrer innstillingene sine for ofte; modulen lagrer dem ikke lenger, for å spare flashminnet
 no-diagnostics = Fastvaren til denne KVM-en har ingen diagnostikk ennå: oppdater den.
 kvm-refused = KVM-en avviste: { $why }.
 

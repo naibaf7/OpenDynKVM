@@ -14,7 +14,10 @@ esp-bootloader-esp-idf = { version = "0.6", features = ["esp32c3"] }
 esp-storage = { version = "0.10", features = ["esp32c3"] }
 esp-alloc = "0.11"
 critical-section = "1.2"
-trouble-host = { version = "0.8", features = ["derive", "security", "scan"] }
+# A connection's event queue holds 16 (trouble-host: 2). A full one drops what comes, `PairingComplete` included: a PC
+# changing PHY, data length and connection interval right after encryption filled it, and the bond was lost
+# (first dongle, 2026-11-15: Windows paired, connected for a moment, and the KVM never knew).
+trouble-host = { version = "0.8", features = ["derive", "security", "scan", "connection-event-queue-size-16"] }
 bt-hci = "0.11"
 embassy-executor = "0.10"
 embassy-time = "0.5.1"

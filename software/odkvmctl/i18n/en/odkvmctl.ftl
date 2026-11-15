@@ -227,6 +227,7 @@ diag-bt-module = ESP32-C3 module
 diag-bt-fw = ESP32-C3 firmware
 diag-bt-link-errors = ESP32-C3 UART errors
 diag-bt-hosts = { -wireless } hosts connected
+diag-bt-settings-held = { -wireless } hosts with settings kept in RAM
 diag-unknown = item { $id }
 
 reset-software = restart from software
@@ -277,6 +278,7 @@ diag-help-bt-module = Orange while the KVM programs it (after an update, 10 to 2
 diag-help-bt-fw = The module runs the firmware the KVM carries: an update of the KVM updates it too.
 diag-help-bt-link-errors = Failed exchanges with the module since start, including its programming.
 diag-help-bt-hosts = Paired hosts that are connected now and can take input.
+diag-help-bt-settings-held = Orange: a host changes its notification settings so often that the module keeps them in RAM until it restarts, to spare its flash. Nothing stops working; they are written with the next pairing. If it keeps coming back, remove the host and pair it again.
 
 ## Settings typed on the command line
 
@@ -561,6 +563,7 @@ fault-enumeration = enumeration failed
 fault-link-down = link down
 fault-power-budget = not enough power
 fault-hub = hub error
+fault-bt-settings-held = a { -wireless(case: "lower") } host changes its settings too often; the module no longer saves them, to spare its flash
 no-diagnostics = This KVM's firmware has no diagnostics yet: update it.
 kvm-refused = The KVM refused: { $why }.
 

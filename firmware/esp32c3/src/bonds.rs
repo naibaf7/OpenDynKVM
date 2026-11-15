@@ -11,8 +11,14 @@
 //! the KVM, a slot forgotten here (several at once in one save). A bonded host reconnecting changes nothing and writes
 //! nothing, whatever the Bluetooth stack reports. Twenty such changes a day would last 27 years.
 //!
+//! A host's notification settings ([`Slot::notify`], 0.1.22 on) are saved when they change: once after pairing for a
+//! real host, and never on a reconnect (the host writes the same values, or none). A host that kept switching them
+//! would save every few seconds, so at most 16 such saves go to flash in one run of the module; after that the module
+//! holds them in RAM ([`Bonds::hold`]), they reach flash with the next save there is anyway, and the RP2354B hears of
+//! it (`EventKind::SettingsHeld`: a fault in the hosts' software, a warning in the diagnostics).
+//!
 //! Record: `magic u32 | seq u32 | 4 × slot (48 bytes) | crc32 u32`; a slot is `used u8 | security u8 | address 7 |
-//! irk 16 | ltk 16 | pad 7`.
+//! irk 16 | ltk 16 | notify u8 | pad 6`. `notify` came in 0.1.22 in what was padding (0 in older records: not known).
 
 use esp_storage::FlashStorage;
 use kvm_proto::link::bt::MAX_HOSTS;
@@ -30,13 +36,35 @@ pub struct Slot {
     pub irk: Option<u128>,
     pub ltk: u128,
     pub authenticated: bool,
+    /// The host's notification settings ([`notify`]): a GATT server keeps them for a bonded client, which doesn't
+    /// write them again when it reconnects.
+    pub notify: u8,
+}
+
+/// [`Slot::notify`]: one bit per characteristic that notifies (`ble::cccds`), and whether they are known.
+pub mod notify {
+    pub const KEYBOARD: u8 = 1 << 0;
+    pub const MOUSE: u8 = 1 << 1;
+    pub const CONSUMER: u8 = 1 << 2;
+    pub const POINTER: u8 = 1 << 3;
+    // Bit 4: the battery level.
+    /// The bits below are the host's: set once it was seen. Without it (a bond from before 0.1.22) the input reports
+    /// count as on, which is what every HID host sets.
+    pub const KNOWN: u8 = 1 << 7;
+    pub const REPORTS: u8 = KEYBOARD | MOUSE | CONSUMER | POINTER;
 }
 
 impl Slot {
+    /// The host's identity. `address` is as [`Address::to_bytes`] gives it: the type, then the address most significant
+    /// byte first, the reverse of [`BdAddr`]'s order. Until 0.1.19 it was taken as stored, so the address came out
+    /// reversed: a host that connects with its public address (a PC) was a stranger to the module and to the Bluetooth
+    /// stack after every restart of the module, and forgetting it could leave its keys in the stack (2026-11-15).
     pub fn identity(&self) -> Identity {
-        let kind = if self.address[0] == 0 { AddrKind::PUBLIC } else { AddrKind::RANDOM };
+        // Types 2 and 3 are how the controller reports a resolved public and random identity address.
+        let kind = if self.address[0] & 1 == 0 { AddrKind::PUBLIC } else { AddrKind::RANDOM };
         let mut a = [0u8; 6];
         a.copy_from_slice(&self.address[1..]);
+        a.reverse();
         Identity {
             addr: Address::new(kind, BdAddr::new(a)),
             irk: self.irk.and_then(|k| core::num::NonZeroU128::new(k)).map(IdentityResolvingKey),
@@ -62,7 +90,13 @@ impl Slot {
             irk: b.identity.irk.map(|k| k.0.get()),
             ltk: b.ltk.0,
             authenticated: b.security_level == SecurityLevel::EncryptedAuthenticated,
+            notify: 0,
         }
+    }
+
+    /// The notifications to restore for this host when it reconnects.
+    pub fn notifications(&self) -> u8 {
+        if self.notify & notify::KNOWN != 0 { self.notify } else { notify::REPORTS }
     }
 }
 
@@ -103,12 +137,19 @@ impl Bonds {
                 address.copy_from_slice(&s[2..9]);
                 let irk = u128::from_le_bytes(s[9..25].try_into().unwrap_or_default());
                 let ltk = u128::from_le_bytes(s[25..41].try_into().unwrap_or_default());
-                *slot = Some(Slot { address, irk: (irk != 0).then_some(irk), ltk, authenticated: s[1] == 2 });
+                *slot =
+                    Some(Slot { address, irk: (irk != 0).then_some(irk), ltk, authenticated: s[1] == 2, notify: s[41] });
             }
             best = Some((seq, slots));
         }
         let (seq, slots) = best.unwrap_or((0, [None; MAX_HOSTS]));
         Bonds { flash, seq, slots }
+    }
+
+    /// Puts `value` in `slot` without saving: it reaches flash with the next save, whichever slot that is for (the wear
+    /// guard on notification settings, `ble::store_notifications`).
+    pub fn hold(&mut self, slot: usize, value: Option<Slot>) {
+        self.slots[slot] = value;
     }
 
     /// Puts `value` in `slot`, saving only if that changes the slot.
@@ -149,6 +190,7 @@ impl Bonds {
                 s[2..9].copy_from_slice(&slot.address);
                 s[9..25].copy_from_slice(&slot.irk.unwrap_or(0).to_le_bytes());
                 s[25..41].copy_from_slice(&slot.ltk.to_le_bytes());
+                s[41] = slot.notify;
             }
         }
         let crc = crc32(&r[..RECORD_LEN - 4]);

@@ -1728,7 +1728,7 @@ impl Engine {
 
     pub fn pc_status(&mut self, pc: Pc, st: AtStatus) {
         let s = &mut self.pcs[pc.index()];
-        let link = usb_to_link(st.usb_state);
+        let link = usb_to_link(crate::standby::host_usb_state(&st));
         if matches!(st.usb_state, UsbState::Default | UsbState::Unpowered | UsbState::Detached) {
             // A bus reset or unplug: the PC starts over in report protocol without multipliers, its cursor anywhere.
             s.out.reset();
@@ -2059,7 +2059,8 @@ impl Engine {
         }
         for k in 0..2 {
             let link = self.pcs[k].link;
-            let speed = match self.pcs[k].status.map(|s| s.speed) {
+            // Only a PC that reset the AT32F405 has set a speed: before, its core reports full speed.
+            let speed = match self.pcs[k].status.filter(|s| s.resets > 0).map(|s| s.speed) {
                 Some(UsbSpeed::High) => Speed::High,
                 Some(UsbSpeed::Full) => Speed::Full,
                 _ => Speed::Unknown,
@@ -2132,6 +2133,9 @@ impl Engine {
             add(id::BT_LINK_ERRORS, Grade::Info, errors as i32);
             let ready = self.bt.mask(|h| h.ready()).count_ones();
             add(id::BT_HOSTS, Grade::Info, ready as i32);
+            if self.bt.settings_held != 0 {
+                add(id::BT_SETTINGS_HELD, Grade::Warn, self.bt.settings_held.count_ones() as i32);
+            }
         }
         // A board on a front port as the module, once one was seen: what its sessions did (bring-up).
         if let Some(m) = b.map(|b| b.board).filter(|m| m.sessions > 0) {
@@ -2608,6 +2612,8 @@ impl Engine {
         self.bt.present = true;
         self.bt.fw = fw;
         self.bt_module = BtModule::Up;
+        // What the module holds comes again with its answer to `RequestState`.
+        self.bt.settings_held = 0;
         for (i, policy) in self.config.bt_policies.into_iter().enumerate() {
             self.emit(Output::Bt(BtOut::Policy { host: i as u8 + 1, policy }));
         }
@@ -2659,8 +2665,13 @@ impl Engine {
     /// A pairing or bond event from the module.
     pub fn bt_event(&mut self, kind: BtEventKind, host: u8, value: u32) {
         let held = self.norm.keys().union(&self.mirr.keys());
+        let settings_held = self.bt.settings_held;
         self.bt.event(kind, host, value, self.now, held);
         self.event(Event::BtChanged(host));
+        // The hosts' software tells the user: a host that keeps changing its settings would wear the module's flash.
+        if self.bt.settings_held != settings_held {
+            self.event(Event::Fault(FaultKind::BtSettingsHeld, None));
+        }
     }
 }
 
@@ -2775,6 +2786,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pc_that_never_reset_its_at32_is_not_asleep() {
+        // First board, 2026-11-15: PC2 shown "asleep", full speed, 0 bus resets. The AT32F405's core reports the idle bus
+        // as a suspend whether or not the PC ever took it up.
+        let mut e = engine();
+        let never =
+            AtStatus { speed: kvm_proto::link::msg::UsbSpeed::Full, resets: 0, ..usb(UsbState::Suspended, false) };
+        e.pc_status(Pc::Pc2, never);
+        assert_eq!(e.status(None).links[1], LinkState::Enumerating);
+        assert_eq!(e.standby.presence(Pc::Pc2), Presence::NoHost);
+        let (items, _) = diag(&mut e);
+        let pc2_speed = items.iter().find(|i| i.id == id::PC2_SPEED).unwrap();
+        assert_eq!((pc2_speed.value, pc2_speed.grade), (Speed::Unknown as i32, Grade::Info));
+        // Once it did, a suspend is sleep.
+        e.pc_status(Pc::Pc2, AtStatus { resets: 1, ..never });
+        assert_eq!(e.status(None).links[1], LinkState::Suspended);
+        assert_eq!(e.standby.presence(Pc::Pc2), Presence::Asleep { wake: false });
+    }
+
+    #[test]
     fn diagnostics_grade_what_the_engine_and_the_firmware_know() {
         let mut e = engine();
         e.pc_status(Pc::Pc1, usb(UsbState::Configured, true));
@@ -2821,7 +2851,12 @@ mod tests {
             cc1_mv: 0,
             cc2_mv: 0,
             frame: 0,
-            resets: 0,
+            // The PC reset it on its way to any of the states after Powered.
+            resets: if matches!(usb_state, UsbState::Unpowered | UsbState::Powered | UsbState::Detached) {
+                0
+            } else {
+                1
+            },
             desc_crc: 0,
             wake_enabled,
             vdda_mv: Some(3300),
@@ -3593,6 +3628,32 @@ mod tests {
         e.switch(Target::Next, SwitchSource::Hotkey);
         assert_eq!((e.active(), e.bt_active()), (Pc::Pc1, None));
         assert!(drain(&mut e).iter().all(|o| !matches!(o, Output::Bt(_))));
+    }
+
+    #[test]
+    fn a_host_whose_settings_the_module_holds_in_ram_is_a_fault_and_a_warning() {
+        let mut e = with_bt();
+        e.set_bt_module(BtModule::Up);
+        let held = |e: &mut Engine| {
+            let (items, _) = diag(e);
+            items.into_iter().find(|i| i.id == id::BT_SETTINGS_HELD).map(|i| (i.grade, i.value))
+        };
+        assert_eq!(held(&mut e), None, "only while there are any");
+        e.bt_event(BtEventKind::SettingsHeld, 2, 0);
+        let out = drain(&mut e);
+        for pc in [Pc::Pc1, Pc::Pc2] {
+            assert!(events_to(&out, pc).contains(&Event::Fault(FaultKind::BtSettingsHeld, None)));
+        }
+        assert_eq!(held(&mut e), Some((Grade::Warn, 1)));
+        // Told again (the module answers every `RequestState`): no second fault.
+        e.bt_event(BtEventKind::SettingsHeld, 2, 0);
+        assert!(!events_to(&drain(&mut e), Pc::Pc1).iter().any(|ev| matches!(ev, Event::Fault(..))));
+        // A module that says hello anew tells what it holds again; until then nothing is held.
+        e.bt_hello(0x000100);
+        assert_eq!(held(&mut e), None);
+        // Out of range: ignored.
+        e.bt_event(BtEventKind::SettingsHeld, 9, 0);
+        assert_eq!(held(&mut e), None);
     }
 
     #[test]

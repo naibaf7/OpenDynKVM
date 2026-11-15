@@ -35,11 +35,19 @@ pub enum Presence {
     Up,
 }
 
+/// What the PC has done with the AT32F405's USB device: its state, except that a suspend before the PC ever reset it is
+/// no sleep. The AT32F405's USB core takes an idle bus for a suspend from the moment it connects, so a PC that never
+/// took it up (off with standby power, its hub not up, or a host that gave up on the port) showed as asleep: first
+/// board, 2026-11-15, PC2 "asleep" with 0 bus resets after the AT32F405s were reprogrammed.
+pub fn host_usb_state(s: &AtStatus) -> UsbState {
+    if s.usb_state == UsbState::Suspended && s.resets == 0 { UsbState::Powered } else { s.usb_state }
+}
+
 impl Presence {
     pub fn of(link: LinkState, status: Option<&AtStatus>) -> Presence {
         match (link, status) {
             (LinkState::LinkDown, _) | (_, None) => Presence::Unknown,
-            (_, Some(s)) => match s.usb_state {
+            (_, Some(s)) => match host_usb_state(s) {
                 UsbState::Unpowered => Presence::NoVbus,
                 UsbState::Powered | UsbState::Detached => Presence::NoHost,
                 UsbState::Suspended => Presence::Asleep { wake: s.wake_enabled },
@@ -231,7 +239,7 @@ mod tests {
             cc1_mv: 0,
             cc2_mv: 0,
             frame: 0,
-            resets: 0,
+            resets: 1,
             desc_crc: 0,
             wake_enabled,
             vdda_mv: None,
@@ -244,6 +252,8 @@ mod tests {
         assert_eq!(of(st(UsbState::Powered, false)), NO_HOST);
         assert_eq!(of(st(UsbState::Suspended, true)), WAKEABLE);
         assert_eq!(of(st(UsbState::Default, false)), UP);
+        // Suspended without ever being reset: the PC never took the KVM up, which is no sleep.
+        assert_eq!(of(AtStatus { resets: 0, ..st(UsbState::Suspended, false) }), NO_HOST);
         assert!(!OFF.has_vbus() && NO_HOST.has_vbus() && WAKEABLE.has_vbus());
     }
 

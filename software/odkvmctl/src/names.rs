@@ -75,6 +75,7 @@ pub fn fault_kind(f: FaultKind) -> String {
         FaultKind::LinkDown => fl!("fault-link-down"),
         FaultKind::PowerBudget => fl!("fault-power-budget"),
         FaultKind::HubError => fl!("fault-hub"),
+        FaultKind::BtSettingsHeld => fl!("fault-bt-settings-held"),
     }
 }
 
@@ -463,6 +464,7 @@ pub fn diag_name(id: u8) -> String {
         BT_FW => fl!("diag-bt-fw"),
         BT_LINK_ERRORS => fl!("diag-bt-link-errors"),
         BT_HOSTS => fl!("diag-bt-hosts"),
+        BT_SETTINGS_HELD => fl!("diag-bt-settings-held"),
         _ => diag::meta(id).map_or_else(|| fl!("diag-unknown", id = format!("{id:#04x}")), |m| m.name.to_string()),
     }
 }
@@ -555,6 +557,7 @@ pub fn diag_help(id: u8) -> String {
         BT_FW => fl!("diag-help-bt-fw"),
         BT_LINK_ERRORS => fl!("diag-help-bt-link-errors"),
         BT_HOSTS => fl!("diag-help-bt-hosts"),
+        BT_SETTINGS_HELD => fl!("diag-help-bt-settings-held"),
         _ => String::new(),
     }
 }

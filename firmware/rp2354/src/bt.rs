@@ -51,8 +51,13 @@ use crate::{kvm, storage};
 const KEEPALIVE: Duration = Duration::from_millis(5);
 /// A frame takes 0.24 ms at 3 Mbaud; the module answers within a millisecond.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(4);
-/// On a dongle a frame is two USB packets each way, one per millisecond (`dongle.rs`).
-const REPLY_TIMEOUT_USB: Duration = Duration::from_millis(10);
+/// On a dongle a frame is two USB packets each way, one per millisecond (`dongle.rs`): about 4 ms an exchange, more
+/// while either side is busy. USB loses no frame, it only delays one, so this waits for a late reply instead of taking
+/// it for lost (the module waits as long for a frame's second packet, `firmware/esp32c3/src/link.rs`). Until 0.1.21 it
+/// was 10 ms: with the mouse going to a Bluetooth host about 15 exchanges a second ran over it, each one resent, and
+/// the late reply then broke the next exchange too, 20–30 ms without motion each time (first dongle, 2026-11-15: the
+/// pointer stuttered).
+const REPLY_TIMEOUT_USB: Duration = Duration::from_millis(40);
 /// Exchanges that fail this long make the link lost. The module answers within a millisecond, but its Bluetooth side can
 /// keep its flash busy a while (a bond being written).
 const LINK_TIMEOUT: Duration = Duration::from_secs(3);

@@ -421,7 +421,16 @@ wire_enum! {
 }
 
 wire_enum! {
-    pub enum FaultKind { OverCurrent = 0, EnumerationFailed = 1, LinkDown = 2, PowerBudget = 3, HubError = 4 }
+    pub enum FaultKind {
+        OverCurrent = 0,
+        EnumerationFailed = 1,
+        LinkDown = 2,
+        PowerBudget = 3,
+        HubError = 4,
+        /// A wireless host changes its notification settings so often that the module stopped writing them to flash
+        /// for this run (its wear guard): they are kept in RAM. Firmware 0.1.23 on; older hosts skip the event.
+        BtSettingsHeld = 5,
+    }
 }
 
 wire_enum! {
@@ -1023,6 +1032,9 @@ pub mod diag {
         pub const BT_FW: u8 = 0x51;
         pub const BT_LINK_ERRORS: u8 = 0x52;
         pub const BT_HOSTS: u8 = 0x53;
+        /// Wireless hosts whose notification settings the module keeps in RAM only, for this run (its flash wear
+        /// guard, `FaultKind::BtSettingsHeld`); only while there are any.
+        pub const BT_SETTINGS_HELD: u8 = 0x54;
 
         /// The module as a board on a front port (software.md §4.13), once one was seen since start: for bring-up.
         pub const BOARD_SESSIONS: u8 = 0x58;
@@ -1193,6 +1205,7 @@ pub mod diag {
             id::BT_FW => m("ESP32-C3 firmware", Version),
             id::BT_LINK_ERRORS => m("ESP32-C3 UART errors", Count),
             id::BT_HOSTS => m("Bluetooth hosts connected", Count),
+            id::BT_SETTINGS_HELD => m("Hosts with settings held in RAM", Count),
             id::BOARD_SESSIONS => m("Module board: sessions", Count),
             id::BOARD_STEPS => m("Module board: last steps", Hex),
             id::BOARD_ROM_ERROR => m("Module board: last ROM error", Hex),
@@ -2653,6 +2666,7 @@ mod tests {
             Event::PortChanged(Port::Other),
             Event::Fault(FaultKind::OverCurrent, Some(Port::Keyboard)),
             Event::Fault(FaultKind::LinkDown, None),
+            Event::Fault(FaultKind::BtSettingsHeld, None),
             Event::ConfigChanged(key::LED_BRIGHTNESS),
             Event::HotkeyLearned(LearnEnd::Learned, Hotkey::combo(0x05, 0x0E)),
             Event::HotkeyLearned(LearnEnd::Learned, Hotkey::double_tap(0xE4, true)),

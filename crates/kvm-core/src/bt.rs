@@ -155,6 +155,9 @@ pub struct BtState {
     /// Last reports sent to the active host, so that only changes go out.
     pub sent_keyboard: [u8; report::KEYBOARD_LEN],
     pub sent_consumer: u16,
+    /// Bit n−1: the module keeps host n's notification settings in RAM only, for this run of it (its flash wear guard,
+    /// [`EventKind::SettingsHeld`]). The module tells again after every `RequestState`.
+    pub settings_held: u8,
 }
 
 impl BtState {
@@ -168,6 +171,7 @@ impl BtState {
         leds: [0; BT_HOSTS],
         sent_keyboard: [0; report::KEYBOARD_LEN],
         sent_consumer: 0,
+        settings_held: 0,
     };
 
     pub fn host(&self, n: u8) -> Option<&HostState> {
@@ -219,6 +223,11 @@ impl BtState {
             }
             EventKind::PairFailed => self.passkey = None,
             EventKind::BondLost => {}
+            EventKind::SettingsHeld => {
+                if (1..=BT_HOSTS as u8).contains(&host) {
+                    self.settings_held |= 1 << (host - 1);
+                }
+            }
         }
     }
 }

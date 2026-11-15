@@ -142,6 +142,11 @@ wire_enum! {
         PairFailed = 5,
         /// A bonded host lost its bond (it forgot the KVM); the slot is free again.
         BondLost = 6,
+        /// The host in `host` changes its notification settings more often than the module writes them to flash in
+        /// one run (its flash wear guard, `firmware/esp32c3/src/bonds.rs`): the module keeps them in RAM from now on,
+        /// and they reach flash with the next save there is anyway (a pairing, a host forgotten). Once per host and
+        /// run of the module.
+        SettingsHeld = 7,
     }
 }
 
@@ -530,6 +535,7 @@ mod tests {
             rssi: -60,
         }));
         roundtrip(BtMsg::Event { kind: EventKind::PairFailed, host: 2, value: 5 });
+        roundtrip(BtMsg::Event { kind: EventKind::SettingsHeld, host: 3, value: 0 });
     }
 
     #[test]

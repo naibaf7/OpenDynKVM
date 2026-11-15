@@ -29,12 +29,15 @@ use kvm_proto::link::bt::{BtMsg, EventKind, HostState, MAX_HOSTS, Motion, Policy
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 
-use crate::bonds::{Bonds, Slot};
+use crate::bonds::{Bonds, Slot, notify};
 use crate::{link, log};
 
 /// Hosts at once: the four slots, and one more while a new host pairs into a free slot.
 const CONNS: usize = MAX_HOSTS + 1;
 const L2CAP: usize = CONNS * 2;
+/// Keys the Bluetooth stack can hold: the slots' and one pairing's under way per connection ([`tidy_keys`]). It was
+/// [`MAX_HOSTS`].
+const KEYS: usize = MAX_HOSTS + CONNS;
 const NAME: &str = "OpenDynKVM";
 
 const MAP_LEN: usize = report::MAP.len();
@@ -120,6 +123,16 @@ struct State {
     /// bond and no connection holds. Before, a second host let in while one paired got the same free slot and took it
     /// over, and the pairing broke off after its passkey (first dongle, 2026-11-14).
     live: [bool; MAX_HOSTS],
+    /// The peer of a slot's connection while it may pair (a new host, or a bonded one that forgot the KVM), until it
+    /// bonds or leaves: the keys its pairing gives the stack are kept for it ([`tidy_keys`]).
+    pairing_peer: [Option<Identity>; MAX_HOSTS],
+    /// A slot's pairing is under way (its passkey was asked for) and hasn't ended: pairing closing doesn't cut it off
+    /// ([`drop_unpaired`]); trouble-host ends one that stalls (SMP's 30 s).
+    pairing_now: [bool; MAX_HOSTS],
+    /// Notification settings written to flash in this run ([`NOTIFY_SAVES`]).
+    notify_saves: u8,
+    /// Bit n: slot n's notification settings are held in RAM, the run's [`NOTIFY_SAVES`] spent.
+    settings_held: u8,
 }
 
 /// A slot a new host may pair into: no bond, no connection.
@@ -153,8 +166,9 @@ fn take_motion(slot: usize) -> Option<(u8, [u8; 8], u8)> {
 /// Each slot's connection task: let the host go (forgotten, or not selected under `ConnectWhenSelected`), or ask it
 /// for other connection parameters (selection changed).
 static CTL: [Signal<CriticalSectionRawMutex, Ctl>; MAX_HOSTS] = [const { Signal::new() }; MAX_HOSTS];
-/// The passkey typed for the slot that asked (None: cancel).
-static PASSKEY: Signal<CriticalSectionRawMutex, Option<u32>> = Signal::new();
+/// The passkey typed for each slot's pairing (None: cancel). Until 0.1.19 one signal served all, and the digits went to
+/// whichever connection waited, which needn't be the host that showed them.
+static PASSKEY: [Signal<CriticalSectionRawMutex, Option<u32>>; MAX_HOSTS] = [const { Signal::new() }; MAX_HOSTS];
 /// Something changed that may start or stop advertising.
 static ADVERTISE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
@@ -190,10 +204,54 @@ fn wanted(s: &State, slot: usize) -> bool {
         && (s.policies[slot] == Policy::StayConnected || s.selected as usize == slot + 1)
 }
 
+/// Pairing closed (ran out, closed by the RP2354B, or a host bonded): a connection without a bond that hasn't started
+/// pairing came in to pair, and goes. Until 0.1.19 one stayed, holding its slot: a host that got in on keys the module
+/// no longer kept, or one that connected and never paired. One whose passkey was asked for finishes: Windows takes long
+/// enough over adding a device that the window may close in the middle.
+fn drop_unpaired() {
+    for (slot, ctl) in CTL.iter().enumerate() {
+        if with(|s| s.live[slot] && !s.hosts[slot].bonded() && !s.pairing_now[slot]) {
+            ctl.signal(Ctl::Disconnect);
+        }
+    }
+}
+
 type Controller = ExternalController<BleConnector<'static>, 20>;
 type St = Stack<'static, Controller, DefaultPacketPool>;
 
-static RESOURCES: StaticCell<HostResources<DefaultPacketPool, CONNS, L2CAP, 1, MAX_HOSTS>> = StaticCell::new();
+/// Keeps the Bluetooth stack's keys to the slots' bonds and the pairings under way. The stack stores a pairing's keys
+/// as soon as it encrypts, whether or not the module keeps the host, and never lets them go by itself: keys left from
+/// a pairing that broke off, or from a host forgotten here that didn't match its identity (`bonds::Slot::identity`),
+/// filled the four places it had, and from then on every pairing failed just after its passkey, on keys it had no room
+/// to store (first dongle, 2026-11-15: "it accepts the code, connects for a moment and drops off").
+fn tidy_keys(stack: &St) {
+    let (ltks, peers) = with(|s| (s.bonds.slots.map(|b| b.map(|b| b.ltk)), s.pairing_peer));
+    let keep = |b: &BondInformation| {
+        ltks.iter().flatten().any(|k| *k == b.ltk.0)
+            || peers.iter().flatten().any(|p| p.match_identity(&b.identity) || b.identity.match_identity(p))
+    };
+    let (kept, stray) = stack.with_bond_information(|keys| {
+        let kept: heapless::Vec<BondInformation, KEYS> = keys.iter().filter(|b| keep(b)).cloned().collect();
+        let stray = keys.len() - kept.len();
+        (kept, stray)
+    });
+    if stray == 0 {
+        return;
+    }
+    // Removing by identity takes the first key that matches it, which may not be the one meant: all go, the kept ones
+    // come back.
+    while let Some(id) = stack.with_bond_information(|keys| keys.first().map(|b| b.identity)) {
+        if stack.remove_bond_information(id).is_err() {
+            break;
+        }
+    }
+    for b in kept {
+        let _ = stack.add_bond_information(b);
+    }
+    log::line(format_args!("Bluetooth: {stray} stray keys dropped"));
+}
+
+static RESOURCES: StaticCell<HostResources<DefaultPacketPool, CONNS, L2CAP, 1, KEYS>> = StaticCell::new();
 static STACK: StaticCell<St> = StaticCell::new();
 static SERVER: StaticCell<Server<'static>> = StaticCell::new();
 static BONDS: StaticCell<Bonds> = StaticCell::new();
@@ -236,6 +294,10 @@ pub async fn run(spawner: Spawner, bt: esp_hal::peripherals::BT<'static>, bonds:
             pairing_until: None,
             conn_gen: [0; MAX_HOSTS],
             live: [false; MAX_HOSTS],
+            pairing_peer: [None; MAX_HOSTS],
+            pairing_now: [false; MAX_HOSTS],
+            notify_saves: 0,
+            settings_held: 0,
         })
     });
     let server = SERVER.init(
@@ -277,6 +339,7 @@ async fn advertise(
         });
         if expired {
             event(EventKind::PairingClosed, 0, 0);
+            drop_unpaired();
         }
         let (pairing, reconnect) = with(|s| {
             let pairing = pairing_open(s) && free_slot(s).is_some();
@@ -384,6 +447,85 @@ fn params(selected: bool) -> RequestedConnParams {
     }
 }
 
+type Conn = GattConnection<'static, 'static, DefaultPacketPool>;
+
+/// The CCCDs of the characteristics that notify, in the order of [`notify`]'s bits.
+fn cccds(server: &Server<'_>) -> [Option<u16>; 5] {
+    [
+        server.hid.keyboard.cccd_handle,
+        server.hid.mouse.cccd_handle,
+        server.hid.consumer.cccd_handle,
+        server.hid.pointer.cccd_handle,
+        server.bas.level.cccd_handle,
+    ]
+}
+
+/// The notifications `conn`'s host has switched on ([`notify`] bits, with `KNOWN`).
+fn notifications(server: &Server<'_>, conn: &Conn) -> u8 {
+    let Some(t) = server.get_client_att_table(conn.raw()) else { return 0 };
+    cccds(server).iter().enumerate().fold(notify::KNOWN, |m, (bit, h)| {
+        let on = h.and_then(|h| t.get(h)).is_some_and(|v| v.first().is_some_and(|b| b & 1 != 0));
+        if on { m | 1 << bit } else { m }
+    })
+}
+
+/// Gives a bonded host that reconnects the notifications it switched on before. A GATT server keeps them for a bonded
+/// client, which doesn't write them again; trouble-host keeps them only in RAM, and only while the module runs. Until
+/// 0.1.21 a host back from sleep counted as not subscribed (the window showed it "connecting…" for good), and after a
+/// restart of the module it got no input at all: Windows writes them once, after pairing (first dongle, 2026-11-15).
+fn restore_notifications(server: &Server<'_>, conn: &Conn, bits: u8) {
+    let Some(mut t) = server.get_client_att_table(conn.raw()) else { return };
+    for (bit, h) in cccds(server).iter().enumerate() {
+        if let Some(h) = h {
+            let _ = t.write(*h, 0, if bits & (1 << bit) != 0 { &[1, 0] } else { &[0, 0] });
+        }
+    }
+    server.set_client_att_table(conn.raw(), &t.view());
+}
+
+/// A host's notification settings go to flash this long after its last change: a host switches several on at once,
+/// and each save erases a sector.
+const NOTIFY_SAVE_AFTER: Duration = Duration::from_secs(2);
+
+/// Saves of notification settings in one run of the module, at most (`bonds.rs`, "Wear"): a real host makes one per
+/// pairing, a host that kept switching them would make one every few seconds.
+const NOTIFY_SAVES: u8 = 16;
+
+/// Writes slot `slot`'s notification settings, if it holds a bond and they changed (`Bonds::set`). Past the run's
+/// [`NOTIFY_SAVES`] they are held in RAM instead, and the RP2354B is told (once per host).
+fn store_notifications(slot: usize, bits: u8) {
+    let first_held = with(|s| {
+        let Some(b) = s.bonds.slots[slot] else { return false };
+        let new = Slot { notify: bits, ..b };
+        if new == b {
+            false
+        } else if s.notify_saves < NOTIFY_SAVES {
+            s.notify_saves += 1;
+            s.bonds.set(slot, Some(new));
+            false
+        } else {
+            s.bonds.hold(slot, Some(new));
+            let first = s.settings_held & (1 << slot) == 0;
+            s.settings_held |= 1 << slot;
+            first
+        }
+    });
+    if first_held {
+        log::line(format_args!("host {}: notification settings held in RAM (wear guard)", slot + 1));
+        event(EventKind::SettingsHeld, slot as u8 + 1, 0);
+    }
+}
+
+fn set_subscribed(slot: usize, bits: u8) {
+    set_flags(slot, |h| {
+        if bits & notify::KEYBOARD != 0 {
+            h.flags |= host_flags::SUBSCRIBED;
+        } else {
+            h.flags &= !host_flags::SUBSCRIBED;
+        }
+    });
+}
+
 #[embassy_executor::task(pool_size = CONNS)]
 async fn connection(
     slot: usize,
@@ -401,24 +543,38 @@ async fn connection(
         h.flags |= host_flags::CONNECTED;
         h.addr = conn.raw().peer_address().to_bytes();
     });
+    with(|s| s.pairing_peer[slot] = new.then(|| conn.raw().peer_identity()));
     while REPORTS[slot].try_receive().is_ok() {}
     MOTION[slot].lock(|m| *m.borrow_mut() = Motion::new());
     MOTION_READY[slot].reset();
     CTL[slot].reset();
+    PASSKEY[slot].reset();
     // Bonded: encrypt with the stored key. New: pair and bond, the host asking for the passkey it shows. Bondable either
     // way (trouble-host's connections start not bondable): a bonded host that forgot the KVM pairs anew on this
     // connection, and trouble-host answers its pairing request before this task hears of it (`BondLost`). Not bondable,
     // that pairing took the passkey and gave no bond (first dongle, 2026-11-14: "it accepts the code, then nothing").
     let _ = conn.raw().set_bondable(true);
     let _ = conn.raw().request_security();
+    if !new {
+        let bits = with(|s| s.bonds.slots[slot].map(|b| b.notifications())).unwrap_or(notify::REPORTS);
+        restore_notifications(server, &conn, bits);
+        set_subscribed(slot, bits);
+    }
     let mut waiting_passkey = false;
-    let kb_cccd = server.hid.keyboard.cccd_handle;
+    // Notification settings changed by the host, and when they go to flash.
+    let mut unsaved: Option<(u8, Instant)> = None;
     loop {
         let passkey = async {
-            if waiting_passkey { PASSKEY.wait().await } else { core::future::pending().await }
+            if waiting_passkey { PASSKEY[slot].wait().await } else { core::future::pending().await }
+        };
+        let save = async {
+            match unsaved {
+                Some((_, at)) => Timer::at(at).await,
+                None => core::future::pending().await,
+            }
         };
         let input = select(REPORTS[slot].receive(), MOTION_READY[slot].wait());
-        let woke = select4(conn.next(), input, CTL[slot].wait(), passkey).await;
+        let woke = select4(conn.next(), input, CTL[slot].wait(), select(passkey, save)).await;
         // Superseded by a newer connection of this slot: nothing of this one counts any more.
         if !current() {
             log::line(format_args!("host {host}: an older connection, superseded"));
@@ -439,21 +595,31 @@ async fn connection(
                 }
                 GattConnectionEvent::PassKeyInput => {
                     waiting_passkey = true;
-                    PASSKEY.reset();
+                    PASSKEY[slot].reset();
+                    with(|s| s.pairing_now[slot] = true);
                     event(EventKind::PasskeyRequest, host, 0);
                 }
                 GattConnectionEvent::PairingComplete { bond, .. } => {
                     waiting_passkey = false;
                     if let Some(b) = bond {
-                        let s = Slot::from_bond(&b);
+                        // With the notifications the host may have switched on before it bonded.
+                        let s = Slot { notify: notifications(server, &conn), ..Slot::from_bond(&b) };
+                        unsaved = None;
                         // Written only if the keys are new (bonds.rs, "Wear").
                         with(|st| {
                             st.bonds.set(slot, Some(s));
                             st.pairing_until = None;
+                            st.pairing_peer[slot] = None;
+                            st.pairing_now[slot] = false;
                         });
                         set_flags(slot, |h| h.flags |= host_flags::BONDED | host_flags::ENCRYPTED);
                         log::line(format_args!("host {host}: bonded"));
                         event(EventKind::Paired, host, 0);
+                        // Pairing is closed now: other hosts let in to pair go, and keys left from earlier attempts.
+                        drop_unpaired();
+                        tidy_keys(stack);
+                        let selected = with(|s| s.selected == host);
+                        let _ = conn.raw().update_connection_params(stack, &params(selected)).await;
                     } else if !with(|s| s.hosts[slot].bonded()) {
                         // Paired without a bond (the host didn't ask for one): nothing to reconnect with, so not a host.
                         log::line(format_args!("host {host}: paired without a bond"));
@@ -463,6 +629,7 @@ async fn connection(
                 }
                 GattConnectionEvent::PairingFailed(_) => {
                     waiting_passkey = false;
+                    with(|s| s.pairing_now[slot] = false);
                     event(EventKind::PairFailed, host, 0);
                     if !with(|s| s.hosts[slot].bonded()) {
                         conn.raw().disconnect();
@@ -479,6 +646,7 @@ async fn connection(
                     event(EventKind::BondLost, host, 0);
                     if with(|s| pairing_open(s)) {
                         // Into the same slot (this connection holds it), with a passkey as any new host.
+                        with(|s| s.pairing_peer[slot] = Some(conn.raw().peer_identity()));
                         log::line(format_args!("host {host}: pairing anew"));
                     } else {
                         // Only while pairing is open, as for any host the module doesn't know.
@@ -488,20 +656,18 @@ async fn connection(
                 }
                 GattConnectionEvent::Encrypted { .. } => {
                     set_flags(slot, |h| h.flags |= host_flags::ENCRYPTED);
-                    let selected = with(|s| s.selected == host);
-                    let _ = conn.raw().update_connection_params(stack, &params(selected)).await;
+                    // A pairing exchanges its keys from here on: the parameters wait for its end (`PairingComplete`),
+                    // so that this task keeps taking the stack's events meanwhile.
+                    if with(|s| s.pairing_peer[slot].is_none()) {
+                        let selected = with(|s| s.selected == host);
+                        let _ = conn.raw().update_connection_params(stack, &params(selected)).await;
+                    }
                 }
                 GattConnectionEvent::Gatt { event: e } => {
+                    let mut cccd = false;
                     if let GattEvent::Write(w) = &e {
-                        if Some(w.handle()) == kb_cccd {
-                            let on = w.with_data(|_, d| d.first().is_some_and(|b| b & 1 != 0));
-                            set_flags(slot, |h| {
-                                if on {
-                                    h.flags |= host_flags::SUBSCRIBED;
-                                } else {
-                                    h.flags &= !host_flags::SUBSCRIBED;
-                                }
-                            });
+                        if cccds(server).contains(&Some(w.handle())) {
+                            cccd = true;
                         } else if w.handle() == server.hid.leds.handle {
                             let leds = w.with_data(|_, d| d.first().copied().unwrap_or(0));
                             link::send(&BtMsg::Output { host, id: report::KEYBOARD, data: &[leds] });
@@ -509,6 +675,12 @@ async fn connection(
                     }
                     if let Ok(reply) = e.accept() {
                         reply.send().await;
+                    }
+                    // Accepted, the write is in the table: what the host has on now, kept with its bond.
+                    if cccd {
+                        let bits = notifications(server, &conn);
+                        set_subscribed(slot, bits);
+                        unsaved = Some((bits, Instant::now() + NOTIFY_SAVE_AFTER));
                     }
                 }
                 _ => {}
@@ -525,9 +697,14 @@ async fn connection(
                 if !MOTION[slot].lock(|m| m.borrow().is_empty()) {
                     MOTION_READY[slot].signal(());
                 }
-                let encrypted = with(|s| s.hosts[slot].flags & host_flags::ENCRYPTED != 0);
+                // The link's own state: an `Encrypted` event can be missed (a full event queue, before 0.1.21), and the
+                // host then got nothing while it showed "connecting…".
+                let encrypted = conn.raw().security_level().is_ok_and(|l| l.encrypted());
                 if !encrypted {
                     continue;
+                }
+                if with(|s| s.hosts[slot].flags & host_flags::ENCRYPTED == 0) {
+                    set_flags(slot, |h| h.flags |= host_flags::ENCRYPTED);
                 }
                 let d = &data[..len as usize];
                 let _ = match id {
@@ -559,7 +736,12 @@ async fn connection(
                 let selected = with(|s| s.selected == host);
                 let _ = conn.raw().update_connection_params(stack, &params(selected)).await;
             }
-            Either4::Fourth(value) => {
+            Either4::Fourth(Either::Second(())) => {
+                if let Some((bits, _)) = unsaved.take() {
+                    store_notifications(slot, bits);
+                }
+            }
+            Either4::Fourth(Either::First(value)) => {
                 waiting_passkey = false;
                 let _ = match value {
                     Some(v) => conn.raw().pass_key_input(v),
@@ -568,15 +750,27 @@ async fn connection(
             }
         }
     }
+    // Settings the host changed just before it left (an older connection's are no longer the slot's).
+    if let Some((bits, _)) = unsaved
+        && current()
+    {
+        store_notifications(slot, bits);
+    }
     // Only the slot's current connection takes its state with it, and lets the slot go.
     if current() {
-        with(|s| s.live[slot] = false);
+        with(|s| {
+            s.live[slot] = false;
+            s.pairing_peer[slot] = None;
+            s.pairing_now[slot] = false;
+        });
         set_flags(slot, |h| {
             h.flags &= !(host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED);
             h.interval = 0;
             h.latency = 0;
         });
     }
+    // A pairing that didn't end in a bond leaves its keys in the stack.
+    tidy_keys(stack);
     ADVERTISE.signal(());
 }
 
@@ -627,25 +821,38 @@ async fn control(stack: &'static St) {
             BtMsg::Pair { on, seconds } => {
                 with(|s| s.pairing_until = on.then(|| Instant::now() + Duration::from_secs(seconds as u64)));
                 event(if on { EventKind::PairingOpen } else { EventKind::PairingClosed }, 0, seconds as u32);
+                if !on {
+                    drop_unpaired();
+                }
                 // The advertising loop closes it when the time is up.
                 ADVERTISE.signal(());
             }
             BtMsg::Forget { host } => {
                 let picked = |slot: usize| host == 0xFF || host as usize == slot + 1;
                 // One flash save for all of them, none for slots already free (bonds.rs, "Wear").
-                let removed = with(|s| s.bonds.clear(picked));
+                with(|s| {
+                    s.bonds.clear(picked);
+                    for (i, p) in s.pairing_peer.iter_mut().enumerate() {
+                        if picked(i) {
+                            *p = None;
+                        }
+                    }
+                });
                 // Out of the stack's keys too: otherwise the forgotten host, which still has its keys, would get back in
-                // encrypted, without a passkey, the next time pairing is open (until the module restarts).
-                for b in removed.iter().flatten() {
-                    let _ = stack.remove_bond_information(b.identity());
-                }
+                // encrypted, without a passkey, the next time pairing is open (until the module restarts). The host
+                // keeps the KVM in its own list: Bluetooth LE has no way to make it let go, so it is removed there.
+                tidy_keys(stack);
                 for slot in (0..MAX_HOSTS).filter(|&i| picked(i)) {
                     set_flags(slot, |h| h.flags &= !host_flags::BONDED);
                     CTL[slot].signal(Ctl::Disconnect);
                 }
                 ADVERTISE.signal(());
             }
-            BtMsg::Passkey { value, .. } => PASSKEY.signal(value),
+            BtMsg::Passkey { host, value } => {
+                if let Some(slot) = (host as usize).checked_sub(1).filter(|i| *i < MAX_HOSTS) {
+                    PASSKEY[slot].signal(value);
+                }
+            }
             BtMsg::Policy { host, policy } => {
                 if let Some(slot) = (host as usize).checked_sub(1).filter(|i| *i < MAX_HOSTS) {
                     with(|s| s.policies[slot] = policy);
@@ -659,6 +866,11 @@ async fn control(stack: &'static St) {
             BtMsg::RequestState | BtMsg::Hello { .. } => {
                 for slot in 0..MAX_HOSTS {
                     report_host(slot);
+                }
+                // The RP2354B may have restarted and forgotten.
+                let held = with(|s| s.settings_held);
+                for slot in (0..MAX_HOSTS).filter(|i| held & (1 << i) != 0) {
+                    event(EventKind::SettingsHeld, slot as u8 + 1, 0);
                 }
             }
             _ => {}
