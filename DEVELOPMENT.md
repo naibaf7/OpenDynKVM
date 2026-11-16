@@ -80,6 +80,10 @@ OPENDYN_SIM_BT=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim   # the same w
 OPENDYN_SIM_BT=dongle cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the module as an ESP32-C3 board on Other
 OPENDYN_SIM_HOP=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the same with screen hop set up
 OPENDYN_LANG=de cargo run -p odkvmctl --bin odkvmctl -- --sim       # in German (en, fr, de, nb, zh; or Settings → Language)
+# The GUI with the simulator in a browser (software.md §9 "On the web"; needs the wasm32-unknown-unknown target and
+# wasm-bindgen-cli of the wasm-bindgen version in Cargo.lock); serve target/web with a <canvas id="opendyn-kvm"> page:
+cargo build -p odkvmctl --bin opendyn-kvm --release --target wasm32-unknown-unknown
+wasm-bindgen --target web --no-typescript --out-dir target/web target/wasm32-unknown-unknown/release/opendyn-kvm.wasm
 ```
 
 `cargo xtask dist` builds the AT32F405 firmware, then the RP2354B firmware with it embedded, and the Bluetooth
@@ -119,8 +123,8 @@ Hardware, firmware and host software each carry a `major.minor.patch` version.
 | What | Now | Where it is set |
 |---|---|---|
 | Hardware | **0.18.0** in design, not ordered yet (0.13.0 to 0.17.0 were designed and never ordered). **0.12.0** is the board ordered as revision 12 | `HW_VERSION` in `hardware/tools/gen_pcb.py` (printed on the board: the design's version) and `kvm_proto::HARDWARE_VERSION` (what the firmware reports: the newest board that was ordered, still 0.12.0) |
-| Firmware, RP2354B and both AT32F405s alike | **0.1.23** | `kvm_proto::FIRMWARE_VERSION` |
-| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.23** | `version` in the root `Cargo.toml` |
+| Firmware, RP2354B and both AT32F405s alike | **0.1.24** | `kvm_proto::FIRMWARE_VERSION` |
+| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.24** | `version` in the root `Cargo.toml` |
 
 - **Hardware:** a new major version is a different board: 1.0.0 will be the mass-production board, 2.0.0 a new design.
   Minor versions are revisions of the same board. When a board is ordered:

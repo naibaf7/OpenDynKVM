@@ -1,12 +1,16 @@
 //! Background thread that owns the connection: runs UI commands, refreshes the snapshot, collects events, and
 //! reconnects when the KVM goes away.
+//!
+//! In a browser (the web build) a page has one thread: [`Web`] does the same rounds, one per frame, with the
+//! simulator; the threads here (and the cursor and monitor sync) are for the desktop.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
+use odkvmctl::time::{Duration, Instant};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 
 use kvm_core::hotkey::format_spec;
 use kvm_proto::ctrl::{
@@ -298,13 +302,109 @@ pub fn spawn_boot_scan(sim: bool, shared: Arc<Mutex<Shared>>, wake: Wake) {
     });
 }
 
+/// What the worker keeps between rounds: the KVM's state as last passed to the follower, and the last snapshot read
+/// (for what changed with the Bluetooth hosts; the window's copy may be edited).
+#[derive(Default)]
+struct Seen {
+    kvm: Option<KvmState>,
+    last: Option<Snapshot>,
+}
+
+/// Runs one of the window's commands. Ok(true): it changes what the snapshot shows (reading the diagnostics doesn't);
+/// Err: the KVM is gone.
+fn command(c: &mut Client, cmd: UiCmd, shared: &Mutex<Shared>, wake: &Wake) -> Result<bool, ()> {
+    let refresh = !matches!(cmd, UiCmd::Diagnose);
+    if let Err(e) = run(c, cmd, shared, wake) {
+        let lost = is_disconnect(&e);
+        shared.lock().unwrap().error = Some(e.to_string());
+        if lost {
+            return Err(());
+        }
+    }
+    Ok(refresh)
+}
+
+/// Reads the KVM's state into `shared`. Err: the KVM is gone.
+fn refresh(
+    c: &mut Client,
+    shared: &Mutex<Shared>,
+    follow: &Option<Sender<KvmState>>,
+    seen: &mut Seen,
+) -> Result<(), ()> {
+    match c.snapshot() {
+        Ok(snap) => {
+            // A change of profile shows here: the events below refresh at once.
+            tell(follow, &mut seen.kvm, kvm_state(&snap));
+            let changes = seen.last.as_ref().map(|old| bt_changes(old, &snap)).unwrap_or_default();
+            seen.last = Some(snap.clone());
+            let mut s = shared.lock().unwrap();
+            for c in changes {
+                s.events.push_front(c);
+            }
+            s.events.truncate(50);
+            s.snap = Some(snap);
+            if s.error.as_deref().is_some_and(|e| e == Error::Timeout.to_string()) {
+                s.error = None;
+            }
+            Ok(())
+        }
+        Err(e) if is_disconnect(&e) => Err(()),
+        Err(e) => {
+            shared.lock().unwrap().error = Some(e.to_string());
+            Ok(())
+        }
+    }
+}
+
+/// Takes the KVM's events into `shared`, waiting up to `wait` for the first. Ok(true): there were some (the snapshot
+/// is due); Err: the KVM is gone.
+fn take_events(
+    c: &mut Client,
+    wait: Duration,
+    shared: &Mutex<Shared>,
+    follow: &Option<Sender<KvmState>>,
+    seen: &mut Seen,
+) -> Result<bool, ()> {
+    let evs = c.events(wait).map_err(|_| ())?;
+    if evs.is_empty() {
+        return Ok(false);
+    }
+    let mut s = shared.lock().unwrap();
+    for e in &evs {
+        if let Some(text) = describe(e) {
+            s.events.push_front(text);
+        }
+        if let Event::HotkeyLearned(end, h) = e {
+            s.learn = Some(Ok((*end, *h)));
+        }
+        // Switches go to the monitors straight away, without waiting for the refresh: to a PC, or to a host the last
+        // snapshot knows. Back from a host (BtActive(0)) a Switched follows.
+        let now = seen.kvm.clone().unwrap_or_default();
+        match e {
+            Event::Switched(pc, _) => {
+                tell(follow, &mut seen.kvm, KvmState { pc: pc.index(), bt: None, ..now });
+            }
+            Event::BtActive(n @ 1..) => {
+                let host = seen.last.as_ref().and_then(|l| l.bt.iter().find(|h| h.slot == *n));
+                if let Some(h) = host {
+                    let bt = Some(h.address());
+                    tell(follow, &mut seen.kvm, KvmState { bt, ..now });
+                }
+            }
+            _ => {}
+        }
+    }
+    s.events.truncate(50);
+    Ok(true)
+}
+
 /// `follow`: switch the monitors bound on the Displays page along (also with the simulator, so it can be tried before a
 /// KVM exists; the tests turn it off so that they never move this computer's monitors).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn(sim: bool, follow: bool, shared: Arc<Mutex<Shared>>, rx: Receiver<UiCmd>, wake: Wake) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let follow = follow.then(|| follower(shared.clone(), wake.clone()));
-        // The KVM's active PC and profile as last passed to the follower.
-        let mut kvm: Option<KvmState> = None;
+        let mut seen = Seen::default();
         loop {
             let mut c = match Client::connect(sim) {
                 Ok(c) => c,
@@ -333,86 +433,33 @@ pub fn spawn(sim: bool, follow: bool, shared: Arc<Mutex<Shared>>, rx: Receiver<U
                 s.error = None;
             }
             let mut next_refresh = Instant::now();
-            // The last snapshot read, for what changed with the Bluetooth hosts (the window's copy may be edited).
-            let mut last: Option<Snapshot> = None;
+            seen.last = None;
             let mut cursor = CursorSync::default();
             'connected: loop {
                 loop {
                     match rx.try_recv() {
-                        Ok(cmd) => {
-                            // A change shows in the snapshot at once; reading the diagnostics changes nothing.
-                            let refresh = !matches!(cmd, UiCmd::Diagnose);
-                            if let Err(e) = run(&mut c, cmd, &shared, &wake) {
-                                let lost = is_disconnect(&e);
-                                shared.lock().unwrap().error = Some(e.to_string());
-                                if lost {
-                                    break 'connected;
-                                }
-                            }
-                            if refresh {
-                                next_refresh = Instant::now();
-                            }
-                        }
+                        Ok(cmd) => match command(&mut c, cmd, &shared, &wake) {
+                            Ok(true) => next_refresh = Instant::now(),
+                            Ok(false) => {}
+                            Err(()) => break 'connected,
+                        },
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => return,
                     }
                 }
                 if Instant::now() >= next_refresh {
-                    match c.snapshot() {
-                        Ok(snap) => {
-                            // A change of profile shows here: the events below refresh at once.
-                            tell(&follow, &mut kvm, kvm_state(&snap));
-                            let changes = last.as_ref().map(|old| bt_changes(old, &snap)).unwrap_or_default();
-                            last = Some(snap.clone());
-                            let mut s = shared.lock().unwrap();
-                            for c in changes {
-                                s.events.push_front(c);
-                            }
-                            s.events.truncate(50);
-                            s.snap = Some(snap);
-                            if s.error.as_deref().is_some_and(|e| e == Error::Timeout.to_string()) {
-                                s.error = None;
-                            }
-                        }
-                        Err(e) if is_disconnect(&e) => break 'connected,
-                        Err(e) => shared.lock().unwrap().error = Some(e.to_string()),
+                    if refresh(&mut c, &shared, &follow, &mut seen).is_err() {
+                        break 'connected;
                     }
                     next_refresh = Instant::now() + REFRESH;
                     wake();
                 }
-                match c.events(Duration::from_millis(100)) {
-                    Ok(evs) if !evs.is_empty() => {
-                        let mut s = shared.lock().unwrap();
-                        for e in &evs {
-                            if let Some(text) = describe(e) {
-                                s.events.push_front(text);
-                            }
-                            if let Event::HotkeyLearned(end, h) = e {
-                                s.learn = Some(Ok((*end, *h)));
-                            }
-                            // Switches go to the monitors straight away, without waiting for the refresh: to a PC, or
-                            // to a host the last snapshot knows. Back from a host (BtActive(0)) a Switched follows.
-                            let now = kvm.clone().unwrap_or_default();
-                            match e {
-                                Event::Switched(pc, _) => {
-                                    tell(&follow, &mut kvm, KvmState { pc: pc.index(), bt: None, ..now });
-                                }
-                                Event::BtActive(n @ 1..) => {
-                                    let host = last.as_ref().and_then(|l| l.bt.iter().find(|h| h.slot == *n));
-                                    if let Some(h) = host {
-                                        tell(&follow, &mut kvm, KvmState { bt: Some(h.address()), ..now });
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        s.events.truncate(50);
-                        next_refresh = Instant::now();
-                    }
-                    Ok(_) => {}
-                    Err(_) => break 'connected,
+                match take_events(&mut c, Duration::from_millis(100), &shared, &follow, &mut seen) {
+                    Ok(true) => next_refresh = Instant::now(),
+                    Ok(false) => {}
+                    Err(()) => break 'connected,
                 }
-                cursor.poll(&mut c, last.as_ref().is_some_and(|l| l.status.hop != HopState::Off));
+                cursor.poll(&mut c, seen.last.as_ref().is_some_and(|l| l.status.hop != HopState::Off));
             }
             {
                 let mut s = shared.lock().unwrap();
@@ -424,6 +471,49 @@ pub fn spawn(sim: bool, follow: bool, shared: Arc<Mutex<Shared>>, rx: Receiver<U
             std::thread::sleep(RECONNECT);
         }
     })
+}
+
+/// The worker in a browser (the web build): the simulator only, one round per frame of the window instead of a
+/// thread of its own (a browser page has one), and no monitors to follow.
+#[cfg(target_arch = "wasm32")]
+pub struct Web {
+    c: Client,
+    shared: Arc<Mutex<Shared>>,
+    rx: Receiver<UiCmd>,
+    wake: Wake,
+    next_refresh: Instant,
+    seen: Seen,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Web {
+    pub fn new(shared: Arc<Mutex<Shared>>, rx: Receiver<UiCmd>, wake: Wake) -> Web {
+        let c = Client::connect(true).expect("the simulator is always there");
+        {
+            let mut s = shared.lock().unwrap();
+            s.device = Some(c.describe());
+            s.sim_keyboard = c.simulated_keyboard();
+        }
+        Web { c, shared, rx, wake, next_refresh: Instant::now(), seen: Seen::default() }
+    }
+
+    /// The window's commands, the snapshot once a [`REFRESH`] (or after a change), the events; never waits.
+    pub fn step(&mut self) {
+        while let Ok(cmd) = self.rx.try_recv() {
+            if let Ok(true) = command(&mut self.c, cmd, &self.shared, &self.wake) {
+                self.next_refresh = Instant::now();
+            }
+        }
+        if Instant::now() >= self.next_refresh {
+            let _ = refresh(&mut self.c, &self.shared, &None, &mut self.seen);
+            self.next_refresh = Instant::now() + REFRESH;
+            (self.wake)();
+        }
+        if let Ok(true) = take_events(&mut self.c, Duration::ZERO, &self.shared, &None, &mut self.seen) {
+            self.next_refresh = Instant::now();
+            (self.wake)();
+        }
+    }
 }
 
 #[cfg(test)]

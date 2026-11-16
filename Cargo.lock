@@ -1154,6 +1154,7 @@ dependencies = [
  "egui-winit",
  "egui_glow",
  "egui_system_font_provider",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -2622,7 +2623,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-core"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "defmt",
  "heapless",
@@ -2633,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-hid"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "defmt",
  "heapless",
@@ -2641,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-proto"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "defmt",
  "heapless",
@@ -2649,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-usbdev"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "defmt",
  "embassy-futures",
@@ -2662,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-vial"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "defmt",
  "heapless",
@@ -3376,7 +3377,7 @@ dependencies = [
 
 [[package]]
 name = "odkvmctl"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "clap",
@@ -3400,6 +3401,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tray-icon",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
  "windows-sys 0.61.2",
 ]
 
@@ -5847,7 +5852,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "anyhow",
  "flate2",

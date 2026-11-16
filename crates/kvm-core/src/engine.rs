@@ -278,6 +278,8 @@ pub struct Engine {
     arrangements_dirty: u8,
     /// Where screen hop last put the active Bluetooth host's absolute pointer: released there when it is left.
     bt_pointer_at: Option<[u16; 2]>,
+    /// The buttons last sent in the active Bluetooth host's mouse report.
+    bt_mouse_buttons: u16,
     /// Saves that may go ahead now, up to [`SAVE_BURST`]; one more each [`SAVE_PACE_MS`] after `save_paced`.
     save_allowance: u8,
     save_paced: u32,
@@ -397,6 +399,7 @@ impl Engine {
             config_dirty: false,
             arrangements_dirty: 0,
             bt_pointer_at: None,
+            bt_mouse_buttons: 0,
             save_allowance: SAVE_BURST,
             save_paced: 0,
             vial: kvm_vial::Vial::new(),
@@ -936,6 +939,7 @@ impl Engine {
         self.bt.active = Some(n);
         self.bt.sent_keyboard = [0; btreport::KEYBOARD_LEN];
         self.bt.sent_consumer = 0;
+        self.bt_mouse_buttons = 0;
         self.emit(Output::Bt(BtOut::Select(n)));
         self.apply_leds();
         self.event(Event::BtActive(n));
@@ -946,6 +950,7 @@ impl Engine {
         let Some(n) = self.bt.active.take() else { return };
         self.bt_input(n, btreport::KEYBOARD, &[0; btreport::KEYBOARD_LEN]);
         self.bt_input(n, btreport::MOUSE, &[0; btreport::MOUSE_LEN]);
+        self.bt_mouse_buttons = 0;
         if let Some([x, y]) = self.bt_pointer_at.take() {
             self.bt_input(n, btreport::POINTER, &kvm_proto::link::bt::pointer_report(0, x, y, 0, 0));
         }
@@ -1580,11 +1585,18 @@ impl Engine {
             (None, Some(n)) => n,
             (None, None) => return,
         };
+        // Absolute on the main screen only: buttons go on the mouse, as on a PC (`PcOutput::pointer`), so a window
+        // dragged onto another screen is let go there.
+        let buttons_rel = self.config.mapping(host) == ctrl::Mapping::MainScreen;
         match motion {
             hop::Report::Abs([x, y]) => {
                 self.bt_pointer_at = Some([x, y]);
-                let r = kvm_proto::link::bt::pointer_report(buttons, x, y, wheel, pan);
+                let r = kvm_proto::link::bt::pointer_report(if buttons_rel { 0 } else { buttons }, x, y, wheel, pan);
                 self.bt_input(n, btreport::POINTER, &r);
+                if buttons_rel && buttons != self.bt_mouse_buttons {
+                    self.bt_mouse_buttons = buttons;
+                    self.bt_input(n, btreport::MOUSE, &kvm_proto::link::bt::mouse_report(buttons, 0, 0, 0, 0));
+                }
             }
             hop::Report::Rel(mut d) => {
                 // The mouse report carries ±32767 each way: a longer move (a park) takes several.
@@ -1593,6 +1605,7 @@ impl Engine {
                     let step = d.map(|v| v.clamp(-32767, 32767));
                     let r = kvm_proto::link::bt::mouse_report(buttons, step[0], step[1], wheel, pan);
                     self.bt_input(n, btreport::MOUSE, &r);
+                    self.bt_mouse_buttons = buttons;
                     d = [d[0] - step[0], d[1] - step[1]];
                     (wheel, pan) = (0, 0);
                     if d == [0, 0] {
@@ -1604,7 +1617,9 @@ impl Engine {
     }
 
     fn send_pointer_report(&mut self, pc: Pc, motion: hop::Report, buttons: u16, wheel: i32, pan: i32) {
-        let reports = self.pcs[pc.index()].out.pointer(motion, buttons, wheel, pan, &self.presentation);
+        // Absolute on the main screen only (Windows): the relative pointer presses, the absolute one only places.
+        let buttons_rel = self.config.mapping(Host::pc(pc)) == ctrl::Mapping::MainScreen;
+        let reports = self.pcs[pc.index()].out.pointer(motion, buttons, wheel, pan, buttons_rel, &self.presentation);
         for (ep, r) in reports {
             self.send(pc, ep, r);
         }

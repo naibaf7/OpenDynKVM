@@ -1,8 +1,8 @@
 //! Request/response client over a [`Transport`], with typed helpers.
 
+use crate::time::{Duration, Instant};
 use std::collections::VecDeque;
 use std::fmt;
-use std::time::{Duration, Instant};
 
 use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::{
@@ -14,7 +14,7 @@ use kvm_proto::ctrl::{
 use kvm_proto::link::bt::host_flags;
 
 use crate::fl;
-use crate::transport::{HidTransport, Transport};
+use crate::transport::Transport;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -264,8 +264,14 @@ impl Client {
         // `odkvmctl` running together each start numbering somewhere else, and an answer counts only with both its id
         // and its request type (`request`). Both counting from 1, `odkvmctl update` once took the window's
         // `GetConfig` answer for its own and gave up (2026-11-12).
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
-        let next_id = ((seed ^ std::process::id().rotate_left(8)) % 255) as u8 + 1;
+        let seed =
+            crate::time::SystemTime::now().duration_since(crate::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        // A browser has no process ids (and runs one app).
+        #[cfg(not(target_arch = "wasm32"))]
+        let pid = std::process::id();
+        #[cfg(target_arch = "wasm32")]
+        let pid = 0u32;
+        let next_id = ((seed ^ pid.rotate_left(8)) % 255) as u8 + 1;
         Self { t, next_id, events: VecDeque::new(), timeout: Duration::from_millis(1000) }
     }
 
@@ -274,8 +280,11 @@ impl Client {
         if sim {
             return Ok(Self::new(Box::new(crate::sim::SimTransport::new())));
         }
-        let t = HidTransport::open_first().map_err(Error::Transport)?;
-        Ok(Self::new(Box::new(t)))
+        #[cfg(not(target_arch = "wasm32"))]
+        return Ok(Self::new(Box::new(crate::transport::HidTransport::open_first().map_err(Error::Transport)?)));
+        // In a browser there is only the simulator.
+        #[cfg(target_arch = "wasm32")]
+        Err(Error::Transport(crate::fl!("no-kvm-found")))
     }
 
     pub fn describe(&self) -> String {
@@ -428,7 +437,7 @@ impl Client {
         }
         let until = Instant::now() + Duration::from_millis(kvm_core::engine::UNLOCK_WAIT_MS as u64 + 1000);
         while Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(250));
+            crate::time::sleep(Duration::from_millis(250));
             if self.status()?.flags & flag != 0 {
                 return Ok(());
             }
@@ -557,7 +566,7 @@ impl Client {
             match self.request(&req) {
                 Ok(Response::Fw { state, progress }) => return Ok((state, progress)),
                 Ok(other) => return Err(Error::Protocol(fl!("protocol-unexpected", answer = format!("{other:?}")))),
-                Err(Error::Device(ErrorCode::Busy)) => std::thread::sleep(Duration::from_millis(5)),
+                Err(Error::Device(ErrorCode::Busy)) => crate::time::sleep(Duration::from_millis(5)),
                 Err(e) => return Err(e),
             }
         }
@@ -580,7 +589,7 @@ impl Client {
             if started.elapsed() > Duration::from_secs(120) {
                 return Err(Error::Timeout);
             }
-            std::thread::sleep(Duration::from_millis(250));
+            crate::time::sleep(Duration::from_millis(250));
             state = self.fw(Request::FwStatus)?.0;
         }
         progress(state, total, total);

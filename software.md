@@ -833,6 +833,12 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
 - **Two pointers, one button:** to a PC the relative and the absolute pointer are two devices, and Linux keeps a
   button down on the device it was pressed on. A button stays on the pointer it was pressed on and is released there
   (`PcOutput::held`); switching away releases both, the absolute one where it is.
+  - With `main-screen` the buttons go on the relative pointer, and the absolute one only places the cursor (a
+    Bluetooth host likewise: its mouse report carries them, its pointer report none). An absolute report always
+    carries a position, and that pointer's reaches the main screen only: until 0.1.23 a window dragged from the main
+    screen onto another was let go by the absolute pointer at its last position, and Windows dropped it back on the
+    main screen (first board, 2026-11-16). Windows keeps one button state for all its mice, so a press on one and the
+    motion on the other drag as one.
 - **Acceleration** (`hop-accel`, `hop-speed` −10–10): an absolute pointer isn't accelerated by the PC, so the KVM is.
   The speed is measured as libinput measures it: back over the last 16 reports within 300 ms while the direction
   stays within neighbouring octants and the speed within 1 count/ms of the latest; the first report after a pause
@@ -1370,6 +1376,12 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
   devices. The GUI is developed and demonstrated with it before hardware exists. It presses the KVM's key when the KVM
   waits for it; its keyboard types what the GUI sends while learning a hotkey: the keys pressed in the window
   (`Transport::simulated_keyboard`), since this computer's keyboard isn't on the simulated KVM.
+- **On the web** (the simulator in a browser): `opendyn-kvm` also builds for `wasm32-unknown-unknown`, the window in a
+  page's `<canvas id="opendyn-kvm">` (`web.rs`: eframe's web runner, WebGL through glow). It has only the simulator: no
+  USB, files, tray, single copy or DDC/CI. The worker's rounds run once per frame (`worker::Web`) instead of on a thread
+  of their own, waits spin on the browser's clock (`odkvmctl::time`), the local settings live in the page's storage,
+  and the page's address stands in for the environment (`?OPENDYN_SIM_BT=1&OPENDYN_SIM_HOP=1`, `OPENDYN_LANG=de`).
+  The product page (repository opendynkvm-web) builds it from here; nothing here depends on that repository.
 - **Linux:** `software/odkvmctl/udev/70-opendyn-kvm.rules` gives the logged-in user access to the control interface's
   hidraw node and to the graphics cards' I2C buses (PCI class 0x03, as ddcutil's rule) for DDC/CI; the packages install
   it, reload udev, and load `i2c-dev` (`modules-load.d`, and `modprobe` on install).

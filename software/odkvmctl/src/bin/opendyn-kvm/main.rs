@@ -5,6 +5,8 @@
 //! copy's window. The look follows the Creative App (`look.rs`): a sidebar with the pages and quick controls, the
 //! content in cards, dark or light.
 #![cfg_attr(windows, windows_subsystem = "windows")]
+// In a browser (the web build, `web.rs`) the desktop's parts go unused: the tray, the single copy, the window loop.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports, unused_variables))]
 
 mod bluetooth;
 mod displays;
@@ -14,6 +16,8 @@ mod pages;
 mod screens;
 mod single;
 mod tray;
+#[cfg(target_arch = "wasm32")]
+mod web;
 mod worker;
 
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -109,7 +113,7 @@ struct App {
     bt_names: [Option<String>; 4],
     hotkeys_loaded: bool,
     /// The hotkey row being learned from the KVM's keyboard, since when; how learning one last ended (Err: not learned).
-    learning: Option<(usize, std::time::Instant)>,
+    learning: Option<(usize, odkvmctl::time::Instant)>,
     learn_note: Option<(usize, Result<String, String>)>,
     /// With the simulator, while learning: the modifiers and keys its keyboard holds, as played in the window.
     sim_keys: Option<(u8, Vec<u8>)>,
@@ -119,12 +123,12 @@ struct App {
     /// A software lock waiting for "are you sure" before it is sent.
     confirm_lock: Option<ConfigValue>,
     /// Allowing software control again: since when the KVM waits for its key, and the status flag that says it's done.
-    unlock_wait: Option<(std::time::Instant, u8)>,
+    unlock_wait: Option<(odkvmctl::time::Instant, u8)>,
     unlock_note: Option<String>,
     /// The firmware file the Firmware page installs.
     fw: install::Files,
     /// When the Firmware page last asked for the diagnostics.
-    diag_asked: Option<std::time::Instant>,
+    diag_asked: Option<odkvmctl::time::Instant>,
     quitting: bool,
     /// Close this window and open a new one with this activation token (Wayland: the only way to raise it).
     reopen: Option<String>,
@@ -191,6 +195,14 @@ pub(crate) fn optimistic(shared: &Mutex<Shared>, v: ConfigValue) {
 /// The active target's colour: the active PC's, or violet while a Bluetooth host has the input.
 fn accent_of(s: &Snapshot) -> Color32 {
     if s.status.bt_active != 0 { bluetooth::violet() } else { look::color32(pc_colors(s)[s.status.active.index()]) }
+}
+
+/// Runs `f` on a thread of its own; in a browser (the web build: one thread) right away.
+pub(crate) fn background(f: impl FnOnce() + Send + 'static) {
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::spawn(f);
+    #[cfg(target_arch = "wasm32")]
+    f();
 }
 
 fn switch_target(pc: Pc) -> Target {
@@ -505,6 +517,7 @@ impl eframe::App for Window<'_> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn options(sim: bool, visible: bool) -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -520,6 +533,13 @@ fn options(sim: bool, visible: bool) -> eframe::NativeOptions {
     }
 }
 
+/// In a browser (the web build) the page starts the window in its canvas: `web::start`.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    web::start();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
     // The language set on this computer (Settings), or the system's.
     odkvmctl::i18n::init(local::load().language.as_deref());
@@ -590,7 +610,7 @@ fn main() -> eframe::Result {
         let token = match app.reopen.take() {
             Some(t) => Some(t),
             None => loop {
-                match app.tray_rx.recv_timeout(std::time::Duration::from_millis(300)) {
+                match app.tray_rx.recv_timeout(odkvmctl::time::Duration::from_millis(300)) {
                     Ok(TrayAction::Open(t)) => break t,
                     Ok(TrayAction::Quit) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     Ok(TrayAction::Switch(t)) => app.switch_to(t),
@@ -631,10 +651,10 @@ mod tests {
             current: Some(0x12),
             error: None,
         }]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(5);
         while shared.lock().unwrap().snap.is_none() {
-            assert!(std::time::Instant::now() < deadline, "simulator never answered");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(odkvmctl::time::Instant::now() < deadline, "simulator never answered");
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
         }
         (ctx, app, shared)
     }
@@ -662,14 +682,14 @@ mod tests {
         }
         assert_eq!(app.hotkeys[0], "double:scrolllock");
         app.send(UiCmd::Switch(Target::Pc2));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(5);
         loop {
             let active = shared.lock().unwrap().snap.as_ref().map(|s| s.status.active);
             if active == Some(Pc::Pc2) {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "switch never showed up");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(odkvmctl::time::Instant::now() < deadline, "switch never showed up");
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
         }
     }
 
@@ -692,10 +712,10 @@ mod tests {
         let kvm_at = |shared: &Mutex<Shared>| {
             shared.lock().unwrap().snap.as_ref().and_then(|s| s.hop()).map(|h| h.arrangements[2].screens[1].at)
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(5);
         while kvm_at(&shared) != Some([1920, 0]) {
-            assert!(std::time::Instant::now() < deadline, "the screens never reached the simulator");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(odkvmctl::time::Instant::now() < deadline, "the screens never reached the simulator");
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
         }
         app.page = Page::Screens;
         let mut time = 0.0;
@@ -731,22 +751,22 @@ mod tests {
         let dropped = app.screens.drawn(1).unwrap().1.at;
         assert_eq!(dropped, sc.at, "dropped where it was dragged to");
         // Not applied: shown where it was dropped, while the KVM keeps it where it was (through refreshes).
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-        while std::time::Instant::now() < until {
+        let until = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_millis(1500);
+        while odkvmctl::time::Instant::now() < until {
             run(&mut app, vec![]);
             assert_eq!(app.screens.drawn(1).unwrap().1.at, dropped, "snapped back");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
         }
         assert_eq!(kvm_at(&shared), Some([1920, 0]), "sent before Apply");
         assert!(app.screens.has_draft());
         // Applied: every frame still shows it there, the KVM gets it, and the draft goes after its grace.
         let hop = shared.lock().unwrap().snap.as_ref().and_then(|s| s.hop()).unwrap();
         app.apply(&hop);
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(3500);
-        while std::time::Instant::now() < until {
+        let until = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_millis(3500);
+        while odkvmctl::time::Instant::now() < until {
             run(&mut app, vec![]);
             assert_eq!(app.screens.drawn(1).unwrap().1.at, dropped, "snapped back after Apply");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
         }
         assert_eq!(kvm_at(&shared), Some(dropped));
         assert!(!app.screens.has_draft(), "the draft stayed after the KVM had it");
@@ -768,10 +788,10 @@ mod tests {
             shared.lock().unwrap().snap.as_ref().map(|s| s.status.flags & status_flags::SW_SWITCH_ALLOWED != 0)
         };
         let wait_for = |want: bool| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(8);
             while switching(&shared) != Some(want) {
-                assert!(std::time::Instant::now() < deadline, "switching from software never became {want}");
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(odkvmctl::time::Instant::now() < deadline, "switching from software never became {want}");
+                std::thread::sleep(odkvmctl::time::Duration::from_millis(50));
             }
         };
         app.page = Page::Settings;
@@ -781,7 +801,7 @@ mod tests {
         app.confirm_lock = None;
         app.set(ConfigValue::SwSwitchAllowed(false));
         wait_for(false);
-        app.unlock_wait = Some((std::time::Instant::now(), status_flags::SW_SWITCH_ALLOWED));
+        app.unlock_wait = Some((odkvmctl::time::Instant::now(), status_flags::SW_SWITCH_ALLOWED));
         app.send(UiCmd::Config(ConfigValue::SwSwitchAllowed(true)));
         frames(&mut app);
         wait_for(true);
@@ -808,7 +828,7 @@ mod tests {
         // Untouched, it learns nothing.
         for _ in 0..30 {
             frame_with(&mut app, Vec::new());
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(50));
         }
         assert!(app.learning.is_some() && app.learn_note.is_none(), "learned without a key pressed");
         let ctrl_alt = egui::Modifiers { ctrl: true, alt: true, command: true, ..Default::default() };
@@ -823,11 +843,11 @@ mod tests {
         frame_with(&mut app, vec![k(true)]);
         frame_with(&mut app, vec![k(false)]);
         frame_with(&mut app, vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(5);
         while app.learning.is_some() {
-            assert!(std::time::Instant::now() < deadline, "nothing learned");
+            assert!(odkvmctl::time::Instant::now() < deadline, "nothing learned");
             frame_with(&mut app, Vec::new());
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(50));
         }
         assert_eq!(app.hotkeys[1], "ctrl+alt+k");
         assert_eq!(app.learn_note, Some((1, Ok("Learned from the keyboard. Apply uses it.".into()))));
@@ -841,7 +861,7 @@ mod tests {
         app.page = Page::Firmware;
         let diag_at = |shared: &Mutex<Shared>| shared.lock().unwrap().diag.as_ref().map(|d| d.0);
         let mut first = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(8);
         loop {
             app.logic(&ctx, &mut frame);
             ctx.run_ui(egui::RawInput::default(), |ui| app.ui(ui, &mut frame)).textures_delta.clear();
@@ -850,8 +870,8 @@ mod tests {
                 (Some(a), Some(b)) if b > a => break,
                 _ => {}
             }
-            assert!(std::time::Instant::now() < deadline, "the diagnostics were not read twice");
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(odkvmctl::time::Instant::now() < deadline, "the diagnostics were not read twice");
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(50));
         }
         let sh = shared.lock().unwrap();
         let items = sh.diag.as_ref().unwrap().1.as_ref().unwrap();
@@ -939,7 +959,7 @@ mod tests {
             app.confirm_lock = None;
             // Learning a hotkey: the countdown, then one learned with a warning.
             app.page = Page::Keyboard;
-            app.learning = Some((1, std::time::Instant::now()));
+            app.learning = Some((1, odkvmctl::time::Instant::now()));
             shot(&mut app, format!("{theme_name}-keyboard-learning.ppm"), h);
             app.learning = None;
             app.hotkeys[1] = "f5".into();
@@ -953,15 +973,15 @@ mod tests {
             let has_bt = shared.lock().unwrap().snap.as_ref().is_some_and(|s| s.has_bluetooth());
             if has_bt {
                 let wait = |what: &str, f: &dyn Fn(&Snapshot) -> bool| {
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                    let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(8);
                     while !shared.lock().unwrap().snap.as_ref().is_some_and(f) {
-                        assert!(std::time::Instant::now() < deadline, "the simulator never got to: {what}");
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        assert!(odkvmctl::time::Instant::now() < deadline, "the simulator never got to: {what}");
+                        std::thread::sleep(odkvmctl::time::Duration::from_millis(50));
                     }
                 };
                 app.page = Page::Overview;
                 app.switch_to(Target::Bt1);
-                std::thread::sleep(std::time::Duration::from_millis(1200));
+                std::thread::sleep(odkvmctl::time::Duration::from_millis(1200));
                 wait("the tablet active", &|s| s.status.bt_active == 1);
                 shot(&mut app, format!("{theme_name}-overview-bt-active.ppm"), h);
                 app.switch_to(Target::Pc1);
@@ -976,9 +996,9 @@ mod tests {
             }
             // The diagnostics, scrolled into view, healthy and then with a warning and a fault.
             app.page = Page::Firmware;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(5);
             while shared.lock().unwrap().diag.is_none() {
-                assert!(std::time::Instant::now() < deadline, "no diagnostics");
+                assert!(odkvmctl::time::Instant::now() < deadline, "no diagnostics");
                 shot(&mut app, format!("{theme_name}-firmware.ppm"), h);
             }
             shot(&mut app, format!("{theme_name}-firmware-diagnostics.ppm"), tall);
@@ -995,7 +1015,7 @@ mod tests {
                     }
                 }
             }
-            app.diag_asked = Some(std::time::Instant::now());
+            app.diag_asked = Some(odkvmctl::time::Instant::now());
             shot(&mut app, format!("{theme_name}-firmware-diagnostics-faults.ppm"), tall);
             // Boards in the boot ROM's bootloader, as the PWR/SERVICE port shows them (no release folder: the app's).
             for kind in ["kvm", "new", "other", "unknown"] {

@@ -3,7 +3,9 @@
 use std::ffi::CString;
 use std::time::Duration;
 
-use kvm_proto::ctrl::{REPORT_LEN, USAGE, USAGE_PAGE};
+use kvm_proto::ctrl::REPORT_LEN;
+#[cfg(not(target_arch = "wasm32"))]
+use kvm_proto::ctrl::{USAGE, USAGE_PAGE};
 
 pub type Report = [u8; REPORT_LEN];
 
@@ -29,7 +31,8 @@ pub struct Found {
 }
 
 /// Every KVM control interface, matched by usage page and usage (so identity mode, with a borrowed VID/PID, is found
-/// too).
+/// too). (None in a browser: the web build has only the simulator.)
+#[cfg(not(target_arch = "wasm32"))]
 pub fn find() -> Result<Vec<Found>, String> {
     let api = hidapi::HidApi::new().map_err(|e| e.to_string())?;
     Ok(api
@@ -45,11 +48,13 @@ pub fn find() -> Result<Vec<Found>, String> {
         .collect())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct HidTransport {
     dev: hidapi::HidDevice,
     desc: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl HidTransport {
     pub fn open(f: &Found) -> Result<Self, String> {
         let api = hidapi::HidApi::new().map_err(|e| e.to_string())?;
@@ -66,6 +71,7 @@ impl HidTransport {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Transport for HidTransport {
     fn write(&mut self, report: &Report) -> Result<(), String> {
         // hidapi wants the report ID first; the control interface uses none.

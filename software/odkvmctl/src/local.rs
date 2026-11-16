@@ -19,7 +19,9 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 
 use kvm_proto::ctrl::MAX_PROFILES;
 use serde::{Deserialize, Serialize};
@@ -182,20 +184,54 @@ pub fn path() -> Option<PathBuf> {
 }
 
 pub fn load() -> Local {
+    #[cfg(target_arch = "wasm32")]
+    return web::load();
+    #[cfg(not(target_arch = "wasm32"))]
     path().map(|p| load_from(&p)).unwrap_or_default()
 }
 
 /// Written to a temporary file, flushed, and renamed over the old one (see the module documentation).
 pub fn save(l: &Local) -> io::Result<()> {
-    let p = path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no configuration directory"))?;
-    save_to(&p, l)
+    #[cfg(target_arch = "wasm32")]
+    return web::save(l);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let p = path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no configuration directory"))?;
+        save_to(&p, l)
+    }
+}
+
+/// In a browser (the web build): the same JSON, in the page's local storage.
+#[cfg(target_arch = "wasm32")]
+mod web {
+    use super::Local;
+    use std::io;
+
+    const KEY: &str = "opendyn-kvm-settings";
+
+    fn storage() -> Option<web_sys::Storage> {
+        web_sys::window()?.local_storage().ok()?
+    }
+
+    pub fn load() -> Local {
+        let json = storage().and_then(|s| s.get_item(KEY).ok().flatten());
+        json.and_then(|j| serde_json::from_str(&j).ok()).unwrap_or_default()
+    }
+
+    pub fn save(l: &Local) -> io::Result<()> {
+        let json = serde_json::to_string(l).map_err(io::Error::other)?;
+        let s = storage().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no storage in this browser"))?;
+        s.set_item(KEY, &json).map_err(|_| io::Error::other("the browser's storage refused the settings"))
+    }
 }
 
 /// Where a file that doesn't parse is kept.
+#[cfg(not(target_arch = "wasm32"))]
 fn unreadable_path(p: &Path) -> PathBuf {
     p.with_extension("json.unreadable")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_from(p: &Path) -> Local {
     let bytes = match std::fs::read(p) {
         Ok(b) => b,
@@ -221,6 +257,7 @@ fn load_from(p: &Path) -> Local {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn save_to(p: &Path, l: &Local) -> io::Result<()> {
     use std::io::Write;
     let dir = p.parent().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no configuration directory"))?;
@@ -243,6 +280,7 @@ fn save_to(p: &Path, l: &Local) -> io::Result<()> {
 
 /// Renames `tmp` over `p`. On Windows, a virus scanner or the search indexer that has `p` open can make the rename
 /// fail for a moment: tried again for up to half a second.
+#[cfg(not(target_arch = "wasm32"))]
 fn replace(tmp: &Path, p: &Path) -> io::Result<()> {
     let mut tries = if cfg!(windows) { 10 } else { 1 };
     loop {

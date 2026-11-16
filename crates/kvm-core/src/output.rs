@@ -31,6 +31,8 @@ pub struct PcOutput {
     pub held: [u16; 2],
     /// Where the absolute pointer last put the cursor.
     pub abs_at: Option<[u16; 2]>,
+    /// The buttons the relative pointer last reported.
+    pub rel_sent: u16,
 }
 
 /// The pointers of the mouse interface, as `PcOutput::held` indexes them.
@@ -46,6 +48,7 @@ impl PcOutput {
         leds: 0,
         held: [0; 2],
         abs_at: None,
+        rel_sent: 0,
     };
 
     /// Back to power-on defaults (the PC reset or re-enumerated the device).
@@ -82,19 +85,26 @@ impl PcOutput {
     /// position (where the interface has it and the PC is in report protocol), on the relative one otherwise. A button
     /// stays on the pointer it was pressed on; when one held on the other pointer is released, that one reports it
     /// first.
+    ///
+    /// `buttons_rel`: the absolute pointer spans only part of the PC's desktop (its main screen, `Mapping::MainScreen`),
+    /// so buttons are pressed on the relative pointer and the absolute one only places the cursor. A button held on the
+    /// absolute pointer is released there, and its release carries a position: dragged onto another screen (reached
+    /// with relative motion), that position was the main screen's, and Windows dropped the window back there (first
+    /// board, 2026-11-16).
     pub fn pointer(
         &mut self,
         motion: hop::Report,
         buttons: u16,
         wheel: i32,
         pan: i32,
+        buttons_rel: bool,
         p: &Presentation,
-    ) -> Vec<(u8, Report), 2> {
+    ) -> Vec<(u8, Report), 3> {
         let abs = match motion {
             hop::Report::Abs(at) if p.mouse_abs && !self.boot_mouse => Some(at),
             _ => None,
         };
-        let (this, other) = if abs.is_some() { (ABS, REL) } else { (REL, ABS) };
+        let (this, other) = if abs.is_some() && !buttons_rel { (ABS, REL) } else { (REL, ABS) };
         let held = self.held[REL] | self.held[ABS];
         let released = held & !buttons;
         let other_lets_go = self.held[other] & released != 0;
@@ -107,20 +117,28 @@ impl PcOutput {
                 let at = self.abs_at.unwrap_or([0, 0]);
                 self.abs_mouse(self.held[ABS], at, 0, 0, p)
             } else {
+                self.rel_sent = self.held[REL];
                 self.mouse(&MouseInput { buttons: self.held[REL], ..MouseInput::default() }, p)
             };
             let _ = out.push(r);
         }
-        let r = match (abs, motion) {
-            (Some(at), _) => self.abs_mouse(self.held[ABS], at, wheel, pan, p),
+        let held_rel = self.held[REL];
+        match (abs, motion) {
+            (Some(at), _) => {
+                let _ = out.push(self.abs_mouse(self.held[ABS], at, wheel, pan, p));
+                // The relative pointer's buttons changed while the absolute one placed the cursor: after it, there.
+                if held_rel != self.rel_sent {
+                    let _ = out.push(self.mouse(&MouseInput { buttons: held_rel, ..MouseInput::default() }, p));
+                }
+            }
             (None, hop::Report::Rel([x, y])) => {
-                self.mouse(&MouseInput { buttons: self.held[REL], x, y, wheel, pan }, p)
+                let _ = out.push(self.mouse(&MouseInput { buttons: held_rel, x, y, wheel, pan }, p));
             }
             (None, hop::Report::Abs(_)) => {
-                self.mouse(&MouseInput { buttons: self.held[REL], wheel, pan, ..MouseInput::default() }, p)
+                let _ = out.push(self.mouse(&MouseInput { buttons: held_rel, wheel, pan, ..MouseInput::default() }, p));
             }
-        };
-        let _ = out.push(r);
+        }
+        self.rel_sent = held_rel;
         out
     }
 
@@ -137,6 +155,7 @@ impl PcOutput {
     pub fn release_all(&mut self, p: &Presentation) -> Vec<(u8, Report), 6> {
         let none = KeyState::EMPTY;
         self.held = [0; 2];
+        self.rel_sent = 0;
         let mut out = Vec::new();
         let _ = out.push((p.boot_keyboard.ep_in, report(&normalized::boot_keyboard_report(&none))));
         let _ = out.push((p.nkro.ep_in, report(&normalized::nkro_report(&none))));
@@ -187,13 +206,13 @@ mod tests {
         let mut o = PcOutput::default();
         let rel = |x| hop::Report::Rel([x, 0]);
         // Pressed while relative, then the pointer goes absolute (screen hop on) while it is held.
-        let r = o.pointer(rel(1), 1, 0, 0, &p);
+        let r = o.pointer(rel(1), 1, 0, 0, false, &p);
         assert_eq!(r.as_slice(), &[(0x82, report(&[1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0]))]);
-        let r = o.pointer(hop::Report::Abs([100, 200]), 1 | 2, 0, 0, &p);
+        let r = o.pointer(hop::Report::Abs([100, 200]), 1 | 2, 0, 0, false, &p);
         assert_eq!(r.as_slice(), &[(0x82, report(&[2, 2, 0, 100, 0, 200, 0, 0, 0, 0, 0]))]);
         assert_eq!(o.held, [1, 2]);
         // Button 1 let go: the relative pointer reports it, then the absolute one moves on with button 2.
-        let r = o.pointer(hop::Report::Abs([101, 200]), 2, 0, 0, &p);
+        let r = o.pointer(hop::Report::Abs([101, 200]), 2, 0, 0, false, &p);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].1.as_slice(), &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(r[1].1.as_slice(), &[2, 2, 0, 101, 0, 200, 0, 0, 0, 0, 0]);
@@ -204,7 +223,30 @@ mod tests {
         assert_eq!(o.held, [0, 0]);
         // In boot protocol (or without the absolute pointer) a position becomes a relative report without motion.
         o.boot_mouse = true;
-        let r = o.pointer(hop::Report::Abs([5, 5]), 4, 0, 0, &p);
+        let r = o.pointer(hop::Report::Abs([5, 5]), 4, 0, 0, false, &p);
         assert_eq!(r.as_slice(), &[(0x82, report(&[4, 0, 0]))]);
+    }
+
+    #[test]
+    fn with_the_main_screen_only_buttons_go_on_the_relative_pointer() {
+        // Windows: the absolute pointer spans the main screen; a window dragged from it onto the next screen is let go
+        // there, not where the absolute pointer last was.
+        let p = Presentation { mouse_abs: true, ..pres() };
+        let mut o = PcOutput::default();
+        // Pressed on the main screen: the absolute pointer places the cursor, the relative one presses.
+        let r = o.pointer(hop::Report::Abs([100, 200]), 1, 0, 0, true, &p);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].1.as_slice(), &[2, 0, 0, 100, 0, 200, 0, 0, 0, 0, 0]);
+        assert_eq!(r[1].1.as_slice(), &[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        // Dragged on the main screen: positions only.
+        let r = o.pointer(hop::Report::Abs([120, 200]), 1, 0, 0, true, &p);
+        assert_eq!(r.as_slice(), &[(0x82, report(&[2, 0, 0, 120, 0, 200, 0, 0, 0, 0, 0]))]);
+        // Onto the next screen, and let go there: on the relative pointer, without a position.
+        let r = o.pointer(hop::Report::Rel([40, 0]), 1, 0, 0, true, &p);
+        assert_eq!(r.as_slice(), &[(0x82, report(&[1, 1, 0, 40, 0, 0, 0, 0, 0, 0, 0]))]);
+        let r = o.pointer(hop::Report::Rel([0, 0]), 0, 0, 0, true, &p);
+        assert_eq!(r.as_slice(), &[(0x82, report(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))]);
+        assert!(r.iter().all(|(_, d)| d[0] != 2), "no absolute report: the cursor stays where it was let go");
+        assert_eq!(o.held, [0, 0]);
     }
 }

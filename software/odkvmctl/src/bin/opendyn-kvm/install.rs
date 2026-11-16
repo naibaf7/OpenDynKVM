@@ -115,6 +115,7 @@ impl App {
                     .hint_text(fl!("fw-file-hint"))
                     .desired_width((ui.available_width() - buttons).max(160.0)),
             );
+            #[cfg(not(target_arch = "wasm32"))]
             if ui.add_enabled(!picking, egui::Button::new(fl!("browse"))).clicked() {
                 self.browse();
             }
@@ -274,7 +275,9 @@ impl App {
         });
     }
 
-    /// The desktop's file dialog, on a thread of its own so that the window keeps drawing.
+    /// The desktop's file dialog, on a thread of its own so that the window keeps drawing. (Not in a browser: the web
+    /// build has no files to install.)
+    #[cfg(not(target_arch = "wasm32"))]
     fn browse(&mut self) {
         let start = {
             let p = self.fw.path();
@@ -308,7 +311,7 @@ impl App {
             sh.boot_install = Some((d.location.clone(), 0, 1));
             sh.boot_result = None;
         }
-        std::thread::spawn(move || {
+        crate::background(move || {
             let r = firmware::for_bootloader(&path, first).and_then(|c| {
                 bootsel::install(&d, &c.data, |done, total| {
                     shared.lock().unwrap().boot_install = Some((d.location.clone(), done, total));
@@ -325,7 +328,7 @@ impl App {
 
     fn boot_restart(&mut self, d: BootDevice) {
         let (shared, wake) = (self.shared.clone(), self.wake.clone());
-        std::thread::spawn(move || {
+        crate::background(move || {
             if let Err(e) = bootsel::restart(&d) {
                 shared.lock().unwrap().boot_result = Some((d.location.clone(), Err(e)));
                 wake();

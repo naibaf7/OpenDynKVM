@@ -7,7 +7,7 @@
 //! all of it at once. After Apply the draft stays until the KVM's copy has it, so that a refusal keeps the edits; while
 //! there is one, the page stays on its arrangement.
 
-use std::time::{Duration, Instant};
+use odkvmctl::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use kvm_proto::ctrl::{

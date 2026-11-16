@@ -17,15 +17,21 @@
 //! - **Access:** Linux needs the udev rule for 2e8a:000f (`udev/70-opendyn-kvm.rules`) and the drive mounted (desktops
 //!   do it; else [`install`] asks udisks); Windows binds WinUSB to PICOBOOT itself, from the ROM's descriptors. Without
 //!   PICOBOOT the board's state is unknown, and the window lets the user say which file it takes.
+//!
+//! In a browser (the web build) there is no USB: nothing is found, and only [`simulated`] boards install.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
+use crate::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use kvm_proto::rpimage::{self, layout};
+#[cfg(not(target_arch = "wasm32"))]
 use nusb::descriptors::TransferType;
+#[cfg(not(target_arch = "wasm32"))]
 use nusb::transfer::{Buffer, Bulk, ControlOut, ControlType, Direction, In, Out, Recipient, TransferError};
+#[cfg(not(target_arch = "wasm32"))]
 use nusb::{DeviceInfo, MaybeFuture};
 
 use crate::fl;
@@ -123,6 +129,7 @@ impl Uf2Status {
 }
 
 /// A PICOBOOT session on one device.
+#[cfg(not(target_arch = "wasm32"))]
 struct Picoboot {
     iface: nusb::Interface,
     out: nusb::Endpoint<Bulk, Out>,
@@ -130,6 +137,7 @@ struct Picoboot {
     token: u32,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Picoboot {
     fn open(d: &DeviceInfo) -> Result<Picoboot, String> {
         let number = d
@@ -260,6 +268,7 @@ enum Target {
     Other,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn identify(pb: &mut Picoboot) -> Result<Board, String> {
     let target = match pb.get_info(info::UF2_TARGET_PARTITION, FAMILY_RP2350_ARM_S) {
         Ok(t) => t,
@@ -302,6 +311,13 @@ pub struct Scanner {
 }
 
 impl Scanner {
+    /// In a browser (the web build) there is no USB to look on.
+    #[cfg(target_arch = "wasm32")]
+    pub fn scan(&mut self) -> Vec<BootDevice> {
+        Vec::new()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn scan(&mut self) -> Vec<BootDevice> {
         let found: Vec<DeviceInfo> = match nusb::list_devices().wait() {
             Ok(list) => list.filter(|d| d.vendor_id() == VID && d.product_id() == PID).collect(),
@@ -462,7 +478,7 @@ fn mount(dev: &BootDevice) -> Option<PathBuf> {
         if devices[0].drive.is_some() || Instant::now() >= until || !present(dev) {
             return devices[0].drive.clone();
         }
-        std::thread::sleep(Duration::from_millis(300));
+        crate::time::sleep(Duration::from_millis(300));
     }
 }
 
@@ -471,6 +487,7 @@ fn mount(_dev: &BootDevice) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn reopen(dev: &BootDevice) -> Option<Picoboot> {
     let list = nusb::list_devices().wait().ok()?;
     let d = list
@@ -479,6 +496,7 @@ fn reopen(dev: &BootDevice) -> Option<Picoboot> {
     Picoboot::open(&d).ok()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn present(dev: &BootDevice) -> bool {
     nusb::list_devices().wait().is_ok_and(|mut l| {
         l.any(|d| {
@@ -516,10 +534,18 @@ pub fn install(dev: &BootDevice, uf2: &[u8], mut progress: impl FnMut(usize, usi
         let total = uf2.len() / 512;
         for k in 0..=20 {
             progress(total * k / 20, total);
-            std::thread::sleep(Duration::from_millis(100));
+            crate::time::sleep(Duration::from_millis(100));
         }
         return Ok(());
     }
+    #[cfg(target_arch = "wasm32")]
+    return Err(fl!("boot-no-drive"));
+    #[cfg(not(target_arch = "wasm32"))]
+    install_on(dev, uf2, progress)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_on(dev: &BootDevice, uf2: &[u8], mut progress: impl FnMut(usize, usize)) -> Result<(), String> {
     let drive = dev.drive.clone().or_else(|| mount(dev)).ok_or_else(|| fl!("boot-no-drive"))?;
     let total = uf2.len() / 512;
     // Only for the ROM's count; the copy works without it.
@@ -562,7 +588,7 @@ pub fn install(dev: &BootDevice, uf2: &[u8], mut progress: impl FnMut(usize, usi
                 progress(seen, total);
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
+        crate::time::sleep(Duration::from_millis(200));
     }
     Err(fl!("boot-no-restart"))
 }
@@ -572,11 +598,16 @@ pub fn restart(dev: &BootDevice) -> Result<(), String> {
     if dev.location == SIM {
         return Ok(());
     }
-    let mut pb = reopen(dev).ok_or_else(|| fl!("boot-no-picoboot"))?;
-    let mut args = [0u8; 16];
-    // Flags 0: a normal boot; after 100 ms, so that the answer gets out first.
-    args[4..8].copy_from_slice(&100u32.to_le_bytes());
-    pb.command(cmd::REBOOT2, &args, 0).map(|_| ())
+    #[cfg(target_arch = "wasm32")]
+    return Err(fl!("boot-no-picoboot"));
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut pb = reopen(dev).ok_or_else(|| fl!("boot-no-picoboot"))?;
+        let mut args = [0u8; 16];
+        // Flags 0: a normal boot; after 100 ms, so that the answer gets out first.
+        args[4..8].copy_from_slice(&100u32.to_le_bytes());
+        pb.command(cmd::REBOOT2, &args, 0).map(|_| ())
+    }
 }
 
 #[cfg(test)]

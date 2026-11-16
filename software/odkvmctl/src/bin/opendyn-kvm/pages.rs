@@ -1,6 +1,6 @@
 //! The pages that show and change the KVM: Overview, Ports, Keyboard, Settings, Firmware.
 
-use std::time::{Duration, Instant};
+use odkvmctl::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, Ui};
 use kvm_core::config::{LONG_PRESS_RANGE_MS, TAP_MAX_MS};

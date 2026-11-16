@@ -93,7 +93,7 @@ impl Displays {
     pub fn start_scan(&self, wake: Wake) {
         *self.scan.lock().unwrap() = Scan::Running;
         let scan = self.scan.clone();
-        std::thread::spawn(move || {
+        crate::background(move || {
             let r = ddc::displays(true).map_err(|e| e.to_string());
             *scan.lock().unwrap() = Scan::Done(r);
             wake();
@@ -103,7 +103,7 @@ impl Displays {
     fn test(&self, id: String, name: String, value: u16, wake: Wake) {
         let test = self.test.clone();
         *test.lock().unwrap() = None;
-        std::thread::spawn(move || {
+        crate::background(move || {
             let r = ddc::set_input(&id, value)
                 .map(|()| fl!("display-switched", monitor = name.as_str(), input = mccs::input_name(value)))
                 .map_err(|e| format!("{name}: {e}"));

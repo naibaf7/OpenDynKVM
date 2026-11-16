@@ -17,9 +17,9 @@
 //! 2560×1440 main screen and a 1920×1080 one left of it, PC2 with a 3840×2160 screen at 150 % to the right. That
 //! monitor is cabled to PC1 too: PC1's is off for hop and lies on PC2's.
 
+use crate::time::{Duration, Instant};
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, Instant};
 
 use heapless::{String as HString, Vec as HVec};
 use kvm_core::bt::BtOut;
@@ -306,10 +306,10 @@ impl Default for SimTransport {
 impl SimTransport {
     /// The simulated KVM, with the Bluetooth module if `OPENDYN_SIM_BT=1`, or a module that gave up with `gave-up`.
     pub fn new() -> Self {
-        match std::env::var("OPENDYN_SIM_BT").as_deref() {
-            Ok("1") => Self::with_module(BtModule::Up),
-            Ok("gave-up") => Self::with_module(BtModule::GaveUp),
-            Ok("dongle") => Self::with_dongle(),
+        match crate::env_var("OPENDYN_SIM_BT").as_deref() {
+            Some("1") => Self::with_module(BtModule::Up),
+            Some("gave-up") => Self::with_module(BtModule::GaveUp),
+            Some("dongle") => Self::with_dongle(),
             _ => Self::with_module(BtModule::Absent),
         }
     }
@@ -363,7 +363,7 @@ impl SimTransport {
         for p in Port::ALL {
             engine.port_attached(*p, &device_for(*p));
         }
-        if std::env::var("OPENDYN_SIM_HOP").as_deref() == Ok("1") {
+        if crate::env_var("OPENDYN_SIM_HOP").as_deref() == Some("1") {
             Self::hop_demo(&mut engine);
         }
         // The simulation starts with everything already enumerated: boot-time outputs are not acted out.
@@ -624,7 +624,7 @@ impl Transport for SimTransport {
             if left.is_zero() {
                 return Ok(None);
             }
-            std::thread::sleep(left.min(Duration::from_millis(5)));
+            crate::time::sleep(left.min(Duration::from_millis(5)));
         }
     }
 
