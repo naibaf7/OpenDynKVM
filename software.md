@@ -262,8 +262,25 @@ hotkeys also work on a mirrored keyboard.
   FAULT is active low with a 10 kΩ pull-up. A fault switches the port off for 1 s, then retries.
 - **CC voltage across Rd (5.1 kΩ) → advertised current:** < 0.2 V nothing, 0.2–0.66 V default USB, 0.66–1.23 V 1.5 A,
   > 1.23 V 3.0 A.
-- Budget estimate = advertised current − 0.3 A for the electronics; it is shown in `odkvmctl` and turns the PC LEDs amber
-  when below the sum of the attached devices' `bMaxPower`.
+- **Supply, measured** (`kvm-core::supply`, protocol 10, firmware 0.1.28): the board measures no current, and a PC
+  port's limit can't be known without going over it; what shows whether a source keeps up is its 5 V under the real
+  load. The KVM judges the source it runs from: the PWR port's VBUS (every 200 ms), or on PC power the higher of the
+  PCs' (the ideal diodes feed the board from it), each AT32F405 sending its reading every 100 ms and the lowest of
+  its 1 ms samples in between (`Status.vbus_min_mv`).
+  - *Good* at 4.5 V and more, whatever the devices declare: many PC ports give far more than the 500 mA they
+    advertise and hold their 5 V. *Sags* under 4.5 V for 2 s: the PC LEDs amber, and the window and `odkvmctl status`
+    suggest the PWR port. *Low* under 4.4 V (the least USB devices must work at) for 0.5 s: in red, devices may drop
+    out. Back to good after 5 s at 4.6 V or more.
+  - The readings are good to about ±3 % (each AT32F405 takes its 3.3 V as the ADC reference), well clear of the 4.75 V
+    and more of a healthy port.
+  - Counted in the diagnostics, not judged: 100 ms windows whose minimum fell under 4.4 V (a device's inrush), and a
+    PC's 5 V gone for less than 3 s (a port that cut out under the load, or the PC restarting: the two look the same
+    from here). Many ports hold 5.0 V right up to an electronic current limit and then cut out: for those a dropout is
+    the first sign there is.
+  - The estimate stays as information: advertised current − 0.2 A for the electronics (`SELF_CURRENT_MA`: the first
+    board took under 1 W from the PWR port in every state, front devices included, 2026-11-17), shown next to what the
+    front devices declare (`bMaxPower`). Until 0.1.27 the LEDs turned amber and the window warned whenever the
+    declared sum was more than that estimate, which on ports that coped well was most of the time.
 
 ### 4.8 Config and keymap storage
 
@@ -296,12 +313,12 @@ The config, the keymap layers, the macros and the keymap settings are items in a
   `CONFIG_DIRTY` set until it is written.
 - **Endurance** (W25Q16JV in the RP2354: 100 000 erase cycles per sector), measured by
   `endurance_with_the_firmware_items` with everything the firmware stores at its largest (8 layers, a full macro buffer,
-  the records and the four arrangements with every screen slot used, 6.6 KB carried around the ring) and the config at
-  its largest (576 bytes, `config::ITEM_MAX`; 324 with the defaults since the arrangements have items of their own):
-  each sector is erased once per 91 config saves, the 17 within one cycle of each other, so 9.2 million saves before the
-  first sector reaches its rated cycles. Paced, that is at least 17 years of a script saving once a minute day and
-  night; set up by hand, it doesn't wear out. The two alternating 4 KB slots used before erased a sector on every save:
-  200 000 saves.
+  Vial's tap dances, combos, key overrides and alternate repeat keys, the records and the four arrangements with every
+  screen slot used, 7.8 KB carried around the ring) and the config at its largest (576 bytes, `config::ITEM_MAX`; 324
+  with the defaults since the arrangements have items of their own): each sector is erased once per 89 config saves,
+  the 17 within one cycle of each other, so 8.9 million saves before the first sector reaches its rated cycles.
+  Paced, that is about 17 years of a script saving once a minute day and night; set up by hand, it doesn't wear out.
+  The two alternating 4 KB slots used before erased a sector on every save: 200 000 saves.
 - **Erase counts** are in each sector's header, for the boot log (`at most N erases per sector`). The spare sector has
   no header, so at mount it takes the highest count of the others (`erase_counts_survive_remounts`).
 - **Stalls:** flash writes stall XIP for both cores, so core 1 parks in RAM (`embassy-rp` `multicore::pause_core1`)
@@ -326,7 +343,7 @@ The config, the keymap layers, the macros and the keymap settings are items in a
   constants in `flash.rs`. A firmware built with another geometry switches USB updates off on a board with the old
   table, and every board would need the pinhole + PWR/SERVICE + `kvm-first.uf2` procedure. What lives *inside* the
   data partition is the firmware's own and may change with any update (items carry versions).
-- The image is 355 KB of the 984 KB (2026-10-29, with the 40 KB AT32F405 image and Vial).
+- The image is 790 KB of the 984 KB (2026-11-18, with the AT32F405 and ESP32-C3 images it carries and Vial).
 
 **RP2354B update** (`update.rs`; RP2350 datasheet §5.1.16–5.1.17):
 1. `odkvmctl update kvm-rp2354.bin` (or the `.uf2`, or the app's Firmware page) checks that the file is an RP2350 Arm
@@ -461,16 +478,37 @@ RP2354B, which already parses the keyboard and owns the config storage; the AT32
   international and language keys, Power, Mute and Volume. The JSON is xz-compressed as vial-qmk does it (616 bytes)
   and served in 32-byte blocks.
 - **Engine** (`remap.rs`): runs on the merged keyboard state of Normalized ports, after the hotkeys (so no keymap can
-  take the PC switch away) and before the output builders. 8 layers (MO, TG, TO, DF/PDF, LM, OSL, tri-layer), modded
-  keys, mod-tap / layer-tap / TT / Space Cadet (tapping term, permissive hold, hold-on-other-key-press), one-shot
-  modifiers, Grave Escape, media and system keys, mouse keys with QMK's acceleration, and 16 macros in Vial's format
-  (text, taps, presses, releases, delays). Macro steps are at least 2 ms apart: the AT32F405 keeps 4 reports per
-  endpoint. On a PC switch it lets go of everything held; toggled layers stay.
+  take the PC switch away) and before the output builders. Events pass three stages, in QMK's order:
+  - **combos** (32, up to 4 keys each, by keycode): a key of a combo waits until the combo is complete and no larger
+    one is still possible, the combo term runs out, another key goes down or one of them comes up. The output is held
+    until the last of its keys is up; keys that make no combo go on with the times they were pressed, so a waited-for
+    tap-hold key keeps its tapping term. `CM_ON` / `CM_OFF` / `CM_TOGG`;
+  - **tap-hold** (mod-tap, layer-tap, Space Cadet): tapping term, permissive hold, hold on other key press, chordal
+    hold (opposite hands: the left half of the main block with F1–F5 is the left hand, Space and the extra keys are
+    either), quick tap term, flow tap, retro tapping, the tap code and Caps Lock delays;
+  - **actions:** 8 layers (MO, TG, TO, DF/PDF, LM, OSL, TT with tapping toggle, tri-layer, Layer Lock), modded keys,
+    one-shot modifiers and layers with tap toggle, Grave Escape with its overrides, media and system keys, mouse keys
+    with QMK's acceleration and Vial's settings for it, 16 macros in Vial's format (text, taps, presses, releases,
+    delays), 32 tap dances (vial-qmk's tap / hold / double tap / tap-hold), caps word (idle timeout 5 s), the Repeat
+    and Alternate Repeat keys (32 alternates of Vial's, then QMK's own), auto shift (its options, `AS_UP` / `AS_DN`
+    / `AS_RPT`, which types the timeout) and the magic keycodes and settings (swaps, GUI off).
+
+  The output is recomputed after each event and 32 **key overrides** are applied to it, as QMK does them (trigger
+  as the last key pressed, required and negative modifiers, suppressed modifiers, layers, the 500 ms key repeat
+  delay for a modifier pressed after the trigger, the trigger kept away after another key). Macro steps are at least
+  2 ms apart: the AT32F405 keeps 4 reports per endpoint. On a PC switch it lets go of everything held, one-shot locks
+  and caps word included; toggled and locked layers stay. 2 KB of RAM and 13 KB of code more than with layers and
+  macros alone.
 - **Protocol** (`protocol.rs`): VIA protocol 9 and Vial protocol 6 (keyboard id, definition, keymap get/set and
-  buffers, layout options, macros, unlock, QMK settings 6, 7, 18, 22, 23, dynamic entries = none). Keycodes are stored
-  exactly as written, so every keycode reads back unchanged. Command decoding and the keycode ranges are adapted from
-  RMK (MIT, `crates/kvm-vial/LICENSE-RMK-MIT`); RMK's keymap engine is async and tied to its runtime, so it is not
-  reused.
+  buffers, layout options, macros, unlock, every QMK setting of vial-qmk but RGB and the pre-0.19 tapping flags, 16
+  qsids per query reply; the dynamic entries: 32 tap dances, combos, key overrides and alternate repeat keys, with
+  caps word and layer lock flagged). Keycodes are stored exactly as written, so every keycode reads back unchanged;
+  QK_BOOT in a key or an entry is stored as KC_NO unless unlocked. Command decoding and the keycode ranges are adapted
+  from RMK (MIT, `crates/kvm-vial/LICENSE-RMK-MIT`); RMK's keymap engine is async and tied to its runtime, so it is
+  not reused. The dynamic entries, the QMK settings and the engine follow vial-qmk and QMK's documentation.
+- **Storage** (`keymap.rs`, `kvm_core::store`): the layers (0x0110–0x0117), the macros (0x0101), the settings
+  (0x0100, 47 bytes; the 13 of before read with the new settings at their defaults) and one item per kind of dynamic
+  entry in Vial's own layout (0x0102–0x0105, 321 bytes each, 193 for the alternate repeat keys).
 - **Interface:** usage page 0xFF60 / usage 0x61, 32-byte reports, IN endpoint only (EP7): the requests arrive as
   SET_REPORT on a `LOCAL_HID` interface, which the AT32F405 already forwards, so its firmware is unchanged. The serial
   number gets Vial's marker `vial:f64c2b3c` (also in identity mode, appended to the cloned serial).
@@ -824,12 +862,34 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
   - Nothing there: a wall.
 - **Mapping** (`hop-mapping-pc1/-pc2`; `hop-mapping-host1`–`4`, protocol 9): where a host puts 0–32767. `desktop`:
   across the bounding box of all its screens' `desk` rectangles, those off for hop included (Linux: X11, GNOME, KDE).
+  macOS (host software 0.1.27 on) detects as `desktop` in logical pixels (points); how it maps an absolute pointer
+  onto several displays isn't measured yet (a community project reports it on the display the cursor is on,
+  2026), so its host software places the cursor on all of them (below), and `desktop` alone is only sure for one display.
   `main-screen`: on its main screen only, the one at `desk` 0,0 (Windows 10 and later map an absolute HID mouse onto the
   primary monitor). Its other screens get relative motion instead: the KVM knows where it last put the cursor (an
   absolute report puts it exactly there) and sends the difference to where the pointer is, in the PC's pixels; back on
   the main screen, the next absolute report puts it exactly in place again. Windows accelerates that relative motion
-  ("Enhance pointer precision"), so with it on the cursor drifts from the KVM's pointer on those screens until it rests
-  (cursor sync, below) or returns to the main screen.
+  itself ("Enhance pointer precision"), and its curve counts its physical pixels, whatever the screen's scaling. So
+  with `hop-accel` other than `flat`, once the cursor's place is known, the host gets counts that the same curve
+  (`hop-accel`, `hop-speed`, at the mouse's speed now) takes as far as the KVM's took the pointer, in that screen's
+  pixels (`hop::Raw`, `Accelerator::counts_for`): the mouse's own counts at 100 %, more at 200 % (two pixels per
+  logical one), less than twice as many as the curve is steeper faster; less what the KVM held back at a wall
+  (all of it where the host's own desktop ends at that wall too, `desktop_ends`: its cursor stops there by itself and
+  meets the edge even where its curve took it less far, a fast motion), and with the fraction of a count kept for the
+  next report. Measured on the first board (2026-11-16), a 2880×1800 screen
+  at 200 %: until 0.1.24 the KVM's motion went, accelerated by the KVM and then by Windows again, so the cursor ran
+  about twice as fast as the pointer and jumped to the main screen's edge when the pointer got there; 0.1.25 sent the
+  mouse's counts alone, and the cursor got only half way across before the pointer met the wall. With `flat`
+  (Enhance pointer precision off: Windows moves one of its pixels per count) the difference goes, in its pixels. What
+  still differs (another slider position, another curve) drifts until the cursor rests (cursor sync, below) or
+  returns to the main screen.
+  - Tried and dropped (0.1.26, first board, 2026-11-16): an external pen instead (page Digitizer, usage Digitizer),
+    which Windows maps onto its whole virtual desktop where it puts an absolute mouse on its main screen only. It
+    hovered on every screen exactly once the host's `desk` places were Windows' own, but no click came through: not
+    with the pen in range (Windows takes no mouse button then), nor with the pen taken out of range just before the
+    mouse pressed. Its own tip and barrel would click only as a pen does (a hold turns into a right-click, a drag
+    starts after a threshold, no middle or side buttons). Every screen absolute as a mouse needs a filter driver that
+    sets `MOUSE_VIRTUAL_DESKTOP` (Windows' HID mouse driver never does), and that needs Microsoft's signature.
 - **Two pointers, one button:** to a PC the relative and the absolute pointer are two devices, and Linux keeps a
   button down on the device it was pressed on. A button stays on the pointer it was pressed on and is released there
   (`PcOutput::held`); switching away releases both, the absolute one where it is.
@@ -853,9 +913,34 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
   - Mouse keys of the keymap accelerate themselves and go through unaccelerated.
 - **Cursor sync** (`PointerAt`, protocol 7): a PC's host software may say where its own cursor is (its pixels).
   Taken over once the KVM hasn't moved the pointer for 150 ms: a touchpad or a program moved it, or Windows'
-  acceleration on a screen reached relatively. `opendyn-kvm` sends it on Windows each time the cursor has rested for
-  250 ms while hop is on in the active profile; on Linux the position isn't available to programs on Wayland (and
-  isn't needed: the whole desktop is absolute).
+  acceleration on a screen reached relatively. `opendyn-kvm` sends it on Windows and macOS each time the cursor has
+  rested for 250 ms while hop is on in the active profile; on Linux the position isn't available to programs on
+  Wayland (and isn't needed: the whole desktop is absolute).
+- **Placed by the PC** (`PlaceCursor`, protocol 10; optional): a PC's host software may put its cursor where the KVM's
+  pointer is itself, on the screens it names (`Placement`): Windows those its mapping reaches only with relative
+  motion (`others`: all but its main screen, which keeps the absolute pointer), macOS all of them (`all`: how macOS
+  maps an absolute pointer onto several displays isn't known, below). It holds a lease of `PLACE_LEASE_MS` (1 s) and
+  asks again every 300 ms while it may; meanwhile the KVM sends it the place on those screens, in its own pixels
+  (`Event::PlaceCursor`, to that PC only, at most one a millisecond and then the latest: the control interface takes
+  one report a millisecond, a mouse may send eight; `Engine::place_cursor`), and nothing on the pointer interfaces
+  but a change of the buttons, the wheel or pan on the relative pointer (`PcOutput::pointer`). Without a lease (no
+  host software, a work PC that may not run it, older firmware or software, the system refusing) the PC's mapping
+  alone applies, as above, and the hop works as before; a lease that runs out (the program crashed, the PC went to
+  sleep) costs at most a second without the pointer on those screens, and the KVM then goes on relatively from where
+  the cursor was put. A bus reset ends it. `opendyn-kvm` places on a thread of its own with a handle of its own on
+  the control interface (`odkvmctl::placer`: the worker's snapshot once a second would hold placements up), on unless
+  turned off on the Screen hop page (a setting of this computer), never with the simulator:
+  - Windows: `SetCursorPos`, in physical pixels (the thread per-monitor DPI aware), while the input desktop is
+    "Default": the sign-in, the lock screen and an administrator prompt ("Winlogon") get no lease. A placement
+    refused (an administrator's window in front, which a program of the user may not reach) gives the lease back at
+    once, and it is asked for again 2 s later.
+  - macOS: a mouse-moved event (dragged, with the button that is down, so that a drag follows) at the place, with the
+    modifiers held and the motion since the last, posted to the HID event tap from an event source that holds back no
+    local events (by default macOS suppresses the real keyboard and mouse for 0.25 s after a synthetic event, and
+    during a synthetic drag, which would swallow the KVM's own keys and buttons). macOS allows it once the app is
+    under System Settings, Privacy & Security, Accessibility; until then the page says so, with *Allow…* for the
+    system's prompt.
+  - Not yet tried on a board or a Mac (2026-11-17): unit tests of the engine, the hop and the placer's protocol.
 - **Switching otherwise** (hotkey, key, software, auto-select): the pointer is found where it was left on that PC, or
   in the middle of its main screen.
 - **Bluetooth hosts** (protocol 9) take the module's absolute pointer (report 4, §4.13), or with `hostN-pointer
@@ -863,9 +948,11 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
   A relative host's cursor isn't known when the pointer comes onto it (a hop, or any switch to it): the KVM first
   pushes it into the top-left corner of the host's desktop (`hop::PARK`, 30 000 counts each way, further than any
   desktop before the host's own acceleration), then moves it to the pointer by the difference, and goes on with
-  differences. Wherever the KVM holds the pointer at an edge (a wall, a push toward another host short of its
-  resistance, a corner, a held button), the push goes on to the host as well, so its cursor meets that edge too: the
-  host's acceleration, which the KVM can't undo, drifts the cursor from the pointer only until the next edge. Leaving
+  differences: with `hop-accel` other than `flat`, counts for the host's own curve (as for Windows' screens reached
+  relatively, above; its units decide its pixels per logical one), else the difference in its pixels. Wherever the KVM holds the pointer at an edge (a wall, a push toward another host
+  short of its resistance, a corner, a held button), the push goes on to the host as well, so its cursor meets that
+  edge too: where the host's acceleration differs from the KVM's, the cursor drifts from the pointer only until the
+  next edge. Leaving
   a Bluetooth host releases its buttons on its mouse and on its absolute pointer. A Bluetooth host has no host
   software: no cursor sync, and its screens are added by hand (`hostN 2388x1668 200% at …`), not detected.
 - Costs (measured 2026-11-13): the pointer with its speed tracker is 504 bytes of the engine (a place and a cursor for
@@ -1065,8 +1152,8 @@ are type 0xFF with the request type and an error code; events use request id 0.
 
 | Request | Response |
 |---|---|
-| 0x01 `GetInfo` | protocol version (7), firmware versions (RP2354B, AT32F405 ×2), hardware version (u32, packed like the firmware's), serial, capability bits (`BLUETOOTH` when the module answers, `SCREEN_HOP` from protocol 7); then (protocol 6) the Bluetooth module's firmware version |
-| 0x02 `GetStatus` | active PC, **which PC is asking**, link state of each PC, power source, advertised current, budget, lock bits, uptime, link errors, self-test bits 0–15 (§4.10); then (protocol 6) the Bluetooth host that gets input, the hosts ready and bonded (bit masks), seconds of pairing left, the host waiting for a passkey, the module's state, and self-test bits 16–31 (so older hosts read bits 0–15 where they were); then (protocol 7) screen hop's state (off, on, or what it needs) and the pointer's place in the arrangement (two i16) |
+| 0x01 `GetInfo` | protocol version (10), firmware versions (RP2354B, AT32F405 ×2), hardware version (u32, packed like the firmware's), serial, capability bits (`BLUETOOTH` when the module answers, `SCREEN_HOP` from protocol 7); then (protocol 6) the Bluetooth module's firmware version |
+| 0x02 `GetStatus` | active PC, **which PC is asking**, link state of each PC, power source, advertised current, budget, lock bits, uptime, link errors, self-test bits 0–15 (§4.10); then (protocol 6) the Bluetooth host that gets input, the hosts ready and bonded (bit masks), seconds of pairing left, the host waiting for a passkey, the module's state, and self-test bits 16–31 (so older hosts read bits 0–15 where they were); then (protocol 7) screen hop's state (off, on, or what it needs) and the pointer's place in the arrangement (two i16); then (protocol 10) the supply judged from its measured 5 V (unknown, good, sags, low), its voltage now and lowest in the last minute, and what the front devices declare (§4.7) |
 | 0x03 `GetPort` | state, mode setting and effective mode, Auto reason, VID:PID, speed, interface classes, report rate, faults |
 | 0x04 `GetPortString` | manufacturer or product string of a port's device (UTF-8, ≤ 58 bytes) |
 | 0x05 `SetActive` | PC1 / PC2 / toggle |
@@ -1079,6 +1166,7 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x14 `GetBtHost` | a Bluetooth host slot (1–4): flags, interval, latency, RSSI, address (protocol 6, §4.13) |
 | 0x15 `BtPair` / 0x16 `BtForget` / 0x17 `BtPasskey` | open or close pairing; forget a slot (0xFF = all); the passkey a pairing host shows |
 | 0x18 `PointerAt` | where the asking PC's cursor is, in its own pixels (two i16), for screen hop's cursor sync (§4.14); `NotActive` from the service port (protocol 7) |
+| 0x19 `PlaceCursor` | the asking PC's host software places its cursor (0 off, 1 the screens its mapping reaches only relatively, 2 all) for `PLACE_LEASE_MS` from now, screen hop's "Placed by the PC" (§4.14); `NotActive` from the service port (protocol 10) |
 
 | Event | Body |
 |---|---|
@@ -1089,6 +1177,7 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0xC4 `HotkeyLearned` | learned / timed out / cancelled, the hotkey (kind, modifiers, key, swallow); to the PC that asked only |
 | 0xC5 `BtChanged` | a Bluetooth host slot changed, or 0: pairing opened, closed or wants a passkey |
 | 0xC6 `BtActive` | input goes to Bluetooth host 1–4, or 0: back on a PC (`Switched` follows) |
+| 0xC7 `PlaceCursor` | where to put the cursor, in the PC's own pixels (two i16); only to a PC holding a `PlaceCursor` lease, at most one a millisecond (protocol 10) |
 
 ### 8.3 Config keys
 
@@ -1147,7 +1236,7 @@ context, and a host that doesn't know an item still shows its grade and number. 
 | System | uptime, why the RP2354B last reset (power-on, brown-out, supply glitch, watchdog, software …), its die temperature, the self-test (§4.10), engine outputs dropped, whether firmware updates over USB are on (the partition it runs from), or which check of the partition table turned them off and what it read | POWMAN `CHIP_RESET` at boot, ADC temperature sensor, engine, `update.rs` at boot (boot ROM `get_partition_table_info`, `flash_runtime_to_storage_addr`, `get_sys_info`) |
 | Clocks | crystal, system and USB PLLs, `clk_sys`, `clk_usb`, `clk_peri`, `clk_adc`, ring oscillator; each AT32F405's clock (crystal or internal) | the RP2354B's frequency counter against its crystal, every 2 s (1 ms each, 2 kHz resolution); `Hello` |
 | USB | Hub-0 on the root port (speed, enumerated), the D+/D− swap of errata E1 and whether it was found at run time, Hub-0 status changes the hub class couldn't handle (cleared by `host.rs`), front-port enumerations or probes that failed (retried twice: replugged on the data lines, then with VBUS off for 1 s), each front port's device speed; per PC: USB speed, link state, bus resets, SPI link errors (counted once the AT32F405 has answered) | `usbh.rs`, `host.rs`, engine, AT32F405 `Status` |
-| Power | PWR VBUS and CC, each PC's VBUS and CC, the 3.3 V at each AT32F405, the front-port budget, each port's power-switch faults | ADCs of both chips |
+| Power | PWR VBUS and CC, each PC's VBUS and CC, the 3.3 V at each AT32F405, the front-port budget (an estimate), each port's power-switch faults, the lowest 5 V in the last minute (graded as the supply, §4.7), 5 V dips under 4.4 V, each PC's 5 V dropouts | ADCs of both chips |
 | PC-side chips | each AT32F405's die temperature and firmware version | AT32F405 `Status`, `Hello` |
 | Bluetooth | only with the module fitted (§4.13): its state (starting, up, being programmed, failed this boot, gave up), its firmware version, the UART exchanges that failed, the hosts connected, and the hosts whose settings it holds in RAM (its wear guard, only while there are any) | `bt.rs`, the module's `Hello`, engine |
 
@@ -1247,8 +1336,10 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     scaling; otherwise `xrandr --listmonitors`; merged into the arrangement, each new screen next to the neighbour it
     touches on its PC, since Windows' pixels are physical and the scalings differ), and the selected screen's PC,
     resolution (a list, or typed), scaling, place on its own PC, place here, and whether screen hop goes onto it. Each
-    PC's mapping and units. The pointer: acceleration, speed, edge resistance, corners. On Windows the worker reports this computer's
-    cursor to the KVM each time it rests (cursor sync, §4.14);
+    PC's mapping and units. The pointer: acceleration, speed, edge resistance, corners. On Windows and macOS the worker
+    reports this computer's cursor to the KVM each time it rests (cursor sync, §4.14), and the page has *Place the
+    cursor from this app…* with what the placer does now (placing, or why not: no KVM, older firmware, the sign-in or
+    an administrator prompt, Windows refusing, macOS not allowing it yet with *Allow…*; §4.14 "Placed by the PC");
   - *Keyboard*: hotkeys, typed or learned (**Learn**, then the hotkey on the KVM's keyboard; it goes into the field
     with any warning, and **Apply** sets it; offered from the active PC with a keyboard the KVM reads, on firmware with
     protocol 4), and the double-tap window; what a tap and a long press on the KVM's key do, and the long
@@ -1302,8 +1393,10 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
   contrast of 4.5:1 (WCAG AA) on its card or chip; the colour itself still fills the LEDs, chips and bars. Tests
   check the contrast rule and that the font has every character of every language.
 - **Local settings** (`odkvmctl::local`): what belongs to this computer and user rather than to the KVM: the theme, the
-  language and the monitor bindings, in `$XDG_CONFIG_HOME/opendyn-kvm/settings.json` (`~/.config` when unset or not
-  absolute) or `%APPDATA%\OpenDynKVM\settings.json` (roaming: a binding applies only to the monitor with its id).
+  language, the monitor bindings and whether the window places the cursor for screen hop (`place_cursor`, on by
+  default), in `$XDG_CONFIG_HOME/opendyn-kvm/settings.json` (`~/.config` when unset or not absolute),
+  `%APPDATA%\OpenDynKVM\settings.json` (roaming: a binding applies only to the monitor with its id) or
+  `~/Library/Application Support/OpenDynKVM/settings.json` (macOS).
   Only the window writes it, as a setting changes: to a temporary file, flushed to disk, then renamed over the old one
   (on Windows tried again for up to half a second while a scanner holds the file), so a power cut leaves one whole
   file. Unknown fields are ignored, missing ones and unknown theme or monitor-mode names take the defaults; a file that
@@ -1333,11 +1426,28 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
 - **Monitors follow the KVM** (`odkvmctl::ddc`): DDC/CI, MCCS VCP 0x60 (input source).
   - Packets: `mccs.rs` (get/set VCP, capabilities string, checksums, EDID for the monitor's id
     `<maker>-<product>-<serial>`), tested against known packets and a real capability string.
+  - On Linux and macOS the program builds the packets and speaks to the display itself: `ddc::Channel` writes a
+    request and reads the reply after 50 ms, and on top of it reads a VCP code (three tries, a busy display's null
+    message tried again), sets one and reads the capability string fragment by fragment. A test drives it with a
+    scripted display.
   - Linux (`ddc/linux.rs`): the connected connectors in `/sys/class/drm`, each with its EDID and its DDC bus (the
     DisplayPort AUX channel's `i2c-N` if there is one, else the connector's `ddc` link), `/dev/i2c-N` with
     `I2C_SLAVE` 0x37. Only address 0x37 is touched; never 0x50 (EDID comes from sysfs) or SMBus.
   - Windows (`ddc/windows.rs`): `EnumDisplayMonitors` → physical monitors (dxva2), `Get/SetVCPFeature` and the
     capability string; the id is the monitor's device interface path.
+  - macOS (`ddc/macos.rs`, 0.1.28 on): Quartz's online displays other than built-in panels, each one's registry entry
+    from the `IODisplayLocation` in CoreDisplay's info dictionary (AirPlay and Sidecar displays have none and are
+    left out); the id from the dictionary's EDID as on Linux (else from Quartz's vendor, model and serial numbers).
+    No rights or driver needed. The two private functions' families (`CoreDisplay_DisplayCreateInfoDictionary`,
+    `IOAVService…`) are looked up at run time, so a macOS without them loses DDC/CI, not the program.
+    - Apple silicon: the AV service proxy (`DCPAVServiceProxy`, `Location` "External") that follows the display's
+      framebuffer in the registry (m1ddc's way), `IOAVServiceWriteI2C` / `ReadI2C` at chip address 0x37 with the
+      source address 0x51 as sub-address; 0xB7 behind the MCDP29xx converter of some models' HDMI port. Each request
+      is written twice, 10 ms apart, as m1ddc and MonitorControl do (a single write is sometimes lost).
+    - Intel Macs: up from the display's entry to its `IOFramebuffer`, then its I²C buses (`IOFBCopyI2CInterfaceForBus`,
+      `IOI2CSendRequest`) in turn: the write and the reply in one request, the DDC/CI reply transaction where the bus
+      lists it, else a plain read; the driver's wait for the reply 30 ms on AMD's framebuffers (ddcctl's finding),
+      none on the others. `IOI2CRequest`'s 64-bit layout (124 bytes, packed to 4) is checked at compile time.
   - Bindings: per monitor, an input for PC1 and PC2 (from the capability string, the current input, or typed in hex:
     how it is wired), and per KVM profile what it does: follow the active PC, stay on PC1, stay on PC2, or nothing
     (`local::DisplayMode`). Files from before profiles have `enabled` instead, which becomes follow (or nothing) in
@@ -1376,12 +1486,32 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
   devices. The GUI is developed and demonstrated with it before hardware exists. It presses the KVM's key when the KVM
   waits for it; its keyboard types what the GUI sends while learning a hotkey: the keys pressed in the window
   (`Transport::simulated_keyboard`), since this computer's keyboard isn't on the simulated KVM.
+  - **Trying it without a KVM** (0.1.28): while no KVM answers, the window's pages offer *Try with a simulated KVM*,
+    for someone who has none yet; `opendyn-kvm --sim` starts with it. `Shared::simulate` says which the worker talks
+    to, and it changes over at once (`worker::spawn_with`). The simulator is made up; this computer's side is real: the
+    monitors bound on the Displays page switch along (DDC/CI, the follower as with a KVM, this computer as the PC1 the
+    simulator says it is), *Detect* on the Screen hop page reads this computer's screens, and this computer's settings
+    are its own file (so monitors set up while trying stay set up for the KVM). The cursor placer talks only to a
+    real KVM and stays out of it.
+  - Every page then says so at the top (not in a browser, which has nothing else), with *Leave the simulator*; while
+    simulating, the worker looks for a KVM's control interface every 2 s (`transport::find`, without opening it), and
+    once one is plugged in the banner says so and offers *Use it*. Leaving puts the monitors that follow back on this
+    computer's input. Nothing of it is saved: the next start looks for the KVM again. The window's title says
+    "simulated" while it lasts. A window test clicks through it against a scripted no-KVM and the simulator.
 - **On the web** (the simulator in a browser): `opendyn-kvm` also builds for `wasm32-unknown-unknown`, the window in a
   page's `<canvas id="opendyn-kvm">` (`web.rs`: eframe's web runner, WebGL through glow). It has only the simulator: no
   USB, files, tray, single copy or DDC/CI. The worker's rounds run once per frame (`worker::Web`) instead of on a thread
   of their own, waits spin on the browser's clock (`odkvmctl::time`), the local settings live in the page's storage,
   and the page's address stands in for the environment (`?OPENDYN_SIM_BT=1&OPENDYN_SIM_HOP=1`, `OPENDYN_LANG=de`).
   The product page (repository opendynkvm-web) builds it from here; nothing here depends on that repository.
+- **macOS** (11 and later, 0.1.27 on; built and checked from Linux with `cargo clippy --target aarch64-apple-darwin`
+  and a stand-in C compiler for hidapi's C, not yet run on a Mac): the control interface through hidapi's IOHIDManager
+  backend; the screens from Quartz's display list in points (`Units::Logical`), each display's scaling from its mode's
+  pixels per point, mirrors left out; the cursor from a Quartz event; placing it as above (§4.14); the tray icon in
+  the menu bar (`tray-icon`, on the window's event-loop thread, so the window starts hidden in the tray and hides on
+  close, as on Windows); start at login as a launch agent (`~/Library/LaunchAgents/org.opendynkvm.opendyn-kvm.plist`,
+  `autostart::BUNDLE_ID`); the boot ROM's drive under `/Volumes`; the firmware in the app's `Contents/Resources`;
+  DDC/CI as above (0.1.28).
 - **Linux:** `software/odkvmctl/udev/70-opendyn-kvm.rules` gives the logged-in user access to the control interface's
   hidraw node and to the graphics cards' I2C buses (PCI class 0x03, as ddcutil's rule) for DDC/CI; the packages install
   it, reload udev, and load `i2c-dev` (`modules-load.d`, and `modprobe` on install).
@@ -1395,6 +1525,12 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     `modules-load.d/opendyn-kvm.conf` (`i2c-dev`) and the licenses. The binaries are built in a Debian 12 container
     (`build-env.sh`, podman or docker, the host's rustup toolchain mounted), so they need glibc 2.35 or later: Debian
     12, Ubuntu 22.04 and later. Built on Fedora 44 directly they would need glibc 2.43.
+  - **macOS** (`cargo xtask package --macos`, on a Mac with Xcode's command line tools and the Rust targets
+    `aarch64-apple-darwin`, `x86_64-apple-darwin`): `OpenDynKVM-<version>.dmg` with `OpenDynKVM.app`, both programs
+    as universal binaries (`lipo`), the firmware and licenses in `Contents/Resources`, the icon as `AppIcon.icns`
+    (PNGs of 16 to 1024 px), signed ad hoc (`codesign -s -`), not by an Apple developer ID nor notarized: a downloaded
+    copy opens with *Open* from its context menu the first time, and macOS asks for the Accessibility permission again
+    after each update (it sees a new app). `odkvmctl` lies in `Contents/MacOS`, for a link from `/usr/local/bin`.
   - **Window icon on Linux:** on Wayland the desktop takes it from the menu entry named after the app id
     (`opendyn-kvm.desktop`), as winit 0.30 doesn't send the window's own; X11 and Windows use the icon the window sets.
     `cargo xtask desktop [--remove]` installs the entry (for `target/debug/opendyn-kvm`) and the icons into
@@ -1413,6 +1549,11 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
 **Toolchain:** rustup's stable Rust (1.99 at the time of writing) with the targets `thumbv8m.main-none-eabihf`,
 `thumbv7em-none-eabihf`, `riscv32imc-unknown-none-elf` (the Bluetooth module) and, for Windows builds from Linux,
 `x86_64-pc-windows-gnu` (MinGW-w64 linker). The module's flash image needs `espflash` (`cargo install espflash`).
+The macOS app builds on a Mac (`aarch64-apple-darwin`, `x86_64-apple-darwin`; hidapi's C needs Apple's SDK); from Linux
+the host software is checked for macOS with `cargo clippy -p odkvmctl --target aarch64-apple-darwin --bins`, with
+`CC_aarch64_apple_darwin` set to a script that only writes the empty object its `-o` (or `-Fo`) names: nothing links.
+The same for `x86_64-apple-darwin` (`CC_x86_64_apple_darwin`) checks the Intel Macs' DDC/CI path, which the Apple
+silicon build leaves out.
 - Each firmware directory pins its target in `.cargo/config.toml` and lists it in `rust-toolchain.toml`.
 - A distribution `rustc` without these targets (Fedora's, for example) won't build the firmware: put `~/.cargo/bin`
   first in `PATH`, or call `~/.cargo/bin/cargo`.
@@ -1425,6 +1566,7 @@ cargo xtask package                                    # installers for odkvmctl
 cargo run -p odkvmctl --bin odkvmctl -- --sim status   # CLI against the simulator
 cargo run -p odkvmctl --bin opendyn-kvm -- --sim       # GUI against the simulator
 cargo build -p odkvmctl --release --target x86_64-pc-windows-gnu
+cargo xtask package --macos                            # on a Mac: OpenDynKVM-<version>.dmg → dist/ (§9)
 (cd firmware/rp2354 && cargo build --release)          # flash: probe-rs (`cargo run`), or picotool over PWR/SERVICE
 (cd firmware/at32f405 && cargo build --release)        # flash: probe-rs over SWD, or DFU (§4.9)
 ```
@@ -1477,9 +1619,9 @@ hash included).
 ## 12. Open items
 
 Not built yet:
-- **Vial:** tap dance, combos, key overrides, caps word and the mouse-key settings report zero entries, so the Vial app
-  hides them (§4.11). The whole path is tested against vial-gui's request sequence, not yet against the app on
-  hardware (M2).
+- **Vial:** every feature of vial-qmk is in (§4.11) but RGB, encoders and the pre-0.19 tapping flags. Macro text is
+  typed with a US layout: on a PC set to another layout, letters and symbols can come out wrong. The whole path is
+  tested against vial-gui's request sequences, not yet against the app on hardware (M2).
 - **Source hi-res wheels:** the normalized mouse offers a resolution multiplier, but source mice are read in detent
   mode for now.
 
@@ -1488,5 +1630,7 @@ Needed from outside:
 - **Artery ISP protocol** (SPI framing of the ROM bootloader): §4.9 implements ST's AN4286 framing on that
   assumption; Artery's note would confirm it before M1 instead of during.
 - **USB PID:** request one from pid.codes (open-source hardware) to replace the test PID `1209:0001`.
-- **Measured power budget** (design.md §12 item 5) feeds the budget estimate in §4.7.
+- **Measured power budget** (design.md §12 item 5): the whole board under 1 W from the PWR port (2026-11-17), so
+  `SELF_CURRENT_MA` is 200 mA; a reading with the front ports empty would narrow it. The warning itself is measured
+  (§4.7).
 - **WebHID page** (design.md §8) reuses `kvm-proto::ctrl` compiled to WebAssembly; after M4.

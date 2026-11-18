@@ -290,9 +290,11 @@ impl App {
         ui.add_space(8.0);
         let st = &s.status;
         card(ui, &fl!("power"), |ui| {
-            ui.label(fl!("power-left", source = names::power_source(st.power), milliamps = st.budget_ma));
-            if st.flags & status_flags::BUDGET_LOW != 0 {
-                ui.label(RichText::new(fl!("budget-low")).color(ink(ui, WARN)));
+            ui.label(names::power_line(st));
+            if let Some((text, bad)) = names::power_warning(st, false) {
+                ui.label(RichText::new(text).color(ink(ui, if bad { BAD } else { WARN })));
+            } else if let Some(note) = names::power_note(st) {
+                look::note(ui, note);
             }
             if st.flags & status_flags::SELFTEST_FAILED != 0 {
                 ui.label(
@@ -1082,6 +1084,17 @@ impl App {
                 note(ui, fl!("udev-hint"));
             }
         });
+        // Without a KVM (yet): the window against the simulator, with this computer's monitors and screens real. (A
+        // browser has the simulator only.)
+        if cfg!(not(target_arch = "wasm32")) {
+            ui.add_space(8.0);
+            card(ui, &fl!("try-sim-title"), |ui| {
+                note(ui, fl!("try-sim-note"));
+                if ui.button(fl!("try-sim")).clicked() {
+                    self.shared.lock().unwrap().simulate = true;
+                }
+            });
+        }
         if !self.shared.lock().unwrap().boot.is_empty() {
             ui.add_space(8.0);
             card(ui, &fl!("boot-title"), |ui| {
@@ -1091,5 +1104,37 @@ impl App {
                 }
             });
         }
+    }
+
+    /// While the KVM is the simulator, at the top of every page: what is made up and what is real, and the way back to
+    /// a real KVM (straight away once one is plugged in). Not in a browser, which has only the simulator.
+    pub(crate) fn sim_banner(&mut self, ui: &mut Ui) {
+        if cfg!(target_arch = "wasm32") {
+            return;
+        }
+        let kvm_present = self.shared.lock().unwrap().kvm_present;
+        let c = if kvm_present { GOOD } else { look::NEUTRAL };
+        egui::Frame::new()
+            .fill(c.gamma_multiply(0.14))
+            .stroke(egui::Stroke::new(1.0, c))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(RichText::new(fl!("sim-banner-title")).strong().color(ink(ui, c)));
+                ui.label(fl!("sim-banner"));
+                ui.horizontal_wrapped(|ui| {
+                    let leave = if kvm_present {
+                        ui.label(RichText::new(fl!("sim-kvm-found")).strong());
+                        ui.button(fl!("sim-use-kvm"))
+                    } else {
+                        ui.button(fl!("sim-leave"))
+                    };
+                    if leave.clicked() {
+                        self.shared.lock().unwrap().simulate = false;
+                    }
+                });
+            });
+        ui.add_space(8.0);
     }
 }

@@ -12,7 +12,7 @@ mod service;
 mod time;
 mod usb;
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use defmt::{info, unwrap, warn};
 use embassy_executor::Spawner;
@@ -73,6 +73,22 @@ async fn ep_out(mut ep: otg::Endpoint<'static, otg::Out>, index: usize) -> ! {
 /// Without the PC's 5 V this long, the PC hub goes into reset; a short dip during a reboot doesn't count.
 const HUB_HOLD_AFTER: Duration = Duration::from_secs(1);
 
+/// The lowest of the PC's 5 V since the last status (mV), from [`vbus_sampler`]; `u16::MAX`: no sample yet.
+static VBUS_MIN: AtomicU16 = AtomicU16::new(u16::MAX);
+
+/// Samples the PC's 5 V every millisecond for the lowest between two statuses (one conversion, about 10 µs): dips the
+/// 100 ms reading misses, such as a device's inrush, for the RP2354B's judgement of the supply (software.md §4.7).
+#[embassy_executor::task]
+async fn vbus_sampler() -> ! {
+    let mut ticker = Ticker::every(Duration::from_millis(1));
+    loop {
+        ticker.next().await;
+        if let Some(v) = adc::read_mv(adc::CH_VDET) {
+            VBUS_MIN.fetch_min(v.saturating_mul(2), Ordering::Relaxed);
+        }
+    }
+}
+
 /// Status to the RP2354B every 100 ms and whenever something changes. Also holds the PC hub in reset while the PC
 /// gives no 5 V (`board::hold_hub`), and lets it go as soon as the 5 V is back.
 #[embassy_executor::task]
@@ -105,10 +121,11 @@ async fn status_task() -> ! {
             _ => UsbSpeed::Unknown,
         };
         let (vdda_mv, temp_dc) = adc::read_internal();
+        let vbus_mv = port.vbus_mv.unwrap_or(0);
         let s = Status {
             usb_state,
             speed,
-            vbus_mv: port.vbus_mv.unwrap_or(0),
+            vbus_mv,
             cc1_mv: port.cc1_mv,
             cc2_mv: port.cc2_mv,
             frame: if usb::running() { usb::frame_number() } else { 0 },
@@ -117,6 +134,7 @@ async fn status_task() -> ! {
             wake_enabled: usb::WAKE_ENABLED.load(Ordering::Relaxed),
             vdda_mv,
             temp_dc,
+            vbus_min_mv: VBUS_MIN.swap(u16::MAX, Ordering::Relaxed).min(vbus_mv),
         };
         let _ = link::try_send(&LinkMsg::Status(s));
     }
@@ -138,6 +156,7 @@ async fn main(spawner: Spawner) {
         warn!("12 MHz crystal not running: on the HICK, USB off");
         spawner.spawn(unwrap!(service::run(role)));
         spawner.spawn(unwrap!(status_task()));
+        spawner.spawn(unwrap!(vbus_sampler()));
         spawner.spawn(unwrap!(usb::sink()));
         return;
     }
@@ -157,5 +176,6 @@ async fn main(spawner: Spawner) {
     }
     spawner.spawn(unwrap!(service::run(role)));
     spawner.spawn(unwrap!(status_task()));
+    spawner.spawn(unwrap!(vbus_sampler()));
     spawner.spawn(unwrap!(usb_task(core)));
 }

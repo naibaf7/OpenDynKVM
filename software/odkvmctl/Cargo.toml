@@ -61,9 +61,8 @@ ksni = { version = "0.3.7", default-features = false, features = ["async-io", "b
 
 [target.'cfg(windows)'.dependencies]
 hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
-tray-icon = "0.26"
-# Autostart (registry), the single-instance event, DDC/CI (dxva2), the monitor list, the screens with their scaling
-# and the cursor for screen hop, and the removable drives (the RP2350's bootloader drive).
+# Autostart (registry), the single-instance event, DDC/CI (dxva2), the monitor list, the screens with their scaling,
+# the cursor and the input desktop for screen hop, and the removable drives (the RP2350's bootloader drive).
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_Display",
     "Win32_Foundation",
@@ -71,11 +70,17 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Registry",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+# The tray icon: the notification area on Windows, the menu bar on macOS.
+tray-icon = "0.26"
+
+# macOS: IOHIDManager through hidapi's own C backend (built with the system's SDK on a Mac).
 [target.'cfg(not(any(windows, target_os = "linux", target_arch = "wasm32")))'.dependencies]
 hidapi = "2.6.7"
 

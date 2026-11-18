@@ -6,6 +6,7 @@
 //! | `opendyn-kvm_<version>_amd64.deb` | Debian, Ubuntu |
 //! | `opendyn-kvm-<version>-1.x86_64.rpm` | Fedora, openSUSE (needs `rpmbuild`) |
 //! | `OpenDynKVM-Setup-<version>.exe` | Windows 10 and 11, per user, no administrator rights (needs `makensis`) |
+//! | `OpenDynKVM-<version>.dmg` | macOS 11 and later, Apple silicon and Intel: `--macos`, on a Mac (Xcode's tools) |
 //!
 //! - The Linux packages hold both programs, the menu entry, the icons, the udev rule (reloaded on install and
 //!   removal) and the `i2c-dev` module setting for DDC/CI (loaded on install and at boot). Starting at login is each
@@ -14,6 +15,11 @@
 //!   `software/odkvmctl/packaging/build-env.sh`) with the host's rustup toolchain mounted, so they need no newer glibc
 //!   than Debian 12 and the current Ubuntu releases have. `--native` builds them on this machine; the packages then
 //!   need its glibc.
+//! - The macOS app (`--macos`, instead of the others) is `OpenDynKVM.app`: both programs as universal binaries in
+//!   `Contents/MacOS` (`lipo` of the two Apple targets; one where only one is installed), the firmware and the licenses
+//!   in `Contents/Resources`, the icon as `AppIcon.icns`, signed ad hoc (`codesign -s -`, as Apple silicon needs) but
+//!   not by a developer: a downloaded copy opens with *Open* from its context menu the first time, and after each
+//!   update its Accessibility permission (for placing the cursor) is granted again, as macOS sees a new app.
 //! - Every package carries the licenses of all it was compiled from (`THIRD-PARTY-LICENSES.txt`, from `cargo metadata`),
 //!   RMK's notice for the parts of `kvm-vial` adapted from it, and the license of the window's text font (Adwaita Sans,
 //!   SIL OFL 1.1, embedded in opendyn-kvm).
@@ -30,6 +36,7 @@ use anyhow::{Context, Result, bail, ensure};
 const PACKAGE: &str = "opendyn-kvm";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const WINDOWS: &str = "x86_64-pc-windows-gnu";
+const MACOS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
 const LINUX: &str = "x86_64-unknown-linux-gnu";
 const BASE_IMAGE: &str = "docker.io/library/debian:bookworm";
 const IMAGE: &str = "opendyn-kvm-build:bookworm";
@@ -65,6 +72,8 @@ fn output(cmd: &mut Command) -> Result<String> {
 pub struct Options {
     pub out: PathBuf,
     pub native: bool,
+    /// The macOS app instead of the Linux packages and the Windows installer.
+    pub macos: bool,
 }
 
 /// The firmware files every package carries (`cargo xtask dist` makes them; `odkvmctl::firmware` finds them): the
@@ -703,9 +712,105 @@ fn windows_installer(
     Ok(exe)
 }
 
+/// `OpenDynKVM.app` in a disk image (see the module documentation). Needs a Mac: the SDK to link, `lipo`, `codesign`,
+/// `hdiutil`.
+pub fn macos(root: &Path, opt: &Options) -> Result<()> {
+    ensure!(cfg!(target_os = "macos"), "the macOS app is built on a Mac (Xcode's command line tools)");
+    let stage = opt.out.join("stage").join("macos");
+    if stage.exists() {
+        fs::remove_dir_all(&stage)?;
+    }
+    let installed = output(Command::new("rustup").args(["target", "list", "--installed"]))?;
+    let targets: Vec<&str> = MACOS.iter().copied().filter(|t| installed.lines().any(|l| l.trim() == *t)).collect();
+    ensure!(!targets.is_empty(), "no macOS target installed: rustup target add {}", MACOS.join(" "));
+    let dirs: Vec<PathBuf> = targets.iter().map(|t| build(root, Some(t))).collect::<Result<_>>()?;
+    let app = stage.join("OpenDynKVM.app");
+    let contents = app.join("Contents");
+    for b in ["odkvmctl", "opendyn-kvm"] {
+        let to = contents.join("MacOS").join(b);
+        fs::create_dir_all(to.parent().unwrap())?;
+        run(Command::new("lipo").arg("-create").args(dirs.iter().map(|d| d.join(b))).arg("-output").arg(&to))?;
+    }
+    put(&contents, "Info.plist", info_plist().as_bytes(), 0o644)?;
+    let icons: Vec<(&str, Vec<u8>)> = ICNS.iter().map(|&(kind, size)| Ok((kind, png(size)?))).collect::<Result<_>>()?;
+    put(&contents, "Resources/AppIcon.icns", &icns(&icons), 0o644)?;
+    for (name, data) in firmware_files(&opt.out)? {
+        put(&contents, &format!("Resources/firmware/{name}"), &data, 0o644)?;
+    }
+    for (name, data) in licenses(root, targets[0])? {
+        put(&contents, &format!("Resources/licenses/{name}"), &data, 0o644)?;
+    }
+    run(Command::new("codesign").args(["--force", "--deep", "--sign", "-"]).arg(&app))?;
+    let dmg = opt.out.join(format!("OpenDynKVM-{VERSION}.dmg"));
+    run(Command::new("hdiutil")
+        .args(["create", "-volname", "OpenDynKVM", "-format", "UDZO", "-ov", "-srcfolder"])
+        .arg(&app)
+        .arg(&dmg))?;
+    println!("{}", dmg.display());
+    Ok(())
+}
+
+/// The app's Info.plist: its identity (`odkvmctl::autostart::BUNDLE_ID`), version, program and icon.
+fn info_plist() -> String {
+    let id = odkvmctl::autostart::BUNDLE_ID;
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n<dict>\n\
+         \t<key>CFBundleName</key>\n\t<string>OpenDynKVM</string>\n\
+         \t<key>CFBundleDisplayName</key>\n\t<string>OpenDynKVM</string>\n\
+         \t<key>CFBundleIdentifier</key>\n\t<string>{id}</string>\n\
+         \t<key>CFBundleVersion</key>\n\t<string>{VERSION}</string>\n\
+         \t<key>CFBundleShortVersionString</key>\n\t<string>{VERSION}</string>\n\
+         \t<key>CFBundleExecutable</key>\n\t<string>opendyn-kvm</string>\n\
+         \t<key>CFBundlePackageType</key>\n\t<string>APPL</string>\n\
+         \t<key>CFBundleIconFile</key>\n\t<string>AppIcon</string>\n\
+         \t<key>LSMinimumSystemVersion</key>\n\t<string>11.0</string>\n\
+         \t<key>LSApplicationCategoryType</key>\n\t<string>public.app-category.utilities</string>\n\
+         \t<key>NSHighResolutionCapable</key>\n\t<true/>\n\
+         </dict>\n</plist>\n"
+    )
+}
+
+/// The icon's images in an `.icns`: its type for each size, PNGs all (macOS 10.7 and later).
+const ICNS: [(&str, usize); 7] =
+    [("icp4", 16), ("icp5", 32), ("icp6", 64), ("ic07", 128), ("ic08", 256), ("ic09", 512), ("ic10", 1024)];
+
+/// An Apple icon file: `icns` and its length, then each image as its type, its length (header included) and its PNG.
+fn icns(images: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (kind, data) in images {
+        body.extend(kind.as_bytes());
+        body.extend((8 + data.len() as u32).to_be_bytes());
+        body.extend(data);
+    }
+    let mut out = b"icns".to_vec();
+    out.extend((8 + body.len() as u32).to_be_bytes());
+    out.extend(body);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_macos_app_names_its_program_icon_and_identity() {
+        let p = info_plist();
+        for want in [
+            "<key>CFBundleExecutable</key>\n\t<string>opendyn-kvm</string>",
+            "<key>CFBundleIconFile</key>\n\t<string>AppIcon</string>",
+            &format!("<key>CFBundleIdentifier</key>\n\t<string>{}</string>", odkvmctl::autostart::BUNDLE_ID),
+            &format!("<key>CFBundleShortVersionString</key>\n\t<string>{VERSION}</string>"),
+        ] {
+            assert!(p.contains(want), "{want} in {p}");
+        }
+        let f = icns(&[("icp4", vec![1, 2, 3]), ("ic10", vec![4])]);
+        assert_eq!(&f[..4], b"icns");
+        assert_eq!(u32::from_be_bytes(f[4..8].try_into().unwrap()) as usize, f.len());
+        assert_eq!(&f[8..16], b"icp4\0\0\0\x0b");
+        assert_eq!(&f[19..27], b"ic10\0\0\0\x09");
+    }
 
     #[test]
     fn ar_members_are_even_aligned_with_60_byte_headers() {

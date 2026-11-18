@@ -24,7 +24,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, Frame, Margin, RichText};
-use kvm_proto::ctrl::{ConfigValue, MAX_PROFILES, Pc, Port, Rgb, Target, status_flags};
+use kvm_proto::ctrl::{ConfigValue, MAX_PROFILES, Pc, Port, Rgb, Target, caps, status_flags};
 use odkvmctl::client::Snapshot;
 use odkvmctl::local::{self, Local};
 use odkvmctl::{autostart, fl, icon};
@@ -141,12 +141,16 @@ struct App {
     displays: displays::Displays,
     /// The Screens page's selection and drag.
     screens: screens::Editor,
+    /// Screen hop's cursor placed from here (`odkvmctl::placer`): on per `local.place_cursor`, and what it does.
+    placer: Arc<odkvmctl::placer::Shared>,
     wake: Wake,
     /// The accent and theme the window's style was last set for.
     styled: Option<(Color32, local::Theme)>,
     /// The sidebar's icon and wordmark, and the window (context) and display scale they were drawn for: a window opened
     /// again is a new context, without the old one's textures.
     logo: Option<(egui::Context, f32, egui::TextureHandle, egui::TextureHandle)>,
+    /// The window's title as last set: whether it says "simulated", in which language.
+    titled: Option<(bool, String)>,
 }
 
 fn config<T>(s: &Snapshot, f: impl Fn(&ConfigValue) -> Option<T>) -> Option<T> {
@@ -213,9 +217,12 @@ fn switch_target(pc: Pc) -> Target {
 const LOGO_ICON: f32 = 28.0;
 const LOGO_WORDMARK: f32 = 15.0;
 
-/// Windows hides the window on close and keeps it; Wayland can't hide windows, so on Linux the window really closes
-/// and the tray's *Open* makes a new one (see `main`).
-const HIDE_ON_CLOSE: bool = cfg!(windows);
+/// Windows and macOS keep the tray icon on the window's event-loop thread (the main thread), so the window stays: it
+/// starts hidden in the tray, and hides on close (macOS can't make a second event loop anyway). Wayland can't hide
+/// windows, so on Linux the tray runs on a thread of its own, the window really closes, and the tray's *Open* makes a
+/// new one (see `main`).
+const TRAY_IN_WINDOW: bool = cfg!(any(windows, target_os = "macos"));
+const HIDE_ON_CLOSE: bool = TRAY_IN_WINDOW;
 
 impl App {
     fn new(shared: Arc<Mutex<Shared>>, tx: Sender<UiCmd>, tray_rx: Receiver<TrayAction>, wake: Wake) -> App {
@@ -250,9 +257,11 @@ impl App {
             local_error: None,
             displays: displays::Displays::default(),
             screens: screens::Editor::default(),
+            placer: Arc::default(),
             wake,
             styled: None,
             logo: None,
+            titled: None,
         }
     }
 
@@ -333,6 +342,13 @@ impl App {
             look::apply(ctx, want.0);
             ctx.set_theme(look::preference(want.1));
             self.styled = Some(want);
+        }
+        // The simulator may be chosen, and left, while the window is open.
+        let title = (self.shared.lock().unwrap().simulate, odkvmctl::i18n::current());
+        if cfg!(not(target_arch = "wasm32")) && self.titled.as_ref() != Some(&title) {
+            let text = if title.0 { fl!("window-title-sim") } else { fl!("product-name") };
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(text));
+            self.titled = Some(title);
         }
     }
 
@@ -478,6 +494,9 @@ impl App {
                 ui.label(RichText::new(e).color(ink(ui, BAD)));
             }
             ui.add_space(8.0);
+            if snap.as_ref().is_some_and(|s| s.info.caps & caps::SIMULATED != 0) {
+                self.sim_banner(ui);
+            }
             if snap.as_ref().is_some_and(|s| s.status.bt_passkey != 0) && self.page != Page::Bluetooth {
                 self.passkey_banner(ui, snap.as_ref().map(|s| &s.status));
             }
@@ -566,26 +585,34 @@ fn main() -> eframe::Result {
     worker::spawn_boot_scan(sim, shared.clone(), wake.clone());
     let (tray_tx, tray_rx) = channel();
     let mut app = App::new(shared, tx, tray_rx, wake.clone());
+    // Screen hop's cursor placed from here, where the system lets a program (never with the simulator: its pointer
+    // isn't this computer's).
+    app.placer.enabled.store(app.local.place_cursor, std::sync::atomic::Ordering::Relaxed);
+    if !sim {
+        let w = wake.clone();
+        odkvmctl::placer::spawn(app.placer.clone(), move || w());
+    }
     if let Some(l) = listener {
         single::listen(l, tray_tx.clone(), wake.clone());
     }
-    // Linux: the tray runs on its own D-Bus thread. Windows: it must be created on the window's event-loop thread,
-    // which happens with the first window below.
+    // Linux: the tray runs on its own D-Bus thread. Windows and macOS: it must be created on the window's event-loop
+    // thread, which happens with the first window below.
     let mut tray_tx = Some(tray_tx);
-    if !cfg!(windows) {
+    if !TRAY_IN_WINDOW {
         app.tray = Tray::new(tray_tx.take().unwrap(), wake.clone());
     }
 
-    // In the tray from the start: on Linux no window until Open; on Windows the window exists (its event loop runs the
-    // tray icon) but stays hidden. Without a tray there is nothing to start into, so the window shows.
-    let mut window = !(in_tray && (cfg!(windows) || app.tray.is_some()));
+    // In the tray from the start: on Linux no window until Open; on Windows and macOS the window exists (its event loop
+    // runs the tray icon) but stays hidden. Without a tray there is nothing to start into, so the window shows.
+    let mut window = !(in_tray && (TRAY_IN_WINDOW || app.tray.is_some()));
     loop {
         if window {
             let (slot, wake_w, tray_tx_w) = (window_ctx.clone(), wake.clone(), tray_tx.take());
-            let hidden = in_tray && cfg!(windows) && tray_tx_w.is_some();
+            let hidden = in_tray && TRAY_IN_WINDOW && tray_tx_w.is_some();
             let app_ref = &mut app;
-            // A new window gets its style set on its first frame.
+            // A new window gets its style and title set on its first frame.
             app_ref.styled = None;
+            app_ref.titled = None;
             eframe::run_native(
                 "opendyn-kvm",
                 options(sim, !hidden),
@@ -657,6 +684,109 @@ mod tests {
             std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
         }
         (ctx, app, shared)
+    }
+
+    /// The centre of the button labelled `label` in a frame's accessibility tree.
+    fn button_at(out: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+        let nodes = &out.platform_output.accesskit_update.as_ref()?.nodes;
+        let (_, n) =
+            nodes.iter().find(|(_, n)| n.role() == egui::accesskit::Role::Button && n.label() == Some(label))?;
+        let r = n.bounds()?;
+        Some(egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32))
+    }
+
+    /// Without a KVM the window offers the simulator. Chosen, the worker changes over at once, every page says so at
+    /// the top with the way back, which turns into "use it" once a KVM is plugged in; leaving goes back to looking for
+    /// the KVM. The window's title follows. (The "KVM" here is never there and the plugged-in one never opened.)
+    #[test]
+    fn without_a_kvm_the_simulator_can_be_tried_and_left() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let wake: Wake = Arc::new(|| {});
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (tx, rx) = channel();
+        let plugged_in = Arc::new(AtomicBool::new(false));
+        let connect = |sim: bool| {
+            if sim {
+                Ok(odkvmctl::Client::new(Box::new(odkvmctl::sim::SimTransport::new())))
+            } else {
+                Err(odkvmctl::Error::Transport(fl!("no-kvm-found")))
+            }
+        };
+        let present = {
+            let p = plugged_in.clone();
+            move || p.load(Ordering::Relaxed)
+        };
+        worker::spawn_with(false, shared.clone(), rx, wake.clone(), connect, present);
+        let (_tray_tx, tray_rx) = channel();
+        let mut app = App::new(shared.clone(), tx, tray_rx, wake);
+        app.local = local::Local::default();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut time = 0.0;
+        let mut run = |app: &mut App, events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 1300.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            app.logic(&ctx, &mut frame);
+            let mut out = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+            out.textures_delta.clear();
+            out
+        };
+        let click =
+            |run: &mut dyn FnMut(&mut App, Vec<egui::Event>) -> egui::FullOutput, app: &mut App, label: &str| {
+                let at = button_at(&run(app, vec![]), label).unwrap_or_else(|| panic!("no button {label:?}"));
+                let button = |pressed| egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                };
+                run(app, vec![egui::Event::PointerMoved(at), button(true)]);
+                run(app, vec![button(false)]);
+            };
+        let wait = |what: &str, done: &dyn Fn(&Shared) -> bool| {
+            let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(6);
+            while !done(&shared.lock().unwrap()) {
+                assert!(odkvmctl::time::Instant::now() < deadline, "never: {what}");
+                std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
+            }
+        };
+        let simulated = |s: &Shared| s.snap.as_ref().is_some_and(|s| s.info.caps & caps::SIMULATED != 0);
+        let title = |out: &egui::FullOutput| {
+            out.viewport_output.values().flat_map(|v| &v.commands).find_map(|c| match c {
+                egui::ViewportCommand::Title(t) => Some(t.clone()),
+                _ => None,
+            })
+        };
+
+        wait("no KVM", &|s| s.error.is_some());
+        assert_eq!(title(&run(&mut app, vec![])), Some(fl!("product-name")));
+        click(&mut run, &mut app, &fl!("try-sim"));
+        assert!(shared.lock().unwrap().simulate);
+        wait("the simulator", &simulated);
+        let out = run(&mut app, vec![]);
+        assert_eq!(title(&out), Some(fl!("window-title-sim")));
+        assert!(button_at(&out, &fl!("sim-leave")).is_some() && button_at(&out, &fl!("sim-use-kvm")).is_none());
+        // Every page has the banner.
+        for page in Page::ALL {
+            app.page = page;
+            assert!(button_at(&run(&mut app, vec![]), &fl!("sim-leave")).is_some(), "no way back on {page:?}");
+        }
+        app.page = Page::Overview;
+
+        plugged_in.store(true, Ordering::Relaxed);
+        wait("the KVM seen", &|s| s.kvm_present);
+        click(&mut run, &mut app, &fl!("sim-use-kvm"));
+        assert!(!shared.lock().unwrap().simulate);
+        wait("back to looking for the KVM", &|s| s.snap.is_none() && s.error.is_some() && !s.kvm_present);
+        let out = run(&mut app, vec![]);
+        assert_eq!(title(&out), Some(fl!("product-name")));
+        assert!(button_at(&out, &fl!("try-sim")).is_some());
     }
 
     /// Drives every page in both themes headlessly against the simulator: catches panics and checks a switch

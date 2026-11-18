@@ -13,18 +13,23 @@
 //!   stands where that PC's screen does; the pointer never goes onto it, but its PC's desktop still includes it.
 //! - **Reports:** what the active host gets is an absolute position, mapped onto its screens as it maps the absolute
 //!   pointer ([`Map`]): across all of them, those off for hop included (Linux), or onto its main screen only
-//!   (Windows), whose other screens the KVM reaches with relative motion from where it last put the cursor. A host's
+//!   (Windows), whose other screens the KVM reaches with relative motion from where it last put the cursor (counts
+//!   for the host's own acceleration where it accelerates, [`Raw`]). A host's
 //!   desktop counts physical pixels (Windows, X11) or logical ones (Wayland, [`Units`]), which decides how a screen's
 //!   arrangement size relates to its place there. A Bluetooth host that takes no absolute pointer ([`Map::relative`])
 //!   gets relative motion only: when the pointer comes onto it, its cursor is pushed into the top-left corner of its
 //!   desktop first, and wherever the KVM holds the pointer at an edge, the push goes on to the host, whose cursor then
-//!   meets that edge too: its own acceleration, which the KVM can't undo, drifts no further than the next edge.
+//!   meets that edge too: where its own acceleration differs from the KVM's, it drifts no further than the next edge.
+//! - **Placed by the PC** ([`Map::placed`], protocol 10): where a PC's host software asked to place the cursor itself,
+//!   the screens it named get the position in the PC's own pixels ([`Report::Place`]) instead of relative motion (or,
+//!   with [`Placement::All`], of any pointer report): exactly there, whatever the PC's acceleration. Optional: without
+//!   the host software, or once its lease ran out, the PC's mapping alone as above.
 //! - **Acceleration:** the PCs don't accelerate an absolute pointer, so the KVM does ([`Accelerator`]): flat, the curve
 //!   of Windows' "Enhance pointer precision", or libinput's adaptive profile, with the speed measured over the last
 //!   reports as libinput measures it.
 
 use heapless::Vec;
-use kvm_proto::ctrl::{Accel, HOSTS, Host, MAX_SCREENS, Mapping, Screen, Units};
+use kvm_proto::ctrl::{Accel, HOSTS, Host, MAX_SCREENS, Mapping, Placement, Screen, Units};
 
 pub use kvm_hid::normalized::ABS_MAX;
 
@@ -50,6 +55,8 @@ pub enum Report {
     /// Relative motion, in the host's pixels: a screen the host maps no absolute position onto, or a host that takes
     /// relative motion only.
     Rel([i32; 2]),
+    /// The cursor's place in the host's own pixels, for its host software to put it there ([`Map::placed`]).
+    Place([i32; 2]),
 }
 
 pub type Reports = Vec<Report, 3>;
@@ -62,12 +69,15 @@ pub struct Map {
     pub units: Units,
     /// Relative motion only (a Bluetooth host set to `BtPointer::Relative`).
     pub relative: bool,
+    /// The screens the host's software places the cursor on itself (a PC whose `PlaceCursor` lease holds).
+    pub placed: Placement,
 }
 
 impl Map {
-    pub const DESKTOP: Map = Map { mapping: Mapping::Desktop, units: Units::Physical, relative: false };
-    pub const MAIN_SCREEN: Map = Map { mapping: Mapping::MainScreen, units: Units::Physical, relative: false };
-    pub const RELATIVE: Map = Map { mapping: Mapping::Desktop, units: Units::Physical, relative: true };
+    pub const DESKTOP: Map =
+        Map { mapping: Mapping::Desktop, units: Units::Physical, relative: false, placed: Placement::Off };
+    pub const MAIN_SCREEN: Map = Map { mapping: Mapping::MainScreen, ..Map::DESKTOP };
+    pub const RELATIVE: Map = Map { relative: true, ..Map::DESKTOP };
 }
 
 /// What the edges allow at the moment.
@@ -81,6 +91,24 @@ pub struct Rules {
     /// host connected and subscribed.
     pub open: [bool; HOSTS],
     pub maps: [Map; HOSTS],
+    /// The mouse's own counts for this motion, where the host accelerates relative motion itself (`hop-accel` other
+    /// than flat: Windows' "Enhance pointer precision", libinput). None: unaccelerated motion (mouse keys), or a host
+    /// that doesn't accelerate (flat).
+    pub raw: Option<Raw>,
+}
+
+/// A motion's counts as the mouse sent them, and the curve the host accelerates them with (taken to be the KVM's own,
+/// `hop-accel` and `hop-speed`). On a screen reached with relative motion the host gets counts that its curve takes as
+/// far as the KVM's took the pointer, in that screen's own pixels ([`Accelerator::counts_for`]): at 100 % the counts
+/// themselves, at 200 % (two of its pixels per logical one) more, and less than twice as many, as the curve is steeper
+/// faster. Until 0.1.24 the KVM's accelerated motion went and was accelerated again: the cursor ran about twice as fast
+/// as the pointer on a 2880×1800 screen at 200 %; the counts alone (0.1.25) got it only half way, as Windows' curve
+/// counts its physical pixels (first board, 2026-11-16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Raw {
+    pub counts: [i32; 2],
+    pub accel: Accel,
+    pub speed: i8,
 }
 
 /// The outcome of a motion.
@@ -136,6 +164,18 @@ fn screens_of(layout: &Layout, host: Host) -> impl Iterator<Item = (usize, &Scre
 /// All the host's screens, those off for hop included: its desktop.
 fn desktop_of(layout: &Layout, host: Host) -> impl Iterator<Item = (usize, &Screen)> {
     layout.iter().enumerate().filter(move |(_, s)| s.host == Some(host) && s.is_valid())
+}
+
+/// Whether `host`'s own desktop ends at screen `slot`'s edge along `axis` in `dir`: none of its screens (those off for
+/// hop included) lies beyond that edge, across from it. A cursor pushed there stops by itself.
+fn desktop_ends(layout: &Layout, host: Host, slot: usize, axis: usize, dir: i8, units: Units) -> bool {
+    let (min, max) = desk_rect(&layout[slot], units);
+    let o = 1 - axis;
+    !desktop_of(layout, host).any(|(i, s)| {
+        let (a, b) = desk_rect(s, units);
+        let beyond = if dir > 0 { a[axis] >= max[axis] - 1.0 } else { b[axis] <= min[axis] + 1.0 };
+        i != slot && beyond && a[o] < max[o] && b[o] > min[o]
+    })
 }
 
 /// Whether `host` has a screen in the arrangement that the pointer goes onto.
@@ -222,6 +262,8 @@ pub struct Pointer {
     left: [Option<[f32; 2]>; HOSTS],
     /// Where each host's own cursor is as far as the KVM knows (its own pixels): after an absolute report exactly there.
     cursor: [Option<[f32; 2]>; HOSTS],
+    /// The fraction of a count not yet sent to a host that accelerates ([`Raw`]), each way.
+    rest: [f32; 2],
     push: f32,
     /// The edge pushed against: slot, axis, direction.
     push_edge: Option<(usize, usize, i8)>,
@@ -242,6 +284,7 @@ impl Pointer {
         slot: None,
         left: [None; HOSTS],
         cursor: [None; HOSTS],
+        rest: [0.0; 2],
         push: 0.0,
         push_edge: None,
         push_at: 0,
@@ -289,6 +332,7 @@ impl Pointer {
             self.left[host.index()] = Some(self.pos);
         }
         self.reset_push();
+        self.rest = [0.0; 2];
     }
 
     /// Puts the pointer on `host` (a switch to it): where it was left there, or in the middle of its main screen.
@@ -328,12 +372,19 @@ impl Pointer {
 
     /// The reports that put `host`'s cursor where the pointer is.
     pub fn here(&mut self, layout: &Layout, host: Host, map: Map) -> Reports {
+        self.place(layout, host, map, None)
+    }
+
+    /// [`Pointer::here`], after a motion of `raw` counts ([`Rules::raw`]): on a screen reached with relative motion,
+    /// where the host's cursor is known, those counts go instead of the difference.
+    fn place(&mut self, layout: &Layout, host: Host, map: Map, raw: Option<[i32; 2]>) -> Reports {
         let mut out = Reports::new();
         let Some(slot) = self.on(layout, host) else { return out };
         let s = &layout[slot];
         let desk = desk_of(s, self.pos, map.units);
         let to_px = |d: [f32; 2]| d.map(round);
         let h = host.index();
+        let raw = raw.filter(|_| self.cursor[h].is_some());
         if map.relative {
             // Relative motion only: from where its cursor is as far as the KVM knows; where that isn't known, push it
             // into the top-left corner of its desktop first.
@@ -348,15 +399,30 @@ impl Pointer {
                 }
             };
             let target = to_px(desk);
-            let _ = out.push(Report::Rel([(target[0] - from[0]) as i32, (target[1] - from[1]) as i32]));
+            let d = raw.unwrap_or([(target[0] - from[0]) as i32, (target[1] - from[1]) as i32]);
+            let _ = out.push(Report::Rel(d));
             self.cursor[h] = Some(target);
             return out;
         }
         let absolute = map.mapping == Mapping::Desktop || main_screen(layout, host) == Some(slot);
+        let placed = match map.placed {
+            Placement::Off => false,
+            Placement::Others => !absolute,
+            Placement::All => true,
+        };
+        if placed {
+            // Its software puts the cursor exactly there.
+            let target = to_px(desk);
+            let _ = out.push(Report::Place([target[0] as i32, target[1] as i32]));
+            self.cursor[h] = Some(target);
+            self.rest = [0.0; 2];
+            return out;
+        }
         if absolute {
             if let Some(area) = abs_area(layout, host, map) {
                 let _ = out.push(Report::Abs(to_abs(desk, area)));
                 self.cursor[h] = Some(to_px(desk));
+                self.rest = [0.0; 2];
             }
             return out;
         }
@@ -373,7 +439,8 @@ impl Pointer {
             }
         };
         let target = to_px(desk);
-        let _ = out.push(Report::Rel([(target[0] - from[0]) as i32, (target[1] - from[1]) as i32]));
+        let d = raw.unwrap_or([(target[0] - from[0]) as i32, (target[1] - from[1]) as i32]);
+        let _ = out.push(Report::Rel(d));
         self.cursor[h] = Some(target);
         out
     }
@@ -389,6 +456,9 @@ impl Pointer {
         // What the KVM held back at an edge (logical pixels): a host that takes relative motion only gets it too, so its
         // cursor meets the edge where the pointer is.
         let mut held = [0.0f32; 2];
+        // Held at an edge where the host's own desktop ends too: its cursor stops there by itself.
+        let mut ends = [false; 2];
+        let units = rules.maps[host.index()].units;
         for axis in 0..2 {
             let delta = d[axis];
             if delta == 0.0 {
@@ -412,6 +482,7 @@ impl Pointer {
             let Some(n) = neighbour(layout, slot, axis, dir, across) else {
                 self.reset_push();
                 held[axis] = dir as f32 * over;
+                ends[axis] = desktop_ends(layout, host, slot, axis, dir, units);
                 continue;
             };
             let nr = rect(&layout[n]);
@@ -431,6 +502,7 @@ impl Pointer {
             if rules.buttons || !rules.open[to.index()] || near_corner {
                 self.reset_push();
                 held[axis] = dir as f32 * over;
+                ends[axis] = desktop_ends(layout, host, slot, axis, dir, units);
                 continue;
             }
             let key = (slot, axis, dir);
@@ -442,6 +514,7 @@ impl Pointer {
             self.push += over;
             if self.push < rules.resistance as f32 {
                 held[axis] = dir as f32 * over;
+                ends[axis] = desktop_ends(layout, host, slot, axis, dir, units);
                 continue;
             }
             // Over: the host left keeps its cursor at the edge, the other gets the pointer at the same place along it.
@@ -456,9 +529,29 @@ impl Pointer {
             return step;
         }
         let map = rules.maps[host.index()];
-        step.reports = self.here(layout, host, map);
+        // The counts for a host that accelerates: a relative host's whole (what the KVM held back at an edge goes on
+        // to it, below), a PC's less what the KVM held back, so its cursor stops at the wall the pointer met.
+        let k = self.slot.map_or(1.0, |i| layout[i].desk_per_logical(map.units));
+        let raw = rules.raw.map(|r| {
+            let c = self.accel.counts_for(r.counts, k, r.accel, r.speed);
+            let rest = self.rest;
+            let out: [i32; 2] = core::array::from_fn(|a| {
+                // Held where the host's desktop goes on: less what was held, so its cursor stops at the pointer's wall.
+                // Where it ends there too, the whole, so the cursor meets that edge even where the host's curve took it
+                // less far than the KVM's (a fast motion): until 0.1.25 it stopped short of it.
+                let moved = if map.relative || d[a] == 0.0 || ends[a] { 1.0 } else { (d[a] - held[a]) / d[a] };
+                let v = c[a] * moved + rest[a];
+                let n = round(v);
+                self.rest[a] = v - n;
+                n as i32
+            });
+            out
+        });
+        let counts_went = raw.is_some() && self.cursor[host.index()].is_some();
+        step.reports = self.place(layout, host, map, raw);
         if map.relative
             && held != [0.0, 0.0]
+            && !counts_went
             && let Some(i) = self.slot
         {
             let k = layout[i].desk_per_logical(map.units);
@@ -666,17 +759,44 @@ impl Accelerator {
         self.n = (self.n + 1).min(TRACKERS);
         let v = self.velocity();
         let gain = match accel {
-            Accel::Flat => slider(speed),
-            Accel::Precision => precision(v) * slider(speed),
             Accel::Adaptive => {
                 // libinput averages the factor between the last speed and this one (Simpson's rule).
                 let s = speed as f32 / 10.0;
                 let last = self.last_v;
                 (adaptive(v, s) + adaptive(last, s) + 4.0 * adaptive((v + last) / 2.0, s)) / 6.0
             }
+            _ => gain(v, accel, speed),
         };
         self.last_v = v;
         [dx as f32 * gain, dy as f32 * gain]
+    }
+
+    /// The counts that the curve, at the speed of the last report, takes `k` times as far as `counts` (`k` its pixels
+    /// per logical one): `r` times them, with r · gain(r · v) = k · gain(v). The gain never falls as the speed rises,
+    /// so `r` lies between 1 and `k`; a bisection finds it.
+    pub fn counts_for(&self, counts: [i32; 2], k: f32, accel: Accel, speed: i8) -> [f32; 2] {
+        let v = self.last_v;
+        let want = k * gain(v, accel, speed);
+        let (mut lo, mut hi) = (k.min(1.0), k.max(1.0));
+        for _ in 0..24 {
+            let r = (lo + hi) / 2.0;
+            if r * gain(r * v, accel, speed) < want {
+                lo = r;
+            } else {
+                hi = r;
+            }
+        }
+        let r = (lo + hi) / 2.0;
+        counts.map(|c| c as f32 * r)
+    }
+}
+
+/// Pixels per count at `v` counts per ms (libinput's adaptive profile without its averaging).
+fn gain(v: f32, accel: Accel, speed: i8) -> f32 {
+    match accel {
+        Accel::Flat => slider(speed),
+        Accel::Precision => precision(v) * slider(speed),
+        Accel::Adaptive => adaptive(v, speed as f32 / 10.0),
     }
 }
 
@@ -699,7 +819,7 @@ mod tests {
     }
 
     fn rules(resistance: u16) -> Rules {
-        Rules { resistance, corner: 20, buttons: false, open: [true; HOSTS], maps: [Map::DESKTOP; HOSTS] }
+        Rules { resistance, corner: 20, buttons: false, open: [true; HOSTS], maps: [Map::DESKTOP; HOSTS], raw: None }
     }
 
     #[test]
@@ -817,6 +937,137 @@ mod tests {
     }
 
     #[test]
+    fn a_host_that_accelerates_gets_counts_for_its_own_curve_on_a_screen_reached_relatively() {
+        // Windows (first board, 2026-11-16): the main screen (1920×1080, its 0,0) on the right, a laptop's 2880×1800 at
+        // 200 % (1440×900 logical) left of it.
+        let l = layout(&[
+            Screen::new(Host::Pc1, 1920, 1080, [1440, 0]),
+            Screen { scale: 200, desk: [-2880, 0], ..Screen::new(Host::Pc1, 2880, 1800, [0, 0]) },
+        ]);
+        let mut r = rules(0);
+        r.maps = [Map::MAIN_SCREEN; HOSTS];
+        let raw = |x, y| Some(Raw { counts: [x, y], accel: Accel::Precision, speed: 0 });
+        let mut p = Pointer::NEW;
+        p.enter(&l, Host::Pc1);
+        p.here(&l, Host::Pc1, Map::MAIN_SCREEN);
+        // Onto the laptop's screen, 40 logical pixels in. The last absolute report put the cursor, so counts go: twice
+        // the mouse's (no speed measured yet, so the curve is straight), as Windows' curve counts its pixels.
+        r.raw = raw(-400, 0);
+        let s = p.motion(&l, Host::Pc1, [-1000.0, 0.0], 0, &r);
+        assert_eq!((p.screen(), p.position()), (Some(1), [1400, 540]));
+        assert_eq!(s.reports.as_slice(), &[Report::Rel([-800, 0])]);
+        r.raw = raw(-4, 1);
+        let s = p.motion(&l, Host::Pc1, [-10.0, 2.0], 1, &r);
+        assert_eq!(s.reports.as_slice(), &[Report::Rel([-8, 2])]);
+        // Into its left edge, a wall where Windows' desktop ends too: all of it, so the cursor gets there even where
+        // Windows' curve took it less far.
+        r.raw = raw(-1000, 0);
+        let s = p.motion(&l, Host::Pc1, [-2000.0, 0.0], 2, &r);
+        assert_eq!(p.position(), [0, 542]);
+        assert_eq!(s.reports.as_slice(), &[Report::Rel([-2000, 0])]);
+        // With a screen of Windows' beyond it (off for hop: shown by the other PC), only what the pointer moved, 1400
+        // of 2000, so the cursor doesn't go on onto it.
+        let mut off = l;
+        off[2] = Screen { off: true, desk: [-4800, 0], ..Screen::new(Host::Pc1, 1920, 1080, [-1920, 0]) };
+        let mut o = Pointer::NEW;
+        o.enter(&off, Host::Pc1);
+        o.here(&off, Host::Pc1, Map::MAIN_SCREEN);
+        o.motion(&off, Host::Pc1, [-1000.0, 0.0], 0, &Rules { raw: None, ..r });
+        let s = o.motion(&off, Host::Pc1, [-2000.0, 0.0], 1, &r);
+        assert_eq!((o.position(), s.reports.as_slice()), ([0, 540], &[Report::Rel([-1400, 0])][..]));
+        // Back onto the main screen: absolute, exactly where the pointer is.
+        r.raw = raw(800, 0);
+        let s = p.motion(&l, Host::Pc1, [2000.0, 0.0], 3, &r);
+        assert_eq!(p.screen(), Some(0));
+        assert!(matches!(s.reports.as_slice(), [Report::Abs(_)]));
+        // A host that doesn't accelerate (flat): the difference, in its pixels.
+        r.raw = None;
+        p.motion(&l, Host::Pc1, [-1000.0, 0.0], 4, &r);
+        let s = p.motion(&l, Host::Pc1, [-10.0, 0.0], 5, &r);
+        assert_eq!(s.reports.as_slice(), &[Report::Rel([-20, 0])]);
+        // A fraction of a count is kept for the next report: 3 counts at ×1.5 (150 %) go as 4 and 5.
+        let l15 = layout(&[
+            Screen::new(Host::Pc1, 1920, 1080, [1280, 0]),
+            Screen { scale: 150, desk: [-1920, 0], ..Screen::new(Host::Pc1, 1920, 1080, [0, 0]) },
+        ]);
+        let mut q = Pointer::NEW;
+        q.enter(&l15, Host::Pc1);
+        q.here(&l15, Host::Pc1, Map::MAIN_SCREEN);
+        q.motion(&l15, Host::Pc1, [-1000.0, 0.0], 10, &Rules { raw: None, ..r });
+        r.raw = raw(-3, 0);
+        let a = q.motion(&l15, Host::Pc1, [-3.0, 0.0], 11, &r);
+        let b = q.motion(&l15, Host::Pc1, [-3.0, 0.0], 12, &r);
+        assert_eq!(
+            (a.reports.as_slice(), b.reports.as_slice()),
+            (&[Report::Rel([-5, 0])][..], &[Report::Rel([-4, 0])][..])
+        );
+        // A relative-only host gets them whole, what the KVM held at an edge included.
+        let mut q = Pointer::NEW;
+        let rel = Map { relative: true, ..Map::DESKTOP };
+        let mut r = rules(0);
+        r.maps = [rel; HOSTS];
+        let one = layout(&[Screen { scale: 200, ..Screen::new(Host::Pc1, 2880, 1800, [0, 0]) }]);
+        q.enter(&one, Host::Pc1);
+        q.here(&one, Host::Pc1, rel);
+        r.raw = raw(-900, 0);
+        let s = q.motion(&one, Host::Pc1, [-2000.0, 0.0], 0, &r);
+        assert_eq!((q.position(), s.reports.as_slice()), ([0, 450], &[Report::Rel([-1800, 0])][..]));
+    }
+
+    #[test]
+    fn a_pc_whose_software_places_the_cursor_gets_its_place_instead_of_relative_motion() {
+        // As above: the main screen right, the laptop's 2880×1800 at 200 % left of it.
+        let l = layout(&[
+            Screen::new(Host::Pc1, 1920, 1080, [1440, 0]),
+            Screen { scale: 200, desk: [-2880, 0], ..Screen::new(Host::Pc1, 2880, 1800, [0, 0]) },
+        ]);
+        let others = Map { placed: Placement::Others, ..Map::MAIN_SCREEN };
+        let mut r = rules(0);
+        r.maps = [others; HOSTS];
+        r.raw = Some(Raw { counts: [-400, 0], accel: Accel::Precision, speed: 0 });
+        let mut p = Pointer::NEW;
+        p.enter(&l, Host::Pc1);
+        // The main screen stays absolute.
+        assert_eq!(p.here(&l, Host::Pc1, others).as_slice(), &[Report::Abs([16392, 16399])]);
+        // Onto the laptop's screen, 40 logical pixels in: its place there in Windows' pixels, whatever the counts.
+        let s = p.motion(&l, Host::Pc1, [-1000.0, 0.0], 0, &r);
+        assert_eq!(s.reports.as_slice(), &[Report::Place([-80, 1080])]);
+        // Back onto the main screen: absolute again.
+        let s = p.motion(&l, Host::Pc1, [1000.0, 0.0], 1, &r);
+        assert!(matches!(s.reports.as_slice(), [Report::Abs(_)]));
+        // The lease ran out on the laptop's screen: relative motion from where the cursor was put.
+        p.motion(&l, Host::Pc1, [-1000.0, 0.0], 2, &r);
+        r.maps = [Map::MAIN_SCREEN; HOSTS];
+        r.raw = None;
+        let s = p.motion(&l, Host::Pc1, [-10.0, 0.0], 3, &r);
+        assert_eq!(s.reports.as_slice(), &[Report::Rel([-20, 0])]);
+        // All of them (macOS): the main screen is placed too, in its logical pixels (the units here).
+        let all = Map { placed: Placement::All, units: Units::Logical, ..Map::DESKTOP };
+        let mut q = Pointer::NEW;
+        q.enter(&l, Host::Pc1);
+        assert_eq!(q.here(&l, Host::Pc1, all).as_slice(), &[Report::Place([960, 540])]);
+    }
+
+    #[test]
+    fn counts_for_a_steeper_part_of_the_curve_take_it_as_far() {
+        // Fast enough that twice the speed is further up Windows' curve: fewer than twice the counts do it.
+        let mut a = Accelerator::NEW;
+        for t in 0..10 {
+            a.apply(8, 0, t * 4, Accel::Precision, 0);
+        }
+        let v = a.last_v;
+        let c = a.counts_for([8, 0], 2.0, Accel::Precision, 0);
+        let r = c[0] / 8.0;
+        assert!(r > 1.0 && r < 1.99, "{r}");
+        let far = r * gain(r * v, Accel::Precision, 0);
+        assert!((far - 2.0 * gain(v, Accel::Precision, 0)).abs() < 1e-3);
+        // Flat: exactly k times.
+        assert_eq!(a.counts_for([8, -3], 1.5, Accel::Flat, 0), [12.0, -4.5]);
+        // At 100 %: the counts themselves.
+        assert_eq!(a.counts_for([8, 0], 1.0, Accel::Precision, 0)[0].round(), 8.0);
+    }
+
+    #[test]
     fn the_pcs_own_cursor_is_taken_over_once_the_pointer_rests() {
         let l = two_pcs();
         let mut p = Pointer::NEW;
@@ -850,7 +1101,7 @@ mod tests {
         if with_shared { layout(&[hd, pc2, pc1_shared]) } else { layout(&[hd, pc2]) }
     }
 
-    const KDE: Map = Map { mapping: Mapping::Desktop, units: Units::Logical, relative: false };
+    const KDE: Map = Map { units: Units::Logical, ..Map::DESKTOP };
 
     #[test]
     fn a_screen_off_for_hop_still_counts_for_its_pcs_desktop() {

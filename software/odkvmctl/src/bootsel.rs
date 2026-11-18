@@ -442,7 +442,16 @@ fn drives() -> Vec<Drive> {
         .collect()
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+/// macOS mounts every FAT drive under /Volumes (the boot ROM's as RP2350).
+#[cfg(target_os = "macos")]
+fn drives() -> Vec<Drive> {
+    std::fs::read_dir("/Volumes")
+        .map(|d| d.flatten().map(|e| e.path()).filter(|p| is_rp2350_drive(p)).map(|path| Drive { path, block: None }))
+        .map(Iterator::collect)
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn drives() -> Vec<Drive> {
     Vec::new()
 }

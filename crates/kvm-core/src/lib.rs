@@ -17,6 +17,7 @@ pub mod policy;
 pub mod presentation;
 pub mod standby;
 pub mod store;
+pub mod supply;
 pub mod usbdesc;
 
 pub use engine::{Engine, KeyEvent, Output, Probed, Route};

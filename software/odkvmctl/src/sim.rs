@@ -228,6 +228,7 @@ fn pc_status(cc_mv: u16, vbus_mv: u16, state: UsbState) -> Status {
         wake_enabled: true,
         vdda_mv: Some(3290),
         temp_dc: Some(380),
+        vbus_min_mv: vbus_mv,
     }
 }
 

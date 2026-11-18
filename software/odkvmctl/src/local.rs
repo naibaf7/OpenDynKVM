@@ -5,8 +5,9 @@
 //! - **Where:** one JSON file in the user's configuration directory: `$XDG_CONFIG_HOME/opendyn-kvm/settings.json`
 //!   (`~/.config/...` when unset, or not an absolute path as the XDG spec requires) on Linux,
 //!   `%APPDATA%\OpenDynKVM\settings.json` on Windows (the roaming profile: the theme and language follow the user,
-//!   and a monitor binding only applies to the monitor with that id, so it is harmless on another computer). Start at
-//!   login is kept where each system looks for it instead ([`crate::autostart`]).
+//!   and a monitor binding only applies to the monitor with that id, so it is harmless on another computer),
+//!   `~/Library/Application Support/OpenDynKVM/settings.json` on macOS. Start at login is kept where each system
+//!   looks for it instead ([`crate::autostart`]).
 //! - **Who writes:** only the window (`opendyn-kvm`), one copy per user, as each setting changes; the command line
 //!   only reads the language. A change is a click, so the whole file is written each time.
 //! - **How:** to a temporary file, flushed to disk, then renamed over the old one: a crash or power cut leaves either
@@ -136,7 +137,7 @@ impl From<DisplayBinding> for StoredBinding {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Local {
     pub theme: Theme,
@@ -144,6 +145,15 @@ pub struct Local {
     /// The language of the window and the command line (`i18n::LANGUAGES`); None: the system's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Screen hop: the window places this computer's cursor where the KVM's pointer is, on the screens the system
+    /// lets it (`crate::placer`, Windows and macOS). On unless turned off: running the window is the choice.
+    pub place_cursor: bool,
+}
+
+impl Default for Local {
+    fn default() -> Self {
+        Local { theme: Theme::default(), displays: Vec::new(), language: None, place_cursor: true }
+    }
 }
 
 impl Local {
@@ -178,7 +188,9 @@ pub fn config_home() -> Option<PathBuf> {
 pub fn path() -> Option<PathBuf> {
     #[cfg(windows)]
     let dir = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("OpenDynKVM"));
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let dir = std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/OpenDynKVM"));
+    #[cfg(not(any(windows, target_os = "macos")))]
     let dir = config_home().map(|c| c.join("opendyn-kvm"));
     dir.map(|d| d.join("settings.json"))
 }

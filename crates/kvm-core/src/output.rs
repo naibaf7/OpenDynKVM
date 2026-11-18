@@ -91,6 +91,9 @@ impl PcOutput {
     /// absolute pointer is released there, and its release carries a position: dragged onto another screen (reached
     /// with relative motion), that position was the main screen's, and Windows dropped the window back there (first
     /// board, 2026-11-16).
+    ///
+    /// A position the PC's software puts the cursor at (`hop::Report::Place`, sent to it by the engine) moves neither
+    /// pointer: the relative one reports only a change of its buttons, the wheel or pan.
     pub fn pointer(
         &mut self,
         motion: hop::Report,
@@ -136,6 +139,12 @@ impl PcOutput {
             }
             (None, hop::Report::Abs(_)) => {
                 let _ = out.push(self.mouse(&MouseInput { buttons: held_rel, wheel, pan, ..MouseInput::default() }, p));
+            }
+            (None, hop::Report::Place(_)) => {
+                if held_rel != self.rel_sent || wheel != 0 || pan != 0 {
+                    let input = MouseInput { buttons: held_rel, wheel, pan, ..MouseInput::default() };
+                    let _ = out.push(self.mouse(&input, p));
+                }
             }
         }
         self.rel_sent = held_rel;
@@ -247,6 +256,24 @@ mod tests {
         let r = o.pointer(hop::Report::Rel([0, 0]), 0, 0, 0, true, &p);
         assert_eq!(r.as_slice(), &[(0x82, report(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))]);
         assert!(r.iter().all(|(_, d)| d[0] != 2), "no absolute report: the cursor stays where it was let go");
+        assert_eq!(o.held, [0, 0]);
+    }
+
+    #[test]
+    fn a_placed_cursor_moves_no_pointer_and_its_buttons_go_on_the_relative_one() {
+        let p = Presentation { mouse_abs: true, ..pres() };
+        let mut o = PcOutput::default();
+        let place = hop::Report::Place([-80, 1080]);
+        // A position alone: nothing on the pointer interfaces (the PC's software puts the cursor there).
+        assert!(o.pointer(place, 0, 0, 0, true, &p).is_empty());
+        // A press there, the wheel: on the relative pointer, without motion; held, nothing more.
+        let r = o.pointer(place, 1, 0, 0, true, &p);
+        assert_eq!(r.as_slice(), &[(0x82, report(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]))]);
+        assert!(o.pointer(place, 1, 0, 0, true, &p).is_empty());
+        let r = o.pointer(place, 1, 2, 0, true, &p);
+        assert_eq!(r.as_slice(), &[(0x82, report(&[1, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0]))]);
+        let r = o.pointer(place, 0, 0, 0, true, &p);
+        assert_eq!(r.as_slice(), &[(0x82, report(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))]);
         assert_eq!(o.held, [0, 0]);
     }
 }

@@ -244,6 +244,7 @@ mod tests {
             wake_enabled,
             vdda_mv: None,
             temp_dc: None,
+            vbus_min_mv: 5000,
         };
         let of = |s| Presence::of(LinkState::Connected, Some(&s));
         assert_eq!(Presence::of(LinkState::LinkDown, Some(&st(UsbState::Configured, false))), Presence::Unknown);

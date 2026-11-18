@@ -309,6 +309,8 @@ impl Client {
             }
             let Some(r) = self.t.read(left).map_err(Error::Transport)? else { return Err(Error::Timeout) };
             match DeviceMsg::decode(&r) {
+                // Screen hop's placements are the placer's (`crate::placer`), on its own handle.
+                Ok(DeviceMsg::Event(Event::PlaceCursor(_))) => {}
                 Ok(DeviceMsg::Event(e)) => self.events.push_back(e),
                 Ok(DeviceMsg::Response { id: rid, request, response }) if rid == id && request == req.type_byte() => {
                     return match response {
@@ -327,7 +329,9 @@ impl Client {
     pub fn events(&mut self, timeout: Duration) -> Result<Vec<Event>> {
         let mut wait = timeout;
         while let Some(r) = self.t.read(wait).map_err(Error::Transport)? {
-            if let Ok(DeviceMsg::Event(e)) = DeviceMsg::decode(&r) {
+            if let Ok(DeviceMsg::Event(e)) = DeviceMsg::decode(&r)
+                && !matches!(e, Event::PlaceCursor(_))
+            {
                 self.events.push_back(e);
             }
             wait = Duration::ZERO;

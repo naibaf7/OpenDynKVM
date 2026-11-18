@@ -17,7 +17,7 @@ Using the KVM is in the [README](README.md).
 | [`analysis.md`](analysis.md), [`report.md`](report.md) | Design reviews of the schematic and the routed board, and the router's development report |
 | `crates/` | Shared Rust crates: protocols (`kvm-proto`), HID parsing (`kvm-hid`), the KVM logic (`kvm-core`), the USB device core (`kvm-usbdev`), Vial and the keymap engine (`kvm-vial`) |
 | `firmware/rp2354/`, `firmware/at32f405/`, `firmware/esp32c3/` | The firmware images (each its own Cargo workspace); the ESP32-C3 one is for the optional Bluetooth module |
-| `software/odkvmctl/` | `odkvmctl` (command line) and `opendyn-kvm` (window and tray icon) for Windows and Linux |
+| `software/odkvmctl/` | `odkvmctl` (command line) and `opendyn-kvm` (window and tray icon) for Windows, Linux and macOS |
 | `xtask/` | `cargo xtask dist`: the firmwares and the files to flash; `cargo xtask package`: the host software's installers; `cargo xtask desktop`: the development build's menu entry and icons (Linux) |
 | [`branding/`](branding/) | The logo, the wordmark and the application icons as SVG, and the script that draws them |
 | [`AGENTS.md`](AGENTS.md) | Working rules for coding agents (routing with the live view, checks after every run) |
@@ -31,7 +31,10 @@ Using the KVM is in the [README](README.md).
   won't build the firmware: put `~/.cargo/bin` first in `PATH`.
 - **espflash** (`cargo install espflash`) for the Bluetooth module's flash image in `cargo xtask dist`.
 - **Windows build of odkvmctl from Linux** (optional): `rustup target add x86_64-pc-windows-gnu` and MinGW-w64.
-- odkvmctl's USB access is pure Rust on Windows and Linux: no libudev or C compiler is needed.
+- odkvmctl's USB access is pure Rust on Windows and Linux: no libudev or C compiler is needed. On macOS it is hidapi's
+  C backend, built with Xcode's command line tools: the macOS app is built on a Mac
+  (`rustup target add aarch64-apple-darwin x86_64-apple-darwin`). From Linux the code can be checked for macOS
+  (the same two targets, then software.md §10: the Intel one for the Intel Macs' DDC/CI).
 - **Installers** (`cargo xtask package`, optional): podman or docker (the Linux packages are built in a Debian 12
   container), `rpmbuild` for the `.rpm`, and NSIS (`makensis`) plus MinGW-w64 for the Windows installer.
 
@@ -75,6 +78,7 @@ cargo run -p odkvmctl --bin opendyn-kvm -- --sim       # the GUI against the sim
 cargo xtask desktop                                    # Linux: menu entry + icons for target/debug (--remove: undo)
 cargo build -p odkvmctl --release                      # odkvmctl and opendyn-kvm for this machine
 cargo build -p odkvmctl --release --target x86_64-pc-windows-gnu
+cargo xtask package --macos                            # on a Mac: the macOS app in a disk image → dist/
 OPENDYN_SHOTS=/tmp/shots cargo test -p odkvmctl --bin opendyn-kvm -- --ignored screenshots   # every GUI page as an image
 OPENDYN_SIM_BT=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim   # the same with the Bluetooth module (0.16.0)
 OPENDYN_SIM_BT=dongle cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the module as an ESP32-C3 board on Other
@@ -96,6 +100,7 @@ module's image; the files it writes and what each is for are in [software.md §1
 | `dist/OpenDynKVM-Setup-<version>.exe` | Windows 10 and 11 |
 | `dist/opendyn-kvm_<version>_amd64.deb` | Debian 12 and later, Ubuntu 22.04 and later |
 | `dist/opendyn-kvm-<version>-1.x86_64.rpm` | Fedora, openSUSE |
+| `dist/OpenDynKVM-<version>.dmg` | macOS 11 and later (`--macos`, on a Mac; instead of the three above) |
 
 The Linux binaries are built in a Debian 12 container, so they need only glibc 2.35 whatever this machine runs
 (`--native` builds them here instead). The `.deb`'s Maintainer comes from `DEBFULLNAME` / `DEBEMAIL`, else from git's
@@ -123,8 +128,8 @@ Hardware, firmware and host software each carry a `major.minor.patch` version.
 | What | Now | Where it is set |
 |---|---|---|
 | Hardware | **0.18.0** in design, not ordered yet (0.13.0 to 0.17.0 were designed and never ordered). **0.12.0** is the board ordered as revision 12 | `HW_VERSION` in `hardware/tools/gen_pcb.py` (printed on the board: the design's version) and `kvm_proto::HARDWARE_VERSION` (what the firmware reports: the newest board that was ordered, still 0.12.0) |
-| Firmware, RP2354B and both AT32F405s alike | **0.1.24** | `kvm_proto::FIRMWARE_VERSION` |
-| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.24** | `version` in the root `Cargo.toml` |
+| Firmware, RP2354B and both AT32F405s alike | **0.1.28** | `kvm_proto::FIRMWARE_VERSION` |
+| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.28** | `version` in the root `Cargo.toml` |
 
 - **Hardware:** a new major version is a different board: 1.0.0 will be the mass-production board, 2.0.0 a new design.
   Minor versions are revisions of the same board. When a board is ordered:
@@ -202,6 +207,16 @@ The first board, a 0.12.0, runs firmware 0.1.17. Faults of the board itself, wit
   - what each PC reports while shut down with standby power (auto-select waits 30 s for a PC with 5 V but no host);
   - the current actually saved.
 - **DDC/CI** switching inputs, and the Windows path.
+- **Screen hop with the cursor placed by the app** (0.1.27, protocol 10): exact on Windows' screens other than the main
+  one, with the app running; tested in the engine and against a scripted KVM only.
+- **The supply judged from the measured 5 V** (0.1.28): the thresholds against a real weak port or long cable, the
+  millisecond minimum of the PC-side chips, and how often a reboot shows as a dropout.
+- **macOS** (host software 0.1.27): compile-checked from Linux only. Still to run on a Mac: the app bundle, the KVM
+  found over hidapi, the screens detected, the cursor placed (after Accessibility is allowed), the tray in the menu
+  bar, start at login, and how macOS maps the absolute pointer onto several displays without the app.
+  - DDC/CI (0.1.28): the monitors found and named, their input read and set, the capability string, on Apple silicon
+    (over USB-C/DisplayPort and over the HDMI port, which on some models takes chip address 0xB7) and on an Intel Mac
+    (the `IOI2CRequest` layout, and AMD's reply wait).
 - **The Bluetooth module** (boards from 0.16.0), the fixes for errata E2 and E3 (from 0.17.0), and the module's EN line (0.18.0).
 - **The module as an ESP32-C3 board on a front port** works on the first 0.12.0 board (2026-11-14): found, programmed
   over USB from blank and updated, paired, switched to, and used in screen hop; mouse to host 5–10 ms at the host's

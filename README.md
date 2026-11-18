@@ -93,6 +93,10 @@ pinhole held while plugging in (or `odkvmctl reboot bootloader`), then *Install*
   needs the AppIndicator extension; without it the window opens instead.
 - **From source on Linux**, install the udev rule and the module setting once yourself
   ([DEVELOPMENT.md](DEVELOPMENT.md#build-and-test)).
+- **Without a KVM yet:** while none is connected, `opendyn-kvm` offers *Try with a simulated KVM*. Everything acts on
+  a made-up KVM, except what doesn't need one: the monitors set up on the Displays page really switch inputs (DDC/CI)
+  when the simulated KVM switches, and Screen hop can detect this computer's screens. Monitors set up this way stay
+  set up for the real KVM. *Leave the simulator* (or *Use it*, once a KVM is plugged in) goes back to it.
 
 Vial (vial.rocks in the browser, or the Vial app) opens the KVM's Vial interface itself, as the logged-in user. The
 packages' udev rule covers it, matched by its interface name "OpenDynKVM Vial" (firmware 0.1.10 on), and opens only that
@@ -200,7 +204,9 @@ from that PC.
 
 `odkvmctl display` lists the monitors (id, inputs, current input); `odkvmctl display input <id> <value>` sets one, for
 scripts. On Linux the monitors are found through `/sys/class/drm` (DisplayPort AUX or the connector's DDC bus), on
-Windows through the monitor API (dxva2); laptop panels have no DDC/CI.
+Windows through the monitor API (dxva2), on macOS through the display's I/O Kit entry (on Apple silicon its AV
+service, on Intel Macs the graphics card's I2C bus); laptop panels have no DDC/CI. On a Mac, a monitor behind some
+docks or adapters (USB display adapters, some HDMI adapters) can't be reached; another port or cable usually helps.
 
 ### Screen hop: one mouse across all the screens
 
@@ -245,14 +251,18 @@ there (it tells the KVM where the cursor came to rest). `odkvmctl screens` shows
   1. `odkvmctl config set vial auto` (or "Vial interface: Auto" in the GUI). Both PCs detect the KVM again, about 1 s.
      `auto` shows the interface only while no mirrored device needs its USB endpoint; `on` keeps it always.
   2. Open the [Vial](https://get.vial.today) app (desktop, or vial.rocks in a Chromium browser) and pick "OpenDynKVM".
-     Choose ANSI or ISO under Layout, then remap keys and layers as on any Vial keyboard.
+     Choose ANSI or ISO under Layout (the KVM keeps it), and the language your computer types in under Vial's
+     *Keyboard layout* menu (Vial keeps that on each computer: it only changes the labels). Then remap keys and layers
+     as on any Vial keyboard.
   3. Macros and the matrix tester ask to **unlock**: hold both Shift keys for 3 s.
   4. Changes are saved 5 s after the last edit. The keymap keeps working with the interface off
      (`odkvmctl config set vial off`); `odkvmctl config set keymap off` bypasses it.
-- Supported: 8 layers (MO, TG, TO, DF, OSL, LM, tri-layer), modded keys, mod-tap and layer-tap (tapping term,
-  permissive hold, hold on other key press), one-shot modifiers, media, system and mouse keys, 16 macros. Not yet: tap
-  dance, combos, key overrides. The keymap applies to keyboards in `normalized` mode, and the KVM sees what the keyboard
-  sends, so a keyboard's own Fn key cannot be remapped. Details: [software.md §4.11](software.md).
+- Supported: what Vial offers on a QMK keyboard, but RGB lighting: 8 layers (MO, TG, TO, DF, OSL, LM, TT, tri-layer,
+  Layer Lock), modded keys, mod-tap and layer-tap with every setting on Vial's Tap-Hold page, one-shot keys, media,
+  system and mouse keys, 16 macros, and 32 each of tap dances, combos, key overrides and alternate repeat keys; caps
+  word, the Repeat keys, auto shift, Grave Escape and the magic swaps. Macro text is typed as on a US layout. The keymap
+  applies to keyboards in `normalized` mode, and the KVM sees what the keyboard sends, so a keyboard's own Fn key
+  cannot be remapped. Details: [software.md §4.11](software.md).
 
 ## Known issues
 

@@ -38,8 +38,10 @@ pub const MAX_CTRL_DATA: usize = 256;
 pub const OUTPUT_QUEUE: usize = 48;
 /// Largest item [`Engine::take_save_item`] produces.
 pub const SAVE_ITEM_MAX: usize = kvm_vial::keymap::MACRO_BUFFER;
-/// Electronics' own draw, subtracted from the advertised current for the budget (design.md §6, to be measured).
-pub const SELF_CURRENT_MA: u16 = 300;
+/// Electronics' own draw, subtracted from the advertised current for the budget (information only since 0.1.28: the
+/// warning comes from the measured 5 V, `supply`). design.md §6 estimated about 0.5 A before the board existed; the
+/// first board took under 1 W from the PWR port in every state, its front devices included (2026-11-17): under 200 mA.
+pub const SELF_CURRENT_MA: u16 = 200;
 /// The Bluetooth module's average draw on 5 V when fitted (design.md §6.1: about 40 mA at 3.3 V with hosts connected,
 /// through the 90 % buck); its +9 dBm transmit peaks (190 mA at 3.3 V) last a few hundred microseconds.
 pub const BT_CURRENT_MA: u16 = 30;
@@ -280,6 +282,11 @@ pub struct Engine {
     bt_pointer_at: Option<[u16; 2]>,
     /// The buttons last sent in the active Bluetooth host's mouse report.
     bt_mouse_buttons: u16,
+    /// Each PC's host software places its cursor on these screens until then (`Request::PlaceCursor`, a lease).
+    placer: [Option<(ctrl::Placement, u32)>; 2],
+    /// Each PC's last `Event::PlaceCursor`: when it went, and a later place waiting for the next millisecond.
+    place_sent: [Option<u32>; 2],
+    place_pending: [Option<[i16; 2]>; 2],
     /// Saves that may go ahead now, up to [`SAVE_BURST`]; one more each [`SAVE_PACE_MS`] after `save_paced`.
     save_allowance: u8,
     save_paced: u32,
@@ -335,6 +342,8 @@ pub struct Engine {
     dropped_outputs: u32,
     /// Standby and auto-select (software.md §4.12).
     standby: Tracker,
+    /// The 5 V the KVM runs from, as measured (software.md §4.7).
+    supply: crate::supply::Tracker,
     /// The Bluetooth module and its hosts (software.md §4.13).
     bt: BtState,
     /// Screen hop's pointer (software.md §4.14).
@@ -400,6 +409,9 @@ impl Engine {
             arrangements_dirty: 0,
             bt_pointer_at: None,
             bt_mouse_buttons: 0,
+            placer: [None; 2],
+            place_sent: [None; 2],
+            place_pending: [None; 2],
             save_allowance: SAVE_BURST,
             save_paced: 0,
             vial: kvm_vial::Vial::new(),
@@ -440,6 +452,7 @@ impl Engine {
             cache: Vec::new(),
             dropped_outputs: 0,
             standby: Tracker::new(),
+            supply: crate::supply::Tracker::new(),
             bt: BtState::EMPTY,
             hop: hop::Pointer::NEW,
         }
@@ -555,8 +568,8 @@ impl Engine {
         if self.fw.0 == FwState::AwaitingKey {
             flags |= status_flags::UPDATE_ARMED;
         }
-        if self.budget_low(budget) {
-            flags |= status_flags::BUDGET_LOW;
+        if matches!(self.supply.level(), ctrl::Supply::Sags | ctrl::Supply::Low) {
+            flags |= status_flags::SUPPLY_SAGS;
         }
         if self.selftest & !ctrl::selftest::RUNNING != 0 {
             flags |= status_flags::SELFTEST_FAILED;
@@ -585,6 +598,10 @@ impl Engine {
             bt_passkey: self.bt.passkey.map_or(0, |p| p.host),
             bt_passkey_digits: self.bt.passkey.map_or(0, |p| p.digits),
             bt_passkey_typed: self.bt.passkey.map_or(0, |p| p.value),
+            supply: self.supply.level(),
+            supply_mv: self.supply.readings().0,
+            supply_lowest_mv: self.supply.readings().1,
+            declared_ma: self.declared_ma(),
             bt_module: self.bt_module,
             hop: self.hop_state(),
             pointer: self.hop.position_on(self.config.layout(), self.active_host()),
@@ -623,9 +640,9 @@ impl Engine {
         (self.hop.screen(), self.hop.position())
     }
 
-    fn budget_low(&self, budget: u16) -> bool {
-        let need: u16 = self.ports.iter().filter_map(|p| p.dev.as_ref()).map(|d| d.summary.max_power_ma).sum();
-        budget != 0 && need > budget
+    /// What the front devices declare they may draw at most (`bMaxPower`): information, as most draw far less.
+    fn declared_ma(&self) -> u16 {
+        self.ports.iter().filter_map(|p| p.dev.as_ref()).map(|d| d.summary.max_power_ma).fold(0, u16::saturating_add)
     }
 
     pub fn led_inputs(&self) -> LedInputs {
@@ -639,7 +656,7 @@ impl Engine {
             brightness: self.config.led_brightness,
             identify: self.now < self.identify_until,
             awaiting_key: self.fw.0 == FwState::AwaitingKey || self.unlock.is_some(),
-            budget_low: self.status(None).flags & status_flags::BUDGET_LOW != 0,
+            supply_sags: matches!(self.supply.level(), ctrl::Supply::Sags | ctrl::Supply::Low),
             selftest: self.selftest_showing().then_some(self.selftest),
             standby: self.standby.plan().mode != PowerMode::Active,
             standby_glow: self.config.standby_glow,
@@ -1251,6 +1268,7 @@ impl Engine {
     /// A raw input report from interface `iface` of the device on `port`.
     pub fn device_report(&mut self, port: Port, iface: u8, data: &[u8], now: u32) {
         self.now = now;
+        self.place_waiting();
         let i = port.index();
         if self.ports[i].state != PortState::Hosted {
             return;
@@ -1581,7 +1599,12 @@ impl Engine {
     /// pointer or its mouse.
     fn send_host_pointer(&mut self, host: Host, motion: hop::Report, buttons: u16, wheel: i32, pan: i32) {
         let n = match (host.as_pc(), host.bt_slot()) {
-            (Some(pc), _) => return self.send_pointer_report(pc, motion, buttons, wheel, pan),
+            (Some(pc), _) => {
+                if let hop::Report::Place(at) = motion {
+                    self.place_cursor(pc, at);
+                }
+                return self.send_pointer_report(pc, motion, buttons, wheel, pan);
+            }
             (None, Some(n)) => n,
             (None, None) => return,
         };
@@ -1613,6 +1636,44 @@ impl Engine {
                     }
                 }
             }
+            // A Bluetooth host has no host software to place its cursor.
+            hop::Report::Place(_) => {}
+        }
+    }
+
+    /// Tells `pc`'s host software where to put its cursor (`Event::PlaceCursor`): at once, unless one went this
+    /// millisecond already (the control interface takes a report a millisecond, a mouse may send eight), then the
+    /// latest with the next.
+    fn place_cursor(&mut self, pc: Pc, at: [i32; 2]) {
+        let at = at.map(|v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        let k = pc.index();
+        if self.place_sent[k] == Some(self.now) {
+            self.place_pending[k] = Some(at);
+        } else {
+            self.place_pending[k] = None;
+            self.place_sent[k] = Some(self.now);
+            self.event_to(pc, Event::PlaceCursor(at));
+        }
+    }
+
+    /// A place that waited for the next millisecond ([`Engine::place_cursor`]).
+    fn place_waiting(&mut self) {
+        for pc in [Pc::Pc1, Pc::Pc2] {
+            let k = pc.index();
+            if self.place_sent[k] != Some(self.now)
+                && let Some(at) = self.place_pending[k].take()
+            {
+                self.place_sent[k] = Some(self.now);
+                self.event_to(pc, Event::PlaceCursor(at));
+            }
+        }
+    }
+
+    /// The screens `pc`'s host software places the cursor on now: none once its lease ran out.
+    fn placement(&self, pc: Pc) -> ctrl::Placement {
+        match self.placer[pc.index()] {
+            Some((p, until)) if until.wrapping_sub(self.now) as i32 > 0 => p,
+            _ => ctrl::Placement::Off,
         }
     }
 
@@ -1631,6 +1692,7 @@ impl Engine {
             mapping: self.config.mapping(host),
             units: self.config.units(host),
             relative: self.config.bt_pointer(host) == BtPointer::Relative,
+            placed: host.as_pc().map_or(ctrl::Placement::Off, |pc| self.placement(pc)),
         }
     }
 
@@ -1664,6 +1726,12 @@ impl Engine {
             buttons: m.buttons != 0,
             open: core::array::from_fn(|i| self.hop_open(host_at(i))),
             maps: core::array::from_fn(|i| self.hop_map(host_at(i))),
+            // A host that accelerates relative motion itself as `hop-accel` does gets the mouse's counts there.
+            raw: (accelerate && h.accel != ctrl::Accel::Flat).then_some(hop::Raw {
+                counts: [m.x, m.y],
+                accel: h.accel,
+                speed: h.speed,
+            }),
         };
         let layout = *self.config.layout();
         let step = self.hop.motion(&layout, host, d, self.now, &rules);
@@ -1745,12 +1813,17 @@ impl Engine {
         let s = &mut self.pcs[pc.index()];
         let link = usb_to_link(crate::standby::host_usb_state(&st));
         if matches!(st.usb_state, UsbState::Default | UsbState::Unpowered | UsbState::Detached) {
-            // A bus reset or unplug: the PC starts over in report protocol without multipliers, its cursor anywhere.
+            // A bus reset or unplug: the PC starts over in report protocol without multipliers, its cursor anywhere,
+            // and its host software asks again to place it.
             s.out.reset();
             self.hop.forget_cursor(Host::pc(pc));
+            self.placer[pc.index()] = None;
+            self.place_pending[pc.index()] = None;
         }
         s.link = link;
         s.status = Some(st);
+        self.supply.pc(self.now, pc.index(), st.vbus_mv, st.vbus_min_mv);
+        self.judge_supply();
         self.update_power();
     }
 
@@ -1976,6 +2049,13 @@ impl Engine {
 
     pub fn set_power(&mut self, p: PowerInfo) {
         self.power = p;
+        self.judge_supply();
+    }
+
+    /// The 5 V the KVM runs from, judged again after a reading (software.md §4.7).
+    fn judge_supply(&mut self) {
+        let pwr = (self.power.source == PowerSource::PwrPort).then_some(self.power.vbus_pwr_mv);
+        self.supply.judge(self.now, pwr);
     }
 
     /// The self-test's findings (`ctrl::selftest` bits); without `RUNNING` the result shows on the LEDs for a while.
@@ -2103,14 +2183,19 @@ impl Engine {
                 add(id::AT_3V3[k], diag::rail_3v3(mv), mv as i32);
             }
         }
-        let budget = if status.flags & status_flags::BUDGET_LOW != 0 {
-            Grade::Warn
-        } else if status.budget_ma == 0 {
-            Grade::Info
-        } else {
-            Grade::Ok
+        // The estimate is information; the measured supply is the judgement.
+        add(id::BUDGET, Grade::Info, status.budget_ma as i32);
+        let supply = match self.supply.level() {
+            ctrl::Supply::Unknown => Grade::Info,
+            ctrl::Supply::Good => Grade::Ok,
+            ctrl::Supply::Sags => Grade::Warn,
+            ctrl::Supply::Low => Grade::Bad,
         };
-        add(id::BUDGET, budget, status.budget_ma as i32);
+        add(id::SUPPLY, supply, status.supply_lowest_mv as i32);
+        add(id::SUPPLY_DIPS, Grade::Info, self.supply.dips() as i32);
+        for k in 0..2 {
+            add(id::PC_DROPOUTS[k], Grade::Info, self.supply.dropouts(k) as i32);
+        }
         for p in Port::ALL {
             let faults = self.port_info(*p).faults;
             let grade = if self.selftest & ctrl::selftest::PORTS[p.index()] != 0 {
@@ -2198,7 +2283,9 @@ impl Engine {
         let unlock = self.unlock.map(|u| u.until);
         let learn = self.learning.as_ref().map(|l| l.until);
         let learn_tap = self.learning.as_ref().and_then(|l| l.learner.deadline());
-        [self.hotkeys.deadline(), save, keymap, unlock, learn, learn_tap, self.bt.pairing_until]
+        // A place waiting for the next millisecond.
+        let place = self.place_pending.iter().any(Option::is_some).then(|| self.now.wrapping_add(1));
+        [self.hotkeys.deadline(), save, keymap, unlock, learn, learn_tap, self.bt.pairing_until, place]
             .into_iter()
             .flatten()
             .min_by_key(|t| t.wrapping_sub(self.now) as i32)
@@ -2206,6 +2293,7 @@ impl Engine {
 
     pub fn tick(&mut self, now: u32) {
         self.now = now;
+        self.place_waiting();
         if let Some(k) = self.hotkeys.tick(now) {
             self.replay_tap(k);
         }
@@ -2604,6 +2692,15 @@ impl Engine {
                 self.event(Event::BtChanged(0));
                 Response::Ok
             }
+            Request::PlaceCursor(placement) => {
+                // Only a PC has a cursor (not the service port).
+                let pc = pc.ok_or(ErrorCode::NotActive)?;
+                self.placer[pc.index()] = match placement {
+                    ctrl::Placement::Off => None,
+                    p => Some((*p, self.now.wrapping_add(ctrl::PLACE_LEASE_MS))),
+                };
+                Response::Ok
+            }
             Request::PointerAt(at) => {
                 // Only a PC has a cursor (not the service port).
                 let pc = pc.ok_or(ErrorCode::NotActive)?;
@@ -2876,6 +2973,7 @@ mod tests {
             wake_enabled,
             vdda_mv: Some(3300),
             temp_dc: Some(350),
+            vbus_min_mv: vbus_mv,
         }
     }
 
@@ -2892,6 +2990,52 @@ mod tests {
 
     fn powers(out: &[Output]) -> std::vec::Vec<PowerPlan> {
         out.iter().filter_map(|o| if let Output::Power(p) = o { Some(*p) } else { None }).collect()
+    }
+
+    #[test]
+    fn the_supply_warning_comes_from_the_measured_5_v_not_the_declared_maximum() {
+        let mut e = settled();
+        e.port_attached(Port::Mouse, &keyboard_and_mouse());
+        let st = |mv: u16, min: u16| AtStatus { vbus_mv: mv, vbus_min_mv: min, ..usb(UsbState::Configured, false) };
+        let mut t = T0;
+        let mut feed = |e: &mut Engine, ms: u32, mv: u16, min: u16| {
+            for _ in 0..ms / 100 {
+                t += 100;
+                e.tick(t);
+                e.pc_status(Pc::Pc1, st(mv, min));
+            }
+        };
+        // PC1 alone, holding its 5 V: good, whatever the devices declare; an inrush dip is only counted.
+        feed(&mut e, 3000, 4950, 4950);
+        feed(&mut e, 100, 4950, 4300);
+        let s = e.status(None);
+        assert_eq!((s.supply, s.flags & status_flags::SUPPLY_SAGS), (ctrl::Supply::Good, 0));
+        assert_eq!((s.supply_mv, s.supply_lowest_mv), (4950, 4300));
+        assert!(s.declared_ma > 0);
+        assert!(!e.led_inputs().supply_sags);
+        // Sagging under 4.5 V for 2 s: the warning, and the connected PC's LED amber.
+        feed(&mut e, 2500, 4450, 4400);
+        let s = e.status(None);
+        assert_eq!((s.supply, s.flags & status_flags::SUPPLY_SAGS), (ctrl::Supply::Sags, status_flags::SUPPLY_SAGS));
+        assert!(e.led_inputs().supply_sags);
+        // PC2 gives a healthy 5 V too: the ideal diodes feed the board from it, so it is good again (after 5 s).
+        for _ in 0..60 {
+            t += 100;
+            e.tick(t);
+            e.pc_status(Pc::Pc1, st(4450, 4400));
+            e.pc_status(Pc::Pc2, st(5050, 5000));
+        }
+        assert_eq!(e.status(None).supply, ctrl::Supply::Good);
+        // On the PWR port, only its reading counts.
+        for _ in 0..30 {
+            t += 100;
+            e.tick(t);
+            e.set_power(PowerInfo { source: PowerSource::PwrPort, adv_pwr: Advertised::A3_0, vbus_pwr_mv: 4350 });
+        }
+        assert_eq!(e.status(None).supply, ctrl::Supply::Low);
+        let (items, _) = diag(&mut e);
+        let item = items.iter().find(|i| i.id == ctrl::diag::id::SUPPLY).unwrap();
+        assert_eq!((item.grade, item.value), (Grade::Bad, 4300));
     }
 
     #[test]
@@ -4182,6 +4326,68 @@ mod tests {
         e.pc_set_report(Pc::Pc1, 1, 3, normalized::MOUSE_REL_ID, &[normalized::MOUSE_REL_ID, 0x05]);
         assert!(e.pcs[0].out.wheel_hires && e.pcs[0].out.pan_hires);
         assert!(matches!(ask(&mut e, Request::GetInfo), Response::Info(i) if i.caps & ctrl::caps::SCREEN_HOP != 0));
+    }
+
+    #[test]
+    fn a_pc_whose_software_places_its_cursor_gets_the_place_instead_of_relative_motion() {
+        let mut e = hopping();
+        // PC1 maps its main screen only (Windows); its second screen is left of it.
+        let second = ctrl::Screen { desk: [-1920, 0], ..ctrl::Screen::new(Host::Pc1, 1920, 1080, [-1920, 0]) };
+        for v in [ConfigValue::HopMapping(Host::Pc1, ctrl::Mapping::MainScreen), ConfigValue::Screen(0, 2, second)] {
+            e.set_config(v, Origin::Software).unwrap();
+        }
+        drain(&mut e);
+        let left = |e: &mut Engine, t| e.device_report(Port::Mouse, 1, &[0x00, (-100i8) as u8, 0], t);
+        let rel =
+            |buttons, x| normalized::mouse_rel_report(&MouseInput { buttons, x, ..Default::default() }, false, false);
+        let placed = |out: &[Output]| {
+            events_to(out, Pc::Pc1)
+                .into_iter()
+                .filter(|ev| matches!(ev, Event::PlaceCursor(_)))
+                .collect::<std::vec::Vec<_>>()
+        };
+        // Without host software: relative motion on the second screen, 40 pixels into it after 1000.
+        for t in 1..=10 {
+            left(&mut e, T0 + t);
+        }
+        let out = drain(&mut e);
+        assert!(placed(&out).is_empty());
+        assert_eq!(reports(&out).last(), Some(&(Pc::Pc1, 0x82, rel(0, -100).to_vec())));
+        // The host software asks: the place, in PC1's pixels, on its control interface only; nothing on the pointers.
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc1), Request::PlaceCursor(ctrl::Placement::Others)), Response::Ok);
+        left(&mut e, T0 + 11);
+        let out = drain(&mut e);
+        assert_eq!(placed(&out), [Event::PlaceCursor([-140, 540])]);
+        assert!(reports(&out).is_empty());
+        assert!(events_to(&out, Pc::Pc2).is_empty());
+        // Two in one millisecond: the first at once, the latest with the next.
+        left(&mut e, T0 + 12);
+        left(&mut e, T0 + 12);
+        assert_eq!(placed(&drain(&mut e)), [Event::PlaceCursor([-240, 540])]);
+        assert_eq!(e.deadline(), Some(T0 + 13));
+        e.tick(T0 + 13);
+        assert_eq!(placed(&drain(&mut e)), [Event::PlaceCursor([-340, 540])]);
+        // A press and its release there: on the relative pointer, without motion.
+        e.device_report(Port::Mouse, 1, &[0x01, 0, 0], T0 + 14);
+        assert_eq!(reports(&drain(&mut e)), [(Pc::Pc1, 0x82, rel(1, 0).to_vec())]);
+        e.device_report(Port::Mouse, 1, &[0x00, 0, 0], T0 + 15);
+        assert_eq!(reports(&drain(&mut e)), [(Pc::Pc1, 0x82, rel(0, 0).to_vec())]);
+        // The lease runs out (the software stopped without saying so): relative motion again, from where it was put.
+        e.tick(T0 + 11 + ctrl::PLACE_LEASE_MS);
+        left(&mut e, T0 + 12 + ctrl::PLACE_LEASE_MS);
+        let out = drain(&mut e);
+        assert!(placed(&out).is_empty());
+        assert_eq!(reports(&out), [(Pc::Pc1, 0x82, rel(0, -100).to_vec())]);
+        // Renewed, then stopped (`Off`): the same.
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc1), Request::PlaceCursor(ctrl::Placement::Others)), Response::Ok);
+        left(&mut e, T0 + 13 + ctrl::PLACE_LEASE_MS);
+        assert_eq!(placed(&drain(&mut e)), [Event::PlaceCursor([-540, 540])]);
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc1), Request::PlaceCursor(ctrl::Placement::Off)), Response::Ok);
+        left(&mut e, T0 + 14 + ctrl::PLACE_LEASE_MS);
+        assert!(placed(&drain(&mut e)).is_empty());
+        // The service port has no cursor.
+        let r = ask_from(&mut e, None, Request::PlaceCursor(ctrl::Placement::All));
+        assert_eq!(r, Response::Error(ErrorCode::NotActive));
     }
 
     #[test]

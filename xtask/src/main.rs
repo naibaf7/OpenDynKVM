@@ -196,11 +196,12 @@ fn main() -> Result<()> {
         ["dist"] => dist(&root().join("dist")),
         ["dist", "--out", dir] => dist(Path::new(dir)),
         ["package", rest @ ..] => {
-            let mut opt = package::Options { out: root().join("dist"), native: false };
+            let mut opt = package::Options { out: root().join("dist"), native: false, macos: false };
             let mut it = rest.iter();
             while let Some(a) = it.next() {
                 match *a {
                     "--native" => opt.native = true,
+                    "--macos" => opt.macos = true,
                     "--out" => opt.out = PathBuf::from(it.next().context("--out needs a directory")?),
                     other => bail!("unknown option {other}"),
                 }
@@ -208,13 +209,14 @@ fn main() -> Result<()> {
             fs::create_dir_all(&opt.out)?;
             // The packages carry the firmware of the same tree: built first, into the same folder.
             dist(&opt.out)?;
-            package::package(&root(), &opt)
+            if opt.macos { package::macos(&root(), &opt) } else { package::package(&root(), &opt) }
         }
         ["desktop"] => package::desktop(&root(), false),
         ["desktop", "--remove"] => package::desktop(&root(), true),
         _ => {
             eprintln!(
-                "usage: cargo xtask dist [--out DIR]\n       cargo xtask package [--out DIR] [--native]\n       \
+                "usage: cargo xtask dist [--out DIR]\n       \
+                 cargo xtask package [--out DIR] [--native | --macos]\n       \
                  cargo xtask desktop [--remove]"
             );
             std::process::exit(2);

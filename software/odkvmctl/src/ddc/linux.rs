@@ -8,15 +8,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use super::mccs::{self, INPUT_SOURCE, ReplyError};
-use super::{Display, Error};
+use super::mccs::{self, INPUT_SOURCE};
+use super::{Channel, Display, Error, REPLY_DELAY};
 
 const I2C_SLAVE: libc::c_ulong = 0x0703;
-/// DDC/CI 1.1: wait at least 40 ms before reading a reply, 50 ms after a write without one.
-const REPLY_DELAY: Duration = Duration::from_millis(50);
-const RETRIES: usize = 3;
 
 struct Connector {
     name: String,
@@ -70,50 +66,14 @@ impl Bus {
         }
         Ok(Bus(f))
     }
+}
 
-    fn exchange(&mut self, request: &[u8], reply: &mut [u8]) -> std::io::Result<usize> {
-        self.0.write_all(request)?;
+impl Channel for Bus {
+    fn exchange(&mut self, request: &[u8], reply: &mut [u8]) -> Result<usize, Error> {
+        let io = |e: std::io::Error| Error::Io(e.to_string());
+        self.0.write_all(request).map_err(io)?;
         std::thread::sleep(REPLY_DELAY);
-        if reply.is_empty() { Ok(0) } else { self.0.read(reply) }
-    }
-
-    fn get_vcp(&mut self, code: u8) -> Result<(u16, u16), Error> {
-        let mut last = Error::Ddc(ReplyError::Empty);
-        for _ in 0..RETRIES {
-            let mut buf = [0u8; 12];
-            match self.exchange(&mccs::get_vcp_request(code), &mut buf) {
-                Ok(n) => match mccs::parse_vcp_reply(&buf[..n], code) {
-                    Ok(v) => return Ok(v),
-                    Err(e @ ReplyError::Unsupported) => return Err(Error::Ddc(e)),
-                    Err(e) => last = Error::Ddc(e),
-                },
-                Err(e) => last = Error::Io(e.to_string()),
-            }
-            std::thread::sleep(REPLY_DELAY);
-        }
-        Err(last)
-    }
-
-    fn capabilities(&mut self) -> Option<String> {
-        let mut text = Vec::new();
-        'fragments: while text.len() < 4096 {
-            for _ in 0..RETRIES {
-                let mut buf = [0u8; 40];
-                let Ok(n) = self.exchange(&mccs::capabilities_request(text.len() as u16), &mut buf) else { continue };
-                if let Ok((offset, data)) = mccs::parse_capabilities_reply(&buf[..n]) {
-                    if offset as usize != text.len() {
-                        continue;
-                    }
-                    if data.is_empty() {
-                        break 'fragments;
-                    }
-                    text.extend_from_slice(data);
-                    continue 'fragments;
-                }
-            }
-            return None;
-        }
-        Some(String::from_utf8_lossy(&text).trim_end_matches('\0').to_string())
+        if reply.is_empty() { Ok(0) } else { self.0.read(reply).map_err(io) }
     }
 }
 
@@ -137,19 +97,7 @@ pub fn displays(capabilities: bool) -> Result<Vec<Display>, Error> {
     for c in connectors() {
         let (id, name) = describe(&c);
         let mut d = Display { id, name, inputs: Vec::new(), current: None, error: None };
-        match Bus::open(&c.bus) {
-            Ok(mut bus) => {
-                match bus.get_vcp(INPUT_SOURCE) {
-                    Ok((cur, _)) => d.current = Some(cur),
-                    Err(e) => d.error = Some(e.to_string()),
-                }
-                if capabilities && d.current.is_some() {
-                    let caps = bus.capabilities().map(|s| mccs::parse_capabilities(&s)).unwrap_or_default();
-                    d.inputs = caps.inputs;
-                }
-            }
-            Err(e) => d.error = Some(e.to_string()),
-        }
+        super::read_display(&mut d, Bus::open(&c.bus), capabilities);
         out.push(d);
     }
     Ok(out)
@@ -165,7 +113,5 @@ pub fn current_input(id: &str) -> Result<u16, Error> {
 }
 
 pub fn set_input(id: &str, value: u16) -> Result<(), Error> {
-    let mut bus = bus_of(id)?;
-    bus.exchange(&mccs::set_vcp_request(INPUT_SOURCE, value), &mut []).map_err(|e| Error::Io(e.to_string()))?;
-    Ok(())
+    bus_of(id)?.set_vcp(INPUT_SOURCE, value)
 }

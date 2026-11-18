@@ -37,12 +37,14 @@ pub fn bundled() -> Option<PathBuf> {
 }
 
 /// Where a release's firmware lies for the executable `exe`: next to it (Windows), in the `share` beside its `bin`
-/// (Linux packages), or in a build tree's `dist/` (`target/<profile>/`, `target/<triple>/<profile>/`).
+/// (Linux packages), in the app bundle's `Resources` beside its `MacOS` (macOS), or in a build tree's `dist/`
+/// (`target/<profile>/`, `target/<triple>/<profile>/`).
 fn bundle_dirs(exe: &Path) -> Vec<PathBuf> {
     let Some(dir) = exe.parent() else { return Vec::new() };
     let mut out = vec![dir.join("firmware")];
     if let Some(prefix) = dir.parent() {
         out.push(prefix.join("share").join("opendyn-kvm").join("firmware"));
+        out.push(prefix.join("Resources").join("firmware"));
     }
     if let Some(root) =
         dir.ancestors().take(3).find(|a| a.file_name().is_some_and(|n| n == "target")).and_then(Path::parent)
@@ -187,9 +189,11 @@ mod tests {
     fn bundled_firmware_is_looked_for_beside_the_programs() {
         let dirs = |exe: &str| bundle_dirs(Path::new(exe));
         assert_eq!(
-            dirs("/usr/bin/opendyn-kvm"),
+            dirs("/usr/bin/opendyn-kvm")[..2],
             [PathBuf::from("/usr/bin/firmware"), PathBuf::from("/usr/share/opendyn-kvm/firmware")]
         );
+        let app = "/Applications/OpenDynKVM.app/Contents/MacOS/opendyn-kvm";
+        assert!(dirs(app).contains(&PathBuf::from("/Applications/OpenDynKVM.app/Contents/Resources/firmware")));
         assert!(dirs("/home/me/kvm/target/debug/opendyn-kvm").contains(&PathBuf::from("/home/me/kvm/dist")));
         assert!(
             dirs("/home/me/kvm/target/x86_64-pc-windows-gnu/release/opendyn-kvm.exe")

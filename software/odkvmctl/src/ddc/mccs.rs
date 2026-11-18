@@ -204,14 +204,18 @@ impl EdidInfo {
     }
 }
 
+/// The three-letter PNP manufacturer ID of the EDID's manufacturer field (big-endian, three 5-bit letters).
+pub fn pnp_id(m: u16) -> String {
+    let letter = |shift: u16| (b'A' - 1 + ((m >> shift) & 0x1F) as u8) as char;
+    [letter(10), letter(5), letter(0)].iter().collect()
+}
+
 /// Identity from the EDID base block.
 pub fn parse_edid(e: &[u8]) -> Option<EdidInfo> {
     if e.len() < 128 || e[..8] != [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] {
         return None;
     }
-    let m = u16::from_be_bytes([e[8], e[9]]);
-    let letter = |shift: u16| (b'A' - 1 + ((m >> shift) & 0x1F) as u8) as char;
-    let manufacturer: String = [letter(10), letter(5), letter(0)].iter().collect();
+    let manufacturer = pnp_id(u16::from_be_bytes([e[8], e[9]]));
     let text = |d: &[u8]| {
         let t: String = d.iter().take_while(|c| **c != 0x0A).map(|c| *c as char).collect();
         Some(t.trim().to_string()).filter(|t| !t.is_empty())
@@ -297,6 +301,7 @@ mod tests {
         assert_eq!((info.manufacturer.as_str(), info.product, info.serial), ("ODK", 0xA0F3, 0x0102_0304));
         assert_eq!(info.display_name(), "GENERIC 27Q");
         assert_eq!(info.id(), "ODK-A0F3-16909060");
+        assert_eq!(pnp_id(m), "ODK");
         assert_eq!(parse_edid(&[0; 128]), None);
     }
 }

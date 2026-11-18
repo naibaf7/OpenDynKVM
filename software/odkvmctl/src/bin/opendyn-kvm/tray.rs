@@ -1,4 +1,5 @@
-//! Tray icon with a quick-switch menu: `ksni` (StatusNotifierItem over D-Bus) on Linux, `tray-icon` on Windows.
+//! Tray icon with a quick-switch menu: `ksni` (StatusNotifierItem over D-Bus) on Linux, `tray-icon` on Windows and
+//! macOS (the menu bar's status item there, its menu on a click).
 //!
 //! The menu switches to PC1 or PC2 and, on a KVM with the Bluetooth module, to each paired Bluetooth host (below the
 //! PCs, only while any is paired). The icon is the logo on a tile in the active target's colour.
@@ -164,7 +165,7 @@ mod imp {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod imp {
     use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -249,7 +250,7 @@ mod imp {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod imp {
     use super::*;
 

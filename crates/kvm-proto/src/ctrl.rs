@@ -24,7 +24,11 @@ pub const PAYLOAD_LEN: usize = REPORT_LEN - 2;
 /// screen's owner a [`Host`] (a PC or a Bluetooth host slot, in the slot's PC byte), each Bluetooth host's mapping,
 /// units and pointer (`HopMapping`, `HopUnits` 0x00D8–0x00DF, `BtPointer` 0x00E0–0x00E3); and a front port can hold the
 /// Bluetooth module, an ESP32-C3 board on USB (`PortState::Module`); `Status` carries the passkey typed so far.
-pub const PROTOCOL_VERSION: u8 = 9;
+/// 10: screen hop with the cursor placed by a PC's host software where it asks for it (`PlaceCursor`, a lease,
+/// [`Placement`]; `Event::PlaceCursor` to that PC only); the supply judged from its measured 5 V (`Status::supply` and
+/// the readings after it, `status_flags::SUPPLY_SAGS` instead of the declared-maximum estimate, the `SUPPLY*` and
+/// `PC*_DROPOUTS` diagnostics).
+pub const PROTOCOL_VERSION: u8 = 10;
 
 /// Vendor usage page and usage of the control interface; hosts discover it by these, not by VID/PID.
 pub const USAGE_PAGE: u16 = 0xFF4B;
@@ -674,6 +678,35 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// The 5 V the KVM runs from (the PWR port, or the higher of the PCs' through their ideal diodes), as measured
+    /// (`Status::supply`, protocol 10).
+    pub enum Supply {
+        /// Not judged (firmware before protocol 10, or no reading yet).
+        Unknown = 0,
+        /// At least 4.5 V: the source keeps up with the load, whatever the devices declare.
+        Good = 1,
+        /// Under 4.5 V for 2 s or more: the source (or its cable) can't quite keep up.
+        Sags = 2,
+        /// Under 4.4 V for half a second or more, below what USB devices are required to work at: they may drop out.
+        Low = 3,
+    }
+}
+
+wire_enum! {
+    /// Which of a PC's screens its host software places the cursor on (`Request::PlaceCursor`, protocol 10): where it
+    /// does, screen hop sends it the position (`Event::PlaceCursor`) instead of a report of the pointer interfaces.
+    pub enum Placement {
+        /// None: the PC's mapping alone (no host software, or it can't place now).
+        Off = 0,
+        /// The screens its mapping reaches with relative motion only (Windows' screens other than its main one); the
+        /// absolute pointer keeps the others.
+        Others = 1,
+        /// All of them (macOS, whose mapping of an absolute pointer onto several displays isn't known).
+        All = 2,
+    }
+}
+
 impl BtPointer {
     pub const fn name(self) -> &'static str {
         match self {
@@ -803,7 +836,10 @@ pub mod status_flags {
     pub const CONFIG_DIRTY: u8 = 1 << 2;
     pub const UPDATE_ARMED: u8 = 1 << 3;
     pub const SELFTEST_FAILED: u8 = 1 << 4;
-    pub const BUDGET_LOW: u8 = 1 << 5;
+    /// The 5 V the KVM runs from sags under the load, as measured ([`super::Status::supply`] `Sags` or `Low`, protocol
+    /// 10). Until protocol 9: the front devices' declared maximum was more than [`super::Status::budget_ma`], which
+    /// warned on many PC ports that give more than they advertise.
+    pub const SUPPLY_SAGS: u8 = 1 << 5;
     /// No PC uses the KVM: the LEDs are dark and front ports are off (software.md §4.12).
     pub const STANDBY: u8 = 1 << 6;
     /// In standby, the active PC sleeps and a key press wakes it; the keyboard and mouse ports stay powered.
@@ -1021,6 +1057,14 @@ pub mod diag {
         pub const KB_FAULTS: u8 = 0x39;
         pub const MS_FAULTS: u8 = 0x3A;
         pub const OT_FAULTS: u8 = 0x3B;
+        /// The lowest 5 V the KVM ran from in the last minute, graded by `Status::supply` (protocol 10).
+        pub const SUPPLY: u8 = 0x3C;
+        /// Since start: the 100 ms windows whose millisecond minimum fell under 4.4 V (a device's inrush, a heavy
+        /// load); a count, not a judgement.
+        pub const SUPPLY_DIPS: u8 = 0x3D;
+        /// Since start: how often each PC's 5 V went away for less than 3 s (a port that cut out, or a reboot).
+        pub const PC1_DROPOUTS: u8 = 0x3E;
+        pub const PC2_DROPOUTS: u8 = 0x3F;
 
         pub const AT1_TEMP: u8 = 0x40;
         pub const AT2_TEMP: u8 = 0x41;
@@ -1061,6 +1105,7 @@ pub mod diag {
         pub const PC_CC: [u8; 2] = [PC1_CC, PC2_CC];
         pub const AT_3V3: [u8; 2] = [AT1_3V3, AT2_3V3];
         pub const PORT_FAULTS: [u8; 3] = [KB_FAULTS, MS_FAULTS, OT_FAULTS];
+        pub const PC_DROPOUTS: [u8; 2] = [PC1_DROPOUTS, PC2_DROPOUTS];
         pub const AT_TEMP: [u8; 2] = [AT1_TEMP, AT2_TEMP];
         pub const AT_FW: [u8; 2] = [AT1_FW, AT2_FW];
     }
@@ -1197,6 +1242,10 @@ pub mod diag {
             id::KB_FAULTS => m("Keyboard port faults", Count),
             id::MS_FAULTS => m("Mouse port faults", Count),
             id::OT_FAULTS => m("Other port faults", Count),
+            id::SUPPLY => m("Lowest 5 V in the last minute", MilliVolt),
+            id::SUPPLY_DIPS => m("5 V dips under 4.4 V", Count),
+            id::PC1_DROPOUTS => m("PC1 5 V dropouts", Count),
+            id::PC2_DROPOUTS => m("PC2 5 V dropouts", Count),
             id::AT1_TEMP => m("AT32F405 #1 temperature", DeciCelsius),
             id::AT2_TEMP => m("AT32F405 #2 temperature", DeciCelsius),
             id::AT1_FW => m("AT32F405 #1 firmware", Version),
@@ -1312,7 +1361,8 @@ pub struct Status {
     pub adv_pc: [Advertised; 2],
     /// VBUS of PWR, PC1, PC2 in mV.
     pub vbus_mv: [u16; 3],
-    /// Estimated current left for the front ports.
+    /// What the source advertises less the KVM's own draw: an estimate, for information (protocol 10; the warning
+    /// comes from [`Status::supply`]).
     pub budget_ma: u16,
     pub flags: u8,
     pub uptime_s: u32,
@@ -1339,6 +1389,14 @@ pub struct Status {
     /// their value, so that the window can show them while they are typed.
     pub bt_passkey_digits: u8,
     pub bt_passkey_typed: u32,
+    /// The 5 V the KVM runs from, judged from its measurements (protocol 10; `Unknown` from older firmware): the level,
+    /// the voltage now, and the lowest in the last minute (the PC-side chips' millisecond minimum, the PWR port's
+    /// readings), in mV.
+    pub supply: Supply,
+    pub supply_mv: u16,
+    pub supply_lowest_mv: u16,
+    /// What the front devices declare they may draw at most (their `bMaxPower`), in mA: information.
+    pub declared_ma: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1893,7 +1951,17 @@ pub enum Request {
     /// Where the asking PC's own cursor is, in its display arrangement's pixels (protocol 7). With screen hop, the KVM
     /// takes it over while it isn't moving the pointer itself: a touchpad or a program moved it.
     PointerAt([i16; 2]),
+    /// The asking PC's host software places its cursor on these screens (protocol 10), for [`PLACE_LEASE_MS`] from
+    /// now: it asks again before then while it can, and says `Off` when it can't (a screen it may not place on, as
+    /// Windows' sign-in screen) or stops. Screen hop then sends it `Event::PlaceCursor` there.
+    PlaceCursor(Placement),
 }
+
+/// How long a `PlaceCursor` lasts: a host software that stops without saying so (it crashed, the PC went to sleep)
+/// costs at most this long without the pointer on its screens.
+pub const PLACE_LEASE_MS: u32 = 1000;
+/// How often host software renews its `PlaceCursor`.
+pub const PLACE_RENEW_MS: u32 = 300;
 
 /// How long Bluetooth pairing stays open.
 pub const BT_PAIR_SECONDS: u8 = 60;
@@ -1938,6 +2006,7 @@ pub mod req {
     pub const BT_FORGET: u8 = 0x16;
     pub const BT_PASSKEY: u8 = 0x17;
     pub const POINTER_AT: u8 = 0x18;
+    pub const PLACE_CURSOR: u8 = 0x19;
     pub const ERROR: u8 = 0xFF;
 }
 
@@ -1949,6 +2018,7 @@ pub mod ev {
     pub const HOTKEY_LEARNED: u8 = 0xC4;
     pub const BT_CHANGED: u8 = 0xC5;
     pub const BT_ACTIVE: u8 = 0xC6;
+    pub const PLACE_CURSOR: u8 = 0xC7;
 }
 
 impl Request {
@@ -1978,6 +2048,7 @@ impl Request {
             Request::BtForget(_) => req::BT_FORGET,
             Request::BtPasskey(_) => req::BT_PASSKEY,
             Request::PointerAt(_) => req::POINTER_AT,
+            Request::PlaceCursor(_) => req::PLACE_CURSOR,
         }
     }
 
@@ -2032,6 +2103,7 @@ impl Request {
                 w.u16(*x as u16)?;
                 w.u16(*y as u16)?;
             }
+            Request::PlaceCursor(p) => w.u8(*p as u8)?,
             Request::LearnHotkey(start) => w.bool(*start)?,
             Request::FwBegin { target, size, crc32 } => {
                 w.u8(*target as u8)?;
@@ -2078,6 +2150,7 @@ impl Request {
             req::BT_FORGET => Request::BtForget(r.u8()?),
             req::BT_PASSKEY => Request::BtPasskey(r.u32()?),
             req::POINTER_AT => Request::PointerAt([r.u16()? as i16, r.u16()? as i16]),
+            req::PLACE_CURSOR => Request::PlaceCursor(r.u8()?.try_into()?),
             _ => return Err(WireError::Invalid),
         };
         Ok((id, req))
@@ -2120,6 +2193,9 @@ pub enum Event {
     BtChanged(u8),
     /// Input now goes to Bluetooth host slot 1–4, or 0: back to a PC (then `Switched` follows). Protocol 6.
     BtActive(u8),
+    /// Put the cursor here, in this PC's own pixels (protocol 10): only to a PC whose host software asked for it
+    /// (`Request::PlaceCursor`), at most once a millisecond, the latest position.
+    PlaceCursor([i16; 2]),
 }
 
 /// Anything the device sends.
@@ -2186,6 +2262,10 @@ impl Response {
                 w.u16(s.pointer[1] as u16)?;
                 w.u8(s.bt_passkey_digits)?;
                 w.u32(s.bt_passkey_typed)?;
+                w.u8(s.supply as u8)?;
+                w.u16(s.supply_mv)?;
+                w.u16(s.supply_lowest_mv)?;
+                w.u16(s.declared_ma)?;
             }
             Response::Port(p) => {
                 w.u8(p.port as u8)?;
@@ -2281,6 +2361,12 @@ impl Event {
                 w.u8(0)?;
                 w.u8(n)?;
             }
+            Event::PlaceCursor([x, y]) => {
+                w.u8(ev::PLACE_CURSOR)?;
+                w.u8(0)?;
+                w.u16(x as u16)?;
+                w.u16(y as u16)?;
+            }
         }
         Ok(out)
     }
@@ -2305,6 +2391,9 @@ impl DeviceMsg {
             ev::CONFIG_CHANGED => return Ok(DeviceMsg::Event(Event::ConfigChanged(r.u16()?))),
             ev::BT_CHANGED => return Ok(DeviceMsg::Event(Event::BtChanged(r.u8()?))),
             ev::BT_ACTIVE => return Ok(DeviceMsg::Event(Event::BtActive(r.u8()?))),
+            ev::PLACE_CURSOR => {
+                return Ok(DeviceMsg::Event(Event::PlaceCursor([r.u16()? as i16, r.u16()? as i16])));
+            }
             ev::HOTKEY_LEARNED => {
                 let end = r.u8()?.try_into()?;
                 let h = Hotkey { kind: r.u8()?.try_into()?, modifiers: r.u8()?, key: r.u8()?, swallow: r.bool()? };
@@ -2364,6 +2453,10 @@ impl DeviceMsg {
                     pointer: [0, 0],
                     bt_passkey_digits: 0,
                     bt_passkey_typed: 0,
+                    supply: Supply::Unknown,
+                    supply_mv: 0,
+                    supply_lowest_mv: 0,
+                    declared_ma: 0,
                 };
                 if r.remaining() >= 2 {
                     st.selftest |= (r.u16()? as u32) << 16;
@@ -2377,6 +2470,13 @@ impl DeviceMsg {
                 if r.remaining() >= 5 {
                     st.bt_passkey_digits = r.u8()?;
                     st.bt_passkey_typed = r.u32()?;
+                }
+                // Protocol 10: zero from older firmware, which reads as `Unknown`.
+                if r.remaining() >= 7 {
+                    st.supply = Supply::from_u8(r.u8()?).unwrap_or(Supply::Unknown);
+                    st.supply_mv = r.u16()?;
+                    st.supply_lowest_mv = r.u16()?;
+                    st.declared_ma = r.u16()?;
                 }
                 Response::Status(st)
             }
@@ -2530,6 +2630,8 @@ mod tests {
             Request::LearnHotkey(false),
             Request::GetDiag(3),
             Request::PointerAt([-1280, 1439]),
+            Request::PlaceCursor(Placement::Others),
+            Request::PlaceCursor(Placement::Off),
             Request::SetConfig(ConfigValue::AbsPointer(true)),
             Request::SetConfig(ConfigValue::HopAccel(Accel::Adaptive)),
             Request::SetConfig(ConfigValue::HopSpeed(-7)),
@@ -2598,6 +2700,10 @@ mod tests {
             pointer: [-1920, 1079],
             bt_passkey_digits: 4,
             bt_passkey_typed: 4242,
+            supply: Supply::Sags,
+            supply_mv: 4480,
+            supply_lowest_mv: 4310,
+            declared_ma: 700,
         };
         let port = PortInfo {
             port: Port::Mouse,
@@ -2671,6 +2777,7 @@ mod tests {
             Event::HotkeyLearned(LearnEnd::Learned, Hotkey::combo(0x05, 0x0E)),
             Event::HotkeyLearned(LearnEnd::Learned, Hotkey::double_tap(0xE4, true)),
             Event::HotkeyLearned(LearnEnd::TimedOut, Hotkey::NONE),
+            Event::PlaceCursor([-2880, 1809]),
         ] {
             assert_eq!(DeviceMsg::decode(&e.encode().unwrap()).unwrap(), DeviceMsg::Event(e));
         }
@@ -2715,6 +2822,8 @@ mod tests {
             id::PWR_VBUS,
             id::PWR_CC,
             id::BUDGET,
+            id::SUPPLY,
+            id::SUPPLY_DIPS,
         ];
         for a in [id::AT_CLOCK, id::PC_SPEED, id::PC_LINK, id::PC_RESETS, id::LINK_ERRORS, id::PC_VBUS, id::PC_CC]
             .into_iter()
@@ -2724,6 +2833,7 @@ mod tests {
         }
         ids.extend(id::PORT_SPEED);
         ids.extend(id::PORT_FAULTS);
+        ids.extend(id::PC_DROPOUTS);
         ids.extend([id::BT_MODULE, id::BT_FW, id::BT_LINK_ERRORS, id::BT_HOSTS]);
         let n = ids.len();
         ids.sort();

@@ -3,6 +3,8 @@
 //! Each PC's software sets the monitors it is bound to whenever the KVM reports a switch or a change of profile. The KVM
 //! reports both (key, hotkey or software) to both PCs, so this also works with the software on one PC only, as long as
 //! the monitor takes DDC/CI commands on an input it is not showing (most do; some only listen on the active input).
+//!
+//! Linux and macOS speak DDC/CI themselves over the display's I²C channel ([`Channel`]); Windows' monitor API does it.
 
 pub mod mccs;
 
@@ -10,16 +12,26 @@ pub mod mccs;
 mod linux;
 #[cfg(target_os = "linux")]
 use linux as imp;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as imp;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 use windows as imp;
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use std::time::Duration;
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+use mccs::ReplyError;
+
 use crate::local::DisplayBinding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Display {
-    /// Identifies the monitor on this computer (Linux: from its EDID; Windows: its device interface).
+    /// Identifies the monitor on this computer (Linux, macOS: from its EDID; Windows: its device interface).
     pub id: String,
     pub name: String,
     /// The input values the monitor lists in its capabilities (empty if not read).
@@ -36,6 +48,8 @@ pub enum Error {
     Permission(String),
     Io(String),
     Ddc(mccs::ReplyError),
+    /// The system gives no DDC/CI channel to this display (macOS: no I²C behind its connection).
+    NoChannel,
     Unsupported,
 }
 
@@ -45,20 +59,21 @@ impl std::fmt::Display for Error {
             Error::NotFound(id) => f.write_str(&crate::fl!("ddc-not-connected", id = id.as_str())),
             Error::Permission(e) | Error::Io(e) => f.write_str(e),
             Error::Ddc(e) => e.fmt(f),
+            Error::NoChannel => f.write_str(&crate::fl!("ddc-no-channel")),
             Error::Unsupported => f.write_str(&crate::fl!("ddc-unsupported-os")),
         }
     }
 }
 
 pub const fn supported() -> bool {
-    cfg!(any(windows, target_os = "linux"))
+    cfg!(any(windows, target_os = "linux", target_os = "macos"))
 }
 
 /// The connected monitors; with `capabilities`, also the inputs each lists (slow: about a second per monitor).
 pub fn displays(capabilities: bool) -> Result<Vec<Display>, Error> {
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     return imp::displays(capabilities);
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = capabilities;
         Err(Error::Unsupported)
@@ -66,9 +81,9 @@ pub fn displays(capabilities: bool) -> Result<Vec<Display>, Error> {
 }
 
 pub fn current_input(id: &str) -> Result<u16, Error> {
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     return imp::current_input(id);
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = id;
         Err(Error::Unsupported)
@@ -76,12 +91,90 @@ pub fn current_input(id: &str) -> Result<u16, Error> {
 }
 
 pub fn set_input(id: &str, value: u16) -> Result<(), Error> {
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     return imp::set_input(id, value);
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
         let _ = (id, value);
         Err(Error::Unsupported)
+    }
+}
+
+/// DDC/CI 1.1: wait at least 40 ms before reading a reply, 50 ms after a write without one.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const REPLY_DELAY: Duration = Duration::from_millis(50);
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+const RETRIES: usize = 3;
+
+/// A display's DDC/CI link, where this program builds the packets itself (Linux, macOS).
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+trait Channel {
+    /// Writes `request` (from the source address 0x51 on, as [`mccs`] builds it); then, after [`REPLY_DELAY`], reads
+    /// the reply into `reply` unless it is empty (from the display's address 0x6E on). Returns the bytes read.
+    fn exchange(&mut self, request: &[u8], reply: &mut [u8]) -> Result<usize, Error>;
+
+    /// A VCP code's (current value, maximum).
+    fn get_vcp(&mut self, code: u8) -> Result<(u16, u16), Error> {
+        let mut last = Error::Ddc(ReplyError::Empty);
+        for _ in 0..RETRIES {
+            let mut buf = [0u8; 12];
+            match self.exchange(&mccs::get_vcp_request(code), &mut buf) {
+                Ok(n) => match mccs::parse_vcp_reply(&buf[..n], code) {
+                    Ok(v) => return Ok(v),
+                    Err(e @ ReplyError::Unsupported) => return Err(Error::Ddc(e)),
+                    Err(e) => last = Error::Ddc(e),
+                },
+                Err(e) => last = e,
+            }
+            std::thread::sleep(REPLY_DELAY);
+        }
+        Err(last)
+    }
+
+    fn set_vcp(&mut self, code: u8, value: u16) -> Result<(), Error> {
+        self.exchange(&mccs::set_vcp_request(code, value), &mut []).map(|_| ())
+    }
+
+    /// The capability string, fragment by fragment (None if it breaks off).
+    fn capabilities(&mut self) -> Option<String> {
+        let mut text = Vec::new();
+        'fragments: while text.len() < 4096 {
+            for _ in 0..RETRIES {
+                let mut buf = [0u8; 40];
+                let Ok(n) = self.exchange(&mccs::capabilities_request(text.len() as u16), &mut buf) else { continue };
+                if let Ok((offset, data)) = mccs::parse_capabilities_reply(&buf[..n]) {
+                    if offset as usize != text.len() {
+                        continue;
+                    }
+                    if data.is_empty() {
+                        break 'fragments;
+                    }
+                    text.extend_from_slice(data);
+                    continue 'fragments;
+                }
+            }
+            return None;
+        }
+        Some(String::from_utf8_lossy(&text).trim_end_matches('\0').to_string())
+    }
+}
+
+/// Fills in what `channel` reads of a monitor: the input it shows and, with `capabilities`, those it lists; or why not.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn read_display(d: &mut Display, channel: Result<impl Channel, Error>, capabilities: bool) {
+    let mut channel = match channel {
+        Ok(c) => c,
+        Err(e) => {
+            d.error = Some(e.to_string());
+            return;
+        }
+    };
+    match channel.get_vcp(mccs::INPUT_SOURCE) {
+        Ok((cur, _)) => d.current = Some(cur),
+        Err(e) => d.error = Some(e.to_string()),
+    }
+    if capabilities && d.current.is_some() {
+        d.inputs = channel.capabilities().map(|s| mccs::parse_capabilities(&s)).unwrap_or_default().inputs;
     }
 }
 
@@ -115,6 +208,76 @@ fn follow_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A display that answers with `replies` in turn (then nothing), noting what it was sent.
+    #[derive(Default)]
+    struct Scripted {
+        replies: std::collections::VecDeque<Vec<u8>>,
+        sent: Vec<Vec<u8>>,
+    }
+
+    impl Channel for Scripted {
+        fn exchange(&mut self, request: &[u8], reply: &mut [u8]) -> Result<usize, Error> {
+            self.sent.push(request.to_vec());
+            if reply.is_empty() {
+                return Ok(0);
+            }
+            let r = self.replies.pop_front().unwrap_or_default();
+            let n = r.len().min(reply.len());
+            reply[..n].copy_from_slice(&r[..n]);
+            Ok(n)
+        }
+    }
+
+    /// A reply from the display: its address, the length, `payload` and the checksum.
+    fn from_display(payload: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x6E, 0x80 | payload.len() as u8];
+        b.extend_from_slice(payload);
+        b.push(b.iter().fold(0x50, |a, x| a ^ x));
+        b
+    }
+
+    #[test]
+    fn a_channel_retries_a_busy_display_and_reads_the_capabilities_fragment_by_fragment() {
+        let mut d = Scripted::default();
+        // Busy (the null message) first, then the input: DisplayPort 1 of a maximum 0x12.
+        d.replies.push_back(from_display(&[]));
+        d.replies.push_back(from_display(&[0x02, 0x00, 0x60, 0x00, 0x00, 0x12, 0x00, 0x0F]));
+        assert_eq!(d.get_vcp(mccs::INPUT_SOURCE), Ok((0x0F, 0x12)));
+        assert_eq!(d.sent, [mccs::get_vcp_request(0x60), mccs::get_vcp_request(0x60)]);
+        // A display without the code says so at once: no retry.
+        d.replies.push_back(from_display(&[0x02, 0x01, 0x60, 0, 0, 0, 0, 0]));
+        assert_eq!(d.get_vcp(mccs::INPUT_SOURCE), Err(Error::Ddc(ReplyError::Unsupported)));
+        assert_eq!(d.sent.len(), 3);
+
+        let caps = b"(vcp(60(0F 11)))";
+        let mut d = Scripted::default();
+        d.replies.push_back(from_display(&[[0xE3, 0, 0].as_slice(), &caps[..8]].concat()));
+        // A fragment for the wrong offset (a repeated reply) is asked again.
+        d.replies.push_back(from_display(&[[0xE3, 0, 0].as_slice(), &caps[..8]].concat()));
+        d.replies.push_back(from_display(&[[0xE3, 0, 8].as_slice(), &caps[8..]].concat()));
+        d.replies.push_back(from_display(&[0xE3, 0, 16]));
+        assert_eq!(d.capabilities().as_deref(), Some("(vcp(60(0F 11)))"));
+        let offsets: Vec<u8> = d.sent.iter().map(|r| r[4]).collect();
+        assert_eq!(offsets, [0, 8, 8, 16]);
+
+        let mut shown = Display { id: "m".into(), name: "m".into(), inputs: vec![], current: None, error: None };
+        let mut d = Scripted::default();
+        d.replies.push_back(from_display(&[0x02, 0x00, 0x60, 0x00, 0x00, 0x12, 0x00, 0x11]));
+        d.replies.push_back(from_display(&[[0xE3, 0, 0].as_slice(), caps].concat()));
+        d.replies.push_back(from_display(&[0xE3, 0, caps.len() as u8]));
+        read_display(&mut shown, Ok(d), true);
+        assert_eq!(
+            (shown.current, shown.inputs.as_slice(), shown.error.clone()),
+            (Some(0x11), [0x0F, 0x11].as_slice(), None)
+        );
+        read_display(&mut shown, Err::<Scripted, _>(Error::NoChannel), true);
+        assert!(shown.error.is_some());
+
+        let mut d = Scripted::default();
+        assert_eq!(d.set_vcp(mccs::INPUT_SOURCE, 0x1B), Ok(()));
+        assert_eq!(d.sent, [mccs::set_vcp_request(0x60, 0x1B)]);
+    }
 
     use crate::local::DisplayMode::{self, Follow, Off, Pc1, Pc2};
 

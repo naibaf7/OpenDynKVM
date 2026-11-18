@@ -29,9 +29,9 @@
 //! - **Unchanged values cost nothing:** writing the value already stored programs nothing ([`Store::write`]).
 //!
 //! The cost of a save is its item's size: at most 0.6 KB for the config. With everything the firmware stores at its
-//! largest (6.6 KB of keymap, macros, records and the four screen-hop arrangements, carried around the ring), each
-//! sector is erased once per about 90 config saves, which makes about 9 million saves before the first sector reaches
-//! its rated cycles
+//! largest (7.8 KB of keymap, macros, Vial's dynamic entries, records and the four screen-hop arrangements, carried
+//! around the ring), each sector is erased once per about 90 config saves, which makes about 9 million saves before
+//! the first sector reaches its rated cycles
 //! (`endurance_with_the_firmware_items`). How often saves come is the engine's business: it saves 5 s after the last
 //! change and caps the rate of saves (`kvm_core::engine`, `SAVE_BURST`), so even a host script that changes a setting
 //! every few seconds for years cannot wear the flash out.
@@ -530,9 +530,10 @@ mod tests {
     const RATED_ERASES: u64 = 100_000;
 
     /// Stores everything the firmware keeps, at its largest: 8 keymap layers, a full macro buffer, the keymap
-    /// settings, both programming records, the four screen-hop arrangements. Returns the bytes it takes in flash.
+    /// settings, Vial's tap dances, combos, key overrides and alternate repeat keys, both programming records, the
+    /// four screen-hop arrangements. Returns the bytes it takes in flash.
     fn firmware_items(s: &mut Store, f: &mut Ram) -> usize {
-        use kvm_vial::keymap::{LAYER_ITEM_LEN, MACRO_BUFFER};
+        use kvm_vial::keymap::{Dynamic, LAYER_ITEM_LEN, MACRO_BUFFER, SETTINGS_LEN};
         for a in 0..kvm_proto::ctrl::MAX_ARRANGEMENTS as u16 {
             s.write(f, crate::config::ARRANGEMENT_ITEM + a, &[a as u8; crate::config::ARRANGEMENT_ITEM_MAX]).unwrap();
         }
@@ -540,7 +541,11 @@ mod tests {
             s.write(f, 0x0110 + l, &[l as u8 + 1; LAYER_ITEM_LEN]).unwrap();
         }
         s.write(f, 0x0101, &[0x55; MACRO_BUFFER]).unwrap();
-        s.write(f, 0x0100, &[1; 8]).unwrap();
+        s.write(f, 0x0100, &[1; SETTINGS_LEN]).unwrap();
+        for kind in Dynamic::ALL {
+            let (key, len) = kind.item();
+            s.write(f, key, &[0x66; 512][..len]).unwrap();
+        }
         s.write(f, crate::at32prog::ITEM, &[2; crate::at32prog::Record::LEN]).unwrap();
         s.write(f, crate::at32prog::BT_ITEM, &[3; crate::at32prog::Record::LEN]).unwrap();
         s.live_bytes()
@@ -553,7 +558,7 @@ mod tests {
         let mut f = Ram::new(FIRMWARE_SECTORS);
         let mut s = Store::mount(&mut f, FIRMWARE_SECTORS).unwrap();
         let cold = firmware_items(&mut s, &mut f);
-        assert!((6_000..7_000).contains(&cold), "{cold} bytes besides the config");
+        assert!((7_500..8_500).contains(&cold), "{cold} bytes besides the config");
         let saves = 20_000u32;
         for k in 0..saves {
             // A different config every time, so each one is written.

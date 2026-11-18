@@ -10,6 +10,7 @@ pub mod icon;
 pub mod image;
 pub mod local;
 pub mod names;
+pub mod placer;
 pub mod screens;
 pub mod sim;
 pub mod transport;

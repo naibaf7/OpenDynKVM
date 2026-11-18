@@ -12,7 +12,7 @@ use odkvmctl::time::{Duration, Instant};
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use kvm_proto::ctrl::{
     Accel, BT_HOSTS, BtPointer, ConfigValue, HOP_CORNER_MAX, HOP_SPEED, HOSTS, HopState, Host, MAX_ARRANGEMENTS,
-    MAX_SCREENS, Mapping, Pc, Port, PortMode, ProfileName, SCREEN_PX, Screen, Units,
+    MAX_SCREENS, Mapping, Pc, Placement, Port, PortMode, ProfileName, SCREEN_PX, Screen, Units,
 };
 use odkvmctl::client::{HopView, Snapshot};
 use odkvmctl::screens::Detection;
@@ -20,6 +20,9 @@ use odkvmctl::{fl, names};
 
 use crate::look::{self, BAD, GOOD, WARN, card, chip, ink, note};
 use crate::{App, pc_colors};
+
+/// The first firmware that takes the cursor placed by the host software (protocol 10).
+const PLACING_SINCE: &str = "0.1.27";
 
 /// Resolutions to pick from; any other can be typed.
 const RESOLUTIONS: &[(u16, u16)] = &[
@@ -630,9 +633,47 @@ impl App {
                     }
                 }
             });
+            // This computer's cursor placed from here (Windows, macOS): optional, the KVM does without it.
+            if odkvmctl::screens::PLACEMENT != Placement::Off && !hop.simulated && s.this_pc().is_some() {
+                self.placement(ui);
+            }
             note(ui, fl!("hop-mapping-note"));
             if screens.iter().any(|x| x.host.is_some_and(|h| h.bt_slot().is_some())) {
                 note(ui, fl!("hop-bt-pointer-note"));
+            }
+        });
+    }
+
+    /// Whether this app places this computer's cursor (`odkvmctl::placer`, a setting of this computer), and what it
+    /// does now: placing, or why not (with the way to allow it on macOS).
+    fn placement(&mut self, ui: &mut Ui) {
+        use odkvmctl::placer::State;
+        use odkvmctl::screens::Unplaceable;
+        let label =
+            if cfg!(target_os = "macos") { fl!("hop-place-cursor-macos") } else { fl!("hop-place-cursor-windows") };
+        let mut on = self.local.place_cursor;
+        if ui.checkbox(&mut on, label).on_hover_text(fl!("hop-place-cursor-hover")).changed() {
+            self.local.place_cursor = on;
+            self.placer.enabled.store(on, std::sync::atomic::Ordering::Relaxed);
+            self.local_changed(ui.ctx());
+        }
+        if !on {
+            return;
+        }
+        let state = *self.placer.state.lock().unwrap();
+        let (text, colour) = match state {
+            State::Off | State::Blocked(Unplaceable::Unsupported) => return,
+            State::Placing => (fl!("hop-place-placing"), GOOD),
+            State::NoKvm => (fl!("hop-place-no-kvm"), WARN),
+            State::FirmwareTooOld => (fl!("hop-place-old-firmware", version = PLACING_SINCE), WARN),
+            State::Blocked(Unplaceable::NotAllowed) => (fl!("hop-place-not-allowed"), WARN),
+            State::Blocked(Unplaceable::OtherDesktop) => (fl!("hop-place-other-desktop"), WARN),
+            State::Blocked(Unplaceable::Refused) => (fl!("hop-place-refused"), WARN),
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(text).color(ink(ui, colour)));
+            if state == State::Blocked(Unplaceable::NotAllowed) && ui.button(fl!("hop-place-allow")).clicked() {
+                odkvmctl::screens::ask_to_place();
             }
         });
     }

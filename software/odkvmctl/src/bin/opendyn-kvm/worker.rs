@@ -70,6 +70,11 @@ pub struct Shared {
     /// The firmware file dialog is open; the file it returned, until the window takes it.
     pub picking: bool,
     pub picked: Option<PathBuf>,
+    /// Talk to the built-in simulator instead of a real KVM (`--sim`, or chosen in the window while none is there):
+    /// the worker changes over as soon as it sees this change.
+    pub simulate: bool,
+    /// While simulating: a real KVM is plugged in (its control interface is there; it isn't opened).
+    pub kvm_present: bool,
 }
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -78,6 +83,8 @@ const REFRESH: Duration = Duration::from_millis(1000);
 /// How often the boot ROMs on USB are looked for while no KVM answers.
 const BOOT_SCAN: Duration = Duration::from_secs(1);
 const RECONNECT: Duration = Duration::from_secs(2);
+/// While simulating, how often a real KVM is looked for.
+const LOOK_FOR_KVM: Duration = Duration::from_secs(2);
 /// Screen hop: this computer's cursor goes to the KVM once it has rested this long (software.md §4.14).
 const CURSOR_REST: Duration = Duration::from_millis(250);
 
@@ -122,7 +129,7 @@ fn describe(e: &Event) -> Option<String> {
         Event::ConfigChanged(k) => fl!("ev-setting-changed", name = names::config_name(*k)),
         Event::HotkeyLearned(LearnEnd::Learned, h) => fl!("ev-hotkey-learned", hotkey = format_spec(h).to_string()),
         Event::HotkeyLearned(end, _) => fl!("ev-hotkey-not-learned", why = names::learn_end(*end)),
-        Event::BtActive(_) | Event::BtChanged(_) => return None,
+        Event::BtActive(_) | Event::BtChanged(_) | Event::PlaceCursor(_) => return None,
     })
 }
 
@@ -398,15 +405,33 @@ fn take_events(
     Ok(true)
 }
 
-/// `follow`: switch the monitors bound on the Displays page along (also with the simulator, so it can be tried before a
-/// KVM exists; the tests turn it off so that they never move this computer's monitors).
+/// `sim`: start with the simulator (`Shared::simulate`, which the window may change later). `follow`: switch the
+/// monitors bound on the Displays page along (also with the simulator, so it can be tried before a KVM exists; the
+/// tests turn it off so that they never move this computer's monitors).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn spawn(sim: bool, follow: bool, shared: Arc<Mutex<Shared>>, rx: Receiver<UiCmd>, wake: Wake) -> JoinHandle<()> {
+    shared.lock().unwrap().simulate = sim;
+    let present = || odkvmctl::transport::find().is_ok_and(|f| !f.is_empty());
+    spawn_with(follow, shared, rx, wake, Client::connect, present)
+}
+
+/// [`spawn`], connecting with `connect` (true: the simulator) and looking for a real KVM with `present`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spawn_with(
+    follow: bool,
+    shared: Arc<Mutex<Shared>>,
+    rx: Receiver<UiCmd>,
+    wake: Wake,
+    connect: impl Fn(bool) -> Result<Client, Error> + Send + 'static,
+    present: impl Fn() -> bool + Send + 'static,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let follow = follow.then(|| follower(shared.clone(), wake.clone()));
         let mut seen = Seen::default();
+        let changed_over = |sim: bool| shared.lock().unwrap().simulate != sim;
         loop {
-            let mut c = match Client::connect(sim) {
+            let sim = shared.lock().unwrap().simulate;
+            let mut c = match connect(sim) {
                 Ok(c) => c,
                 Err(e) => {
                     {
@@ -416,9 +441,9 @@ pub fn spawn(sim: bool, follow: bool, shared: Arc<Mutex<Shared>>, rx: Receiver<U
                         s.error = Some(e.to_string());
                     }
                     wake();
-                    // Commands made while disconnected are dropped.
+                    // Commands made while disconnected are dropped; the simulator chosen meanwhile is taken at once.
                     let until = Instant::now() + RECONNECT;
-                    while Instant::now() < until {
+                    while Instant::now() < until && !changed_over(sim) {
                         if let Err(RecvTimeoutError::Disconnected) = rx.recv_timeout(Duration::from_millis(200)) {
                             return;
                         }
@@ -433,9 +458,20 @@ pub fn spawn(sim: bool, follow: bool, shared: Arc<Mutex<Shared>>, rx: Receiver<U
                 s.error = None;
             }
             let mut next_refresh = Instant::now();
+            let mut next_look = Instant::now();
             seen.last = None;
             let mut cursor = CursorSync::default();
             'connected: loop {
+                if changed_over(sim) {
+                    break 'connected;
+                }
+                if sim && Instant::now() >= next_look {
+                    let there = present();
+                    next_look = Instant::now() + LOOK_FOR_KVM;
+                    if std::mem::replace(&mut shared.lock().unwrap().kvm_present, there) != there {
+                        wake();
+                    }
+                }
                 loop {
                     match rx.try_recv() {
                         Ok(cmd) => match command(&mut c, cmd, &shared, &wake) {
@@ -461,14 +497,28 @@ pub fn spawn(sim: bool, follow: bool, shared: Arc<Mutex<Shared>>, rx: Receiver<U
                 }
                 cursor.poll(&mut c, seen.last.as_ref().is_some_and(|l| l.status.hop != HopState::Off));
             }
+            // Leaving the simulator puts the monitors that follow it back on this computer (the PC it plays), rather
+            // than leave them on an input the simulator switched them to.
+            if sim
+                && changed_over(sim)
+                && let Some(now) = seen.kvm.clone()
+            {
+                let home = seen.last.as_ref().and_then(|s| s.status.asking).map_or(0, |pc| pc.index());
+                tell(&follow, &mut seen.kvm, KvmState { pc: home, bt: None, ..now });
+            }
             {
                 let mut s = shared.lock().unwrap();
                 s.device = None;
                 s.snap = None;
                 s.diag = None;
+                s.sim_keyboard = None;
+                s.kvm_present = false;
             }
             wake();
-            std::thread::sleep(RECONNECT);
+            // A change between the simulator and the KVM goes over at once.
+            if !changed_over(sim) {
+                std::thread::sleep(RECONNECT);
+            }
         }
     })
 }

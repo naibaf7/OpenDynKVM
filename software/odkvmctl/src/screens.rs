@@ -11,12 +11,22 @@
 //!   - Otherwise `xrandr --listmonitors` (X11; XWayland on other Wayland desktops), physical pixels at 100 %.
 //!
 //!   The cursor position isn't available to programs on Wayland, so none is reported.
+//! - **macOS:** Quartz's display list, in points ([`Units::Logical`]: a display's bounds), each display's scaling from
+//!   its mode's pixels per point. How macOS maps an absolute pointer onto several displays isn't known yet, so the
+//!   host software places the cursor on all of them where it may ([`PLACEMENT`]); without it the mapping is
+//!   [`Mapping::Desktop`], right for one display.
+//!
+//! **Placing the cursor** ([`place_cursor`], screen hop's optional placement by the host software, protocol 10:
+//! [`crate::placer`]): Windows `SetCursorPos`, in physical pixels, while the input desktop is this program's (not the
+//! sign-in, lock or administrator prompt); macOS a mouse-moved event (dragged while a button is down) posted to the HID
+//! event tap, once allowed under Accessibility; Linux not at all (Wayland lets no program move the cursor, and an
+//! absolute pointer spans the desktop anyway).
 //!
 //! Every screen the system reports goes into the arrangement, also a monitor cabled to both PCs that shows the other
 //! one: that is switched off for hop ([`Screen::off`]) and dragged onto the other PC's screen, and still counts for its
 //! PC's desktop. Detected places on the computer are kept ([`Screen::fixed`]) wherever a screen is dragged.
 
-use kvm_proto::ctrl::{Host, MAX_SCREENS, Mapping, SCREEN_PX, SCREEN_SCALE, Screen, Units};
+use kvm_proto::ctrl::{Host, MAX_SCREENS, Mapping, Placement, SCREEN_PX, SCREEN_SCALE, Screen, Units};
 
 use crate::fl;
 
@@ -125,6 +135,51 @@ pub fn desks(screens: &[Screen; MAX_SCREENS], host: Host, units: Units) -> [Scre
 /// Where this computer's cursor is, in its own pixels, where the system tells programs.
 pub fn cursor() -> Option<[i32; 2]> {
     imp::cursor()
+}
+
+/// The screens this computer's host software places the cursor on, where it may ([`crate::placer`]): Windows those it
+/// reaches only with relative motion (all but its main screen), macOS all of them. Linux none.
+pub const PLACEMENT: Placement = if cfg!(windows) {
+    Placement::Others
+} else if cfg!(target_os = "macos") {
+    Placement::All
+} else {
+    Placement::Off
+};
+
+/// Why this program can't place the cursor now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unplaceable {
+    /// The system doesn't let it: macOS until it is allowed under Privacy & Security, Accessibility.
+    NotAllowed,
+    /// Another desktop has the input: Windows' sign-in, lock screen or administrator prompt.
+    OtherDesktop,
+    /// The system refused this once (Windows, with an administrator's window in front).
+    Refused,
+    /// Not on this system (Linux).
+    Unsupported,
+}
+
+/// Whether this program may place the cursor now ([`place_cursor`]).
+pub fn can_place_cursor() -> Result<(), Unplaceable> {
+    imp::can_place()
+}
+
+/// Puts this computer's cursor at `at`, in its own pixels (those of the screens' `desk`).
+pub fn place_cursor(at: [i32; 2]) -> Result<(), Unplaceable> {
+    imp::place(at)
+}
+
+/// For the thread that places the cursor, once before it does (Windows: per-monitor DPI aware, so that its places
+/// count physical pixels whatever the rest of the process is).
+pub fn prepare_to_place() {
+    imp::prepare_to_place()
+}
+
+/// Asks the person to let this program place the cursor, where the system asks for that (macOS: its own prompt, which
+/// opens Privacy & Security, Accessibility); elsewhere nothing.
+pub fn ask_to_place() {
+    imp::ask_to_place()
 }
 
 /// A screen's corners in the arrangement (top-left, bottom-right exclusive).
@@ -394,6 +449,26 @@ mod imp {
     pub fn cursor() -> Option<[i32; 2]> {
         None
     }
+
+    pub use super::unsupported::{ask_to_place, can_place, place, prepare_to_place};
+}
+
+/// Placing the cursor where the system has no way to.
+#[cfg(not(any(windows, target_os = "macos")))]
+mod unsupported {
+    use super::Unplaceable;
+
+    pub fn can_place() -> Result<(), Unplaceable> {
+        Err(Unplaceable::Unsupported)
+    }
+
+    pub fn place(_: [i32; 2]) -> Result<(), Unplaceable> {
+        Err(Unplaceable::Unsupported)
+    }
+
+    pub fn prepare_to_place() {}
+
+    pub fn ask_to_place() {}
 }
 
 #[cfg(windows)]
@@ -402,13 +477,17 @@ mod imp {
     use windows_sys::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     };
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, OpenInputDesktop, UOI_NAME,
+    };
     use windows_sys::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
+        SetThreadDpiAwarenessContext,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, MONITORINFOF_PRIMARY};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, MONITORINFOF_PRIMARY, SetCursorPos};
     use windows_sys::core::BOOL;
 
-    use super::{Detected, Units};
+    use super::{Detected, Units, Unplaceable};
 
     unsafe extern "system" fn collect(h: HMONITOR, _: HDC, _: *mut RECT, list: LPARAM) -> BOOL {
         // SAFETY: `list` is the Vec passed to EnumDisplayMonitors below, alive for the call.
@@ -470,9 +549,284 @@ mod imp {
         // SAFETY: writes the one POINT passed.
         (unsafe { GetCursorPos(&mut p) } != 0).then_some([p.x, p.y])
     }
+
+    /// The desktop with the input is this program's ("Default"), not the one of the sign-in, the lock screen or an
+    /// administrator prompt ("Winlogon"), which a program of the user may not even open.
+    pub fn can_place() -> Result<(), Unplaceable> {
+        // SAFETY: plain calls with a buffer of the size passed; the handle is closed again.
+        unsafe {
+            let d = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+            if d.is_null() {
+                return Err(Unplaceable::OtherDesktop);
+            }
+            let mut name = [0u16; 32];
+            let mut len = 0u32;
+            let ok = GetUserObjectInformationW(d, UOI_NAME, name.as_mut_ptr().cast(), 64, &mut len) != 0;
+            CloseDesktop(d);
+            let name = String::from_utf16_lossy(&name[..name.iter().position(|c| *c == 0).unwrap_or(name.len())]);
+            if ok && name.eq_ignore_ascii_case("Default") { Ok(()) } else { Err(Unplaceable::OtherDesktop) }
+        }
+    }
+
+    pub fn place(at: [i32; 2]) -> Result<(), Unplaceable> {
+        // SAFETY: a plain call.
+        if unsafe { SetCursorPos(at[0], at[1]) } != 0 { Ok(()) } else { Err(Unplaceable::Refused) }
+    }
+
+    pub fn prepare_to_place() {
+        // SAFETY: a plain call with a documented constant; it applies to this thread only.
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    }
+
+    pub fn ask_to_place() {}
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod imp {
+    //! Quartz (CoreGraphics) and Accessibility, declared here: plain C functions, no Objective-C.
+    use core::ffi::c_void;
+    use std::cell::Cell;
+
+    use super::{Detected, Units, Unplaceable};
+    use crate::fl;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGSize {
+        width: f64,
+        height: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
+    }
+
+    type CGDirectDisplayID = u32;
+    type CFTypeRef = *const c_void;
+    type CGEventRef = *mut c_void;
+    type CGEventSourceRef = *mut c_void;
+    type CGDisplayModeRef = *mut c_void;
+
+    /// `CFDictionaryKeyCallBacks` / `CFDictionaryValueCallBacks`: only their address is taken.
+    #[repr(C)]
+    struct KeyCallBacks([usize; 6]);
+    #[repr(C)]
+    struct ValueCallBacks([usize; 5]);
+
+    // CGEventSourceStateID
+    const COMBINED_SESSION_STATE: i32 = 0;
+    const HID_SYSTEM_STATE: i32 = 1;
+    // CGEventTapLocation
+    const HID_EVENT_TAP: u32 = 0;
+    // CGEventType
+    const MOUSE_MOVED: u32 = 5;
+    const LEFT_MOUSE_DRAGGED: u32 = 6;
+    const RIGHT_MOUSE_DRAGGED: u32 = 7;
+    const OTHER_MOUSE_DRAGGED: u32 = 27;
+    // CGMouseButton
+    const LEFT: u32 = 0;
+    const RIGHT: u32 = 1;
+    const CENTER: u32 = 2;
+    // CGEventField
+    const MOUSE_DELTA_X: u32 = 4;
+    const MOUSE_DELTA_Y: u32 = 5;
+    // CGEventSuppressionState, CGEventFilterMask
+    const SUPPRESSION_INTERVAL: u32 = 0;
+    const REMOTE_MOUSE_DRAG: u32 = 1;
+    const PERMIT_ALL_LOCAL: u32 = 0x1 | 0x2 | 0x4;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGGetActiveDisplayList(max: u32, displays: *mut CGDirectDisplayID, count: *mut u32) -> i32;
+        fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+        fn CGDisplayIsMain(display: CGDirectDisplayID) -> u32;
+        fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> u32;
+        fn CGDisplayMirrorsDisplay(display: CGDirectDisplayID) -> CGDirectDisplayID;
+        fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CGDisplayModeRef;
+        fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeRelease(mode: CGDisplayModeRef);
+        fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+        fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+        fn CGEventSourceCreate(state: i32) -> CGEventSourceRef;
+        fn CGEventSourceSetLocalEventsSuppressionInterval(source: CGEventSourceRef, seconds: f64);
+        fn CGEventSourceSetLocalEventsFilterDuringSuppressionState(source: CGEventSourceRef, filter: u32, state: u32);
+        fn CGEventSourceButtonState(state: i32, button: u32) -> u8;
+        fn CGEventSourceFlagsState(state: i32) -> u64;
+        fn CGEventCreateMouseEvent(source: CGEventSourceRef, kind: u32, at: CGPoint, button: u32) -> CGEventRef;
+        fn CGEventSetFlags(event: CGEventRef, flags: u64);
+        fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
+        fn CGEventPost(tap: u32, event: CGEventRef);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: CFTypeRef);
+        fn CFDictionaryCreate(
+            allocator: CFTypeRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            count: isize,
+            key_callbacks: *const KeyCallBacks,
+            value_callbacks: *const ValueCallBacks,
+        ) -> CFTypeRef;
+        static kCFBooleanTrue: CFTypeRef;
+        static kCFTypeDictionaryKeyCallBacks: KeyCallBacks;
+        static kCFTypeDictionaryValueCallBacks: ValueCallBacks;
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXIsProcessTrusted() -> u8;
+        fn AXIsProcessTrustedWithOptions(options: CFTypeRef) -> u8;
+        static kAXTrustedCheckOptionPrompt: CFTypeRef;
+    }
+
+    /// The displays, in points (global display coordinates: the main display's top-left at 0,0, y down), with their
+    /// pixels (those of the display mode: a "looks like 1800 × 1169" mode on a 3024-pixel panel draws 3600 at 200 %).
+    /// Displays that mirror another are left out.
+    pub fn detect() -> Result<(Vec<Detected>, Units), String> {
+        let mut ids = [0u32; 16];
+        let mut n = 0u32;
+        // SAFETY: the list holds `ids.len()` entries; `n` says how many were written.
+        if unsafe { CGGetActiveDisplayList(ids.len() as u32, ids.as_mut_ptr(), &mut n) } != 0 {
+            return Err(fl!("screens-macos-failed"));
+        }
+        let mut out = Vec::new();
+        for &id in &ids[..(n as usize).min(ids.len())] {
+            // SAFETY: plain calls on a display the system just listed; the mode is released again.
+            unsafe {
+                if CGDisplayMirrorsDisplay(id) != 0 {
+                    continue;
+                }
+                let b = CGDisplayBounds(id);
+                let mode = CGDisplayCopyDisplayMode(id);
+                let (pw, ph) = if mode.is_null() {
+                    (b.size.width as usize, b.size.height as usize)
+                } else {
+                    let px = (CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode));
+                    CGDisplayModeRelease(mode);
+                    px
+                };
+                let scale = (pw as f64 * 100.0 / b.size.width.max(1.0)).round() as u16;
+                let name = if CGDisplayIsBuiltin(id) != 0 { "built-in".to_string() } else { format!("display-{id}") };
+                out.push(Detected {
+                    name,
+                    w: pw.min(u16::MAX as usize) as u16,
+                    h: ph.min(u16::MAX as usize) as u16,
+                    scale,
+                    desk: [b.origin.x.round() as i32, b.origin.y.round() as i32],
+                    main: CGDisplayIsMain(id) != 0,
+                });
+            }
+        }
+        Ok((out, Units::Logical))
+    }
+
+    pub fn cursor() -> Option<[i32; 2]> {
+        // SAFETY: an event without a source just carries the cursor's location; it is released again.
+        unsafe {
+            let e = CGEventCreate(core::ptr::null_mut());
+            if e.is_null() {
+                return None;
+            }
+            let p = CGEventGetLocation(e);
+            CFRelease(e as CFTypeRef);
+            Some([p.x.floor() as i32, p.y.floor() as i32])
+        }
+    }
+
+    pub fn can_place() -> Result<(), Unplaceable> {
+        // SAFETY: a plain call.
+        if unsafe { AXIsProcessTrusted() } != 0 { Ok(()) } else { Err(Unplaceable::NotAllowed) }
+    }
+
+    thread_local! {
+        /// The placing thread's event source (with local events let through, below) and where it last put the cursor.
+        static SOURCE: Cell<CGEventSourceRef> = const { Cell::new(core::ptr::null_mut()) };
+        static LAST: Cell<Option<[i32; 2]>> = const { Cell::new(None) };
+    }
+
+    /// An event source whose events don't hold back the real keyboard and mouse: by default the system suppresses
+    /// local hardware events for 0.25 s after a synthetic one, and during a synthetic drag, which would swallow the
+    /// KVM's own keys and buttons.
+    pub fn prepare_to_place() {
+        // SAFETY: plain calls; the source lives as long as the thread.
+        unsafe {
+            let s = CGEventSourceCreate(COMBINED_SESSION_STATE);
+            if !s.is_null() {
+                CGEventSourceSetLocalEventsSuppressionInterval(s, 0.0);
+                CGEventSourceSetLocalEventsFilterDuringSuppressionState(s, PERMIT_ALL_LOCAL, SUPPRESSION_INTERVAL);
+                CGEventSourceSetLocalEventsFilterDuringSuppressionState(s, PERMIT_ALL_LOCAL, REMOTE_MOUSE_DRAG);
+            }
+            SOURCE.with(|c| c.set(s));
+        }
+    }
+
+    /// A mouse-moved event at `at` (dragged with the button that is down, so that a drag follows), with the modifiers
+    /// held now and the motion since the last (for programs that read deltas), posted where the mouse's own go.
+    pub fn place(at: [i32; 2]) -> Result<(), Unplaceable> {
+        can_place()?;
+        let pressed = |b| unsafe { CGEventSourceButtonState(HID_SYSTEM_STATE, b) } != 0;
+        let (kind, button) = if pressed(LEFT) {
+            (LEFT_MOUSE_DRAGGED, LEFT)
+        } else if pressed(RIGHT) {
+            (RIGHT_MOUSE_DRAGGED, RIGHT)
+        } else if pressed(CENTER) {
+            (OTHER_MOUSE_DRAGGED, CENTER)
+        } else {
+            (MOUSE_MOVED, LEFT)
+        };
+        let delta = LAST.with(|l| l.replace(Some(at))).map_or([0, 0], |p| [at[0] - p[0], at[1] - p[1]]);
+        let source = SOURCE.with(Cell::get);
+        // SAFETY: plain calls; the event is released after it was posted.
+        unsafe {
+            let e = CGEventCreateMouseEvent(source, kind, CGPoint { x: at[0] as f64, y: at[1] as f64 }, button);
+            if e.is_null() {
+                return Err(Unplaceable::Refused);
+            }
+            CGEventSetFlags(e, CGEventSourceFlagsState(HID_SYSTEM_STATE));
+            CGEventSetIntegerValueField(e, MOUSE_DELTA_X, delta[0] as i64);
+            CGEventSetIntegerValueField(e, MOUSE_DELTA_Y, delta[1] as i64);
+            CGEventPost(HID_EVENT_TAP, e);
+            CFRelease(e as CFTypeRef);
+        }
+        Ok(())
+    }
+
+    /// The system's own prompt to allow this program under Accessibility (once; after that it opens nothing).
+    pub fn ask_to_place() {
+        // SAFETY: a one-entry dictionary of the documented key, released after the call.
+        unsafe {
+            let keys = [kAXTrustedCheckOptionPrompt];
+            let values = [kCFBooleanTrue];
+            let d = CFDictionaryCreate(
+                core::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            );
+            AXIsProcessTrustedWithOptions(d);
+            if !d.is_null() {
+                CFRelease(d);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod imp {
     use super::{Detected, Units};
     use crate::fl;
@@ -484,6 +838,8 @@ mod imp {
     pub fn cursor() -> Option<[i32; 2]> {
         None
     }
+
+    pub use super::unsupported::{ask_to_place, can_place, place, prepare_to_place};
 }
 
 #[cfg(test)]

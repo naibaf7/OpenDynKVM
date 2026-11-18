@@ -29,7 +29,8 @@ pub struct LedInputs {
     pub brightness: u8,
     pub identify: bool,
     pub awaiting_key: bool,
-    pub budget_low: bool,
+    /// The 5 V the KVM runs from sags under the load, as measured (`kvm_core::supply`): the connected PCs' LEDs amber.
+    pub supply_sags: bool,
     /// While the boot-time self-test runs, and for a few seconds after: its `ctrl::selftest` bits.
     pub selftest: Option<u32>,
     /// Standby (software.md §4.12): everything dark, or with `standby_glow` a slow glow on the key.
@@ -145,7 +146,7 @@ pub fn render(i: &LedInputs, now_ms: u32) -> [Rgb; COUNT] {
             }
             LinkState::Suspended => scale(c, 16 + wave(now_ms, 3000) / 3),
             LinkState::Detached | LinkState::Enumerating => scale(c, 40),
-            LinkState::Connected if i.budget_low => scale(AMBER, if active { 255 } else { 60 }),
+            LinkState::Connected if i.supply_sags => scale(AMBER, if active { 255 } else { 60 }),
             LinkState::Connected => scale(c, if active { 255 } else { 40 }),
         };
     }
@@ -214,7 +215,7 @@ mod tests {
             bt_active: false,
             bt_pairing: false,
             bt_passkey: false,
-            budget_low: false,
+            supply_sags: false,
             selftest: None,
             standby: false,
             standby_glow: false,

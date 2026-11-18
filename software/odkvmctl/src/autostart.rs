@@ -7,6 +7,9 @@
 //! - **Linux:** an XDG autostart entry, `$XDG_CONFIG_HOME/autostart/opendyn-kvm.desktop` (`~/.config/...`), with
 //!   this executable's path. If a package update replaced the executable while this copy runs, Linux reports its path
 //!   with " (deleted)" after it; the entry gets the path without, which is where the new one is.
+//! - **macOS:** a launch agent, `~/Library/LaunchAgents/`[`BUNDLE_ID`]`.plist`, run at load (each login) with this
+//!   executable's path (inside the app bundle). Switched off in System Settings, General, Login Items, it stays there
+//!   and counts as on here.
 
 use std::io;
 use std::path::Path;
@@ -15,10 +18,12 @@ use std::path::Path;
 pub const NAME: &str = "OpenDynKVM";
 /// The command line option that starts in the tray, without a window.
 pub const TRAY_ARG: &str = "--tray";
+/// The app's identifier on macOS: its bundle's (`xtask package --macos`) and its launch agent's label.
+pub const BUNDLE_ID: &str = "org.opendynkvm.opendyn-kvm";
 
 /// Whether this platform has autostart support here.
 pub const fn supported() -> bool {
-    cfg!(any(windows, target_os = "linux"))
+    cfg!(any(windows, target_os = "linux", target_os = "macos"))
 }
 
 /// Whether `opendyn-kvm` starts when the user logs in.
@@ -209,7 +214,54 @@ mod imp {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::*;
+
+    fn path() -> Option<std::path::PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        Some(Path::new(&home).join("Library/LaunchAgents").join(format!("{BUNDLE_ID}.plist")))
+    }
+
+    pub fn is_enabled() -> bool {
+        path().is_some_and(|p| p.exists())
+    }
+
+    pub fn set(enabled: bool, exe: &Path) -> io::Result<()> {
+        let p = path().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no HOME"))?;
+        if enabled {
+            if let Some(d) = p.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            std::fs::write(p, launch_agent(exe))
+        } else {
+            match std::fs::remove_file(p) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        }
+    }
+}
+
+/// The launch agent that starts `exe` in the tray at each login (macOS).
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent(exe: &Path) -> String {
+    let xml = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n<dict>\n\
+         \t<key>Label</key>\n\t<string>{BUNDLE_ID}</string>\n\
+         \t<key>ProgramArguments</key>\n\t<array>\n\
+         \t\t<string>{}</string>\n\t\t<string>{TRAY_ARG}</string>\n\t</array>\n\
+         \t<key>RunAtLoad</key>\n\t<true/>\n\
+         \t<key>ProcessType</key>\n\t<string>Interactive</string>\n\
+         </dict>\n</plist>\n",
+        xml(&exe.to_string_lossy())
+    )
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod imp {
     use super::*;
 
@@ -218,7 +270,7 @@ mod imp {
     }
 
     pub fn set(_enabled: bool, _exe: &Path) -> io::Result<()> {
-        Err(io::Error::new(io::ErrorKind::Unsupported, "autostart is only set up on Windows and Linux"))
+        Err(io::Error::new(io::ErrorKind::Unsupported, "autostart is only set up on Windows, macOS and Linux"))
     }
 }
 
@@ -242,6 +294,15 @@ mod tests {
         set_in(&dir, false, exe).unwrap();
         assert!(!entry_path(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_launch_agent_starts_this_executable_in_the_tray() {
+        let text = launch_agent(Path::new("/Applications/Open & Dyn.app/Contents/MacOS/opendyn-kvm"));
+        let program = "<string>/Applications/Open &amp; Dyn.app/Contents/MacOS/opendyn-kvm</string>";
+        assert!(text.contains("<string>org.opendynkvm.opendyn-kvm</string>"), "{text}");
+        assert!(text.contains(&format!("{program}\n\t\t<string>--tray</string>")), "{text}");
+        assert!(text.contains("<key>RunAtLoad</key>\n\t<true/>"), "{text}");
     }
 
     #[test]

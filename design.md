@@ -373,7 +373,8 @@ A set of modes for all three ports is a profile, and the key on the KVM switches
   keeps them Normalized.
 - **Any other keyboard** can be remapped on the KVM itself, with the Vial app (software.md §4.11). The RP2354B runs a
   QMK-style keymap on the keyboard state it already parses: 8 layers, mod-tap and layer-tap, one-shot keys, media and
-  mouse keys, 16 macros. One keymap serves both PCs; it applies to keyboards in Normalized mode.
+  mouse keys, 16 macros, tap dances, combos, key overrides, caps word, the repeat keys and auto shift. One keymap
+  serves both PCs; it applies to keyboards in Normalized mode.
   - The "matrix" is the HID keyboard page (one position per usage), so the KVM sees what the keyboard sends: its own
     Fn key stays invisible.
   - Vial talks to a raw HID interface of its own, which takes one IN endpoint. The setting is **Off** (default),
@@ -482,7 +483,9 @@ USB-C PC2  VBUS ─► LM66200 ch.B ─┴───────────► T
   removes the case (report.md N1).
 
   An RGB gaming keyboard alone can draw 300–500 mA, and a webcam another 200–500 mA. The host software and the LEDs
-  warn when the advertised budget is too low.
+  warn when the source's 5 V sags under the load (software.md §4.7), not from these figures: many PC ports give far
+  more than they advertise. Measured on the first board (2026-11-17): under 1 W from the PWR port in every state,
+  front devices included, far below the estimate above.
 
 ### 6.1 Budget with the Bluetooth module (0.16.0)
 

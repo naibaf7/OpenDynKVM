@@ -314,9 +314,9 @@ fn print_status(c: &Client, s: &Snapshot) {
     if st.bt_passkey != 0 {
         println!("  {}", fl!("cli-passkey-waits"));
     }
-    let mut power = fl!("power-left", source = names::power_source(st.power), milliamps = st.budget_ma);
-    if st.flags & status_flags::BUDGET_LOW != 0 {
-        power += &format!("  ({})", fl!("cli-budget-low"));
+    let mut power = names::power_line(st);
+    if let Some((short, _)) = names::power_warning(st, true) {
+        power += &format!("  ({short})");
     }
     println!("{}", fl!("cli-power", power = power));
     if s.has_hop() {
@@ -625,6 +625,8 @@ fn print_event(e: &Event) {
         Event::BtActive(n) => println!("{}", fl!("cli-ev-host-active", slot = u32::from(*n))),
         Event::BtChanged(0) => println!("{}", fl!("cli-ev-pairing-changed")),
         Event::BtChanged(n) => println!("{}", fl!("cli-ev-host-changed", slot = u32::from(*n))),
+        // Screen hop's placements, for the window's placer: `Client` keeps none.
+        Event::PlaceCursor(_) => {}
     }
 }
 

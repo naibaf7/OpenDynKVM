@@ -13,7 +13,7 @@
 use kvm_hid::KeyState;
 
 use crate::keycode::{KC_NO, QK_BOOT};
-use crate::keymap::{Keymap, MACRO_BUFFER, MACRO_COUNT, Settings, qsid};
+use crate::keymap::{Dynamic, Keymap, MACRO_BUFFER, MACRO_COUNT, Settings, qsid};
 use crate::remap::Remap;
 use crate::{COLS, DEFINITION, KEYBOARD_UID, LAYERS, POSITIONS, REPORT_LEN, ROWS};
 
@@ -272,11 +272,11 @@ impl Vial {
                 r[2] = if s.unlocked { 0 } else { left.div_ceil(100) as u8 };
             }
             0x08 => *s = Session::default(),
-            // vial_qmk_settings_query: the supported qsids above the given one, 0xFFFF after the last.
+            // vial_qmk_settings_query: up to 16 supported qsids above the given one, 0xFFFF after the last.
             0x09 => {
                 let above = le16(2);
                 r.fill(0xFF);
-                for (i, id) in qsid::ALL.iter().filter(|id| **id > above).enumerate() {
+                for (i, id) in qsid::ALL.iter().filter(|id| **id > above).take(REPORT_LEN / 2).enumerate() {
                     r[2 * i..2 * i + 2].copy_from_slice(&id.to_le_bytes());
                 }
             }
@@ -301,12 +301,56 @@ impl Vial {
                     km.settings_changed();
                 }
             }
-            // vial_dynamic_entry_op: no tap dance, combos, key overrides or alt-repeat entries, no feature flags.
-            0x0D => r.fill(0),
+            // vial_dynamic_entry_op: [2] sub-command, [3] entry, [4..] the entry for a set.
+            0x0D => match q[2] {
+                0x00 => {
+                    r.fill(0);
+                    for (i, kind) in Dynamic::ALL.iter().enumerate() {
+                        r[i] = kind.count() as u8;
+                    }
+                    r[REPORT_LEN - 1] = FEATURE_CAPS_WORD | FEATURE_LAYER_LOCK;
+                }
+                // Get (odd) and set (even) for tap dance, combo, key override, alternate repeat key.
+                sub @ 0x01..=0x08 => {
+                    let kind = Dynamic::ALL[(sub as usize - 1) / 2];
+                    let i = q[3] as usize;
+                    if sub % 2 == 1 {
+                        let mut e = [0u8; 10];
+                        let got = km.dynamic(kind, i, &mut e);
+                        r.fill(0);
+                        match got {
+                            Some(n) => r[1..1 + n].copy_from_slice(&e[..n]),
+                            None => r[0] = 1,
+                        }
+                    } else {
+                        let mut e = [0u8; 10];
+                        e[..kind.size()].copy_from_slice(&q[4..4 + kind.size()]);
+                        // vial-qmk's firewall on every keycode the entry sends.
+                        let sent: &[usize] = match kind {
+                            Dynamic::TapDance => &[0, 2, 4, 6],
+                            Dynamic::Combo => &[8],
+                            Dynamic::KeyOverride => &[2],
+                            Dynamic::AltRepeat => &[0, 2],
+                        };
+                        for &at in sent {
+                            let kc = firewall(u16::from_le_bytes([e[at], e[at + 1]]), s.unlocked);
+                            e[at..at + 2].copy_from_slice(&kc.to_le_bytes());
+                        }
+                        let ok = ctx.writable && km.set_dynamic(kind, i, &e);
+                        r.fill(0);
+                        r[0] = !ok as u8;
+                    }
+                }
+                _ => r[0] = UNHANDLED,
+            },
             _ => r[0] = UNHANDLED,
         }
     }
 }
+
+/// Feature bits in the last byte of the dynamic entry count (vial-qmk's `vial_dynamic_entry_op`).
+pub const FEATURE_CAPS_WORD: u8 = 1 << 0;
+pub const FEATURE_LAYER_LOCK: u8 = 1 << 1;
 
 /// Keycode `idx` of the flat keymap (layer × position).
 fn flat(km: &Keymap, idx: usize) -> u16 {
@@ -354,8 +398,10 @@ mod tests {
         assert_eq!(ask(&mut v, &c, &[0x11])[1], 8);
         assert_eq!(ask(&mut v, &c, &[0x0C])[1], 16);
         assert_eq!(ask(&mut v, &c, &[0x0D])[1..3], [0x08, 0x00]);
+        // Dynamic entries: 32 of each kind; caps word and layer lock in the last byte.
         let dynamic = ask(&mut v, &c, &[0xFE, 0x0D, 0x00]);
-        assert!(dynamic.iter().all(|b| *b == 0));
+        assert_eq!(dynamic[..5], [32, 32, 32, 32, 0]);
+        assert_eq!(dynamic[REPORT_LEN - 1], FEATURE_CAPS_WORD | FEATURE_LAYER_LOCK);
         // Keymap buffer, as reload_keymap fetches it: layer 0 holds the identity, big-endian.
         let mut buf = std::vec::Vec::new();
         let total = LAYERS * POSITIONS * 2;
@@ -367,11 +413,52 @@ mod tests {
         }
         assert_eq!(buf[2 * 0x04..2 * 0x04 + 2], [0x00, 0x04]);
         assert_eq!(buf[2 * POSITIONS..2 * POSITIONS + 2], [0x00, 0x01], "layer 1 is transparent");
-        // QMK settings: the query ends at 0xFFFF; tapping term reads 200.
-        let q = ask(&mut v, &c, &[0xFE, 0x09, 0, 0]);
-        assert_eq!(q[..12], [6, 0, 7, 0, 18, 0, 22, 0, 23, 0, 0xFF, 0xFF]);
+        // QMK settings, queried as reload_settings does: 16 qsids per reply, from the highest seen, until 0xFFFF.
+        let mut ids = std::vec::Vec::new();
+        let mut cur = 0u16;
+        while cur != 0xFFFF {
+            let c16 = cur.to_le_bytes();
+            let q = ask(&mut v, &c, &[0xFE, 0x09, c16[0], c16[1]]);
+            for pair in q.chunks(2) {
+                let id = u16::from_le_bytes([pair[0], pair[1]]);
+                cur = cur.max(id);
+                if id != 0xFFFF {
+                    ids.push(id);
+                }
+            }
+        }
+        assert_eq!(ids, qsid::ALL);
         let tt = ask(&mut v, &c, &[0xFE, 0x0A, 7, 0]);
         assert_eq!(tt[..3], [0, 200, 0]);
+        // Then every entry of every kind, each with status 0 (reload_tap_dance and the others).
+        for (sub, n) in [(0x01, 32u8), (0x03, 32), (0x05, 32), (0x07, 32)] {
+            for i in 0..n {
+                assert_eq!(ask(&mut v, &c, &[0xFE, 0x0D, sub, i])[0], 0);
+            }
+            assert_eq!(ask(&mut v, &c, &[0xFE, 0x0D, sub, n])[0], 1, "past the last");
+        }
+    }
+
+    #[test]
+    fn dynamic_entries_set_and_read_back_with_the_firewall() {
+        let mut v = Vial::new();
+        let none = KeyState::EMPTY;
+        let c = ctx(&none, 0);
+        // Combo 2: A + B → Escape, as combo_set sends it.
+        ask(&mut v, &c, &[0xFE, 0x0D, 0x04, 2, 0x04, 0, 0x05, 0, 0, 0, 0, 0, 0x29, 0]);
+        let r = ask(&mut v, &c, &[0xFE, 0x0D, 0x03, 2]);
+        assert_eq!(r[..11], [0, 0x04, 0, 0x05, 0, 0, 0, 0, 0, 0x29, 0]);
+        // A tap dance whose hold is QK_BOOT, while locked: stored as KC_NO.
+        ask(&mut v, &c, &[0xFE, 0x0D, 0x02, 0, 0x04, 0, 0x00, 0x7C, 0, 0, 0, 0, 200, 0]);
+        let r = ask(&mut v, &c, &[0xFE, 0x0D, 0x01, 0]);
+        assert_eq!(r[..11], [0, 0x04, 0, 0, 0, 0, 0, 0, 0, 200, 0]);
+        // An alternate repeat key (6 bytes), and nothing written without "configuration from software".
+        ask(&mut v, &c, &[0xFE, 0x0D, 0x08, 31, 0x50, 0, 0x4F, 0, 0, 0x08]);
+        assert_eq!(ask(&mut v, &c, &[0xFE, 0x0D, 0x07, 31])[..7], [0, 0x50, 0, 0x4F, 0, 0, 0x08]);
+        let ro = Context { writable: false, ..ctx(&none, 0) };
+        let r = ask(&mut v, &ro, &[0xFE, 0x0D, 0x06, 0, 0x2A, 0, 0x4C, 0, 0xFF, 0xFF, 0x22, 0, 0x22, 0x87]);
+        assert_eq!(r[0], 1);
+        assert_eq!(v.keymap.key_overrides()[0].trigger, 0);
     }
 
     #[test]

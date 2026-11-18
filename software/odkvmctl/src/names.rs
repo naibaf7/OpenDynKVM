@@ -7,7 +7,7 @@ use kvm_proto::ctrl::{
     Accel, Advertised, AutoReason, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, ErrorCode, FaultKind, FwState,
     HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Host, Hotkey, HotkeyKind, KeyAction, LearnEnd, LinkState,
     MAX_ARRANGEMENTS, MAX_PROFILES, Mapping, PROFILE_NAME_MAX, Polling, Port, PortMode, PortState, PowerSource,
-    ProfileName, Rgb, Screen, Speed, SwitchSource, Units, VialMode, class, diag, key,
+    ProfileName, Rgb, Screen, Speed, Status, Supply, SwitchSource, Units, VialMode, class, diag, key, status_flags,
 };
 
 pub fn error(c: ErrorCode) -> String {
@@ -174,6 +174,37 @@ pub fn power_source(p: PowerSource) -> String {
         PowerSource::PwrPort => fl!("power-source-pwr"),
         PowerSource::PcBus => fl!("power-source-pc"),
     }
+}
+
+/// The source and what is measured of its 5 V (protocol 10); from older firmware, the estimate left for the front ports.
+pub fn power_line(st: &Status) -> String {
+    let source = power_source(st.power);
+    if st.supply == Supply::Unknown {
+        return fl!("power-left", source = source, milliamps = st.budget_ma);
+    }
+    let v = |mv: u16| crate::i18n::decimal(mv as f64 / 1000.0, 2);
+    fl!("power-supply", source = source, volts = v(st.supply_mv), lowest = v(st.supply_lowest_mv))
+}
+
+/// The supply warning there is, and whether it is serious: the measured 5 V sagging or too low (protocol 10), or older
+/// firmware's estimate (the devices' declared maximum over the budget). `short`: the command line's few words.
+pub fn power_warning(st: &Status, short: bool) -> Option<(String, bool)> {
+    match (st.supply, short) {
+        (Supply::Unknown, _) if st.flags & status_flags::SUPPLY_SAGS == 0 => None,
+        (Supply::Unknown, false) => Some((fl!("budget-low"), false)),
+        (Supply::Unknown, true) => Some((fl!("cli-budget-low"), false)),
+        (Supply::Good, _) => None,
+        (Supply::Sags, false) => Some((fl!("supply-sags"), false)),
+        (Supply::Sags, true) => Some((fl!("cli-supply-sags"), false)),
+        (Supply::Low, false) => Some((fl!("supply-low"), true)),
+        (Supply::Low, true) => Some((fl!("cli-supply-low"), true)),
+    }
+}
+
+/// Why there is no warning though the front devices declare more than the estimate leaves them: the 5 V holds.
+pub fn power_note(st: &Status) -> Option<String> {
+    (st.supply == Supply::Good && st.declared_ma > st.budget_ma)
+        .then(|| fl!("power-declared", declared = st.declared_ma, milliamps = st.budget_ma))
 }
 
 pub fn fw_state(s: FwState) -> String {
@@ -453,6 +484,10 @@ pub fn diag_name(id: u8) -> String {
         AT1_3V3 => fl!("diag-at-3v3", n = 1),
         AT2_3V3 => fl!("diag-at-3v3", n = 2),
         BUDGET => fl!("diag-budget"),
+        SUPPLY => fl!("diag-supply"),
+        SUPPLY_DIPS => fl!("diag-supply-dips"),
+        PC1_DROPOUTS => fl!("diag-dropouts", pc = "PC1"),
+        PC2_DROPOUTS => fl!("diag-dropouts", pc = "PC2"),
         KB_FAULTS => fl!("diag-kb-faults"),
         MS_FAULTS => fl!("diag-ms-faults"),
         OT_FAULTS => fl!("diag-ot-faults"),
@@ -550,6 +585,9 @@ pub fn diag_help(id: u8) -> String {
         PWR_CC | PC1_CC | PC2_CC => fl!("diag-help-cc"),
         AT1_3V3 | AT2_3V3 => fl!("diag-help-3v3"),
         BUDGET => fl!("diag-help-budget"),
+        SUPPLY => fl!("diag-help-supply"),
+        SUPPLY_DIPS => fl!("diag-help-supply-dips"),
+        PC1_DROPOUTS | PC2_DROPOUTS => fl!("diag-help-dropouts"),
         KB_FAULTS | MS_FAULTS | OT_FAULTS => fl!("diag-help-faults"),
         AT1_TEMP | AT2_TEMP => fl!("diag-help-at-temp"),
         AT1_FW | AT2_FW => fl!("diag-help-at-fw"),
@@ -931,6 +969,29 @@ pub fn mode_names() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_power_line_says_what_is_measured_and_warns_only_when_the_5_v_sags() {
+        let mut c = crate::Client::new(Box::new(crate::sim::SimTransport::with_bluetooth(false)));
+        let mut st = c.status().unwrap();
+        assert_eq!(st.supply, Supply::Good);
+        st = Status { supply_mv: 4950, supply_lowest_mv: 4870, budget_ma: 300, declared_ma: 200, ..st };
+        assert_eq!(power_line(&st), "From PC USB: 4.95 V, lowest 4.87 V in the last minute");
+        assert_eq!((power_warning(&st, false), power_note(&st)), (None, None));
+        // More declared than the estimate, but the 5 V holds: a note why that is fine, no warning.
+        st.declared_ma = 700;
+        assert!(power_note(&st).is_some_and(|n| n.contains("700 mA")));
+        assert_eq!(power_warning(&st, false), None);
+        st = Status { supply: Supply::Sags, flags: st.flags | status_flags::SUPPLY_SAGS, ..st };
+        assert_eq!(power_warning(&st, true), Some(("5 V sags".into(), false)));
+        assert_eq!(power_note(&st), None);
+        st.supply = Supply::Low;
+        assert!(power_warning(&st, false).is_some_and(|(_, bad)| bad));
+        // Older firmware: its estimate, and its warning from the same flag.
+        st.supply = Supply::Unknown;
+        assert_eq!(power_line(&st), "From PC USB, about 300 mA left for the front ports");
+        assert_eq!(power_warning(&st, false).unwrap().0, "The attached devices may need more: use the PWR port.");
+    }
 
     #[test]
     fn a_learned_hotkey_warns_of_plain_keys_and_twins() {
