@@ -296,12 +296,7 @@ impl<'a> BtMsg<'a> {
     pub fn decode(msg: &'a [u8]) -> Result<Self, WireError> {
         let mut r = Reader::new(msg);
         Ok(match r.u8()? {
-            ty::HELLO => BtMsg::Hello {
-                proto: r.u8()?,
-                fw_version: r.u32()?,
-                role: r.u8()?,
-                flags: if r.remaining() > 0 { r.u8()? } else { 0 },
-            },
+            ty::HELLO => BtMsg::Hello { proto: r.u8()?, fw_version: r.u32()?, role: r.u8()?, flags: r.u8()? },
             ty::INPUT => BtMsg::Input { host: r.u8()?, id: r.u8()?, data: r.rest() },
             ty::OUTPUT => BtMsg::Output { host: r.u8()?, id: r.u8()?, data: r.rest() },
             ty::SELECT => BtMsg::Select { host: r.u8()? },

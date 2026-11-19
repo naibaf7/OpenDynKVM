@@ -21,9 +21,6 @@ use odkvmctl::{fl, names};
 use crate::look::{self, BAD, GOOD, WARN, card, chip, ink, note};
 use crate::{App, pc_colors};
 
-/// The first firmware that takes the cursor placed by the host software (protocol 10).
-const PLACING_SINCE: &str = "0.1.27";
-
 /// Resolutions to pick from; any other can be typed.
 const RESOLUTIONS: &[(u16, u16)] = &[
     (1280, 720),
@@ -387,10 +384,7 @@ impl App {
     }
 
     pub(crate) fn screens(&mut self, ui: &mut Ui, s: &Snapshot) {
-        let Some(hop) = s.hop() else {
-            card(ui, "", |ui| note(ui, fl!("hop-firmware-too-old")));
-            return;
-        };
+        let hop = s.hop();
         self.screens.settle(&hop);
         // Shown while configuration from software is off, not editable.
         let locked = App::locked_note(ui, s);
@@ -665,7 +659,7 @@ impl App {
             State::Off | State::Blocked(Unplaceable::Unsupported) => return,
             State::Placing => (fl!("hop-place-placing"), GOOD),
             State::NoKvm => (fl!("hop-place-no-kvm"), WARN),
-            State::FirmwareTooOld => (fl!("hop-place-old-firmware", version = PLACING_SINCE), WARN),
+            State::Mismatch => (fl!("hop-place-mismatch"), WARN),
             State::Blocked(Unplaceable::NotAllowed) => (fl!("hop-place-not-allowed"), WARN),
             State::Blocked(Unplaceable::OtherDesktop) => (fl!("hop-place-other-desktop"), WARN),
             State::Blocked(Unplaceable::Refused) => (fl!("hop-place-refused"), WARN),

@@ -204,7 +204,18 @@ hotkeys also work on a mirrored keyboard.
   works, 300 ms late.
 - **Combo:** exact modifier set + one key, e.g. Ctrl+Alt+1. The key's press and release are swallowed. The modifiers
   have already reached the PC; that is harmless and matches other KVMs.
-- Bindings: toggle, select PC1, select PC2. Stored in the config (§8.3).
+- **The list** (`Config::hotkeys`, config keys 0x00F0–0x00FF, §8.3): up to 16 entries, each an action and its
+  hotkey; an entry may have no hotkey yet (it does nothing), and two entries may do the same. The default is one entry,
+  toggle PC on a double Scroll Lock. The actions (`HotkeyAction`; `odkvmctl` names in brackets):
+  - toggle PC (`toggle-pc`): the other PC; from a Bluetooth host, back to the PC that was active before it;
+  - next / previous host (`next-host`, `prev-host`): PC1, PC2, then each Bluetooth host that is ready, and round;
+  - select a host (`select-pc1`, `select-pc2`, `select-host1`–`4`): a slot with no host bonded leaves the input where
+    it is, as `SetActive` does;
+  - next / previous profile (`next-profile`, `prev-profile`), among those in use; select profile 0–3
+    (`select-profile0`–`3`), ignored while it isn't in use;
+  - cycle the Other port's mode (`other-port`), as the KVM's key can.
+
+  Like the key, a hotkey works whatever the software locks say (`Origin::Device`).
 - **Learning** (`hotkey::Learner`, request `LearnHotkey`): the KVM learns a hotkey from the keys pressed. It reads the
   same key state as the matcher, with the same timing, so it learns exactly what the matcher will recognise. A host
   couldn't: it sees the keys after the Vial keymap, and the OS keeps some from programs (Ctrl+Alt+Del, the Windows key,
@@ -262,7 +273,7 @@ hotkeys also work on a mirrored keyboard.
   FAULT is active low with a 10 kΩ pull-up. A fault switches the port off for 1 s, then retries.
 - **CC voltage across Rd (5.1 kΩ) → advertised current:** < 0.2 V nothing, 0.2–0.66 V default USB, 0.66–1.23 V 1.5 A,
   > 1.23 V 3.0 A.
-- **Supply, measured** (`kvm-core::supply`, protocol 10, firmware 0.1.28): the board measures no current, and a PC
+- **Supply, measured** (`kvm-core::supply`, firmware 0.1.28): the board measures no current, and a PC
   port's limit can't be known without going over it; what shows whether a source keeps up is its 5 V under the real
   load. The KVM judges the source it runs from: the PWR port's VBUS (every 200 ms), or on PC power the higher of the
   PCs' (the ideal diodes feed the board from it), each AT32F405 sending its reading every 100 ms and the lowest of
@@ -614,7 +625,7 @@ The RP2354B side runs on core 0 (`bt::run`); core 1 keeps to the AT32F405 links.
 
 **Reports.** One HID service with a fixed report map (`kvm_proto::link::bt::report::MAP`, 229 bytes): keyboard (boot
 layout, ID 1, with the LED output report), mouse (16 buttons, 16-bit X/Y, wheel, AC pan, ID 2), consumer (one 16-bit
-usage, ID 3), and screen hop's absolute pointer (protocol 9: 16 buttons, X/Y 0–32767, wheel, AC pan, ID 4). The
+usage, ID 3), and screen hop's absolute pointer (16 buttons, X/Y 0–32767, wheel, AC pan, ID 4). The
 pointer is a top-level collection of usage Pointer of its own, as on the PCs' USB interface, so a host that takes no
 absolute pointer leaves it alone; the engine sends it nothing unless screen hop puts that host's pointer there
 (§4.14). Desktop and mobile systems take it without a driver: HID over GATT is built into them. Motion is coalesced
@@ -623,14 +634,12 @@ reports up to 1000 times a second, the link to a module on a front port carries 
 host takes notifications at its connection events (7.5–15 ms for the selected one). So one motion report waits at a
 time, relative moves adding up and an absolute position replacing the one before; a report with other buttons sends
 the waiting one first, so no click is lost. Queued one by one, as at first, the reports came late, and those that
-didn't fit were dropped with their motion: on the first dongle (2026-11-14) the pointer crawled. Up to 0.1.12 the map
-was 161 bytes, without the pointer; no host had bonded with it yet (no module was on a board), so none holds a stale
-copy of the GATT database.
+didn't fit were dropped with their motion: on the first dongle (2026-11-14) the pointer crawled.
 
 **Engine** (`kvm-core::bt`, `Engine::switch`):
 - **Targets:** PC1, PC2 and the bonded hosts 1–4. `Target::Bt1`–`Bt4` select a host; `Toggle` from a host goes back
-  to the home PC; `Next` (hotkey `hotkey-next`, or the key's `next-target` action) cycles PC1, PC2, then the hosts that
-  are ready (connected, encrypted, subscribed).
+  to the home PC; `Next` (a hotkey's `next-host`, or the key's `next-target` action) cycles PC1, PC2, then the hosts
+  that are ready (connected, encrypted, subscribed); `prev-host` goes the other way, `select-host1`–`4` to one host.
 - **Switching to a host:** as a PC switch: the PC left gets neutral reports, what is held stays hidden from the host
   until released, the keymap lets go. Then `Select`, and the keyboard's LEDs show the host's lock state. Leaving a host
   sends it every key and button released.
@@ -639,7 +648,7 @@ copy of the GATT database.
   ErrorRollOver; system control (power, sleep) stays with the PCs.
 - **Pairing:** `BtPair` opens it for 60 s (`BT_PAIR_SECONDS`). LE Secure Connections, IO capability KeyboardOnly: the
   host shows six digits, and while it waits the KVM's keyboard goes to nobody else: digits on the top row or keypad,
-  Backspace, Enter sends them, Escape cancels. `Status.bt_passkey_digits` / `bt_passkey_typed` (protocol 9) carry
+  Backspace, Enter sends them, Escape cancels. `Status.bt_passkey_digits` / `bt_passkey_typed` carry
   what is typed so far, and each digit is a `BtChanged(0)`, so the window shows them as they come (the KVM has the
   keyboard, so nothing else does). What is held when it ends stays hidden until released. `BtPasskey` does
   the same from software. No Just Works, so a host in range can't pair unnoticed.
@@ -738,8 +747,8 @@ leaves every watchdog off).
   (`selftest::BT_FW`, Bluetooth off until then). After 5 failed attempts in a row it gives up (`BT_GAVE_UP`), until
   the image changes, the key is held at power-up, or `odkvmctl reboot wireless-retry` / the GUI's *Try again*.
 - **State** (`bt::State`, `Status.bt_module`): not fitted, starting (waiting for its `Hello`), up, being programmed,
-  failed this boot, gave up. `Info.bt_fw` is its firmware while it is up. Both are protocol 6; hosts hear of a
-  change at once (`BtChanged(0)`).
+  failed this boot, gave up. `Info.bt_fw` is its firmware while it is up. Hosts hear of a change at once
+  (`BtChanged(0)`).
 - **Self-test and LEDs** (§4.10): `BT_FW` and `BT_GAVE_UP` show on the key in the self-test's LED code and keep it
   blinking red afterwards (`selftest::ON_KEY`). A module that is still starting or being programmed isn't a failure;
   the self-test's verdict waits for it until its 12 s deadline, and the bits follow the module after that.
@@ -782,7 +791,7 @@ small C3 boards) runs the same module firmware, and the RP2354B reaches it on a 
   attached and has answered (its ROM: not a blank ESP32-C3), or when 5 restarts into its ROM in a row missed; then it
   is restarted into its own firmware and declined again at once when it comes back (for 10 s). A board that doesn't
   run the firmware after its attempts stays off until the KVM restarts (*Try again* restarts it).
-- **The port:** `PortState::Module` (protocol 9): the LED glows violet, the window and `odkvmctl` say the port holds
+- **The port:** `PortState::Module`: the LED glows violet, the window and `odkvmctl` say the port holds
   the wireless module and is attached to no PC, and how to get the port back (unplug the board, or a passthrough
   mode). Its current comes from the port, so the budget doesn't count `BT_CURRENT_MA` for it. Unplugged, Bluetooth goes
   as for a module that stops answering, and the next board may be the module.
@@ -808,7 +817,7 @@ port).
 
 ### 4.14 Screen hop (`kvm-core::hop`)
 
-The KVM moves the pointer itself, across an arrangement of its hosts' screens (both PCs', and since protocol 9 the
+The KVM moves the pointer itself, across an arrangement of its hosts' screens (both PCs' and the
 Bluetooth hosts'), and switches to another host when the pointer is pushed across an edge onto one of its screens
 (design.md §4, "Screen hop"). It runs on the RP2354B, in the engine, on the motion of the normalized pointing devices;
 the hosts get an absolute pointer (a Bluetooth host set so: relative motion, below).
@@ -818,14 +827,11 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
   pointer); the active host (a PC in report protocol, or a Bluetooth host) with a screen in the arrangement.
   `Status.hop` says which is missing, and the hosts offer the fix. Until 0.1.12 a Bluetooth host with the input
   turned it off (`HopState::Wireless`, never sent since).
-- **Arrangements** (protocol 9): the KVM keeps four (`MAX_ARRANGEMENTS`), each a name (`arrangementN-name`, empty:
+- **Arrangements**: the KVM keeps four (`MAX_ARRANGEMENTS`), each a name (`arrangementN-name`, empty:
   "Arrangement n") and 8 screen slots, and each profile uses one of them or none (`profileN-arrangement`). Each is a
   store item of its own (0x0010–0x0013, §4.8, at most 160 bytes: its name and the slots in use): editing one writes
   only it, and switching profiles, which switches the arrangement in use, writes nothing (unless the profile itself is
   remembered). Another arrangement in use starts the pointer over in the middle of the active host's main screen.
-  Firmware up to 0.1.12 had one arrangement, in the config item, at the keys that are arrangement 0's now: such an
-  item loads it as arrangement 0, which gets its own item at the first save, written before the config item that no
-  longer holds it; a profile's switch "on" (1) reads as arrangement 0.
 - **Absolute pointer:** with `abs-pointer` on, interface 1 carries report IDs: ID 1 is the relative mouse as before
   (the resolution-multiplier feature report with it), ID 2 an absolute pointer, a top-level collection of usage
   Pointer: 16 buttons, X/Y 0–32767, wheel and AC Pan in detents (`normalized::MOUSE_ABS_DESC`). A collection of its
@@ -834,11 +840,11 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
   never does, so a profile without hop (gaming) gets the relative mouse at once. In boot protocol everything is
   relative.
 - **Arrangement:** 8 screen slots (`arrangementN-screen0`–`7`), each a host's (PC1, PC2, or a Bluetooth host slot:
-  its `Host` value, protocol 9, in the slot's host byte): resolution, display scaling (100–400 %), its top-left in that
+  its `Host` value, in the slot's host byte): resolution, display scaling (100–400 %), its top-left in that
   host's own display arrangement (`desk`, in its units, below), and its top-left in the arrangement (`at`, logical
   pixels: a screen at 150 % takes two thirds of its pixels each way, so screens of the same physical size line up).
-  The pointer lives in the arrangement, in logical pixels with sub-pixel precision. Two flags per screen (protocol 8,
-  in the slot's host byte):
+  The pointer lives in the arrangement, in logical pixels with sub-pixel precision. Two flags per screen (in the
+  slot's host byte):
   - **Off for hop** (`off`): a screen of a monitor cabled to both PCs, on the PC it doesn't show. It lies where the
     other PC's screen is; the pointer never goes onto it, but it still counts for its PC's desktop (mapping, below).
     Measured on the first board's desk (2026-11-12): PC1 (KDE) had the shared 4K monitor left of its HD monitor, and
@@ -846,7 +852,7 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
     before every hop.
   - **Fixed** (`fixed`): its `desk` is the PC's own (detected, or typed in); the app doesn't derive it from where the
     screen is dragged. The KVM only stores it.
-- **Units** (`hop-units-pc1/-pc2`, protocol 8; `hop-units-host1`–`4`, protocol 9): what a host's `desk` coordinates
+- **Units** (`hop-units-pc1/-pc2`; `hop-units-host1`–`4`): what a host's `desk` coordinates
   count. `physical` (Windows, X11): a
   screen covers its resolution there. `logical` (Wayland desktops: KDE Plasma, GNOME): it covers its arrangement
   size, its resolution over its scaling, and an absolute pointer is spread in those units.
@@ -860,7 +866,7 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
     connected, encrypted and subscribed. Then the host left gets the pointer at its edge, released (a switch like any
     other, `SwitchSource::Edge`), and the other host the pointer at the same place along its screen's edge.
   - Nothing there: a wall.
-- **Mapping** (`hop-mapping-pc1/-pc2`; `hop-mapping-host1`–`4`, protocol 9): where a host puts 0–32767. `desktop`:
+- **Mapping** (`hop-mapping-pc1/-pc2`; `hop-mapping-host1`–`4`): where a host puts 0–32767. `desktop`:
   across the bounding box of all its screens' `desk` rectangles, those off for hop included (Linux: X11, GNOME, KDE).
   macOS (host software 0.1.27 on) detects as `desktop` in logical pixels (points); how it maps an absolute pointer
   onto several displays isn't measured yet (a community project reports it on the display the cursor is on,
@@ -911,12 +917,12 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
     1:1 up to the threshold (0.4 − 0.25 s, at least 0.2), then a rise of 1.1 + 0.75 s to the cap 2 + 1.5 s, with s
     = speed / 10, averaged between the last speed and this one (Simpson's rule) as libinput does.
   - Mouse keys of the keymap accelerate themselves and go through unaccelerated.
-- **Cursor sync** (`PointerAt`, protocol 7): a PC's host software may say where its own cursor is (its pixels).
+- **Cursor sync** (`PointerAt`): a PC's host software may say where its own cursor is (its pixels).
   Taken over once the KVM hasn't moved the pointer for 150 ms: a touchpad or a program moved it, or Windows'
   acceleration on a screen reached relatively. `opendyn-kvm` sends it on Windows and macOS each time the cursor has
   rested for 250 ms while hop is on in the active profile; on Linux the position isn't available to programs on
   Wayland (and isn't needed: the whole desktop is absolute).
-- **Placed by the PC** (`PlaceCursor`, protocol 10; optional): a PC's host software may put its cursor where the KVM's
+- **Placed by the PC** (`PlaceCursor`; optional): a PC's host software may put its cursor where the KVM's
   pointer is itself, on the screens it names (`Placement`): Windows those its mapping reaches only with relative
   motion (`others`: all but its main screen, which keeps the absolute pointer), macOS all of them (`all`: how macOS
   maps an absolute pointer onto several displays isn't known, below). It holds a lease of `PLACE_LEASE_MS` (1 s) and
@@ -924,7 +930,7 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
   (`Event::PlaceCursor`, to that PC only, at most one a millisecond and then the latest: the control interface takes
   one report a millisecond, a mouse may send eight; `Engine::place_cursor`), and nothing on the pointer interfaces
   but a change of the buttons, the wheel or pan on the relative pointer (`PcOutput::pointer`). Without a lease (no
-  host software, a work PC that may not run it, older firmware or software, the system refusing) the PC's mapping
+  host software, a work PC that may not run it, the system refusing) the PC's mapping
   alone applies, as above, and the hop works as before; a lease that runs out (the program crashed, the PC went to
   sleep) costs at most a second without the pointer on those screens, and the KVM then goes on relatively from where
   the cursor was put. A bus reset ends it. `opendyn-kvm` places on a thread of its own with a handle of its own on
@@ -943,7 +949,7 @@ the hosts get an absolute pointer (a Bluetooth host set so: relative motion, bel
   - Not yet tried on a board or a Mac (2026-11-17): unit tests of the engine, the hop and the placer's protocol.
 - **Switching otherwise** (hotkey, key, software, auto-select): the pointer is found where it was left on that PC, or
   in the middle of its main screen.
-- **Bluetooth hosts** (protocol 9) take the module's absolute pointer (report 4, §4.13), or with `hostN-pointer
+- **Bluetooth hosts** take the module's absolute pointer (report 4, §4.13), or with `hostN-pointer
   relative` the relative mouse only (`BtPointer`; for systems that take no absolute pointer, some tablets and phones).
   A relative host's cursor isn't known when the pointer comes onto it (a hop, or any switch to it): the KVM first
   pushes it into the top-left corner of the host's desktop (`hop::PARK`, 30 000 counts each way, further than any
@@ -1144,6 +1150,10 @@ Limit 4 KB. The AT32F405 keeps the active set and a staging buffer, and checks t
 - Present on **both** PCs, including the inactive one. The RP2354B holds the only state and pushes events to both.
 - **Discovery** is by usage page + usage, not VID/PID, so the control interface is found in identity mode too. The
   Linux udev rule matches the interface string `OpenDynKVM Control` for the same reason.
+- **One version:** host and firmware talk only when their `PROTOCOL_VERSION`s are the same. The host reads `GetInfo`
+  first (`Client::info_checked`); with another version it reads nothing else, every page of the window says so and
+  leads to the Firmware page, whose update works (`GetInfo` and the `Fw*` requests are all it needs), and `odkvmctl`
+  refuses every command but `update`. Messages decode strictly: there is no support for older or newer firmware.
 
 ### 8.2 Messages
 
@@ -1152,8 +1162,8 @@ are type 0xFF with the request type and an error code; events use request id 0.
 
 | Request | Response |
 |---|---|
-| 0x01 `GetInfo` | protocol version (10), firmware versions (RP2354B, AT32F405 ×2), hardware version (u32, packed like the firmware's), serial, capability bits (`BLUETOOTH` when the module answers, `SCREEN_HOP` from protocol 7); then (protocol 6) the Bluetooth module's firmware version |
-| 0x02 `GetStatus` | active PC, **which PC is asking**, link state of each PC, power source, advertised current, budget, lock bits, uptime, link errors, self-test bits 0–15 (§4.10); then (protocol 6) the Bluetooth host that gets input, the hosts ready and bonded (bit masks), seconds of pairing left, the host waiting for a passkey, the module's state, and self-test bits 16–31 (so older hosts read bits 0–15 where they were); then (protocol 7) screen hop's state (off, on, or what it needs) and the pointer's place in the arrangement (two i16); then (protocol 10) the supply judged from its measured 5 V (unknown, good, sags, low), its voltage now and lowest in the last minute, and what the front devices declare (§4.7) |
+| 0x01 `GetInfo` | protocol version (11), firmware versions (RP2354B, AT32F405 ×2), hardware version (u32, packed like the firmware's), serial, capability bits (`BLUETOOTH` when the module answers); then the Bluetooth module's firmware version |
+| 0x02 `GetStatus` | active PC, **which PC is asking**, link state of each PC, power source, advertised current, budget, lock bits, uptime, link errors, self-test bits 0–15 (§4.10); then the Bluetooth host that gets input, the hosts ready and bonded (bit masks), seconds of pairing left, the host waiting for a passkey, the module's state, and self-test bits 16–31; then screen hop's state (off, on, or what it needs) and the pointer's place in the arrangement (two i16); then the supply judged from its measured 5 V (unknown, good, sags, low), its voltage now and lowest in the last minute, and what the front devices declare (§4.7) |
 | 0x03 `GetPort` | state, mode setting and effective mode, Auto reason, VID:PID, speed, interface classes, report rate, faults |
 | 0x04 `GetPortString` | manufacturer or product string of a port's device (UTF-8, ≤ 58 bytes) |
 | 0x05 `SetActive` | PC1 / PC2 / toggle |
@@ -1161,12 +1171,12 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x07 `GetConfig`, 0x08 `SetConfig` | key + value (§8.3) |
 | 0x09 `SaveConfig`, 0x0A `FactoryReset`, 0x0B `Reboot`, 0x0C `Identify`, 0x0D `Redetect` | — |
 | 0x0E `LearnHotkey` | start (1) or stop (0) learning a hotkey (§4.5); start answers `NotActive` from the inactive PC, `Busy` while another PC's session runs |
-| 0x0F `GetDiag` | page n of the diagnostics (§8.4): page, page count, up to 9 items of id, grade, value (protocol 5) |
+| 0x0F `GetDiag` | page n of the diagnostics (§8.4): page, page count, up to 9 items of id, grade, value |
 | 0x10–0x13 `FwBegin` / `FwData` / `FwCommit` / `FwStatus` | §4.9 |
-| 0x14 `GetBtHost` | a Bluetooth host slot (1–4): flags, interval, latency, RSSI, address (protocol 6, §4.13) |
+| 0x14 `GetBtHost` | a Bluetooth host slot (1–4): flags, interval, latency, RSSI, address (§4.13) |
 | 0x15 `BtPair` / 0x16 `BtForget` / 0x17 `BtPasskey` | open or close pairing; forget a slot (0xFF = all); the passkey a pairing host shows |
-| 0x18 `PointerAt` | where the asking PC's cursor is, in its own pixels (two i16), for screen hop's cursor sync (§4.14); `NotActive` from the service port (protocol 7) |
-| 0x19 `PlaceCursor` | the asking PC's host software places its cursor (0 off, 1 the screens its mapping reaches only relatively, 2 all) for `PLACE_LEASE_MS` from now, screen hop's "Placed by the PC" (§4.14); `NotActive` from the service port (protocol 10) |
+| 0x18 `PointerAt` | where the asking PC's cursor is, in its own pixels (two i16), for screen hop's cursor sync (§4.14); `NotActive` from the service port |
+| 0x19 `PlaceCursor` | the asking PC's host software places its cursor (0 off, 1 the screens its mapping reaches only relatively, 2 all) for `PLACE_LEASE_MS` from now, screen hop's "Placed by the PC" (§4.14); `NotActive` from the service port |
 
 | Event | Body |
 |---|---|
@@ -1177,13 +1187,12 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0xC4 `HotkeyLearned` | learned / timed out / cancelled, the hotkey (kind, modifiers, key, swallow); to the PC that asked only |
 | 0xC5 `BtChanged` | a Bluetooth host slot changed, or 0: pairing opened, closed or wants a passkey |
 | 0xC6 `BtActive` | input goes to Bluetooth host 1–4, or 0: back on a PC (`Switched` follows) |
-| 0xC7 `PlaceCursor` | where to put the cursor, in the PC's own pixels (two i16); only to a PC holding a `PlaceCursor` lease, at most one a millisecond (protocol 10) |
+| 0xC7 `PlaceCursor` | where to put the cursor, in the PC's own pixels (two i16); only to a PC holding a `PlaceCursor` lease, at most one a millisecond |
 
 ### 8.3 Config keys
 
 | Key | Value |
 |---|---|
-| 0x0001–0x0003 | hotkey for toggle / PC1 / PC2: kind (none, double-tap, combo), modifiers, key usage, swallow |
 | 0x0004 | double-tap window (ms) |
 | 0x0005 / 0x0006 | what a tap / a long press on the KVM's key does: nothing, toggle PC (tap's default), next profile (long press's default), cycle the Other port's mode (§4.6) |
 | 0x0007 | how long the key is held for a long press: 800–3000 ms (default 1000) |
@@ -1204,7 +1213,6 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x0072 | remember-profile: power up in the profile last active (default off: in profile 0, and a change of profile isn't saved) |
 | 0x0080–0x0083 | port modes of profile 0–3 (Keyboard, Mouse, Other); defaults: 0 all Auto, 1 all Passthrough, 2 and 3 all Auto |
 | 0x0088–0x008B | name of profile 0–3, UTF-8, at most 12 bytes; defaults: work, gaming, profile 2, profile 3 |
-| 0x0008 | hotkey for the next target: PC1, PC2, the Bluetooth hosts that are ready |
 | 0x0090–0x0093 | name of Bluetooth host slot 1–4 (empty: "BT n") |
 | 0x0098–0x009B | policy of Bluetooth host slot 1–4: stay connected (default), or connect only while selected |
 | 0x00A0 | absolute pointer on the KVM's mouse interface (default off; changing it re-enumerates both PCs, §4.14) |
@@ -1213,16 +1221,17 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x00A3 | edge resistance: how far the pointer is pushed against an edge to the other PC before it hops, 0–2000 logical pixels (default 100) |
 | 0x00A4 | corners: how far from each end of such an edge it never hops, 0–500 (default 20) |
 | 0x00A6 / 0x00A7 | how PC1 / PC2 maps the absolute pointer: across all its screens (default) or onto its main screen only |
-| 0x00A8–0x00AB | the arrangement profile 0–3 uses: 0 none (default, screen hop off), n + 1 arrangement n (protocol 9; until 8 screen hop on (1) or off, which read as arrangement 0 and none) |
-| 0x00AC / 0x00AD | what PC1's / PC2's desktop coordinates count: physical pixels (default) or logical (protocol 8) |
-| 0x00B0–0x00CF | arrangement a's screen slot s at 0x00B0 + 8a + s: host (0 = free, 1 PC1, 2 PC2, 0x11–0x14 Bluetooth host 1–4 since protocol 9; bit 7 off for hop, bit 6 fixed place, protocol 8), width, height, scaling %, `desk` x, y, `at` x, y (15 bytes). Arrangement 0's slots are protocol 8's one arrangement. In the arrangement's own item (§4.8), not the config item |
-| 0x00D0–0x00D3 | name of arrangement 0–3, UTF-8, at most 12 bytes (empty: "Arrangement n"); in the arrangement's item (protocol 9) |
-| 0x00D8–0x00DB | how Bluetooth host 1–4 maps the absolute pointer, as 0x00A6 (protocol 9) |
-| 0x00DC–0x00DF | what Bluetooth host 1–4's desktop coordinates count, as 0x00AC (protocol 9) |
-| 0x00E0–0x00E3 | how screen hop moves Bluetooth host 1–4's pointer: its absolute pointer (default) or relative motion only (protocol 9) |
+| 0x00A8–0x00AB | the arrangement profile 0–3 uses: 0 none (default, screen hop off), n + 1 arrangement n |
+| 0x00AC / 0x00AD | what PC1's / PC2's desktop coordinates count: physical pixels (default) or logical |
+| 0x00B0–0x00CF | arrangement a's screen slot s at 0x00B0 + 8a + s: host (0 = free, 1 PC1, 2 PC2, 0x11–0x14 Bluetooth host 1–4; bit 7 off for hop, bit 6 fixed place), width, height, scaling %, `desk` x, y, `at` x, y (15 bytes). Arrangement 0's slots are protocol 8's one arrangement. In the arrangement's own item (§4.8), not the config item |
+| 0x00D0–0x00D3 | name of arrangement 0–3, UTF-8, at most 12 bytes (empty: "Arrangement n"); in the arrangement's item |
+| 0x00D8–0x00DB | how Bluetooth host 1–4 maps the absolute pointer, as 0x00A6 |
+| 0x00DC–0x00DF | what Bluetooth host 1–4's desktop coordinates count, as 0x00AC |
+| 0x00E0–0x00E3 | how screen hop moves Bluetooth host 1–4's pointer: its absolute pointer (default) or relative motion only |
+| 0x00F0–0x00FF | entry 0–15 of the hotkey list (§4.5): action (kind, argument: a host for select-host, a profile for select-profile; kind 0 = unused entry), then the hotkey: kind (none, double-tap, combo), modifiers, key usage, swallow |
 
-The config item (§4.8) keeps 0x0030–0x0032 too, so firmware from before profiles still finds the active profile's
-modes, and a config saved by it loads its modes into profile 0. Hosts skip keys an older firmware refuses.
+0x0030–0x0032 are the active profile's modes: the config item (§4.8) doesn't keep them, the profiles' modes are
+there.
 
 ### 8.4 Diagnostics
 
@@ -1268,14 +1277,16 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
   - `odkvmctl wireless` (the four host slots), `wireless pair [stop]`, `wireless passkey <digits>`,
     `wireless forget <slot|all>`, `wireless name <slot> [<name>]`, `wireless policy <slot> stay|on-select` (a KVM with
     the Bluetooth module, §4.13). The user-facing name is neutral until the product is listed with the Bluetooth SIG
-    (design.md §16); the earlier names `bt`, `bt1`…`bt4`, `bt-retry` and the settings `bt1-name`… still work;
+    (design.md §16);
   - `odkvmctl port <keyboard|mouse|other> [mode <…>|redetect]`;
   - `odkvmctl profile` (list), `odkvmctl profile next|<number>|<name>` (make it active),
     `odkvmctl profile <number|name> name <text>`, `odkvmctl profile <number|name> <keyboard|mouse|other> <mode>`;
     the count and the key's actions are settings: `config set profiles 3`, `config set key-long next-profile`;
-  - `odkvmctl hotkey <toggle|pc1|pc2> [<spec>|learn]` (e.g. `double:scrolllock`, `ctrl+alt+1`, `f13`); `learn` has
-    the KVM learn it from the keyboard (§4.5), warns of a plain key or one another hotkey has, and on a terminal asks
-    before using it;
+  - `odkvmctl hotkey [list]`, `hotkey add <action> <hotkey>`, `hotkey set <n> <hotkey> [--action <action>]`,
+    `hotkey remove <n>`: the hotkey list (§4.5), entries numbered 1–16, actions by their names (`select-pc1`,
+    `next-profile`, …), hotkeys as `double:scrolllock`, `ctrl+alt+1`, `f13` or `none`; `learn` instead has the KVM learn
+    it from the keyboard, warns of a plain key or one another entry has, and on a terminal asks before using it. As
+    settings: `hotkey1`–`hotkey16`, `<action> <hotkey>` or `none`;
   - `odkvmctl config get [<name>]`, `config set <name> <value>`, `config save`, `config reset`. Turning
     `software-switching` or `software-config` off prints what stops working and, on a terminal, asks y/N; turning one
     on asks the KVM and waits for its key (`Client::allow_software`);
@@ -1299,8 +1310,7 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     `hop-mapping-host1`–`4`, `hop-units-pc1/2`, `hop-units-host1`–`4`, `host1`–`4-pointer` (`absolute`, `relative`),
     `profileN-arrangement` (`none`, 0–3), `arrangementN-name`, and `arrangementN-screenS` as
     `pc1 2560x1440 150% at 1920,0 desk 0,0` (`pc1`, `pc2` or `host1`–`host4`; scaling and positions may be left out;
-    `no-hop` for a screen off for hop, `fixed` for a place on its computer that dragging doesn't change) or `off`. The
-    names of protocol 8, `screenN` (arrangement 0's) and `profileN-hop` (`on` is arrangement 0), still work.
+    `no-hop` for a screen off for hop, `fixed` for a place on its computer that dragging doesn't change) or `off`.
     `odkvmctl status` has a screen-hop line.
   - `--sim` runs any command against a built-in simulated device (`OPENDYN_SIM_HOP=1`: with screen hop set up, two
     arrangements and, with `OPENDYN_SIM_BT=1`, the tablet of host 1 in both).
@@ -1313,7 +1323,7 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     the KVM powers up in the last one), then per port device, state, mode selector (the active profile's), report
     rate, faults, re-detect;
   - *Displays*: monitors that follow the KVM, per profile (below);
-  - *Screen hop* (the feature's name is a translation term; for firmware with `caps::SCREEN_HOP`, §4.14): whether it
+  - *Screen hop* (the feature's name is a translation term, §4.14): whether it
     runs and, if not, what it needs, with a button for the absolute pointer or the Mouse port's mode; the profiles it
     is on in; the absolute pointer. The arrangement on a canvas: the screens to scale in their PC's colour (its main
     screen marked), the pointer live on them; a click selects a screen, a drag moves it, its edges snapping to the
@@ -1338,11 +1348,13 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     resolution (a list, or typed), scaling, place on its own PC, place here, and whether screen hop goes onto it. Each
     PC's mapping and units. The pointer: acceleration, speed, edge resistance, corners. On Windows and macOS the worker
     reports this computer's cursor to the KVM each time it rests (cursor sync, §4.14), and the page has *Place the
-    cursor from this app…* with what the placer does now (placing, or why not: no KVM, older firmware, the sign-in or
+    cursor from this app…* with what the placer does now (placing, or why not: no KVM, firmware of another version, the sign-in or
     an administrator prompt, Windows refusing, macOS not allowing it yet with *Allow…*; §4.14 "Placed by the PC");
-  - *Keyboard*: hotkeys, typed or learned (**Learn**, then the hotkey on the KVM's keyboard; it goes into the field
-    with any warning, and **Apply** sets it; offered from the active PC with a keyboard the KVM reads, on firmware with
-    protocol 4), and the double-tap window; what a tap and a long press on the KVM's key do, and the long
+  - *Keyboard*: the hotkey list, one row per entry: what it does (host and profile actions by their names; the
+    wireless ones with the module, a profile only while in use), its hotkey typed or learned (**Learn**, then the
+    hotkey on the KVM's keyboard; it goes into the field with any warning, and **Apply** sets it; offered from the
+    active PC with a keyboard the KVM reads), and × to remove it; **Add hotkey** puts a new entry after the last one,
+    doing something no entry does yet. Then the double-tap window; what a tap and a long press on the KVM's key do, and the long
     press's duration: a slider whose handle sits on a bar from 0 to 3 s that shows the tap window and where the long
     press begins; the Vial interface and keymap, shown when `Info.caps` has `VIAL`;
   - *Settings*: this computer (start at login, appearance: system / dark / light, language), LEDs, PC side, software control,
@@ -1450,8 +1462,7 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
       none on the others. `IOI2CRequest`'s 64-bit layout (124 bytes, packed to 4) is checked at compile time.
   - Bindings: per monitor, an input for PC1 and PC2 (from the capability string, the current input, or typed in hex:
     how it is wired), and per KVM profile what it does: follow the active PC, stay on PC1, stay on PC2, or nothing
-    (`local::DisplayMode`). Files from before profiles have `enabled` instead, which becomes follow (or nothing) in
-    every profile; it is still written, as profile 0's, for older versions.
+    (`local::DisplayMode`).
   - Optionally, an input per paired Bluetooth host (§4.13), for a laptop or tablet wired to the monitor as well
     (`bt_inputs`). It is keyed by the host's identity address, not its slot, so a host paired into a slot another
     one was forgotten from doesn't inherit its input. While a host has the input, a monitor that follows the KVM shows

@@ -1,20 +1,17 @@
 //! Persistent configuration (software.md §8.3) and its flash item (§4.8).
 //!
-//! Item ([`ITEM`] in [`crate::store`], which adds the CRC): a list of entries `key u16 | len u8 | value`. Unknown keys
-//! are skipped, so a newer firmware's item still loads in an older one.
+//! Item ([`ITEM`] in [`crate::store`], which adds the CRC): a list of entries `key u16 | len u8 | value`; an entry
+//! that doesn't parse keeps its default.
 //!
-//! The screen-hop arrangements (protocol 9) are items of their own ([`ARRANGEMENT_ITEM`] + n, the same entries: the
-//! arrangement's name and its screens), so that editing one writes only it, and switching profiles writes nothing.
-//! Firmware up to 0.1.12 kept its one arrangement in the config item, under the keys that are arrangement 0's now: such
-//! an item loads into arrangement 0, which is written as an item of its own at the next save, before the config item
-//! that no longer holds it.
+//! The screen-hop arrangements are items of their own ([`ARRANGEMENT_ITEM`] + n, the same entries: the arrangement's
+//! name and its screens), so that editing one writes only it, and switching profiles writes nothing.
 
 use core::ops::RangeInclusive;
 
 use kvm_proto::ctrl::{
     Accel, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, ErrorCode, HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HOSTS,
-    Host, Hotkey, KeyAction, MAX_ARRANGEMENTS, MAX_PROFILES, MAX_SCREENS, Mapping, PROFILE_NAME_MAX, Polling, Port,
-    PortMode, ProfileName, Rgb, Screen, Units, VialMode, key,
+    Host, Hotkey, HotkeyAction, HotkeyBinding, KeyAction, MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, MAX_SCREENS,
+    Mapping, PROFILE_NAME_MAX, Polling, Port, PortMode, ProfileName, Rgb, Screen, Units, VialMode, key,
 };
 use kvm_proto::wire::{Reader, Writer};
 
@@ -22,12 +19,7 @@ pub use crate::hop::Layout;
 
 /// Store key of the config.
 pub const ITEM: u16 = 0x0001;
-/// Room for every key with margin.
-/// 0.16.0 added the Bluetooth settings (a hotkey, four names, four policies): up to 83 bytes more.
-/// Screen hop added the absolute pointer, its settings, four profile switches and eight screens: 194 bytes more.
-/// Each PC's units for screen hop (protocol 8): 8 bytes more.
-/// Arrangements in items of their own (protocol 9): the eight screens out (144 bytes), the Bluetooth hosts' mapping,
-/// units and pointer in (48 bytes).
+/// Room for every key with margin (`item_roundtrip` keeps the item at its longest 32 bytes short of it).
 pub const ITEM_MAX: usize = 576;
 /// Store key of arrangement 0's item; arrangement n's is this + n.
 pub const ARRANGEMENT_ITEM: u16 = 0x0010;
@@ -44,9 +36,8 @@ pub const LONG_PRESS_RANGE_MS: RangeInclusive<u16> = 800..=3000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Config {
-    pub hotkey_toggle: Hotkey,
-    pub hotkey_pc1: Hotkey,
-    pub hotkey_pc2: Hotkey,
+    /// The hotkey list: what each entry does and its hotkey (unused entries have no action).
+    pub hotkeys: [HotkeyBinding; MAX_HOTKEYS],
     pub double_tap_ms: u16,
     pub led_brightness: u8,
     pub color_pc1: Rgb,
@@ -71,8 +62,6 @@ pub struct Config {
     /// profile is what one expects, and it saves a flash write per profile change.
     pub remember_profile: bool,
     pub profiles: [Profile; MAX_PROFILES],
-    /// Hotkey for the next target (PC1, PC2, the Bluetooth hosts that are ready).
-    pub hotkey_next: Hotkey,
     /// Names of the Bluetooth host slots 1–4 (empty: "BT n").
     pub bt_names: [ProfileName; BT_HOSTS],
     /// What the Bluetooth module does with each host slot while another target is active.
@@ -137,9 +126,13 @@ impl Default for Config {
 
 impl Config {
     pub const DEFAULT: Config = Config {
-        hotkey_toggle: Hotkey::double_tap(kvm_hid::usage::key::SCROLL_LOCK, true),
-        hotkey_pc1: Hotkey::NONE,
-        hotkey_pc2: Hotkey::NONE,
+        // One entry: double Scroll Lock toggles the PC.
+        hotkeys: {
+            let mut list = [HotkeyBinding::NONE; MAX_HOTKEYS];
+            list[0] =
+                HotkeyBinding::new(HotkeyAction::TogglePc, Hotkey::double_tap(kvm_hid::usage::key::SCROLL_LOCK, true));
+            list
+        },
         double_tap_ms: 300,
         // Dim: at full brightness the six LEDs can draw 0.22 A of a PC port's budget (analysis.md finding 6).
         led_brightness: 32,
@@ -171,7 +164,6 @@ impl Config {
             Profile::new("profile 2", PortMode::Auto),
             Profile::new("profile 3", PortMode::Auto),
         ],
-        hotkey_next: Hotkey::NONE,
         bt_names: [ProfileName::new(""); BT_HOSTS],
         bt_policies: [BtPolicy::StayConnected; BT_HOSTS],
         // Opt-in: it changes the KVM's mouse interface, so both PCs reconnect it once.
@@ -243,9 +235,7 @@ pub enum Origin {
 impl Config {
     pub fn get(&self, k: u16) -> Option<ConfigValue> {
         Some(match k {
-            key::HOTKEY_TOGGLE => ConfigValue::HotkeyToggle(self.hotkey_toggle),
-            key::HOTKEY_PC1 => ConfigValue::HotkeyPc1(self.hotkey_pc1),
-            key::HOTKEY_PC2 => ConfigValue::HotkeyPc2(self.hotkey_pc2),
+            k if let Some(i) = key::hotkey_of(k) => ConfigValue::Hotkey(i, self.hotkeys[i as usize]),
             key::DOUBLE_TAP_MS => ConfigValue::DoubleTapMs(self.double_tap_ms),
             key::LED_BRIGHTNESS => ConfigValue::LedBrightness(self.led_brightness),
             key::COLOR_PC1 => ConfigValue::ColorPc1(self.color_pc1),
@@ -277,7 +267,6 @@ impl Config {
                 let i = k - key::PROFILE_NAME_BASE;
                 ConfigValue::ProfileName(i as u8, self.profiles[i as usize].name)
             }
-            key::HOTKEY_NEXT => ConfigValue::HotkeyNext(self.hotkey_next),
             k if (key::BT_NAME_BASE..key::BT_NAME_BASE + BT_HOSTS as u16).contains(&k) => {
                 let i = k - key::BT_NAME_BASE;
                 ConfigValue::BtName(i as u8, self.bt_names[i as usize])
@@ -328,12 +317,7 @@ impl Config {
             _ => h.key > 3,
         };
         match v {
-            ConfigValue::HotkeyToggle(h)
-            | ConfigValue::HotkeyPc1(h)
-            | ConfigValue::HotkeyPc2(h)
-            | ConfigValue::HotkeyNext(h)
-                if !valid_hotkey(&h) =>
-            {
+            ConfigValue::Hotkey(i, b) if i as usize >= MAX_HOTKEYS || !valid_hotkey(&b.hotkey) => {
                 return Err(ErrorCode::InvalidValue);
             }
             ConfigValue::DoubleTapMs(ms) if !(100..=1000).contains(&ms) => return Err(ErrorCode::InvalidValue),
@@ -371,9 +355,12 @@ impl Config {
             _ => {}
         }
         match v {
-            ConfigValue::HotkeyToggle(h) => self.hotkey_toggle = h,
-            ConfigValue::HotkeyPc1(h) => self.hotkey_pc1 = h,
-            ConfigValue::HotkeyPc2(h) => self.hotkey_pc2 = h,
+            ConfigValue::Hotkey(i, b) => {
+                // An unused entry is stored as such, whatever hotkey came with it.
+                let b = if b.is_used() { b } else { HotkeyBinding::NONE };
+                self.hotkeys[i as usize] = b;
+                return Ok(ConfigValue::Hotkey(i, b));
+            }
             ConfigValue::DoubleTapMs(ms) => self.double_tap_ms = ms,
             ConfigValue::LedBrightness(b) => self.led_brightness = b,
             ConfigValue::ColorPc1(c) => self.color_pc1 = c,
@@ -402,7 +389,6 @@ impl Config {
             }
             ConfigValue::ProfileModes(i, m) => self.profiles[i as usize].port_modes = m,
             ConfigValue::ProfileName(i, n) => self.profiles[i as usize].name = n,
-            ConfigValue::HotkeyNext(h) => self.hotkey_next = h,
             ConfigValue::BtName(i, n) => self.bt_names[i as usize] = n,
             ConfigValue::BtPolicy(i, p) => self.bt_policies[i as usize] = p,
             ConfigValue::AbsPointer(b) => self.abs_pointer = b,
@@ -425,20 +411,25 @@ impl Config {
         Ok(v)
     }
 
-    /// Encodes the flash item, without the arrangements (their own items); returns its length.
+    /// Encodes the flash item, without the arrangements (their own items) and the port modes (the active profile's);
+    /// returns its length.
     pub fn encode(&self, out: &mut [u8; ITEM_MAX]) -> usize {
         let mut w = Writer::new(out);
-        for v in self.all().filter(|v| key::arrangement_of(v.key()).is_none()) {
+        let stored =
+            |v: &ConfigValue| key::arrangement_of(v.key()).is_none() && !matches!(v, ConfigValue::PortMode(..));
+        for v in self.all().filter(stored) {
             entry(&mut w, &v);
         }
         w.len()
     }
 
-    /// Decodes an item; entries that don't parse keep their default. An item from firmware up to 0.1.12 brings its
-    /// one arrangement, as arrangement 0.
+    /// Decodes an item; entries that don't parse keep their default. The arrangements come from their own items
+    /// ([`Config::restore_arrangement`]).
     pub fn decode(item: &[u8]) -> Config {
         let mut cfg = Config::default();
-        cfg.apply(item, |_| true);
+        cfg.apply(item, |k| {
+            key::arrangement_of(k).is_none() && !(key::PORT_MODE_BASE..key::PORT_MODE_BASE + 3).contains(&k)
+        });
         if !cfg.remember_profile {
             cfg.profile = 0;
         }
@@ -457,7 +448,7 @@ impl Config {
         w.len()
     }
 
-    /// Arrangement `a`'s item, read from flash: it replaces what the config item brought for it.
+    /// Arrangement `a`'s item, read from flash.
     pub fn restore_arrangement(&mut self, a: u8, item: &[u8]) {
         if a as usize >= MAX_ARRANGEMENTS {
             return;
@@ -532,6 +523,13 @@ mod tests {
         for i in 0..BT_HOSTS as u8 {
             c.set(ConfigValue::BtPointer(i, BtPointer::Relative), Origin::Software).unwrap();
         }
+        // Every entry of the hotkey list used.
+        for i in 0..MAX_HOTKEYS as u8 {
+            let b = HotkeyBinding::new(HotkeyAction::ALL[i as usize], Hotkey::combo(0x05, 0x3A + i));
+            c.set(ConfigValue::Hotkey(i, b), Origin::Software).unwrap();
+        }
+        let past = ConfigValue::Hotkey(MAX_HOTKEYS as u8, HotkeyBinding::NONE);
+        assert_eq!(c.set(past, Origin::Software), Err(ErrorCode::InvalidValue));
         for a in 0..MAX_ARRANGEMENTS as u8 {
             c.set(ConfigValue::ArrangementName(a, ProfileName::new("twelve bytes")), Origin::Software).unwrap();
             for i in 0..MAX_SCREENS as u8 {
@@ -589,26 +587,29 @@ mod tests {
         assert_eq!(d.led_brightness, Config::default().led_brightness);
     }
 
+    /// The config item holds neither the arrangements (their own items) nor the port modes (the active profile's): such
+    /// entries in it are left alone.
     #[test]
-    fn a_config_item_with_one_arrangement_loads_it_as_arrangement_0() {
-        // Firmware up to 0.1.12: the screens at 0x00B0–0x00B7 and each profile's switch at 0x00A8–0x00AB.
-        let mut old = [0u8; 64];
-        let mut w = Writer::new(&mut old);
-        w.u16(key::PROFILE_ARRANGEMENT_BASE + 1).unwrap();
-        w.lv(&[1]).unwrap();
-        let s = Screen { scale: 150, ..Screen::new(Host::Pc2, 3840, 2160, [-2560, 0]) };
-        let mut enc = [0u8; 24];
-        let mut ew = Writer::new(&mut enc);
-        ConfigValue::Screen(0, 6, s).encode(&mut ew).unwrap();
-        let enc = ew.finish();
-        assert_eq!(u16::from_le_bytes([enc[0], enc[1]]), 0x00B6);
-        w.u16(0x00B6).unwrap();
-        w.lv(&enc[2..]).unwrap();
+    fn the_config_item_leaves_arrangements_and_port_modes_to_their_own_places() {
+        let mut c = Config::default();
+        c.set(ConfigValue::Screen(0, 6, Screen::new(Host::Pc2, 3840, 2160, [-2560, 0])), Origin::Software).unwrap();
+        c.set(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc2), Origin::Software).unwrap();
+        let mut buf = [0u8; ITEM_MAX];
+        let n = c.encode(&mut buf);
+        let mut r = Reader::new(&buf[..n]);
+        while let (Ok(k), Ok(_)) = (r.u16(), r.lv()) {
+            assert!(key::arrangement_of(k).is_none() && !(0x0030..0x0033).contains(&k), "{k:#06x}");
+        }
+        let d = Config::decode(&buf[..n]);
+        assert_eq!(d.port_modes(), c.port_modes(), "from the profile's own modes");
+        assert_eq!(d.arrangements[0], Arrangement::EMPTY);
+        // Written into a config item anyway, they change nothing.
+        let mut item = [0u8; 16];
+        let mut w = Writer::new(&mut item);
+        w.u16(key::PORT_MODE_BASE + 2).unwrap();
+        w.lv(&[PortMode::PassthroughPc2 as u8]).unwrap();
         let n = w.len();
-        let c = Config::decode(&old[..n]);
-        assert_eq!(c.arrangements[0].screens[6], s);
-        assert_eq!(c.profiles[1].arrangement, Some(0));
-        assert_eq!(c.profiles[0].arrangement, None);
+        assert_eq!(Config::decode(&item[..n]).port_modes(), [PortMode::Auto; 3]);
     }
 
     #[test]
@@ -654,19 +655,6 @@ mod tests {
         // A PC's pointer is absolute whatever the Bluetooth settings say.
         c.set(ConfigValue::BtPointer(0, BtPointer::Relative), Origin::Software).unwrap();
         assert_eq!((c.bt_pointer(Host::Bt1), c.bt_pointer(Host::Pc1)), (BtPointer::Relative, BtPointer::Absolute));
-    }
-
-    #[test]
-    fn port_modes_saved_before_profiles_go_to_the_first_profile() {
-        let mut old = [0u8; 16];
-        let mut w = Writer::new(&mut old);
-        w.u16(key::PORT_MODE_BASE + 2).unwrap();
-        w.lv(&[PortMode::PassthroughPc2 as u8]).unwrap();
-        let n = w.len();
-        let c = Config::decode(&old[..n]);
-        assert_eq!((c.profile, c.profile_count), (0, 2));
-        assert_eq!(c.port_modes(), [PortMode::Auto, PortMode::Auto, PortMode::PassthroughPc2]);
-        assert_eq!(c.profiles[1].port_modes, [PortMode::Passthrough; 3]);
     }
 
     #[test]

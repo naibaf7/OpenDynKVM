@@ -18,7 +18,7 @@
 //! it (`EventKind::SettingsHeld`: a fault in the hosts' software, a warning in the diagnostics).
 //!
 //! Record: `magic u32 | seq u32 | 4 × slot (48 bytes) | crc32 u32`; a slot is `used u8 | security u8 | address 7 |
-//! irk 16 | ltk 16 | notify u8 | pad 6`. `notify` came in 0.1.22 in what was padding (0 in older records: not known).
+//! irk 16 | ltk 16 | notify u8 | pad 6` (`notify` 0: not known yet).
 
 use esp_storage::FlashStorage;
 use kvm_proto::link::bt::MAX_HOSTS;
@@ -48,8 +48,8 @@ pub mod notify {
     pub const CONSUMER: u8 = 1 << 2;
     pub const POINTER: u8 = 1 << 3;
     // Bit 4: the battery level.
-    /// The bits below are the host's: set once it was seen. Without it (a bond from before 0.1.22) the input reports
-    /// count as on, which is what every HID host sets.
+    /// The bits below are the host's: set once it was seen. Until then the input reports count as on, which is what
+    /// every HID host sets.
     pub const KNOWN: u8 = 1 << 7;
     pub const REPORTS: u8 = KEYBOARD | MOUSE | CONSUMER | POINTER;
 }

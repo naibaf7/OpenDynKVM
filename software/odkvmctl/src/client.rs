@@ -7,9 +7,9 @@ use std::fmt;
 use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::{
     Accel, BT_HOSTS, BtHostInfo, BtPointer, BtPolicy, ConfigValue, DeviceMsg, ErrorCode, Event, FW_CHUNK, FwState,
-    FwTarget, HOSTS, Host, Hotkey, Info, LearnEnd, MAX_ARRANGEMENTS, MAX_PROFILES, MAX_SCREENS, Mapping, Pc, Port,
-    PortInfo, PortMode, PortState, RebootTarget, Request, Response, Screen, Status, StringKind, Target, Units, caps,
-    diag, key, status_flags,
+    FwTarget, HOSTS, Host, Hotkey, Info, LearnEnd, MAX_ARRANGEMENTS, MAX_PROFILES, MAX_SCREENS, Mapping,
+    PROTOCOL_VERSION, Pc, Port, PortInfo, PortMode, PortState, RebootTarget, Request, Response, Screen, Status,
+    StringKind, Target, Units, caps, diag, key, status_flags,
 };
 use kvm_proto::link::bt::host_flags;
 
@@ -25,6 +25,8 @@ pub enum Error {
     Protocol(String),
     /// The KVM waited for its key, and nobody pressed it.
     NotConfirmed,
+    /// The KVM's firmware speaks another protocol than these programs (its identity): only its firmware can be updated.
+    Mismatch(Info),
 }
 
 impl fmt::Display for Error {
@@ -35,6 +37,11 @@ impl fmt::Display for Error {
             Error::Device(c) => f.write_str(&fl!("error-device", why = crate::names::error(*c))),
             Error::Protocol(e) => f.write_str(&fl!("error-protocol", error = e.as_str())),
             Error::NotConfirmed => f.write_str(&fl!("error-not-confirmed")),
+            Error::Mismatch(info) => f.write_str(&fl!(
+                "error-mismatch",
+                firmware = crate::names::version(info.rp_fw),
+                app = env!("CARGO_PKG_VERSION")
+            )),
         }
     }
 }
@@ -106,11 +113,11 @@ pub struct ProfileView {
     pub name: String,
     /// Keyboard, Mouse, Other.
     pub modes: [PortMode; 3],
-    /// The arrangement screen hop uses in it; None: screen hop is off there (and from firmware without it).
+    /// The arrangement screen hop uses in it; None: screen hop is off there.
     pub arrangement: Option<u8>,
 }
 
-/// Screen hop's settings and arrangements (software.md §4.14), from firmware with `caps::SCREEN_HOP`.
+/// Screen hop's settings and arrangements (software.md §4.14).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HopView {
     pub abs_pointer: bool,
@@ -181,16 +188,8 @@ impl Snapshot {
         self.bt.iter().filter(|h| h.bonded())
     }
 
-    /// The KVM has screen hop (protocol 7).
-    pub fn has_hop(&self) -> bool {
-        self.info.caps & caps::SCREEN_HOP != 0
-    }
-
-    /// Screen hop's settings and arrangement; None from firmware without it.
-    pub fn hop(&self) -> Option<HopView> {
-        if !self.has_hop() {
-            return None;
-        }
+    /// Screen hop's settings and arrangements.
+    pub fn hop(&self) -> HopView {
         let empty = ArrangementView { name: String::new(), screens: [Screen::NONE; MAX_SCREENS] };
         let mut v = HopView {
             abs_pointer: false,
@@ -224,7 +223,7 @@ impl Snapshot {
                 _ => {}
             }
         }
-        Some(v)
+        v
     }
 
     /// The PC this computer is (the one the KVM answered), if it says.
@@ -232,7 +231,7 @@ impl Snapshot {
         self.status.asking
     }
 
-    /// The active profile and every stored one (the first `count` in use); None from firmware without profiles.
+    /// The active profile and every stored one (the first `count` in use); None from a snapshot without the config.
     pub fn profiles(&self) -> Option<(u8, u8, Vec<ProfileView>)> {
         let find = |k: u16| self.config.iter().find(|v| v.key() == k);
         let Some(ConfigValue::Profile(active)) = find(key::PROFILE) else { return None };
@@ -357,7 +356,7 @@ impl Client {
         self.expect(Request::GetStatus, |r| if let Response::Status(s) = r { Some(s) } else { None })
     }
 
-    /// Every diagnostics item (protocol 5; older firmware refuses with `Malformed`), in the firmware's order. Pages
+    /// Every diagnostics item, in the firmware's order. Pages
     /// fetched while the list changes may repeat an item: the later reading counts.
     pub fn diag(&mut self) -> Result<Vec<diag::Item>> {
         let mut items: Vec<diag::Item> = Vec::new();
@@ -414,17 +413,9 @@ impl Client {
         self.expect(Request::SetConfig(v), |r| if let Response::Config(v) = r { Some(v) } else { None })
     }
 
-    /// Every setting this firmware knows (an older one refuses the newer keys, which are left out).
+    /// Every setting.
     pub fn all_config(&mut self) -> Result<Vec<ConfigValue>> {
-        let mut all = Vec::new();
-        for k in key::ALL {
-            match self.get_config(*k) {
-                Ok(v) => all.push(v),
-                Err(Error::Device(ErrorCode::InvalidValue)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(all)
+        key::ALL.iter().map(|k| self.get_config(*k)).collect()
     }
 
     /// Turns switching or configuration from software back on (`v`: `SwSwitchAllowed(true)` / `SwConfigAllowed(true)`).
@@ -450,8 +441,7 @@ impl Client {
     }
 
     /// Has the KVM learn a hotkey from its keyboards (software.md §4.5), or start over: the result comes as
-    /// `Event::HotkeyLearned` within `LEARN_MS`. Only the active PC may; firmware before protocol 4 answers
-    /// `Malformed`.
+    /// `Event::HotkeyLearned` within `LEARN_MS`. Only the active PC may.
     pub fn start_learning(&mut self) -> Result<()> {
         self.ok(Request::LearnHotkey(true))
     }
@@ -492,8 +482,18 @@ impl Client {
         self.ok(Request::Reboot(t))
     }
 
-    pub fn snapshot(&mut self) -> Result<Snapshot> {
+    /// The KVM's identity, if its firmware speaks these programs' protocol ([`Error::Mismatch`] otherwise: then only
+    /// the firmware update works).
+    pub fn info_checked(&mut self) -> Result<Info> {
         let info = self.info()?;
+        if info.proto != PROTOCOL_VERSION {
+            return Err(Error::Mismatch(info));
+        }
+        Ok(info)
+    }
+
+    pub fn snapshot(&mut self) -> Result<Snapshot> {
+        let info = self.info_checked()?;
         let status = self.status()?;
         let mut ports = [PortInfo::empty(Port::Keyboard, PortMode::Auto); 3];
         let mut products: [String; 3] = Default::default();

@@ -17,7 +17,7 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kvm_proto::ctrl::{DeviceMsg, ErrorCode, Event, PLACE_RENEW_MS, Placement, Request, Response, req};
+use kvm_proto::ctrl::{DeviceMsg, Event, PLACE_RENEW_MS, PROTOCOL_VERSION, Placement, Request, Response, req};
 
 use crate::screens::{self, Unplaceable};
 use crate::time::{Duration, Instant};
@@ -33,8 +33,8 @@ pub enum State {
     Off,
     /// No KVM answers.
     NoKvm,
-    /// The KVM's firmware is older than protocol 10.
-    FirmwareTooOld,
+    /// The KVM's firmware speaks another protocol than this program.
+    Mismatch,
     /// The KVM takes this computer's placements: it sends them while screen hop puts the pointer on its screens.
     Placing,
     /// The system doesn't let it now.
@@ -52,15 +52,15 @@ pub struct Shared {
 /// way this long before this computer asks to place it again.
 const RETRY_AFTER_REFUSAL: Duration = Duration::from_secs(2);
 const RECONNECT: Duration = Duration::from_secs(2);
-/// Firmware without placement is asked again this rarely (it may be updated meanwhile).
-const RETRY_OLD_FIRMWARE: Duration = Duration::from_secs(30);
+/// Firmware of another protocol is asked again this rarely (it may be updated meanwhile).
+const RETRY_MISMATCH: Duration = Duration::from_secs(30);
 
 /// Why a session with the KVM ended.
 enum End {
     /// Turned off: the lease was given back.
     Disabled,
     Lost,
-    FirmwareTooOld,
+    Mismatch,
 }
 
 /// This computer's cursor as the placer uses it: the system's ([`System`]), or a test's.
@@ -131,9 +131,9 @@ fn run(shared: &Shared, wake: &dyn Fn()) {
                 set(State::NoKvm);
                 std::thread::sleep(RECONNECT);
             }
-            End::FirmwareTooOld => {
-                set(State::FirmwareTooOld);
-                std::thread::sleep(RETRY_OLD_FIRMWARE);
+            End::Mismatch => {
+                set(State::Mismatch);
+                std::thread::sleep(RETRY_MISMATCH);
             }
         }
     }
@@ -144,6 +144,22 @@ fn send(t: &mut dyn Transport, p: Placement) -> Result<(), End> {
     t.write(&raw).map_err(|_| End::Lost)
 }
 
+/// Whether the KVM's firmware speaks this program's protocol (it places the cursor only then).
+fn check_protocol(t: &mut dyn Transport) -> Result<(), End> {
+    let raw = Request::GetInfo.encode(0).map_err(|_| End::Lost)?;
+    t.write(&raw).map_err(|_| End::Lost)?;
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        let Some(r) = t.read(Duration::from_millis(50)).map_err(|_| End::Lost)? else { continue };
+        if let Ok(DeviceMsg::Response { id: 0, request: req::GET_INFO, response: Response::Info(i) }) =
+            DeviceMsg::decode(&r)
+        {
+            return if i.proto == PROTOCOL_VERSION { Ok(()) } else { Err(End::Mismatch) };
+        }
+    }
+    Err(End::Lost)
+}
+
 /// One connection: the lease while placing may and is allowed, the placements, until it is turned off or the KVM
 /// goes away.
 fn session(
@@ -152,6 +168,7 @@ fn session(
     set: &dyn Fn(State),
     cursor: &mut dyn Cursor,
 ) -> Result<Infallible, End> {
+    check_protocol(t)?;
     let renew = Duration::from_millis(PLACE_RENEW_MS as u64);
     let mut next = Instant::now();
     // What the KVM was asked for last, unless that was `Off`.
@@ -201,9 +218,6 @@ fn session(
             }
             Ok(DeviceMsg::Response { id: 0, request: req::PLACE_CURSOR, response }) => match response {
                 Response::Ok if leased => set(State::Placing),
-                Response::Error(ErrorCode::Malformed) => {
-                    return Err(End::FirmwareTooOld);
-                }
                 _ => {}
             },
             _ => {}
@@ -214,6 +228,7 @@ fn session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kvm_proto::ctrl::Info;
     use std::cell::RefCell;
     use std::collections::VecDeque;
 
@@ -273,6 +288,20 @@ mod tests {
         r.encode(req::PLACE_CURSOR, 0).unwrap()
     }
 
+    /// The KVM's answer to the protocol check.
+    fn info(proto: u8) -> Report {
+        let i = Info {
+            proto,
+            rp_fw: 0x00011D,
+            at_fw: [0x00011D; 2],
+            hw: 0x000C00,
+            serial: *b"TEST0001",
+            caps: 0,
+            bt_fw: 0,
+        };
+        Response::Info(i).encode(req::GET_INFO, 0).unwrap()
+    }
+
     fn run_session(kvm: &mut Kvm, cursor: &mut Fake) -> (End, Vec<State>) {
         let shared = Shared { enabled: AtomicBool::new(true), ..Shared::default() };
         let states = RefCell::new(Vec::new());
@@ -284,6 +313,7 @@ mod tests {
     fn it_asks_for_the_lease_and_places_the_cursor_where_the_kvm_says() {
         let mut kvm = Kvm::default();
         kvm.sends.extend([
+            info(PROTOCOL_VERSION),
             answer(Response::Ok),
             event(Event::PlaceCursor([-140, 540])),
             // Another program's answer, and the other events, are left alone.
@@ -294,7 +324,7 @@ mod tests {
         let mut cursor = Fake { placed: Vec::new(), refuse_from: usize::MAX };
         let (end, states) = run_session(&mut kvm, &mut cursor);
         assert!(matches!(end, End::Lost));
-        assert_eq!(kvm.got, [Request::PlaceCursor(Placement::Others)]);
+        assert_eq!(kvm.got, [Request::GetInfo, Request::PlaceCursor(Placement::Others)]);
         assert_eq!(states, [State::Placing]);
         assert_eq!(cursor.placed, [[-140, 540], [-240, 541]]);
     }
@@ -303,6 +333,7 @@ mod tests {
     fn a_refusal_gives_the_lease_back_at_once() {
         let mut kvm = Kvm::default();
         kvm.sends.extend([
+            info(PROTOCOL_VERSION),
             answer(Response::Ok),
             event(Event::PlaceCursor([1, 2])),
             event(Event::PlaceCursor([3, 4])),
@@ -311,17 +342,20 @@ mod tests {
         ]);
         let mut cursor = Fake { placed: Vec::new(), refuse_from: 1 };
         let (_, states) = run_session(&mut kvm, &mut cursor);
-        assert_eq!(kvm.got, [Request::PlaceCursor(Placement::Others), Request::PlaceCursor(Placement::Off)]);
+        assert_eq!(
+            kvm.got,
+            [Request::GetInfo, Request::PlaceCursor(Placement::Others), Request::PlaceCursor(Placement::Off)]
+        );
         assert_eq!(states, [State::Placing, State::Blocked(Unplaceable::Refused)]);
         assert_eq!(cursor.placed, [[1, 2]]);
     }
 
     #[test]
-    fn firmware_without_placement_is_told_apart() {
+    fn firmware_of_another_protocol_is_never_asked_to_place() {
         let mut kvm = Kvm::default();
-        // What firmware before protocol 10 answers to a request it doesn't know.
-        kvm.sends.push_back(Response::Error(ErrorCode::Malformed).encode(req::PLACE_CURSOR, 0).unwrap());
+        kvm.sends.push_back(info(PROTOCOL_VERSION - 1));
         let (end, _) = run_session(&mut kvm, &mut Fake { placed: Vec::new(), refuse_from: usize::MAX });
-        assert!(matches!(end, End::FirmwareTooOld));
+        assert!(matches!(end, End::Mismatch));
+        assert_eq!(kvm.got, [Request::GetInfo]);
     }
 }

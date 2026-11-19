@@ -75,6 +75,9 @@ pub struct Shared {
     pub simulate: bool,
     /// While simulating: a real KVM is plugged in (its control interface is there; it isn't opened).
     pub kvm_present: bool,
+    /// The KVM's firmware speaks another protocol than this program: its identity, for the update (nothing else is
+    /// read from it then).
+    pub mismatch: Option<kvm_proto::ctrl::Info>,
 }
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -241,7 +244,6 @@ fn run(c: &mut Client, cmd: UiCmd, shared: &Mutex<Shared>, wake: &Wake) -> Resul
         UiCmd::Diagnose => {
             let r = match c.diag() {
                 Ok(items) => Ok(items),
-                Err(Error::Device(ErrorCode::Malformed)) => Err(fl!("no-diagnostics")),
                 Err(e) if is_disconnect(&e) => return Err(e),
                 Err(e) => Err(e.to_string()),
             };
@@ -252,9 +254,6 @@ fn run(c: &mut Client, cmd: UiCmd, shared: &Mutex<Shared>, wake: &Wake) -> Resul
         UiCmd::Learn(true) => {
             let why = match c.start_learning() {
                 Ok(()) => return Ok(()),
-                Err(Error::Device(ErrorCode::Malformed)) => {
-                    fl!("cant-learn-firmware")
-                }
                 Err(Error::Device(code)) => fl!("kvm-refused", why = names::error(code)),
                 Err(e) => return Err(e),
             };
@@ -350,12 +349,20 @@ fn refresh(
             }
             s.events.truncate(50);
             s.snap = Some(snap);
+            s.mismatch = None;
             if s.error.as_deref().is_some_and(|e| e == Error::Timeout.to_string()) {
                 s.error = None;
             }
             Ok(())
         }
         Err(e) if is_disconnect(&e) => Err(()),
+        Err(Error::Mismatch(info)) => {
+            let mut s = shared.lock().unwrap();
+            s.error = Some(Error::Mismatch(info).to_string());
+            s.snap = None;
+            s.mismatch = Some(info);
+            Ok(())
+        }
         Err(e) => {
             shared.lock().unwrap().error = Some(e.to_string());
             Ok(())
@@ -438,6 +445,7 @@ pub fn spawn_with(
                         let mut s = shared.lock().unwrap();
                         s.device = None;
                         s.snap = None;
+                        s.mismatch = None;
                         s.error = Some(e.to_string());
                     }
                     wake();
@@ -510,6 +518,7 @@ pub fn spawn_with(
                 let mut s = shared.lock().unwrap();
                 s.device = None;
                 s.snap = None;
+                s.mismatch = None;
                 s.diag = None;
                 s.sim_keyboard = None;
                 s.kvm_present = false;

@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, RichText, Ui};
-use kvm_proto::ctrl::FwState;
+use kvm_proto::ctrl::{FwState, Info};
 use odkvmctl::bootsel::{self, Board, BootDevice};
 use odkvmctl::client::Snapshot;
 use odkvmctl::{firmware, fl, image, names};
@@ -76,10 +76,12 @@ impl App {
         if let Some(p) = self.shared.lock().unwrap().picked.take() {
             self.fw.path = p.display().to_string();
         }
-        card(ui, &fl!("fw-file-title"), |ui| self.firmware_file(ui, s));
-        if let Some(s) = s {
+        // The KVM on this PC's port: read whole, or only its identity when its firmware speaks another protocol.
+        let info = s.map(|s| s.info).or(self.shared.lock().unwrap().mismatch);
+        card(ui, &fl!("fw-file-title"), |ui| self.firmware_file(ui, info.as_ref()));
+        if let Some(info) = &info {
             ui.add_space(8.0);
-            self.update_card(ui, s);
+            self.update_card(ui, info);
         }
         let boot = self.shared.lock().unwrap().boot.clone();
         for d in &boot {
@@ -94,7 +96,7 @@ impl App {
                 Err(e) => ui.label(RichText::new(e).color(ink(ui, BAD))),
             };
         }
-        if s.is_none() && boot.is_empty() {
+        if info.is_none() && boot.is_empty() {
             ui.add_space(8.0);
             card(ui, &fl!("boot-none-title"), |ui| {
                 note(ui, fl!("boot-none-note"));
@@ -105,7 +107,7 @@ impl App {
         }
     }
 
-    fn firmware_file(&mut self, ui: &mut Ui, s: Option<&Snapshot>) {
+    fn firmware_file(&mut self, ui: &mut Ui, info: Option<&Info>) {
         let picking = self.shared.lock().unwrap().picking;
         ui.horizontal(|ui| {
             let shipped = self.fw.bundled.clone().filter(|_| !self.fw.is_bundled());
@@ -132,14 +134,14 @@ impl App {
                     line = format!("{line} · {}", fl!("fw-shipped-note"));
                 }
                 note(ui, line);
-                if let Some(s) = s {
-                    match image::check_hardware(version, major, s.info.hw) {
+                if let Some(info) = info {
+                    match image::check_hardware(version, major, info.hw) {
                         Err(e) => {
                             ui.label(RichText::new(e).color(ink(ui, BAD)));
                         }
                         Ok(()) => {
-                            let kvm = names::version(s.info.rp_fw);
-                            let (text, color) = match version.cmp(&s.info.rp_fw) {
+                            let kvm = names::version(info.rp_fw);
+                            let (text, color) = match version.cmp(&info.rp_fw) {
                                 Ordering::Equal => (fl!("fw-same"), None),
                                 Ordering::Greater => (fl!("fw-newer", kvm = kvm), Some(GOOD)),
                                 Ordering::Less => (fl!("fw-older", kvm = kvm), Some(WARN)),
@@ -160,12 +162,12 @@ impl App {
     }
 
     /// Over this computer's PC port, to the KVM that answers there.
-    fn update_card(&mut self, ui: &mut Ui, s: &Snapshot) {
+    fn update_card(&mut self, ui: &mut Ui, info: &Info) {
         let (update, result) = {
             let sh = self.shared.lock().unwrap();
             (sh.update, sh.update_result.clone())
         };
-        let fits = self.fw.described().is_ok_and(|(v, m)| image::check_hardware(v, m, s.info.hw).is_ok());
+        let fits = self.fw.described().is_ok_and(|(v, m)| image::check_hardware(v, m, info.hw).is_ok());
         card(ui, &fl!("update"), |ui| {
             note(ui, fl!("update-over-pc-note"));
             let busy =

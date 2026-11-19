@@ -5,9 +5,10 @@ use kvm_core::hotkey::{format_spec, parse_spec};
 use crate::{fl, i18n};
 use kvm_proto::ctrl::{
     Accel, Advertised, AutoReason, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, ErrorCode, FaultKind, FwState,
-    HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Host, Hotkey, HotkeyKind, KeyAction, LearnEnd, LinkState,
-    MAX_ARRANGEMENTS, MAX_PROFILES, Mapping, PROFILE_NAME_MAX, Polling, Port, PortMode, PortState, PowerSource,
-    ProfileName, Rgb, Screen, Speed, Status, Supply, SwitchSource, Units, VialMode, class, diag, key, status_flags,
+    HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Host, Hotkey, HotkeyAction, HotkeyBinding, HotkeyKind,
+    KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, MAX_PROFILES, Mapping, PROFILE_NAME_MAX, Polling, Port, PortMode,
+    PortState, PowerSource, ProfileName, Rgb, Screen, Speed, Status, Supply, SwitchSource, Units, VialMode, class,
+    diag, key,
 };
 
 pub fn error(c: ErrorCode) -> String {
@@ -176,7 +177,7 @@ pub fn power_source(p: PowerSource) -> String {
     }
 }
 
-/// The source and what is measured of its 5 V (protocol 10); from older firmware, the estimate left for the front ports.
+/// The source and what is measured of its 5 V; before the first reading, the estimate left for the front ports.
 pub fn power_line(st: &Status) -> String {
     let source = power_source(st.power);
     if st.supply == Supply::Unknown {
@@ -186,14 +187,11 @@ pub fn power_line(st: &Status) -> String {
     fl!("power-supply", source = source, volts = v(st.supply_mv), lowest = v(st.supply_lowest_mv))
 }
 
-/// The supply warning there is, and whether it is serious: the measured 5 V sagging or too low (protocol 10), or older
-/// firmware's estimate (the devices' declared maximum over the budget). `short`: the command line's few words.
+/// The supply warning there is, and whether it is serious: the measured 5 V sagging or too low. `short`: the command
+/// line's few words.
 pub fn power_warning(st: &Status, short: bool) -> Option<(String, bool)> {
     match (st.supply, short) {
-        (Supply::Unknown, _) if st.flags & status_flags::SUPPLY_SAGS == 0 => None,
-        (Supply::Unknown, false) => Some((fl!("budget-low"), false)),
-        (Supply::Unknown, true) => Some((fl!("cli-budget-low"), false)),
-        (Supply::Good, _) => None,
+        (Supply::Unknown | Supply::Good, _) => None,
         (Supply::Sags, false) => Some((fl!("supply-sags"), false)),
         (Supply::Sags, true) => Some((fl!("cli-supply-sags"), false)),
         (Supply::Low, false) => Some((fl!("supply-low"), true)),
@@ -301,7 +299,6 @@ pub fn hop_state(s: HopState) -> String {
         HopState::NotNormalized => fl!("hop-state-not-normalized"),
         HopState::NoScreens => fl!("hop-state-no-screens"),
         HopState::BootProtocol => fl!("hop-state-boot-protocol"),
-        HopState::Wireless => fl!("hop-state-wireless"),
     }
 }
 
@@ -642,9 +639,23 @@ pub fn duration(s: u32) -> String {
 }
 
 pub const CONFIG_NAMES: &[(&str, u16)] = &[
-    ("hotkey-toggle", key::HOTKEY_TOGGLE),
-    ("hotkey-pc1", key::HOTKEY_PC1),
-    ("hotkey-pc2", key::HOTKEY_PC2),
+    // The hotkey list, entries 1–16 (keys 0x00F0–0x00FF).
+    ("hotkey1", key::HOTKEY_BASE),
+    ("hotkey2", key::HOTKEY_BASE + 1),
+    ("hotkey3", key::HOTKEY_BASE + 2),
+    ("hotkey4", key::HOTKEY_BASE + 3),
+    ("hotkey5", key::HOTKEY_BASE + 4),
+    ("hotkey6", key::HOTKEY_BASE + 5),
+    ("hotkey7", key::HOTKEY_BASE + 6),
+    ("hotkey8", key::HOTKEY_BASE + 7),
+    ("hotkey9", key::HOTKEY_BASE + 8),
+    ("hotkey10", key::HOTKEY_BASE + 9),
+    ("hotkey11", key::HOTKEY_BASE + 10),
+    ("hotkey12", key::HOTKEY_BASE + 11),
+    ("hotkey13", key::HOTKEY_BASE + 12),
+    ("hotkey14", key::HOTKEY_BASE + 13),
+    ("hotkey15", key::HOTKEY_BASE + 14),
+    ("hotkey16", key::HOTKEY_BASE + 15),
     ("double-tap-ms", key::DOUBLE_TAP_MS),
     ("key-tap", key::KEY_TAP),
     ("key-long", key::KEY_LONG),
@@ -675,7 +686,6 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("profile1-name", key::PROFILE_NAME_BASE + 1),
     ("profile2-name", key::PROFILE_NAME_BASE + 2),
     ("profile3-name", key::PROFILE_NAME_BASE + 3),
-    ("hotkey-next", key::HOTKEY_NEXT),
     ("host1-name", key::BT_NAME_BASE),
     ("host2-name", key::BT_NAME_BASE + 1),
     ("host3-name", key::BT_NAME_BASE + 2),
@@ -752,17 +762,6 @@ pub fn config_name(k: u16) -> &'static str {
 }
 
 pub fn config_key(name: &str) -> Option<u16> {
-    // The wireless hosts' settings were called bt1-name … bt4-policy before; screen0–screen7 and profileN-hop were the
-    // one arrangement's screens and each profile's switch before there were several (protocol 9).
-    let name = match name.strip_prefix("bt") {
-        Some(rest) if rest.starts_with(['1', '2', '3', '4']) => format!("host{rest}"),
-        _ => name.to_string(),
-    };
-    let name = match (name.strip_prefix("screen"), name.strip_suffix("-hop")) {
-        (Some(slot), _) => format!("arrangement0-screen{slot}"),
-        (_, Some(profile)) if profile.starts_with("profile") => format!("{profile}-arrangement"),
-        _ => name,
-    };
     CONFIG_NAMES.iter().find(|(n, _)| *n == name).map(|(_, k)| *k)
 }
 
@@ -787,13 +786,36 @@ fn parse_bool(s: &str) -> Result<bool, String> {
     }
 }
 
+/// An entry of the hotkey list as text: `<action> <hotkey>` (`select-pc1 ctrl+alt+1`), `none` when unused.
+pub fn format_binding(b: &HotkeyBinding) -> String {
+    if b.is_used() { format!("{} {}", b.action.name(), format_spec(&b.hotkey)) } else { "none".into() }
+}
+
+/// The action named `name` (`toggle-pc`, `select-host2`, …; the old hotkey names `toggle`, `pc1`, `next` too).
+pub fn parse_action(name: &str) -> Result<HotkeyAction, String> {
+    HotkeyAction::from_name(name.trim()).filter(|a| *a != HotkeyAction::None).ok_or_else(|| {
+        let names: Vec<&str> =
+            HotkeyAction::ALL.iter().filter(|a| **a != HotkeyAction::None).map(|a| a.name()).collect();
+        fl!("parse-one-of", value = name, choices = names.join(", "))
+    })
+}
+
+/// [`format_binding`]'s text back: `none`, or an action and a hotkey (`none` for one not set yet).
+pub fn parse_binding(s: &str) -> Result<HotkeyBinding, String> {
+    let s = s.trim();
+    if s == "none" {
+        return Ok(HotkeyBinding::NONE);
+    }
+    let (action, hotkey) = s.split_once(char::is_whitespace).unwrap_or((s, "none"));
+    let hotkey =
+        parse_spec(hotkey.trim()).map_err(|e| fl!("parse-hotkey", value = hotkey, error = format!("{e:?}")))?;
+    Ok(HotkeyBinding::new(parse_action(action)?, hotkey))
+}
+
 pub fn format_value(v: &ConfigValue) -> String {
     let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
     match v {
-        ConfigValue::HotkeyToggle(h)
-        | ConfigValue::HotkeyPc1(h)
-        | ConfigValue::HotkeyPc2(h)
-        | ConfigValue::HotkeyNext(h) => format_spec(h).to_string(),
+        ConfigValue::Hotkey(_, b) => format_binding(b),
         ConfigValue::BtName(_, n) | ConfigValue::ArrangementName(_, n) => n.as_str().into(),
         ConfigValue::BtPolicy(_, p) => p.name().into(),
         ConfigValue::BtPointer(_, p) => p.name().into(),
@@ -828,15 +850,11 @@ pub fn format_value(v: &ConfigValue) -> String {
 }
 
 pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
-    let hotkey = || parse_spec(s).map_err(|e| fl!("parse-hotkey", value = s, error = format!("{e:?}")));
     let num = |max: u32| -> Result<u32, String> {
         s.trim().parse::<u32>().ok().filter(|v| *v <= max).ok_or_else(|| fl!("parse-number", value = s, max = max))
     };
     Ok(match k {
-        key::HOTKEY_TOGGLE => ConfigValue::HotkeyToggle(hotkey()?),
-        key::HOTKEY_PC1 => ConfigValue::HotkeyPc1(hotkey()?),
-        key::HOTKEY_PC2 => ConfigValue::HotkeyPc2(hotkey()?),
-        key::HOTKEY_NEXT => ConfigValue::HotkeyNext(hotkey()?),
+        k if let Some(i) = key::hotkey_of(k) => ConfigValue::Hotkey(i, parse_binding(s)?),
         k if (key::BT_NAME_BASE..key::BT_NAME_BASE + BT_HOSTS as u16).contains(&k) => {
             let s = s.trim();
             if s.len() > PROFILE_NAME_MAX {
@@ -934,8 +952,7 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
 /// setting `profileN-hop` took before there were several.
 pub fn parse_arrangement(s: &str) -> Result<Option<u8>, String> {
     match s.trim() {
-        "none" | "off" => Ok(None),
-        "on" => Ok(Some(0)),
+        "none" => Ok(None),
         n => n
             .parse::<u8>()
             .ok()
@@ -982,15 +999,15 @@ mod tests {
         st.declared_ma = 700;
         assert!(power_note(&st).is_some_and(|n| n.contains("700 mA")));
         assert_eq!(power_warning(&st, false), None);
-        st = Status { supply: Supply::Sags, flags: st.flags | status_flags::SUPPLY_SAGS, ..st };
+        st = Status { supply: Supply::Sags, flags: st.flags | kvm_proto::ctrl::status_flags::SUPPLY_SAGS, ..st };
         assert_eq!(power_warning(&st, true), Some(("5 V sags".into(), false)));
         assert_eq!(power_note(&st), None);
         st.supply = Supply::Low;
         assert!(power_warning(&st, false).is_some_and(|(_, bad)| bad));
-        // Older firmware: its estimate, and its warning from the same flag.
-        st.supply = Supply::Unknown;
+        // Before the first reading: the estimate, and no warning.
+        st = Status { supply: Supply::Unknown, flags: 0, ..st };
         assert_eq!(power_line(&st), "From PC USB, about 300 mA left for the front ports");
-        assert_eq!(power_warning(&st, false).unwrap().0, "The attached devices may need more: use the PWR port.");
+        assert_eq!(power_warning(&st, false), None);
     }
 
     #[test]
@@ -1016,6 +1033,17 @@ mod tests {
         }
         assert!(parse_value(key::COLOR_PC1, "#12345").is_err());
         assert_eq!(config_key("mode-mouse"), Some(key::PORT_MODE_BASE + 1));
+        // An entry of the hotkey list: an action and a hotkey, or none.
+        let k = config_key("hotkey3").unwrap();
+        let v = parse_value(k, "select-host3 ctrl+alt+3").unwrap();
+        let host3 = HotkeyBinding::new(HotkeyAction::SelectHost(Host::Bt3), Hotkey::combo(0x05, 0x20));
+        assert_eq!(v, ConfigValue::Hotkey(2, host3));
+        assert_eq!((format_value(&v), v.key()), ("select-host3 ctrl+alt+3".to_string(), k));
+        assert_eq!(parse_value(k, "none"), Ok(ConfigValue::Hotkey(2, HotkeyBinding::NONE)));
+        let pc1 = HotkeyBinding::new(HotkeyAction::SelectHost(Host::Pc1), Hotkey::NONE);
+        assert_eq!(parse_binding("select-pc1"), Ok(pc1), "an entry with no hotkey yet");
+        assert!(parse_binding("pc1").is_err());
+        assert!(parse_binding("dance ctrl+alt+3").is_err());
         // Every key has a name, and the names are distinct.
         for k in key::ALL {
             assert_ne!(config_name(*k), "?", "{k:#06x}");
@@ -1027,13 +1055,11 @@ mod tests {
     }
 
     #[test]
-    fn arrangement_settings_and_their_old_names() {
+    fn arrangement_settings() {
         assert_eq!(config_key("arrangement3-screen7"), Some(0x00CF));
-        assert_eq!(config_key("screen5"), config_key("arrangement0-screen5"));
-        assert_eq!(config_key("profile2-hop"), config_key("profile2-arrangement"));
-        assert_eq!(config_key("bt4-pointer"), config_key("host4-pointer"));
+        assert_eq!((config_key("screen5"), config_key("bt4-pointer")), (None, None));
         let k = config_key("profile1-arrangement").unwrap();
-        assert_eq!(parse_value(k, "on"), Ok(ConfigValue::ProfileArrangement(1, Some(0))));
+        assert!(parse_value(k, "on").is_err());
         assert_eq!(parse_value(k, "none"), Ok(ConfigValue::ProfileArrangement(1, None)));
         assert_eq!(parse_value(k, "2"), Ok(ConfigValue::ProfileArrangement(1, Some(2))));
         assert!(parse_value(k, "4").is_err());

@@ -60,11 +60,11 @@ impl Page {
     ];
 
     /// Shown in the sidebar: the Bluetooth page only for a KVM with the module fitted (up, or starting, being
-    /// updated or failed: then the page says so), the Screens page only for firmware with screen hop.
+    /// updated or failed: then the page says so), the Screens page only with a KVM.
     fn shown(self, s: Option<&Snapshot>) -> bool {
         match self {
             Page::Bluetooth => s.is_some_and(|s| s.status.bt_module != kvm_proto::ctrl::diag::BtModule::Absent),
-            Page::Screens => s.is_some_and(|s| s.has_hop()),
+            Page::Screens => s.is_some(),
             _ => true,
         }
     }
@@ -104,8 +104,10 @@ struct App {
     tray: Option<Tray>,
     tray_state: Option<TrayState>,
     page: Page,
-    hotkeys: [String; 4],
-    hotkey_error: [Option<String>; 4],
+    /// The hotkey list's fields (by entry), their errors, and the hotkey each last showed of the KVM's.
+    hotkeys: [String; kvm_proto::ctrl::MAX_HOTKEYS],
+    hotkey_error: [Option<String>; kvm_proto::ctrl::MAX_HOTKEYS],
+    hotkey_seen: [Option<kvm_proto::ctrl::Hotkey>; kvm_proto::ctrl::MAX_HOTKEYS],
     /// The Bluetooth page: a passkey typed in the window, and the host names being edited.
     bt_passkey: String,
     /// The page that was open when it went away for a moment (`Page::shown`), to go back to.
@@ -235,6 +237,7 @@ impl App {
             page: Page::Overview,
             hotkeys: Default::default(),
             hotkey_error: Default::default(),
+            hotkey_seen: [None; kvm_proto::ctrl::MAX_HOTKEYS],
             bt_passkey: String::new(),
             hidden_page: None,
             bt_names: Default::default(),
@@ -465,9 +468,9 @@ impl App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let (snap, device, error) = {
+        let (snap, device, error, mismatch) = {
             let sh = self.shared.lock().unwrap();
-            (sh.snap.clone(), sh.device.clone(), sh.error.clone())
+            (sh.snap.clone(), sh.device.clone(), sh.error.clone(), sh.mismatch.is_some())
         };
         let palette = look::palette(ui);
         egui::Panel::left("nav")
@@ -512,6 +515,7 @@ impl App {
                 }
                 (Page::Settings, s) => self.settings(ui, s),
                 (Page::Firmware, s) => self.firmware(ui, s),
+                (_, None) if mismatch => self.mismatch(ui),
                 (_, None) => self.no_kvm(ui),
                 (Page::Overview, Some(s)) => self.overview(ui, s),
                 (Page::Ports, Some(s)) => self.ports(ui, s),
@@ -686,6 +690,139 @@ mod tests {
         (ctx, app, shared)
     }
 
+    /// The centres of the buttons labelled `label` in a frame's accessibility tree, top to bottom.
+    fn buttons_at(out: &egui::FullOutput, label: &str) -> Vec<egui::Pos2> {
+        let Some(update) = out.platform_output.accesskit_update.as_ref() else { return Vec::new() };
+        let mut at: Vec<egui::Pos2> = update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == egui::accesskit::Role::Button && n.label() == Some(label))
+            .filter_map(|(_, n)| n.bounds())
+            .map(|r| egui::pos2(((r.x0 + r.x1) / 2.0) as f32, ((r.y0 + r.y1) / 2.0) as f32))
+            .collect();
+        at.sort_by(|a, b| a.y.total_cmp(&b.y));
+        at
+    }
+
+    /// The Keyboard page's hotkey list, against the simulator: Add puts an entry on the KVM that does something no
+    /// entry does yet (Select PC1, the toggle being taken), Apply gives it the hotkey typed, Remove takes it off again.
+    /// The default entry stays throughout.
+    #[test]
+    fn hotkeys_are_added_set_and_removed_on_the_keyboard_page() {
+        use kvm_proto::ctrl::{Host, Hotkey, HotkeyAction, HotkeyBinding};
+        let (ctx, mut app, shared) = simulated();
+        ctx.enable_accesskit();
+        app.page = Page::Keyboard;
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut time = 0.0;
+        let mut run = |app: &mut App, events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1400.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            app.logic(&ctx, &mut frame);
+            let mut out = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+            out.textures_delta.clear();
+            out
+        };
+        let click = |run: &mut dyn FnMut(&mut App, Vec<egui::Event>) -> egui::FullOutput,
+                     app: &mut App,
+                     label: &str,
+                     nth: usize| {
+            let at = buttons_at(&run(app, vec![]), label);
+            let at = *at.get(nth).unwrap_or_else(|| panic!("no button {label:?} number {nth} of {}", at.len()));
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            run(app, vec![egui::Event::PointerMoved(at), button(true)]);
+            run(app, vec![button(false)]);
+        };
+        let entry = |i: usize| shared.lock().unwrap().snap.as_ref().map(pages::hotkey_list).map(|l| l[i]);
+        let wait = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(6);
+            while !done() {
+                assert!(odkvmctl::time::Instant::now() < deadline, "never: {what}");
+                std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
+            }
+        };
+        let toggle = HotkeyBinding::new(HotkeyAction::TogglePc, Hotkey::double_tap(0x47, true));
+        run(&mut app, vec![]);
+        assert_eq!((entry(0), app.hotkeys[0].as_str()), (Some(toggle), "double:scrolllock"));
+
+        click(&mut run, &mut app, &fl!("hotkey-add"), 0);
+        let pc1 = HotkeyAction::SelectHost(Host::Pc1);
+        wait("an entry added", &|| entry(1) == Some(HotkeyBinding::new(pc1, Hotkey::NONE)));
+        run(&mut app, vec![]);
+        assert_eq!(app.hotkeys[1], "");
+
+        app.hotkeys[1] = "ctrl+alt+1".into();
+        click(&mut run, &mut app, &fl!("apply"), 1);
+        wait("its hotkey set", &|| entry(1) == Some(HotkeyBinding::new(pc1, Hotkey::combo(0x05, 0x1E))));
+
+        click(&mut run, &mut app, pages::REMOVE, 1);
+        wait("the entry removed", &|| entry(1).is_some_and(|b| !b.is_used()));
+        assert_eq!(entry(0), Some(toggle));
+        assert_eq!(buttons_at(&run(&mut app, vec![]), pages::REMOVE).len(), 1);
+    }
+
+    /// A KVM whose firmware speaks another protocol: the window reads nothing but its identity, every page says so and
+    /// leads to the Firmware page, which offers the update.
+    #[test]
+    fn firmware_of_another_protocol_gets_only_the_update() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let wake: Wake = Arc::new(|| {});
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let (tx, rx) = channel();
+        let other = kvm_proto::ctrl::PROTOCOL_VERSION + 1;
+        let connect =
+            move |_sim: bool| Ok(odkvmctl::Client::new(Box::new(odkvmctl::sim::SimTransport::new().speaking(other))));
+        worker::spawn_with(false, shared.clone(), rx, wake.clone(), connect, || false);
+        let (_tray_tx, tray_rx) = channel();
+        let mut app = App::new(shared.clone(), tx, tray_rx, wake);
+        app.local = local::Local::default();
+        let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(5);
+        while shared.lock().unwrap().mismatch.is_none() {
+            assert!(odkvmctl::time::Instant::now() < deadline, "the mismatch never seen");
+            std::thread::sleep(odkvmctl::time::Duration::from_millis(20));
+        }
+        {
+            let s = shared.lock().unwrap();
+            assert!(s.snap.is_none());
+            assert!(s.error.as_deref().is_some_and(|e| e.contains("0.1.")), "{:?}", s.error);
+        }
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut run = |app: &mut App, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 1400.0))),
+                events,
+                ..Default::default()
+            };
+            app.logic(&ctx, &mut frame);
+            let mut out = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+            out.textures_delta.clear();
+            out
+        };
+        let says = |out: &egui::FullOutput, text: &str| {
+            out.platform_output
+                .accesskit_update
+                .as_ref()
+                .is_some_and(|u| u.nodes.iter().any(|(_, n)| n.label() == Some(text) || n.value() == Some(text)))
+        };
+        for page in [Page::Overview, Page::Ports, Page::Keyboard] {
+            app.page = page;
+            assert!(says(&run(&mut app, vec![]), &fl!("mismatch-title")), "{page:?}");
+        }
+        app.page = Page::Firmware;
+        assert!(button_at(&run(&mut app, vec![]), &fl!("install")).is_some(), "no update offered");
+    }
+
     /// The centre of the button labelled `label` in a frame's accessibility tree.
     fn button_at(out: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
         let nodes = &out.platform_output.accesskit_update.as_ref()?.nodes;
@@ -840,7 +977,7 @@ mod tests {
         }
         app.screens.pick(2);
         let kvm_at = |shared: &Mutex<Shared>| {
-            shared.lock().unwrap().snap.as_ref().and_then(|s| s.hop()).map(|h| h.arrangements[2].screens[1].at)
+            shared.lock().unwrap().snap.as_ref().map(|s| s.hop()).map(|h| h.arrangements[2].screens[1].at)
         };
         let deadline = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_secs(5);
         while kvm_at(&shared) != Some([1920, 0]) {
@@ -890,7 +1027,7 @@ mod tests {
         assert_eq!(kvm_at(&shared), Some([1920, 0]), "sent before Apply");
         assert!(app.screens.has_draft());
         // Applied: every frame still shows it there, the KVM gets it, and the draft goes after its grace.
-        let hop = shared.lock().unwrap().snap.as_ref().and_then(|s| s.hop()).unwrap();
+        let hop = shared.lock().unwrap().snap.as_ref().map(|s| s.hop()).unwrap();
         app.apply(&hop);
         let until = odkvmctl::time::Instant::now() + odkvmctl::time::Duration::from_millis(3500);
         while odkvmctl::time::Instant::now() < until {
@@ -952,8 +1089,11 @@ mod tests {
             let input = egui::RawInput { events, ..Default::default() };
             ctx.run_ui(input, |ui| app.ui(ui, &mut frame)).textures_delta.clear();
         };
+        // An entry with nothing set yet: its field is empty.
+        let pc1 = kvm_proto::ctrl::HotkeyAction::SelectHost(kvm_proto::ctrl::Host::Pc1);
+        app.set(ConfigValue::Hotkey(1, kvm_proto::ctrl::HotkeyBinding::new(pc1, kvm_proto::ctrl::Hotkey::NONE)));
         frame_with(&mut app, Vec::new());
-        assert_eq!(app.hotkeys[1], "none");
+        assert_eq!(app.hotkeys[1], "");
         app.learn(1);
         // Untouched, it learns nothing.
         for _ in 0..30 {
@@ -1089,6 +1229,9 @@ mod tests {
             app.confirm_lock = None;
             // Learning a hotkey: the countdown, then one learned with a warning.
             app.page = Page::Keyboard;
+            let pc1 = kvm_proto::ctrl::HotkeyAction::SelectHost(kvm_proto::ctrl::Host::Pc1);
+            let entry = kvm_proto::ctrl::HotkeyBinding::new(pc1, kvm_proto::ctrl::Hotkey::NONE);
+            app.set(ConfigValue::Hotkey(1, entry));
             app.learning = Some((1, odkvmctl::time::Instant::now()));
             shot(&mut app, format!("{theme_name}-keyboard-learning.ppm"), h);
             app.learning = None;
@@ -1097,7 +1240,8 @@ mod tests {
             app.learn_note = Some((1, Err(format!("{warning} Apply uses it anyway."))));
             shot(&mut app, format!("{theme_name}-keyboard-learned.ppm"), h);
             app.learn_note = None;
-            app.hotkeys[1] = "none".into();
+            app.hotkeys[1] = String::new();
+            app.set(ConfigValue::Hotkey(1, kvm_proto::ctrl::HotkeyBinding::NONE));
             // With the Bluetooth module (OPENDYN_SIM_BT=1): a host with the input, then a host pairing that waits for
             // its passkey (the banner on the Overview, the Bluetooth page).
             let has_bt = shared.lock().unwrap().snap.as_ref().is_some_and(|s| s.has_bluetooth());

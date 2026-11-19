@@ -7,8 +7,9 @@ use kvm_core::config::{LONG_PRESS_RANGE_MS, TAP_MAX_MS};
 use kvm_core::engine::{LEARN_MS, UNLOCK_WAIT_MS};
 use kvm_core::hotkey::format_spec;
 use kvm_proto::ctrl::{
-    ConfigValue, Hotkey, KeyAction, LearnEnd, LinkState, MAX_PROFILES, Pc, Polling, Port, PortMode, PortState,
-    ProfileName, Rgb, Target, VialMode, caps, class, diag, key, selftest, status_flags,
+    ConfigValue, Hotkey, HotkeyAction, HotkeyBinding, HotkeyKind, KeyAction, LearnEnd, LinkState, MAX_HOTKEYS,
+    MAX_PROFILES, Pc, Polling, Port, PortMode, PortState, ProfileName, Rgb, Target, VialMode, caps, class, diag,
+    selftest, status_flags,
 };
 use odkvmctl::client::Snapshot;
 use odkvmctl::{autostart, fl, i18n, local, names};
@@ -71,13 +72,59 @@ fn diag_column(ui: &mut Ui, id: &str, groups: &[(Option<diag::Group>, Vec<&diag:
 }
 
 /// The hotkey rows on the Keyboard page; the last only for a KVM with the Bluetooth module.
-fn hotkeys() -> [(String, u16); 4] {
-    [
-        (fl!("hotkey-toggle"), key::HOTKEY_TOGGLE),
-        (fl!("hotkey-pc1"), key::HOTKEY_PC1),
-        (fl!("hotkey-pc2"), key::HOTKEY_PC2),
-        (fl!("hotkey-next"), key::HOTKEY_NEXT),
-    ]
+/// The button that removes an entry of the hotkey list.
+pub(crate) const REMOVE: &str = "×";
+
+/// What a hotkey of the list does, as the Keyboard page names it: with the host's and the profile's own names.
+pub(crate) fn action_label(s: &Snapshot, a: HotkeyAction) -> String {
+    match a {
+        HotkeyAction::None => fl!("key-action-none"),
+        HotkeyAction::TogglePc => fl!("hotkey-toggle"),
+        HotkeyAction::NextHost => fl!("hotkey-next"),
+        HotkeyAction::PrevHost => fl!("hotkey-prev"),
+        HotkeyAction::SelectHost(h) => fl!("hotkey-host", host = crate::screens::host_label(s, h)),
+        HotkeyAction::NextProfile => fl!("hotkey-next-profile"),
+        HotkeyAction::PrevProfile => fl!("hotkey-prev-profile"),
+        HotkeyAction::SelectProfile(n) => {
+            let name = config(s, |v| match v {
+                ConfigValue::ProfileName(i, name) if *i == n && !name.as_str().is_empty() => {
+                    Some(name.as_str().to_string())
+                }
+                _ => None,
+            });
+            fl!("hotkey-profile", profile = name.unwrap_or_else(|| fl!("profile-n", n = n)))
+        }
+        HotkeyAction::OtherPortMode => fl!("hotkey-other-port"),
+    }
+}
+
+/// The hotkey list as the KVM has it.
+pub(crate) fn hotkey_list(s: &Snapshot) -> [HotkeyBinding; MAX_HOTKEYS] {
+    let mut list = [HotkeyBinding::NONE; MAX_HOTKEYS];
+    for v in &s.config {
+        if let ConfigValue::Hotkey(i, b) = v
+            && let Some(slot) = list.get_mut(*i as usize)
+        {
+            *slot = *b;
+        }
+    }
+    list
+}
+
+/// The actions the Keyboard page offers for an entry doing `now`: the wireless ones only with the module, a profile
+/// only while it is in use (and whatever the entry does already).
+fn offered_actions(s: &Snapshot, now: HotkeyAction) -> Vec<HotkeyAction> {
+    let profiles = config(s, |v| if let ConfigValue::ProfileCount(n) = v { Some(*n) } else { None }).unwrap_or(2);
+    HotkeyAction::ALL
+        .iter()
+        .copied()
+        .filter(|a| {
+            let wireless = matches!(a, HotkeyAction::NextHost | HotkeyAction::PrevHost)
+                || matches!(a, HotkeyAction::SelectHost(h) if h.bt_slot().is_some());
+            let unused_profile = matches!(a, HotkeyAction::SelectProfile(n) if *n >= profiles);
+            *a == now || (*a != HotkeyAction::None && !(wireless && !s.has_bluetooth()) && !unused_profile)
+        })
+        .collect()
 }
 
 /// The keyboard usage of a key in the window (for the simulated keyboard).
@@ -117,9 +164,7 @@ fn hid_usage(k: egui::Key) -> Option<u8> {
 
 /// Why a hotkey can't be learned now, if it can't.
 fn cant_learn(s: &Snapshot) -> Option<String> {
-    if s.info.proto < 4 {
-        Some(fl!("cant-learn-firmware"))
-    } else if s.status.asking.is_some_and(|pc| pc != s.status.active) {
+    if s.status.asking.is_some_and(|pc| pc != s.status.active) {
         Some(fl!("cant-learn-not-active"))
     } else if !s.ports.iter().any(|p| p.state == PortState::Hosted && p.classes & class::KEYBOARD != 0) {
         Some(fl!("cant-learn-no-keyboard"))
@@ -389,69 +434,62 @@ impl App {
             note(ui, fl!("profiles-note"));
             let hop = s.hop();
             ui.add_enabled_ui(!locked, |ui| {
-                egui::Grid::new("profiles").num_columns(if hop.is_some() { 6 } else { 5 }).spacing([10.0, 6.0]).show(
-                    ui,
-                    |ui| {
-                        ui.label("");
-                        note(ui, fl!("name"));
-                        for port in Port::ALL {
-                            note(ui, names::port_short(*port));
+                egui::Grid::new("profiles").num_columns(6).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("");
+                    note(ui, fl!("name"));
+                    for port in Port::ALL {
+                        note(ui, names::port_short(*port));
+                    }
+                    note(ui, fl!("profile-hop"));
+                    ui.end_row();
+                    for (i, p) in list.iter().enumerate().take(count as usize) {
+                        let n = i as u8;
+                        if ui.radio(n == active, "").clicked() && n != active {
+                            self.set(ConfigValue::Profile(n));
                         }
-                        if hop.is_some() {
-                            note(ui, fl!("profile-hop"));
+                        // The name follows the KVM except while it is being edited.
+                        if self.profile_editing != Some(i) {
+                            self.profile_names[i] = p.name.clone();
+                        }
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut self.profile_names[i]).min_size(egui::vec2(110.0, 0.0)),
+                        );
+                        if r.has_focus() {
+                            self.profile_editing = Some(i);
+                        } else if r.lost_focus() {
+                            self.profile_editing = None;
+                            let name = self.profile_names[i].trim();
+                            if !name.is_empty() && name != p.name {
+                                self.set(ConfigValue::ProfileName(n, ProfileName::new(name)));
+                            }
+                        }
+                        let mut modes = p.modes;
+                        for port in Port::ALL {
+                            let m = &mut modes[port.index()];
+                            egui::ComboBox::from_id_salt(("profile-mode", i, port.index()))
+                                .selected_text(names::mode_short(*m))
+                                .width(110.0)
+                                .show_ui(ui, |ui| {
+                                    for mode in PortMode::ALL {
+                                        ui.selectable_value(m, *mode, names::mode(*mode));
+                                    }
+                                });
+                        }
+                        if modes != p.modes {
+                            self.set(ConfigValue::ProfileModes(n, modes));
+                        }
+                        // Screen hop's arrangement in this profile (none: off).
+                        if let Some(a) = crate::screens::arrangement_picker(
+                            ui,
+                            egui::IdSalt::new(("profile-hop", i)),
+                            p.arrangement,
+                            &hop,
+                        ) {
+                            self.set(ConfigValue::ProfileArrangement(n, a));
                         }
                         ui.end_row();
-                        for (i, p) in list.iter().enumerate().take(count as usize) {
-                            let n = i as u8;
-                            if ui.radio(n == active, "").clicked() && n != active {
-                                self.set(ConfigValue::Profile(n));
-                            }
-                            // The name follows the KVM except while it is being edited.
-                            if self.profile_editing != Some(i) {
-                                self.profile_names[i] = p.name.clone();
-                            }
-                            let r = ui.add(
-                                egui::TextEdit::singleline(&mut self.profile_names[i]).min_size(egui::vec2(110.0, 0.0)),
-                            );
-                            if r.has_focus() {
-                                self.profile_editing = Some(i);
-                            } else if r.lost_focus() {
-                                self.profile_editing = None;
-                                let name = self.profile_names[i].trim();
-                                if !name.is_empty() && name != p.name {
-                                    self.set(ConfigValue::ProfileName(n, ProfileName::new(name)));
-                                }
-                            }
-                            let mut modes = p.modes;
-                            for port in Port::ALL {
-                                let m = &mut modes[port.index()];
-                                egui::ComboBox::from_id_salt(("profile-mode", i, port.index()))
-                                    .selected_text(names::mode_short(*m))
-                                    .width(110.0)
-                                    .show_ui(ui, |ui| {
-                                        for mode in PortMode::ALL {
-                                            ui.selectable_value(m, *mode, names::mode(*mode));
-                                        }
-                                    });
-                            }
-                            if modes != p.modes {
-                                self.set(ConfigValue::ProfileModes(n, modes));
-                            }
-                            // Screen hop's arrangement in this profile (none: off).
-                            if let Some(h) = &hop
-                                && let Some(a) = crate::screens::arrangement_picker(
-                                    ui,
-                                    egui::IdSalt::new(("profile-hop", i)),
-                                    p.arrangement,
-                                    h,
-                                )
-                            {
-                                self.set(ConfigValue::ProfileArrangement(n, a));
-                            }
-                            ui.end_row();
-                        }
-                    },
-                );
+                    }
+                });
                 ui.horizontal(|ui| {
                     ui.label(fl!("profiles-in-use"));
                     let mut n = count;
@@ -549,20 +587,15 @@ impl App {
         let note = match outcome {
             Some(Ok((LearnEnd::Learned, h))) => {
                 self.hotkeys[i] = format_spec(&h).to_string();
-                let rows = hotkeys();
-                let others: Vec<(&str, Hotkey)> = rows
+                // The other entries' hotkeys, by what they do.
+                let list = hotkey_list(s);
+                let labelled: Vec<(String, Hotkey)> = list
                     .iter()
-                    .filter(|(_, k)| *k != rows[i].1)
-                    .filter_map(|(label, k)| match config(s, |v| (v.key() == *k).then_some(*v)) {
-                        Some(
-                            ConfigValue::HotkeyToggle(h)
-                            | ConfigValue::HotkeyPc1(h)
-                            | ConfigValue::HotkeyPc2(h)
-                            | ConfigValue::HotkeyNext(h),
-                        ) => Some((label.as_str(), h)),
-                        _ => None,
-                    })
+                    .enumerate()
+                    .filter(|(j, b)| *j != i && b.is_used())
+                    .map(|(_, b)| (action_label(s, b.action), b.hotkey))
                     .collect();
+                let others: Vec<(&str, Hotkey)> = labelled.iter().map(|(l, h)| (l.as_str(), *h)).collect();
                 match names::hotkey_warning(&h, &others) {
                     Some(w) => Err(fl!("learned-with-warning", warning = w)),
                     None => Ok(fl!("learned")),
@@ -579,13 +612,18 @@ impl App {
 
     pub(crate) fn keyboard(&mut self, ui: &mut Ui, s: &Snapshot) {
         let locked = Self::locked_note(ui, s);
+        // A field takes its entry's hotkey whenever that changes on the KVM (and all of them in a fresh window); a
+        // hotkey learned or typed, not applied yet, stays until then.
         if !self.hotkeys_loaded {
-            for (i, (_, k)) in hotkeys().into_iter().enumerate() {
-                if let Some(v) = s.config.iter().find(|v| v.key() == k) {
-                    self.hotkeys[i] = names::format_value(v);
-                }
-            }
+            self.hotkey_seen = [None; MAX_HOTKEYS];
             self.hotkeys_loaded = true;
+        }
+        for (i, b) in hotkey_list(s).iter().enumerate() {
+            if self.hotkey_seen[i] != Some(b.hotkey) {
+                self.hotkey_seen[i] = Some(b.hotkey);
+                self.hotkeys[i] =
+                    if b.hotkey.kind == HotkeyKind::None { String::new() } else { format_spec(&b.hotkey).to_string() };
+            }
         }
         self.learn_outcome(s);
         let sim_keyboard = self.shared.lock().unwrap().sim_keyboard.clone();
@@ -596,17 +634,34 @@ impl App {
         let cant_learn = cant_learn(s);
         ui.add_enabled_ui(!locked, |ui| {
             card(ui, &fl!("hotkeys"), |ui| {
-                note(ui, "double:scrolllock · double:rctrl:noswallow · ctrl+alt+1 · f13 · none");
+                let list = hotkey_list(s);
+                note(ui, "double:scrolllock · double:rctrl:noswallow · ctrl+alt+1 · f13");
                 note(ui, if sim { fl!("learn-hint-sim") } else { fl!("learn-hint") });
+                let used: Vec<usize> = (0..MAX_HOTKEYS).filter(|i| list[*i].is_used()).collect();
+                if used.is_empty() {
+                    note(ui, fl!("hotkeys-none"));
+                }
                 // Notes go below the rows: in the grid they would widen the field's column and move the buttons.
                 let mut notes = Vec::new();
-                egui::Grid::new("hotkeys").num_columns(4).spacing([12.0, 8.0]).show(ui, |ui| {
-                    for (i, (label, k)) in hotkeys().into_iter().enumerate() {
-                        if k == key::HOTKEY_NEXT && !s.has_bluetooth() {
-                            continue;
+                egui::Grid::new("hotkeys").num_columns(5).spacing([8.0, 8.0]).show(ui, |ui| {
+                    for i in used.iter().copied() {
+                        let b = list[i];
+                        let label = action_label(s, b.action);
+                        let mut action = b.action;
+                        egui::ComboBox::from_id_salt(("hotkey-action", i))
+                            .selected_text(&label)
+                            .width(180.0)
+                            .show_ui(ui, |ui| {
+                                for a in offered_actions(s, b.action) {
+                                    ui.selectable_value(&mut action, a, action_label(s, a));
+                                }
+                            })
+                            .response
+                            .on_hover_text(fl!("hotkey-action-hover"));
+                        if action != b.action {
+                            self.set(ConfigValue::Hotkey(i as u8, HotkeyBinding::new(action, b.hotkey)));
                         }
-                        ui.label(&label);
-                        let field = egui::vec2(220.0, 0.0);
+                        let field = egui::vec2(180.0, 0.0);
                         let learning = self.learning.map(|(row, since)| (row == i, since));
                         if let Some((true, since)) = learning {
                             // The countdown fills the field.
@@ -620,29 +675,50 @@ impl App {
                                 self.send(UiCmd::Learn(false));
                             }
                         } else {
-                            let r = ui.add(egui::TextEdit::singleline(&mut self.hotkeys[i]).min_size(field));
+                            let edit = egui::TextEdit::singleline(&mut self.hotkeys[i]).hint_text("ctrl+alt+1");
+                            let r = ui.add(edit.min_size(field));
                             let apply = ui.button(fl!("apply")).clicked()
                                 || (r.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter)));
                             if apply {
-                                match names::parse_value(k, &self.hotkeys[i]) {
-                                    Ok(v) => {
+                                let text = self.hotkeys[i].trim().to_string();
+                                let parsed = if text.is_empty() {
+                                    Ok(Hotkey::NONE)
+                                } else {
+                                    kvm_core::hotkey::parse_spec(&text).map_err(|e| {
+                                        fl!("parse-hotkey", value = text.as_str(), error = format!("{e:?}"))
+                                    })
+                                };
+                                match parsed {
+                                    Ok(h) => {
                                         self.hotkey_error[i] = None;
                                         self.learn_note = None;
-                                        self.set(v);
+                                        self.set(ConfigValue::Hotkey(i as u8, HotkeyBinding::new(b.action, h)));
                                     }
                                     Err(e) => self.hotkey_error[i] = Some(e),
                                 }
                             }
-                            let b = ui
+                            let learn = ui
                                 .add_enabled(
                                     cant_learn.is_none() && learning.is_none(),
                                     egui::Button::new(fl!("learn")),
                                 )
                                 .on_hover_text(fl!("learn-hover"));
                             let why = cant_learn.clone().unwrap_or_else(|| fl!("learning-another"));
-                            if b.on_disabled_hover_text(why).clicked() {
+                            if learn.on_disabled_hover_text(why).clicked() {
                                 self.learn(i);
                             }
+                        }
+                        // A narrow "×", so that the row fits in every language.
+                        if ui.button(REMOVE).on_hover_text(fl!("hotkey-remove")).clicked() {
+                            if self.learning.is_some_and(|(row, _)| row == i) {
+                                self.learning = None;
+                                self.send(UiCmd::Learn(false));
+                            }
+                            if self.learn_note.as_ref().is_some_and(|(row, _)| *row == i) {
+                                self.learn_note = None;
+                            }
+                            self.hotkey_error[i] = None;
+                            self.set(ConfigValue::Hotkey(i as u8, HotkeyBinding::NONE));
                         }
                         ui.end_row();
                         let row_note = match &self.learn_note {
@@ -657,6 +733,24 @@ impl App {
                 });
                 for (text, color) in notes {
                     ui.label(RichText::new(text).color(ink(ui, color)));
+                }
+                // A new entry: after the last one in use, else in the first free one; doing something no entry does
+                // yet.
+                let after = list.iter().rposition(HotkeyBinding::is_used).map_or(0, |j| j + 1);
+                let free = (after..MAX_HOTKEYS).chain(0..after).find(|j| !list[*j].is_used());
+                let add = ui
+                    .add_enabled(free.is_some(), egui::Button::new(fl!("hotkey-add")))
+                    .on_disabled_hover_text(fl!("hotkeys-full", max = MAX_HOTKEYS));
+                if add.clicked()
+                    && let Some(i) = free
+                {
+                    let action = offered_actions(s, HotkeyAction::None)
+                        .into_iter()
+                        .find(|a| *a != HotkeyAction::None && !list.iter().any(|b| b.action == *a))
+                        .unwrap_or(HotkeyAction::TogglePc);
+                    self.hotkeys[i] = String::new();
+                    self.hotkey_error[i] = None;
+                    self.set(ConfigValue::Hotkey(i as u8, HotkeyBinding::new(action, Hotkey::NONE)));
                 }
                 if s.ports.iter().any(|p| p.state == PortState::Passthrough && p.classes & class::KEYBOARD != 0) {
                     note(ui, fl!("passthrough-keyboard-note"));
@@ -1074,6 +1168,16 @@ impl App {
     }
 
     /// What the KVM pages show while no KVM answers; and where to go when one waits in its bootloader.
+    /// The KVM's firmware speaks another protocol: nothing but its update, on the Firmware page.
+    pub(crate) fn mismatch(&mut self, ui: &mut Ui) {
+        card(ui, &fl!("mismatch-title"), |ui| {
+            note(ui, fl!("mismatch-note"));
+            if ui.button(fl!("page-firmware")).clicked() {
+                self.page = crate::Page::Firmware;
+            }
+        });
+    }
+
     pub(crate) fn no_kvm(&mut self, ui: &mut Ui) {
         card(ui, &fl!("looking-for-kvm"), |ui| {
             ui.horizontal(|ui| {

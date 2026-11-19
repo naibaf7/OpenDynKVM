@@ -60,7 +60,6 @@ impl DisplayMode {
 
 /// A monitor whose input follows the KVM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "StoredBinding", into = "StoredBinding")]
 pub struct DisplayBinding {
     /// `ddc::Display::id`.
     pub id: String,
@@ -71,6 +70,7 @@ pub struct DisplayBinding {
     pub profiles: [DisplayMode; MAX_PROFILES],
     /// Optional: the input that shows a Bluetooth host (a laptop or tablet wired to the monitor too), by the host's
     /// address (`BtHostView::address`). A host without one leaves the monitor on the PC.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bt_inputs: BTreeMap<String, u16>,
 }
 
@@ -92,47 +92,6 @@ impl DisplayBinding {
             DisplayMode::Follow => host.or(self.inputs[s.pc.min(1)]),
             DisplayMode::Pc1 => self.inputs[0],
             DisplayMode::Pc2 => self.inputs[1],
-        }
-    }
-}
-
-/// A binding as files hold it. Before profiles there was only `enabled` (follow or not); it is still written, as
-/// profile 0's, so that an older version keeps the binding.
-#[derive(Serialize, Deserialize)]
-struct StoredBinding {
-    id: String,
-    name: String,
-    #[serde(default)]
-    enabled: bool,
-    inputs: [Option<u16>; 2],
-    profiles: Option<[DisplayMode; MAX_PROFILES]>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    bt_inputs: BTreeMap<String, u16>,
-}
-
-impl From<StoredBinding> for DisplayBinding {
-    fn from(s: StoredBinding) -> Self {
-        let old = if s.enabled { DisplayMode::Follow } else { DisplayMode::Off };
-        DisplayBinding {
-            id: s.id,
-            name: s.name,
-            inputs: s.inputs,
-            profiles: s.profiles.unwrap_or([old; MAX_PROFILES]),
-            bt_inputs: s.bt_inputs,
-        }
-    }
-}
-
-impl From<DisplayBinding> for StoredBinding {
-    fn from(b: DisplayBinding) -> Self {
-        let enabled = b.profiles[0] == DisplayMode::Follow;
-        StoredBinding {
-            id: b.id,
-            name: b.name,
-            enabled,
-            inputs: b.inputs,
-            profiles: Some(b.profiles),
-            bt_inputs: b.bt_inputs,
         }
     }
 }
@@ -376,21 +335,8 @@ mod tests {
         let text = serde_json::to_string(&l).unwrap();
         assert!(text.contains("\"theme\":\"light\""), "{text}");
         assert_eq!(serde_json::from_str::<Local>(&text).unwrap(), l);
-        // Missing fields keep their defaults, so older files still load.
+        // Missing fields keep their defaults.
         assert_eq!(serde_json::from_str::<Local>("{}").unwrap(), Local::default());
-    }
-
-    #[test]
-    fn a_monitor_that_followed_before_profiles_follows_in_every_profile() {
-        let old = r#"{"displays":[{"id":"a","name":"A","enabled":true,"inputs":[15,17]},
-                                  {"id":"b","name":"B","enabled":false,"inputs":[15,null]}]}"#;
-        let l: Local = serde_json::from_str(old).unwrap();
-        assert_eq!(l.displays[0].profiles, [DisplayMode::Follow; MAX_PROFILES]);
-        assert_eq!(l.displays[1].profiles, [DisplayMode::Off; MAX_PROFILES]);
-        let b = &l.displays[0];
-        let at = |pc, profile| KvmState { pc, bt: None, profile };
-        assert_eq!((b.target(&at(0, 0)), b.target(&at(1, 3))), (Some(15), Some(17)));
-        assert!(b.bt_inputs.is_empty(), "files from before Bluetooth hosts have none");
     }
 
     #[test]

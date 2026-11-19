@@ -12,8 +12,8 @@ use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::diag::{self as cdiag, BtModule, ClockSource, Grade, Item, id};
 use kvm_proto::ctrl::{
     self, Advertised, AutoReason, BtPointer, ConfigValue, ErrorCode, Event, FaultKind, FwState, HopState, Host, Hotkey,
-    Info, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, Pc, Port, PortInfo, PortMode, PortState, PowerSource,
-    RebootTarget, Request, Response, Speed, StringKind, SwitchSource, Target, VialMode, status_flags,
+    HotkeyAction, Info, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, Pc, Port, PortInfo, PortMode, PortState,
+    PowerSource, RebootTarget, Request, Response, Speed, StringKind, SwitchSource, Target, VialMode, status_flags,
 };
 use kvm_proto::link::bt::{EventKind as BtEventKind, HostState as BtHostState, report as btreport};
 use kvm_proto::link::msg::{Status as AtStatus, UsbSpeed, UsbState};
@@ -22,7 +22,7 @@ use crate::bt::{self, BtOut, BtState, PasskeyStep};
 use crate::config::{self, Config, Origin};
 use crate::diag::{self, BoardDiag};
 use crate::hop;
-use crate::hotkey::{Action, HotkeyEngine, Learner};
+use crate::hotkey::{HotkeyEngine, Learner};
 use crate::leds::LedInputs;
 use crate::merge::Merger;
 use crate::output::{PcOutput, Report};
@@ -38,8 +38,8 @@ pub const MAX_CTRL_DATA: usize = 256;
 pub const OUTPUT_QUEUE: usize = 48;
 /// Largest item [`Engine::take_save_item`] produces.
 pub const SAVE_ITEM_MAX: usize = kvm_vial::keymap::MACRO_BUFFER;
-/// Electronics' own draw, subtracted from the advertised current for the budget (information only since 0.1.28: the
-/// warning comes from the measured 5 V, `supply`). design.md §6 estimated about 0.5 A before the board existed; the
+/// Electronics' own draw, subtracted from the advertised current for the budget (information only: the warning comes
+/// from the measured 5 V, `supply`). design.md §6 estimated about 0.5 A before the board existed; the
 /// first board took under 1 W from the PWR port in every state, its front devices included (2026-11-17): under 200 mA.
 pub const SELF_CURRENT_MA: u16 = 200;
 /// The Bluetooth module's average draw on 5 V when fitted (design.md §6.1: about 40 mA at 3.3 V with hosts connected,
@@ -462,9 +462,6 @@ impl Engine {
     /// bits) and the serial number, and builds the descriptor set.
     pub fn start(&mut self, config: Config, info: Info, serial: &str) {
         self.config = config;
-        // A config item from firmware up to 0.1.12 brought its one arrangement as arrangement 0: it gets an item of its
-        // own at the next save, before the config item without it, unless that item is there (`restore_item`).
-        self.arrangements_dirty = (self.config.arrangements[0] != config::Arrangement::EMPTY) as u8;
         self.hotkeys.configure(&self.config);
         self.info = info;
         self.serial = String::try_from(&serial[..serial.len().min(16)]).unwrap_or_default();
@@ -942,6 +939,18 @@ impl Engine {
         (after + 1..=ctrl::BT_HOSTS as u8).find(|n| ready(*n))
     }
 
+    /// The target before the current one in the order of [`Engine::next_target`]: from PC1 the last host that is ready
+    /// (PC2 if none is), from PC2 PC1, from a host the ready one before it or PC2.
+    fn prev_target(&self) -> Target {
+        let ready = |n: u8| self.bt.selectable(n) && self.bt.host(n).is_some_and(|h| h.ready());
+        let before = match self.bt.active {
+            Some(n) => n,
+            None if self.active == Pc::Pc2 => return Target::Pc1,
+            None => ctrl::BT_HOSTS as u8 + 1,
+        };
+        (1..before).rev().find(|n| ready(*n)).and_then(Target::bt).unwrap_or(Target::Pc2)
+    }
+
     /// Selects Bluetooth host slot `n` (bonded; it gets input once ready).
     fn switch_bt(&mut self, n: u8, source: SwitchSource) {
         if !self.bt.selectable(n) || self.bt.active == Some(n) {
@@ -1410,13 +1419,7 @@ impl Engine {
         }
         let swallowed = union.without(&hk.keys);
         if let Some(a) = hk.action {
-            let target = match a {
-                Action::Toggle => Target::Toggle,
-                Action::SelectPc1 => Target::Pc1,
-                Action::SelectPc2 => Target::Pc2,
-                Action::Next => Target::Next,
-            };
-            self.switch(target, SwitchSource::Hotkey);
+            self.hotkey_action(a);
         }
         swallowed
     }
@@ -2032,19 +2035,45 @@ impl Engine {
             KeyAction::None => {}
             KeyAction::TogglePc => self.switch(Target::Toggle, SwitchSource::Key),
             KeyAction::NextTarget => self.switch(Target::Next, SwitchSource::Key),
-            KeyAction::NextProfile => {
-                let _ = self.set_config(ConfigValue::Profile(self.config.next_profile()), Origin::Device);
-            }
-            KeyAction::OtherPortMode => {
-                let next = match self.config.port_modes()[Port::Other.index()] {
-                    PortMode::Auto => PortMode::Passthrough,
-                    PortMode::Passthrough => PortMode::PassthroughPc1,
-                    PortMode::PassthroughPc1 => PortMode::PassthroughPc2,
-                    _ => PortMode::Auto,
-                };
-                let _ = self.set_config(ConfigValue::PortMode(Port::Other, next), Origin::Device);
-            }
+            KeyAction::NextProfile => self.select_profile(self.config.next_profile()),
+            KeyAction::OtherPortMode => self.cycle_other_port(),
         }
+    }
+
+    /// What a hotkey of the list does (software.md §4.5). Like the KVM's key, it works whatever the software locks.
+    fn hotkey_action(&mut self, a: HotkeyAction) {
+        let count = self.config.profile_count;
+        match a {
+            HotkeyAction::None => {}
+            HotkeyAction::TogglePc => self.switch(Target::Toggle, SwitchSource::Hotkey),
+            HotkeyAction::NextHost => self.switch(Target::Next, SwitchSource::Hotkey),
+            HotkeyAction::PrevHost => {
+                let t = self.prev_target();
+                self.switch(t, SwitchSource::Hotkey);
+            }
+            // A host slot with no host bonded leaves the input where it is.
+            HotkeyAction::SelectHost(h) => self.switch(h.target(), SwitchSource::Hotkey),
+            HotkeyAction::NextProfile => self.select_profile(self.config.next_profile()),
+            HotkeyAction::PrevProfile => self.select_profile((self.config.profile + count - 1) % count),
+            // A profile past those in use is refused, as from the software.
+            HotkeyAction::SelectProfile(n) => self.select_profile(n),
+            HotkeyAction::OtherPortMode => self.cycle_other_port(),
+        }
+    }
+
+    fn select_profile(&mut self, n: u8) {
+        let _ = self.set_config(ConfigValue::Profile(n), Origin::Device);
+    }
+
+    /// The Other port's mode: Auto → Passthrough → pinned PC1 → pinned PC2 → Auto.
+    fn cycle_other_port(&mut self) {
+        let next = match self.config.port_modes()[Port::Other.index()] {
+            PortMode::Auto => PortMode::Passthrough,
+            PortMode::Passthrough => PortMode::PassthroughPc1,
+            PortMode::PassthroughPc1 => PortMode::PassthroughPc2,
+            _ => PortMode::Auto,
+        };
+        let _ = self.set_config(ConfigValue::PortMode(Port::Other, next), Origin::Device);
     }
 
     pub fn set_power(&mut self, p: PowerInfo) {
@@ -2427,11 +2456,7 @@ impl Engine {
             return Ok(v);
         }
         match v {
-            ConfigValue::HotkeyToggle(_)
-            | ConfigValue::HotkeyPc1(_)
-            | ConfigValue::HotkeyPc2(_)
-            | ConfigValue::HotkeyNext(_)
-            | ConfigValue::DoubleTapMs(_) => self.hotkeys.configure(&self.config),
+            ConfigValue::Hotkey(..) | ConfigValue::DoubleTapMs(_) => self.hotkeys.configure(&self.config),
             ConfigValue::BtPolicy(i, policy) => self.emit(Output::Bt(BtOut::Policy { host: i + 1, policy })),
             // The mouse interface changes: both PCs enumerate it again.
             ConfigValue::PcPolling(_) | ConfigValue::AbsPointer(_) => self.rebuild_presentation(),
@@ -2508,7 +2533,6 @@ impl Engine {
                     info.caps |= ctrl::caps::BLUETOOTH;
                     info.bt_fw = self.bt.fw;
                 }
-                info.caps |= ctrl::caps::SCREEN_HOP;
                 Response::Info(info)
             }
             Request::GetStatus => Response::Status(self.status(pc)),
@@ -3463,7 +3487,10 @@ mod tests {
         );
         assert_eq!(ask(&mut e, Request::SetActive(Target::Toggle)), Response::Ok);
         assert_eq!(e.active(), Pc::Pc2);
-        let hk = ConfigValue::HotkeyPc1(Hotkey::combo(0x05, 0x1E));
+        let hk = ConfigValue::Hotkey(
+            1,
+            ctrl::HotkeyBinding::new(HotkeyAction::SelectHost(Host::Pc1), Hotkey::combo(0x05, 0x1E)),
+        );
         assert_eq!(ask(&mut e, Request::SetConfig(hk)), Response::Config(hk));
         assert_eq!(
             ask(&mut e, Request::SetConfig(ConfigValue::SwSwitchAllowed(false))),
@@ -3769,6 +3796,89 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Sets entry `i` of the hotkey list to `action` on Ctrl+Alt+`key`.
+    fn bind(e: &mut Engine, i: u8, action: HotkeyAction, key: u8) {
+        let v = ConfigValue::Hotkey(i, ctrl::HotkeyBinding::new(action, Hotkey::combo(0x05, key)));
+        assert_eq!(ask(e, Request::SetConfig(v)), Response::Config(v));
+    }
+
+    /// Ctrl+Alt+`key` on the KVM's keyboard, pressed and released.
+    fn chord(e: &mut Engine, key: u8, t: u32) {
+        e.device_report(Port::Keyboard, 0, &[0x05, 0, key, 0, 0, 0, 0, 0], t);
+        e.device_report(Port::Keyboard, 0, &[0; 8], t + 10);
+    }
+
+    #[test]
+    fn hotkeys_select_hosts_and_cycle_them_both_ways() {
+        // Host 2 ready, host 3 bonded only.
+        let mut e = with_bt();
+        bind(&mut e, 1, HotkeyAction::SelectHost(Host::Bt2), 0x1F);
+        bind(&mut e, 2, HotkeyAction::SelectHost(Host::Bt3), 0x20);
+        bind(&mut e, 3, HotkeyAction::SelectHost(Host::Bt1), 0x1E);
+        bind(&mut e, 4, HotkeyAction::NextHost, 0x11);
+        bind(&mut e, 5, HotkeyAction::PrevHost, 0x13);
+        chord(&mut e, 0x1F, 100);
+        assert_eq!((e.active(), e.bt_active()), (Pc::Pc1, Some(2)));
+        assert!(drain(&mut e).contains(&Output::Bt(BtOut::Select(2))));
+        // Host 3 is bonded but not connected: selected all the same, as from the app.
+        chord(&mut e, 0x20, 200);
+        assert_eq!(e.bt_active(), Some(3));
+        // Slot 1 has no host: the input stays where it is.
+        chord(&mut e, 0x1E, 300);
+        assert_eq!(e.bt_active(), Some(3));
+        // The hotkeys' keys reached no host.
+        assert!(bt_inputs(&drain(&mut e)).iter().all(|(_, _, d)| !d.contains(&0x1E) && !d.contains(&0x20)));
+        // Previous from host 3: the ready host 2 (3 isn't ready), PC2, PC1, and round to host 2 again.
+        let mut seen = std::vec::Vec::new();
+        for t in 0..4 {
+            chord(&mut e, 0x13, 400 + t * 50);
+            seen.push((e.active(), e.bt_active()));
+        }
+        assert_eq!(seen, [(Pc::Pc1, Some(2)), (Pc::Pc2, None), (Pc::Pc1, None), (Pc::Pc1, Some(2))]);
+        // Next from host 2: PC1, PC2, host 2.
+        let mut seen = std::vec::Vec::new();
+        for t in 0..3 {
+            chord(&mut e, 0x11, 700 + t * 50);
+            seen.push((e.active(), e.bt_active()));
+        }
+        assert_eq!(seen, [(Pc::Pc1, None), (Pc::Pc2, None), (Pc::Pc2, Some(2))]);
+    }
+
+    #[test]
+    fn hotkeys_select_and_cycle_profiles_and_the_other_ports_mode() {
+        let mut e = engine();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        e.set_config(ConfigValue::ProfileCount(3), Origin::Software).unwrap();
+        // Software configuration locked: like the KVM's key, the hotkeys still work.
+        e.set_config(ConfigValue::SwConfigAllowed(false), Origin::Software).unwrap();
+        for (i, (action, key)) in [
+            (HotkeyAction::NextProfile, 0x11),
+            (HotkeyAction::PrevProfile, 0x13),
+            (HotkeyAction::SelectProfile(2), 0x1F),
+            (HotkeyAction::SelectProfile(3), 0x20),
+            (HotkeyAction::OtherPortMode, 0x12),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let v = ConfigValue::Hotkey(i as u8 + 1, ctrl::HotkeyBinding::new(action, Hotkey::combo(0x05, key)));
+            e.set_config(v, Origin::Device).unwrap();
+        }
+        drain(&mut e);
+        let mut t = 100;
+        let mut press = |e: &mut Engine, key: u8| {
+            chord(e, key, t);
+            t += 50;
+            e.config().profile
+        };
+        assert_eq!(press(&mut e, 0x13), 2, "previous from 0: the last in use");
+        assert_eq!(press(&mut e, 0x11), 0, "next from the last: the first");
+        assert_eq!(press(&mut e, 0x1F), 2);
+        assert_eq!(press(&mut e, 0x20), 2, "profile 3 isn't in use");
+        press(&mut e, 0x12);
+        assert_eq!(e.config().port_modes()[Port::Other.index()], PortMode::Passthrough);
     }
 
     #[test]
@@ -4107,7 +4217,7 @@ mod tests {
         assert_eq!(events_to(&out, Pc::Pc1), [Event::HotkeyLearned(LearnEnd::Learned, Hotkey::combo(0x05, 0x0E))]);
         assert!(events_to(&out, Pc::Pc2).is_empty());
         // Nothing changed, and typing reaches the PC again.
-        assert_eq!(e.config().hotkey_toggle, Config::default().hotkey_toggle);
+        assert_eq!(e.config().hotkeys, Config::default().hotkeys);
         e.device_report(Port::Keyboard, 0, &[0, 0, 0x04, 0, 0, 0, 0, 0], 300);
         assert_eq!(typed(&drain(&mut e)), Some(std::vec![0x04]));
 
@@ -4325,7 +4435,6 @@ mod tests {
         // The feature report of the multipliers carries the report ID too.
         e.pc_set_report(Pc::Pc1, 1, 3, normalized::MOUSE_REL_ID, &[normalized::MOUSE_REL_ID, 0x05]);
         assert!(e.pcs[0].out.wheel_hires && e.pcs[0].out.pan_hires);
-        assert!(matches!(ask(&mut e, Request::GetInfo), Response::Info(i) if i.caps & ctrl::caps::SCREEN_HOP != 0));
     }
 
     #[test]
@@ -4521,19 +4630,17 @@ mod tests {
     }
 
     #[test]
-    fn an_arrangement_from_an_old_config_item_gets_its_own_item_unless_it_has_one() {
+    fn a_restored_arrangement_is_not_written_again() {
         let info =
             Info { proto: 1, rp_fw: 0x000100, at_fw: [0; 2], hw: 0x000C00, serial: *b"TEST0001", caps: 0, bt_fw: 0 };
-        let mut old = Config::default();
-        old.arrangements[0].screens[0] = ctrl::Screen::new(Host::Pc1, 1920, 1080, [0, 0]);
+        let mut stored = Config::default();
+        stored.arrangements[0].screens[0] = ctrl::Screen::new(Host::Pc1, 1920, 1080, [0, 0]);
         let mut buf = [0u8; SAVE_ITEM_MAX];
-        let mut e = Engine::new(old, info, "TEST0001");
-        assert_eq!(e.take_save_item(&mut buf).map(|(k, _)| k), Some(config::ARRANGEMENT_ITEM));
-        // Its item is in flash already: nothing to write.
         let mut item = [0u8; config::ARRANGEMENT_ITEM_MAX];
-        let n = old.encode_arrangement(0, &mut item);
-        let mut e = Engine::new(old, info, "TEST0001");
+        let n = stored.encode_arrangement(0, &mut item);
+        let mut e = Engine::new(Config::default(), info, "TEST0001");
         e.restore_item(config::ARRANGEMENT_ITEM, &item[..n]);
+        assert_eq!(e.config().arrangements[0], stored.arrangements[0]);
         assert!(e.take_save_item(&mut buf).is_none());
         assert_eq!(Engine::item_keys().filter(|k| (0x0010..0x0014).contains(k)).count(), MAX_ARRANGEMENTS);
     }

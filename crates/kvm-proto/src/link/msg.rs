@@ -96,8 +96,8 @@ pub struct Status {
     pub vdda_mv: Option<u16>,
     /// The AT32F405's die temperature in tenths of a °C (its sensor's offset varies by up to 20 °C between chips).
     pub temp_dc: Option<i16>,
-    /// The lowest of the PC's 5 V since the last status, sampled every millisecond (firmware 0.1.28 on; older firmware
-    /// sends none, which reads as `vbus_mv`): catches dips the 100 ms reading misses.
+    /// The lowest of the PC's 5 V since the last status, sampled every millisecond: catches dips the 100 ms reading
+    /// misses.
     pub vbus_min_mv: u16,
 }
 
@@ -243,13 +243,7 @@ impl<'a> LinkMsg<'a> {
         let mut r = Reader::new(msg);
         let t = r.u8()?;
         Ok(match t {
-            ty::HELLO => LinkMsg::Hello {
-                proto: r.u8()?,
-                fw_version: r.u32()?,
-                role: r.u8()?,
-                // Not sent by AT32F405 firmware 0.1.0.
-                flags: if r.remaining() > 0 { r.u8()? } else { 0 },
-            },
+            ty::HELLO => LinkMsg::Hello { proto: r.u8()?, fw_version: r.u32()?, role: r.u8()?, flags: r.u8()? },
             0x11..=0x17 => LinkMsg::Report { ep: t - ty::REPORT_BASE, data: r.rest() },
             ty::DESC_BEGIN => LinkMsg::DescBegin { total_len: r.u16()?, crc32: r.u32()? },
             ty::DESC_DATA => LinkMsg::DescData { offset: r.u16()?, data: r.rest() },
@@ -269,27 +263,20 @@ impl<'a> LinkMsg<'a> {
             }
             ty::PROTOCOL_CHANGED => LinkMsg::ProtocolChanged { iface: r.u8()?, protocol: r.u8()? },
             ty::COMMAND => LinkMsg::Command(r.u8()?.try_into()?),
-            ty::STATUS => {
-                let mut s = Status {
-                    usb_state: r.u8()?.try_into()?,
-                    speed: r.u8()?.try_into()?,
-                    vbus_mv: r.u16()?,
-                    cc1_mv: r.u16()?,
-                    cc2_mv: r.u16()?,
-                    frame: r.u16()?,
-                    resets: r.u16()?,
-                    desc_crc: r.u32()?,
-                    // Not sent by AT32F405 firmware 0.1.0.
-                    wake_enabled: if r.remaining() > 0 { r.bool()? } else { false },
-                    // Not sent by AT32F405 firmware before the diagnostics (protocol 5 of the control protocol).
-                    vdda_mv: if r.remaining() >= 2 { Some(r.u16()?).filter(|v| *v != NO_VDDA) } else { None },
-                    temp_dc: if r.remaining() >= 2 { Some(r.u16()? as i16).filter(|v| *v != NO_TEMP) } else { None },
-                    vbus_min_mv: 0,
-                };
-                // Not sent before 0.1.28: the minimum is the one reading there is.
-                s.vbus_min_mv = if r.remaining() >= 2 { r.u16()? } else { s.vbus_mv };
-                LinkMsg::Status(s)
-            }
+            ty::STATUS => LinkMsg::Status(Status {
+                usb_state: r.u8()?.try_into()?,
+                speed: r.u8()?.try_into()?,
+                vbus_mv: r.u16()?,
+                cc1_mv: r.u16()?,
+                cc2_mv: r.u16()?,
+                frame: r.u16()?,
+                resets: r.u16()?,
+                desc_crc: r.u32()?,
+                wake_enabled: r.bool()?,
+                vdda_mv: Some(r.u16()?).filter(|v| *v != NO_VDDA),
+                temp_dc: Some(r.u16()? as i16).filter(|v| *v != NO_TEMP),
+                vbus_min_mv: r.u16()?,
+            }),
             _ => return Err(WireError::Invalid),
         })
     }
@@ -434,15 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_from_firmware_0_1_0_has_no_flags() {
-        let mut buf = [0u8; MAX_MSG];
-        let n = LinkMsg::Hello { proto: 1, fw_version: 0x100, role: role::PC1, flags: 1 }.encode(&mut buf).unwrap();
-        let old = LinkMsg::decode(&buf[..n - 1]).unwrap();
-        assert_eq!(old, LinkMsg::Hello { proto: 1, fw_version: 0x100, role: role::PC1, flags: 0 });
-    }
-
-    #[test]
-    fn status_from_firmware_0_1_0_has_no_wake_flag() {
+    fn a_status_cut_short_is_refused() {
         let s = Status {
             usb_state: UsbState::Suspended,
             speed: UsbSpeed::High,
@@ -459,15 +438,10 @@ mod tests {
         };
         let mut buf = [0u8; MAX_MSG];
         let n = LinkMsg::Status(s).encode(&mut buf).unwrap();
-        // Before 0.1.28 no minimum: the reading stands in for it.
-        let s = Status { vbus_min_mv: s.vbus_mv, ..s };
-        let before_min = LinkMsg::decode(&buf[..n - 2]).unwrap();
-        assert_eq!(before_min, LinkMsg::Status(s));
-        let old = LinkMsg::decode(&buf[..n - 7]).unwrap();
-        assert_eq!(old, LinkMsg::Status(Status { wake_enabled: false, vdda_mv: None, temp_dc: None, ..s }));
-        // Firmware with the wake flag but without the measurements.
-        let before_diag = LinkMsg::decode(&buf[..n - 6]).unwrap();
-        assert_eq!(before_diag, LinkMsg::Status(Status { vdda_mv: None, temp_dc: None, ..s }));
+        assert_eq!(LinkMsg::decode(&buf[..n]), Ok(LinkMsg::Status(s)));
+        assert!(LinkMsg::decode(&buf[..n - 2]).is_err());
+        let n = LinkMsg::Hello { proto: 1, fw_version: 0x100, role: role::PC1, flags: 1 }.encode(&mut buf).unwrap();
+        assert!(LinkMsg::decode(&buf[..n - 1]).is_err(), "a Hello without its flags");
     }
 
     #[test]

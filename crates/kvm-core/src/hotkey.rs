@@ -5,19 +5,9 @@ use core::fmt::Write;
 use heapless::String;
 use kvm_hid::KeyState;
 use kvm_hid::keys::{modifier_of, name_of, usage_of};
-use kvm_proto::ctrl::{Hotkey, HotkeyKind};
+use kvm_proto::ctrl::{Hotkey, HotkeyAction, HotkeyKind, MAX_HOTKEYS};
 
 use crate::config::Config;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum Action {
-    Toggle,
-    SelectPc1,
-    SelectPc2,
-    /// The next target: PC1, PC2, then the Bluetooth hosts that are ready.
-    Next,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tap {
@@ -31,15 +21,16 @@ enum Tap {
 pub struct HotkeyOutput {
     /// Key state to forward to the active PC.
     pub keys: KeyState,
-    pub action: Option<Action>,
+    pub action: Option<HotkeyAction>,
     /// A swallowed single tap to replay (press + release) to the active PC before `keys`.
     pub replay: Option<u8>,
 }
 
 pub struct HotkeyEngine {
-    bindings: [(Action, Hotkey); 4],
+    /// The config's hotkey list.
+    bindings: [(HotkeyAction, Hotkey); MAX_HOTKEYS],
     window_ms: u32,
-    tap: [Tap; 4],
+    tap: [Tap; MAX_HOTKEYS],
     swallowed: KeyState,
     prev: KeyState,
 }
@@ -65,14 +56,9 @@ fn alone(state: &KeyState, k: u8) -> bool {
 impl HotkeyEngine {
     /// No bindings yet: [`HotkeyEngine::configure`] sets them.
     pub const EMPTY: HotkeyEngine = HotkeyEngine {
-        bindings: [
-            (Action::Toggle, Hotkey::NONE),
-            (Action::SelectPc1, Hotkey::NONE),
-            (Action::SelectPc2, Hotkey::NONE),
-            (Action::Next, Hotkey::NONE),
-        ],
+        bindings: [(HotkeyAction::None, Hotkey::NONE); MAX_HOTKEYS],
         window_ms: 300,
-        tap: [Tap::Idle; 4],
+        tap: [Tap::Idle; MAX_HOTKEYS],
         swallowed: KeyState::EMPTY,
         prev: KeyState::EMPTY,
     };
@@ -84,12 +70,12 @@ impl HotkeyEngine {
     }
 
     pub fn configure(&mut self, cfg: &Config) {
-        self.bindings[0].1 = cfg.hotkey_toggle;
-        self.bindings[1].1 = cfg.hotkey_pc1;
-        self.bindings[2].1 = cfg.hotkey_pc2;
-        self.bindings[3].1 = cfg.hotkey_next;
+        for (b, entry) in self.bindings.iter_mut().zip(cfg.hotkeys) {
+            // An entry without an action matches nothing.
+            *b = (entry.action, if entry.is_used() { entry.hotkey } else { Hotkey::NONE });
+        }
         self.window_ms = cfg.double_tap_ms as u32;
-        self.tap = [Tap::Idle; 4];
+        self.tap = [Tap::Idle; MAX_HOTKEYS];
     }
 
     /// Keys currently hidden from the PCs (a swallowed hotkey key that is still held).
@@ -197,7 +183,7 @@ impl HotkeyEngine {
     /// Starts afresh with `held` down (after learning a hotkey, when it didn't see the keys): no tap under way, and
     /// only keys pressed from now on count as pressed.
     pub fn resume(&mut self, held: &KeyState) {
-        self.tap = [Tap::Idle; 4];
+        self.tap = [Tap::Idle; MAX_HOTKEYS];
         self.swallowed = self.swallowed.intersect(held);
         self.prev = *held;
     }
@@ -383,6 +369,7 @@ pub fn format_spec(h: &Hotkey) -> String<48> {
 mod tests {
     use super::*;
     use kvm_hid::usage::key::SCROLL_LOCK;
+    use kvm_proto::ctrl::{Host, HotkeyBinding};
 
     fn keys(list: &[u8]) -> KeyState {
         let mut s = KeyState::EMPTY;
@@ -394,7 +381,7 @@ mod tests {
 
     fn engine() -> HotkeyEngine {
         let mut cfg = Config::default();
-        cfg.hotkey_pc1 = Hotkey::combo(0x01 | 0x04, 0x1E); // ctrl+alt+1
+        cfg.hotkeys[1] = HotkeyBinding::new(HotkeyAction::SelectHost(Host::Pc1), Hotkey::combo(0x01 | 0x04, 0x1E)); // ctrl+alt+1
         HotkeyEngine::new(&cfg)
     }
 
@@ -407,7 +394,7 @@ mod tests {
         assert_eq!((o.keys, o.action, o.replay), (none, None, None));
         assert_eq!(e.process(&none, 80).keys, none);
         let o = e.process(&sl, 200);
-        assert_eq!((o.keys, o.action), (none, Some(Action::Toggle)));
+        assert_eq!((o.keys, o.action), (none, Some(HotkeyAction::TogglePc)));
         assert_eq!(e.process(&none, 260), HotkeyOutput::default());
         assert_eq!(e.tick(1000), None);
     }
@@ -459,7 +446,7 @@ mod tests {
         assert_eq!(e.process(&held, 0).keys, held);
         held.press(0x1E);
         let o = e.process(&held, 10);
-        assert_eq!(o.action, Some(Action::SelectPc1));
+        assert_eq!(o.action, Some(HotkeyAction::SelectHost(Host::Pc1)));
         assert_eq!(o.keys, keys(&[0xE4, 0xE2]));
         held.release(0x1E);
         assert_eq!(e.process(&held, 20).keys, held);
@@ -553,13 +540,38 @@ mod tests {
     }
 
     #[test]
+    fn every_entry_of_the_list_is_matched_and_one_without_an_action_never() {
+        let mut cfg = Config::default();
+        let host3 = HotkeyAction::SelectHost(Host::Bt3);
+        cfg.hotkeys[15] = HotkeyBinding::new(host3, Hotkey::combo(0x01 | 0x04, 0x20)); // ctrl+alt+3
+        cfg.hotkeys[7] = HotkeyBinding::new(HotkeyAction::NextProfile, Hotkey::double_tap(0x48, true)); // double Pause
+        cfg.hotkeys[3] = HotkeyBinding { action: HotkeyAction::None, hotkey: Hotkey::combo(0x01, 0x04) };
+        let mut e = HotkeyEngine::new(&cfg);
+        assert_eq!(e.process(&keys(&[0xE0, 0xE2, 0x20]), 0).action, Some(host3));
+        e.process(&KeyState::EMPTY, 10);
+        e.process(&keys(&[0x48]), 100);
+        e.process(&KeyState::EMPTY, 150);
+        let o = e.process(&keys(&[0x48]), 250);
+        assert_eq!((o.action, o.keys), (Some(HotkeyAction::NextProfile), KeyState::EMPTY));
+        e.process(&KeyState::EMPTY, 260);
+        // Ctrl+A reaches the PC: its entry has no action.
+        let o = e.process(&keys(&[0xE0, 0x04]), 300);
+        assert_eq!((o.action, o.keys), (None, keys(&[0xE0, 0x04])));
+        // The default toggle's double Scroll Lock still works beside them.
+        e.process(&KeyState::EMPTY, 310);
+        e.process(&keys(&[SCROLL_LOCK]), 1000);
+        e.process(&KeyState::EMPTY, 1050);
+        assert_eq!(e.process(&keys(&[SCROLL_LOCK]), 1100).action, Some(HotkeyAction::TogglePc));
+    }
+
+    #[test]
     fn resume_counts_only_new_presses() {
         let mut e = engine();
         let held = keys(&[0xE0, 0xE2, 0x1E]);
         e.resume(&held);
         assert_eq!(e.process(&held, 0).action, None, "ctrl+alt+1 was down before");
         e.process(&keys(&[0xE0, 0xE2]), 10);
-        assert_eq!(e.process(&held, 20).action, Some(Action::SelectPc1));
+        assert_eq!(e.process(&held, 20).action, Some(HotkeyAction::SelectHost(Host::Pc1)));
     }
 
     #[test]

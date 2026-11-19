@@ -245,6 +245,8 @@ pub struct SimTransport {
     bt: Option<[HostState; 4]>,
     /// The module is an ESP32-C3 board on the Other port (`OPENDYN_SIM_BT=dongle`).
     dongle: bool,
+    /// The protocol `GetInfo` says, if not this program's ([`SimTransport::speaking`]).
+    proto: Option<u8>,
 }
 
 /// An ESP32-C3 board's USB serial port (303A:1001: IAD, CDC-ACM, CDC data with bulk endpoints, the JTAG interface).
@@ -386,7 +388,14 @@ impl SimTransport {
             keys: channel(),
             bt,
             dongle: false,
+            proto: None,
         }
+    }
+
+    /// The simulated KVM's firmware speaking protocol `proto` (another than this program's: the programs offer only the
+    /// firmware update then).
+    pub fn speaking(self, proto: u8) -> Self {
+        Self { proto: Some(proto), ..self }
     }
 
     /// Screen hop set up (`OPENDYN_SIM_HOP=1`): the desk in arrangement 0, used by profile 0, with the tablet of
@@ -601,7 +610,12 @@ impl SimTransport {
 impl Transport for SimTransport {
     fn write(&mut self, report: &Report) -> Result<(), String> {
         self.pump();
-        if let Some(resp) = self.engine.control(Some(Pc::Pc1), report) {
+        if let Some(mut resp) = self.engine.control(Some(Pc::Pc1), report) {
+            if let (Some(proto), Ok(DeviceMsg::Response { id, request, response: Response::Info(i) })) =
+                (self.proto, DeviceMsg::decode(&resp))
+            {
+                resp = Response::Info(Info { proto, ..i }).encode(request, id).map_err(|e| format!("{e:?}"))?;
+            }
             // Someone "presses the key" on the simulated KVM when it asks for it.
             if let Ok(DeviceMsg::Response { response: Response::Error(ErrorCode::NeedsKeyPress), .. }) =
                 DeviceMsg::decode(&resp)
@@ -642,7 +656,9 @@ impl Transport for SimTransport {
 mod tests {
     use super::*;
     use crate::Client;
-    use kvm_proto::ctrl::{ConfigValue, Event, Hotkey, LearnEnd, PortMode, PortState, SwitchSource, Target};
+    use kvm_proto::ctrl::{
+        ConfigValue, Event, Hotkey, HotkeyAction, HotkeyBinding, LearnEnd, PortMode, PortState, SwitchSource, Target,
+    };
 
     #[test]
     fn configuration_comes_back_after_the_key_is_pressed() {
@@ -670,14 +686,11 @@ mod tests {
                 }
             })
             .unwrap();
-        assert_eq!(
-            (end, crate::names::format_value(&ConfigValue::HotkeyToggle(h))),
-            (LearnEnd::Learned, "ctrl+alt+k".into())
-        );
-        assert_eq!(
-            c.get_config(kvm_proto::ctrl::key::HOTKEY_TOGGLE),
-            Ok(ConfigValue::HotkeyToggle(Hotkey::double_tap(0x47, true)))
-        );
+        assert_eq!((end, kvm_core::hotkey::format_spec(&h).to_string()), (LearnEnd::Learned, "ctrl+alt+k".into()));
+        // Learning changed nothing: the list still has its one default entry.
+        let toggle = HotkeyBinding::new(HotkeyAction::TogglePc, Hotkey::double_tap(0x47, true));
+        assert_eq!(c.get_config(kvm_proto::ctrl::key::hotkey(0)), Ok(ConfigValue::Hotkey(0, toggle)));
+        assert_eq!(c.get_config(kvm_proto::ctrl::key::hotkey(1)), Ok(ConfigValue::Hotkey(1, HotkeyBinding::NONE)));
     }
 
     #[test]

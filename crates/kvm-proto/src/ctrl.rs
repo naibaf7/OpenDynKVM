@@ -10,25 +10,10 @@ use crate::wire::{Reader, WireError, Writer, wire_enum};
 
 pub const REPORT_LEN: usize = 64;
 pub const PAYLOAD_LEN: usize = REPORT_LEN - 2;
-/// 6: Bluetooth hosts (boards 0.16.0 with the module): `caps::BLUETOOTH`, `Target::Next`/`Bt1`–`Bt4`, the Bluetooth
-/// fields at the end of `Status`, the `Bt*` requests and events, `HotkeyNext`, `BtName`, `BtPolicy`.
-/// 7: screen hop (`caps::SCREEN_HOP`): the absolute pointer, the hop settings, the screen arrangement and each
-/// profile's hop switch (config keys 0x00A0–0x00B7), `SwitchSource::Edge`, the hop fields at the end of `Status`,
-/// `PointerAt`.
-/// 8: screen hop: each PC's units (`HopUnits`, config keys 0x00AC–0x00AD: whether its desktop counts logical
-/// pixels), and a screen's flags in its slot's PC byte: off for hop (`Screen::off`, bit 7) and a fixed place on its
-/// PC (`Screen::fixed`, bit 6).
-/// 9: screen hop with arrangements and Bluetooth hosts: four named arrangements (`MAX_ARRANGEMENTS`; their screens at
-/// config keys 0x00B0–0x00CF, arrangement 0's where the one arrangement was, their names at 0x00D0–0x00D3), each
-/// profile's arrangement instead of its switch (`ProfileArrangement`, 0x00A8–0x00AB: 0 none, n + 1 arrangement n), a
-/// screen's owner a [`Host`] (a PC or a Bluetooth host slot, in the slot's PC byte), each Bluetooth host's mapping,
-/// units and pointer (`HopMapping`, `HopUnits` 0x00D8–0x00DF, `BtPointer` 0x00E0–0x00E3); and a front port can hold the
-/// Bluetooth module, an ESP32-C3 board on USB (`PortState::Module`); `Status` carries the passkey typed so far.
-/// 10: screen hop with the cursor placed by a PC's host software where it asks for it (`PlaceCursor`, a lease,
-/// [`Placement`]; `Event::PlaceCursor` to that PC only); the supply judged from its measured 5 V (`Status::supply` and
-/// the readings after it, `status_flags::SUPPLY_SAGS` instead of the declared-maximum estimate, the `SUPPLY*` and
-/// `PC*_DROPOUTS` diagnostics).
-pub const PROTOCOL_VERSION: u8 = 10;
+/// The protocol's version. A host and the firmware talk only when theirs are the same: otherwise the host offers the
+/// firmware it came with, and nothing else (`GetInfo` and the `Fw*` requests are all it uses then). Raised with every
+/// change of a message, a config key or a value.
+pub const PROTOCOL_VERSION: u8 = 11;
 
 /// Vendor usage page and usage of the control interface; hosts discover it by these, not by VID/PID.
 pub const USAGE_PAGE: u16 = 0xFF4B;
@@ -160,7 +145,7 @@ wire_enum! {
         /// Enumerated but nothing usable (e.g. a hub on a front port).
         Unsupported = 6,
         /// The KVM's Bluetooth module: an ESP32-C3 board with the module's firmware on this port, for a KVM without the
-        /// module on board (protocol 9, software.md §4.13). `Status.bt_module` says how it is doing.
+        /// module on board (software.md §4.13). `Status.bt_module` says how it is doing.
         Module = 7,
     }
 }
@@ -238,7 +223,7 @@ wire_enum! {
         Boot = 3,
         /// Automatic: the active PC was switched off, or only the other one is running (config `AUTO_SELECT`).
         Power = 4,
-        /// Screen hop: the pointer was pushed across a screen edge onto the other PC's screen (protocol 7).
+        /// Screen hop: the pointer was pushed across a screen edge onto the other PC's screen.
         Edge = 5,
     }
 }
@@ -253,9 +238,9 @@ wire_enum! {
         Pc2 = 2,
         /// The other PC; from a Bluetooth host, back to the PC that was active before it.
         Toggle = 3,
-        /// The next target in the order PC1, PC2, Bluetooth hosts 1–4, skipping hosts that aren't ready (protocol 6).
+        /// The next target in the order PC1, PC2, Bluetooth hosts 1–4, skipping hosts that aren't ready.
         Next = 4,
-        /// Bluetooth host slot 1–4 (protocol 6, boards with the Bluetooth module).
+        /// Bluetooth host slot 1–4 (boards with the Bluetooth module).
         Bt1 = 0x11,
         Bt2 = 0x12,
         Bt3 = 0x13,
@@ -302,7 +287,7 @@ impl Target {
 pub const BT_HOSTS: usize = 4;
 
 wire_enum! {
-    /// A computer the KVM serves (protocol 9): a PC on its USB port, or a Bluetooth host slot. Its values are
+    /// A computer the KVM serves: a PC on its USB port, or a Bluetooth host slot. Its values are
     /// [`Target`]'s.
     pub enum Host { Pc1 = 1, Pc2 = 2, Bt1 = 0x11, Bt2 = 0x12, Bt3 = 0x13, Bt4 = 0x14 }
 }
@@ -411,7 +396,7 @@ wire_enum! {
         /// Forget the failed attempts at programming the AT32F405s, then restart, so that both get up to 5 more
         /// (software.md §4.9).
         At32Retry = 4,
-        /// The same for the Bluetooth module (software.md §4.13), protocol 6.
+        /// The same for the Bluetooth module (software.md §4.13).
         BtRetry = 5,
     }
 }
@@ -432,7 +417,7 @@ wire_enum! {
         PowerBudget = 3,
         HubError = 4,
         /// A wireless host changes its notification settings so often that the module stopped writing them to flash
-        /// for this run (its wear guard): they are kept in RAM. Firmware 0.1.23 on; older hosts skip the event.
+        /// for this run (its wear guard): they are kept in RAM.
         BtSettingsHeld = 5,
     }
 }
@@ -514,7 +499,7 @@ wire_enum! {
         NextProfile = 2,
         /// Cycle the Other port's mode: Auto → Passthrough → pinned PC1 → pinned PC2.
         OtherPortMode = 3,
-        /// The next target: PC1, PC2, then each Bluetooth host that is ready (protocol 6).
+        /// The next target: PC1, PC2, then each Bluetooth host that is ready.
         NextTarget = 4,
     }
 }
@@ -569,7 +554,7 @@ impl ProfileName {
     }
 }
 
-/// Screen-hop arrangements the KVM keeps (protocol 9): each a name and [`MAX_SCREENS`] screens; a profile uses one of
+/// Screen-hop arrangements the KVM keeps: each a name and [`MAX_SCREENS`] screens; a profile uses one of
 /// them or none (`ConfigValue::ProfileArrangement`).
 pub const MAX_ARRANGEMENTS: usize = 4;
 /// Screen slots of an arrangement (`ConfigValue::Screen`).
@@ -635,7 +620,7 @@ impl Mapping {
 }
 
 wire_enum! {
-    /// What a PC's desktop coordinates count ([`Screen::desk`], `ConfigValue::HopUnits`, protocol 8).
+    /// What a PC's desktop coordinates count ([`Screen::desk`], `ConfigValue::HopUnits`).
     pub enum Units {
         /// Physical pixels: each screen covers its resolution (Windows, X11).
         Physical = 0,
@@ -658,7 +643,7 @@ impl Units {
     }
 }
 
-/// Physical pixels: what the KVM assumed before protocol 8.
+/// Physical pixels.
 impl Default for Units {
     fn default() -> Self {
         Units::Physical
@@ -666,7 +651,7 @@ impl Default for Units {
 }
 
 wire_enum! {
-    /// How screen hop moves a Bluetooth host's pointer (protocol 9).
+    /// How screen hop moves a Bluetooth host's pointer.
     pub enum BtPointer {
         /// The absolute pointer (report 4 of the module's HID service): exactly where the KVM's pointer is, as on the
         /// PCs (most desktop systems).
@@ -680,9 +665,9 @@ wire_enum! {
 
 wire_enum! {
     /// The 5 V the KVM runs from (the PWR port, or the higher of the PCs' through their ideal diodes), as measured
-    /// (`Status::supply`, protocol 10).
+    /// (`Status::supply`).
     pub enum Supply {
-        /// Not judged (firmware before protocol 10, or no reading yet).
+        /// Not judged: no reading yet.
         Unknown = 0,
         /// At least 4.5 V: the source keeps up with the load, whatever the devices declare.
         Good = 1,
@@ -694,7 +679,7 @@ wire_enum! {
 }
 
 wire_enum! {
-    /// Which of a PC's screens its host software places the cursor on (`Request::PlaceCursor`, protocol 10): where it
+    /// Which of a PC's screens its host software places the cursor on (`Request::PlaceCursor`): where it
     /// does, screen hop sends it the position (`Event::PlaceCursor`) instead of a report of the pointer interfaces.
     pub enum Placement {
         /// None: the PC's mapping alone (no host software, or it can't place now).
@@ -734,8 +719,6 @@ wire_enum! {
         NoScreens = 4,
         /// The active PC uses the boot protocol (its firmware setup, before the OS runs).
         BootProtocol = 5,
-        /// A Bluetooth host had the input (until protocol 8; since 9 a Bluetooth host takes part in screen hop).
-        Wireless = 6,
     }
 }
 
@@ -743,7 +726,7 @@ wire_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Screen {
-    /// The host it belongs to, a PC or a Bluetooth host (protocol 9); None: the slot is free.
+    /// The host it belongs to, a PC or a Bluetooth host; None: the slot is free.
     pub host: Option<Host>,
     /// Resolution, in the PC's pixels.
     pub w: u16,
@@ -754,7 +737,7 @@ pub struct Screen {
     pub desk: [i16; 2],
     /// Its top-left corner in the arrangement, in logical pixels.
     pub at: [i16; 2],
-    /// Screen hop leaves it alone (protocol 8): its PC has it, but another PC shows on it (a monitor cabled to both).
+    /// Screen hop leaves it alone: its PC has it, but another PC shows on it (a monitor cabled to both).
     /// It stands where that PC's screen does, and still counts for its PC's desktop: the PC spreads the absolute
     /// pointer across it too.
     pub off: bool,
@@ -821,7 +804,7 @@ pub mod class {
     pub const OTHER_HID: u16 = 1 << 12;
 }
 
-/// Bits of a screen slot's host byte above the host (protocol 8; the host, a [`Host`](super::Host), in bits 0–5).
+/// Bits of a screen slot's host byte above the host (the host, a [`Host`](super::Host), in bits 0–5).
 pub mod screen_flags {
     /// [`Screen::off`](super::Screen::off).
     pub const OFF: u8 = 1 << 7;
@@ -836,9 +819,7 @@ pub mod status_flags {
     pub const CONFIG_DIRTY: u8 = 1 << 2;
     pub const UPDATE_ARMED: u8 = 1 << 3;
     pub const SELFTEST_FAILED: u8 = 1 << 4;
-    /// The 5 V the KVM runs from sags under the load, as measured ([`super::Status::supply`] `Sags` or `Low`, protocol
-    /// 10). Until protocol 9: the front devices' declared maximum was more than [`super::Status::budget_ma`], which
-    /// warned on many PC ports that give more than they advertise.
+    /// The 5 V the KVM runs from sags under the load, as measured ([`super::Status::supply`] `Sags` or `Low`).
     pub const SUPPLY_SAGS: u8 = 1 << 5;
     /// No PC uses the KVM: the LEDs are dark and front ports are off (software.md §4.12).
     pub const STANDBY: u8 = 1 << 6;
@@ -876,8 +857,8 @@ pub mod selftest {
     /// Still running; the other bits are provisional.
     pub const RUNNING: u32 = 1 << 15;
     /// The Bluetooth module (boards 0.16.0 on, when fitted) doesn't run the embedded firmware: programming it failed
-    /// this boot, or it doesn't answer; tried again at the next power-up. Bits 16 and up travel at the end of `Status`
-    /// (protocol 6), so older hosts see bits 0–15 as before.
+    /// this boot, or it doesn't answer; tried again at the next power-up. Bits 16 and up travel after the Bluetooth
+    /// fields of `Status`.
     pub const BT_FW: u32 = 1 << 16;
     /// Programming the Bluetooth module failed 5 times in a row: no more attempts until the embedded image changes, the
     /// KVM's key is held at power-up, or `RebootTarget::BtRetry`.
@@ -1057,7 +1038,7 @@ pub mod diag {
         pub const KB_FAULTS: u8 = 0x39;
         pub const MS_FAULTS: u8 = 0x3A;
         pub const OT_FAULTS: u8 = 0x3B;
-        /// The lowest 5 V the KVM ran from in the last minute, graded by `Status::supply` (protocol 10).
+        /// The lowest 5 V the KVM ran from in the last minute, graded by `Status::supply`.
         pub const SUPPLY: u8 = 0x3C;
         /// Since start: the 100 ms windows whose millisecond minimum fell under 4.4 V (a device's inrush, a heavy
         /// load); a count, not a judgement.
@@ -1277,10 +1258,8 @@ pub mod caps {
     pub const FW_UPDATE: u16 = 1 << 3;
     /// Vial keymap editor and the keymap engine (software.md §4.11).
     pub const VIAL: u16 = 1 << 4;
-    /// The Bluetooth module (boards 0.16.0 on) is fitted and answers: Bluetooth hosts are targets (protocol 6).
+    /// The Bluetooth module (boards 0.16.0 on) is fitted and answers: Bluetooth hosts are targets.
     pub const BLUETOOTH: u16 = 1 << 5;
-    /// Screen hop and the absolute pointer (protocol 7).
-    pub const SCREEN_HOP: u16 = 1 << 6;
     pub const SIMULATED: u16 = 1 << 15;
 }
 
@@ -1334,6 +1313,135 @@ impl Hotkey {
     }
 }
 
+/// Entries in the hotkey list.
+pub const MAX_HOTKEYS: usize = 16;
+
+/// What a hotkey of the list does. On the wire: a kind byte and an argument byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum HotkeyAction {
+    /// An unused entry.
+    None,
+    /// The other PC; from a Bluetooth host, back to the PC that was active before it.
+    TogglePc,
+    /// The next host: PC1, PC2, then each Bluetooth host that is ready, then PC1 again.
+    NextHost,
+    /// The same order backwards.
+    PrevHost,
+    SelectHost(Host),
+    /// The next profile in use, after the last one the first.
+    NextProfile,
+    PrevProfile,
+    /// Profile 0–3 (ignored while it isn't one of those in use).
+    SelectProfile(u8),
+    /// Cycle the Other port's mode: Auto → Passthrough → pinned PC1 → pinned PC2.
+    OtherPortMode,
+}
+
+impl HotkeyAction {
+    /// Every action, in the order hosts list them.
+    pub const ALL: [HotkeyAction; 17] = [
+        HotkeyAction::TogglePc,
+        HotkeyAction::NextHost,
+        HotkeyAction::PrevHost,
+        HotkeyAction::SelectHost(Host::Pc1),
+        HotkeyAction::SelectHost(Host::Pc2),
+        HotkeyAction::SelectHost(Host::Bt1),
+        HotkeyAction::SelectHost(Host::Bt2),
+        HotkeyAction::SelectHost(Host::Bt3),
+        HotkeyAction::SelectHost(Host::Bt4),
+        HotkeyAction::NextProfile,
+        HotkeyAction::PrevProfile,
+        HotkeyAction::SelectProfile(0),
+        HotkeyAction::SelectProfile(1),
+        HotkeyAction::SelectProfile(2),
+        HotkeyAction::SelectProfile(3),
+        HotkeyAction::OtherPortMode,
+        HotkeyAction::None,
+    ];
+
+    /// Its name for `odkvmctl` (`toggle-pc`, `select-pc1`, `select-host3`, `select-profile2`, …).
+    pub const fn name(self) -> &'static str {
+        match self {
+            HotkeyAction::None => "none",
+            HotkeyAction::TogglePc => "toggle-pc",
+            HotkeyAction::NextHost => "next-host",
+            HotkeyAction::PrevHost => "prev-host",
+            HotkeyAction::SelectHost(Host::Pc1) => "select-pc1",
+            HotkeyAction::SelectHost(Host::Pc2) => "select-pc2",
+            HotkeyAction::SelectHost(Host::Bt1) => "select-host1",
+            HotkeyAction::SelectHost(Host::Bt2) => "select-host2",
+            HotkeyAction::SelectHost(Host::Bt3) => "select-host3",
+            HotkeyAction::SelectHost(Host::Bt4) => "select-host4",
+            HotkeyAction::NextProfile => "next-profile",
+            HotkeyAction::PrevProfile => "prev-profile",
+            HotkeyAction::SelectProfile(0) => "select-profile0",
+            HotkeyAction::SelectProfile(1) => "select-profile1",
+            HotkeyAction::SelectProfile(2) => "select-profile2",
+            HotkeyAction::SelectProfile(_) => "select-profile3",
+            HotkeyAction::OtherPortMode => "other-port",
+        }
+    }
+
+    /// The action named `name` ([`HotkeyAction::name`]).
+    pub fn from_name(name: &str) -> Option<HotkeyAction> {
+        Self::ALL.iter().copied().find(|a| a.name() == name)
+    }
+
+    pub fn encode(self, w: &mut Writer) -> Result<(), WireError> {
+        let (kind, arg) = match self {
+            HotkeyAction::None => (0, 0),
+            HotkeyAction::TogglePc => (1, 0),
+            HotkeyAction::NextHost => (2, 0),
+            HotkeyAction::PrevHost => (3, 0),
+            HotkeyAction::SelectHost(h) => (4, h as u8),
+            HotkeyAction::NextProfile => (5, 0),
+            HotkeyAction::PrevProfile => (6, 0),
+            HotkeyAction::SelectProfile(n) => (7, n),
+            HotkeyAction::OtherPortMode => (8, 0),
+        };
+        w.u8(kind)?;
+        w.u8(arg)
+    }
+
+    pub fn decode(r: &mut Reader) -> Result<HotkeyAction, WireError> {
+        let (kind, arg) = (r.u8()?, r.u8()?);
+        Ok(match kind {
+            0 => HotkeyAction::None,
+            1 => HotkeyAction::TogglePc,
+            2 => HotkeyAction::NextHost,
+            3 => HotkeyAction::PrevHost,
+            4 => HotkeyAction::SelectHost(arg.try_into()?),
+            5 => HotkeyAction::NextProfile,
+            6 => HotkeyAction::PrevProfile,
+            7 if (arg as usize) < MAX_PROFILES => HotkeyAction::SelectProfile(arg),
+            8 => HotkeyAction::OtherPortMode,
+            _ => return Err(WireError::Invalid),
+        })
+    }
+}
+
+/// An entry of the hotkey list: what it does, and its hotkey (none yet: the entry is kept, and does nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct HotkeyBinding {
+    pub action: HotkeyAction,
+    pub hotkey: Hotkey,
+}
+
+impl HotkeyBinding {
+    pub const NONE: HotkeyBinding = HotkeyBinding { action: HotkeyAction::None, hotkey: Hotkey::NONE };
+
+    pub const fn new(action: HotkeyAction, hotkey: Hotkey) -> Self {
+        Self { action, hotkey }
+    }
+
+    /// An entry of the list (an unused one has no action).
+    pub fn is_used(&self) -> bool {
+        self.action != HotkeyAction::None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Info {
@@ -1345,7 +1453,7 @@ pub struct Info {
     pub hw: u32,
     pub serial: [u8; 8],
     pub caps: u16,
-    /// Firmware of the Bluetooth module (protocol 6; 0 = none, not answering, or older firmware).
+    /// Firmware of the Bluetooth module (0 = none, or not answering).
     pub bt_fw: u32,
 }
 
@@ -1361,15 +1469,15 @@ pub struct Status {
     pub adv_pc: [Advertised; 2],
     /// VBUS of PWR, PC1, PC2 in mV.
     pub vbus_mv: [u16; 3],
-    /// What the source advertises less the KVM's own draw: an estimate, for information (protocol 10; the warning
+    /// What the source advertises less the KVM's own draw: an estimate, for information (the warning
     /// comes from [`Status::supply`]).
     pub budget_ma: u16,
     pub flags: u8,
     pub uptime_s: u32,
     pub link_errors: [u16; 2],
-    /// [`selftest`] bits; 16 and up are protocol 6.
+    /// [`selftest`] bits.
     pub selftest: u32,
-    /// Bluetooth (protocol 6; 0 from older firmware): the host slot that gets input (0 = a PC is active, `active`).
+    /// Bluetooth: the host slot that gets input (0 = a PC is active, `active`).
     pub bt_active: u8,
     /// Host slots ready for input (bit n−1 for slot n): connected, encrypted, subscribed.
     pub bt_ready: u8,
@@ -1381,15 +1489,15 @@ pub struct Status {
     pub bt_passkey: u8,
     /// The Bluetooth module: absent, up, being programmed, failed (`diag::BtModule`).
     pub bt_module: diag::BtModule,
-    /// Screen hop (protocol 7; Off from older firmware): whether it moves the pointer, and where the pointer is in the
+    /// Screen hop: whether it moves the pointer, and where the pointer is in the
     /// arrangement (logical pixels).
     pub hop: HopState,
     pub pointer: [i16; 2],
-    /// The passkey typed so far on the KVM's keyboard for the host in `bt_passkey` (protocol 9): how many digits, and
+    /// The passkey typed so far on the KVM's keyboard for the host in `bt_passkey`: how many digits, and
     /// their value, so that the window can show them while they are typed.
     pub bt_passkey_digits: u8,
     pub bt_passkey_typed: u32,
-    /// The 5 V the KVM runs from, judged from its measurements (protocol 10; `Unknown` from older firmware): the level,
+    /// The 5 V the KVM runs from, judged from its measurements: the level,
     /// the voltage now, and the lowest in the last minute (the PC-side chips' millisecond minimum, the PWR port's
     /// readings), in mV.
     pub supply: Supply,
@@ -1442,17 +1550,12 @@ impl PortInfo {
 
 /// Config keys (software.md §8.3).
 pub mod key {
-    pub const HOTKEY_TOGGLE: u16 = 0x0001;
-    pub const HOTKEY_PC1: u16 = 0x0002;
-    pub const HOTKEY_PC2: u16 = 0x0003;
     pub const DOUBLE_TAP_MS: u16 = 0x0004;
     /// What a tap / a long press on the KVM's key does.
     pub const KEY_TAP: u16 = 0x0005;
     pub const KEY_LONG: u16 = 0x0006;
     /// How long the key is held for a long press (ms).
     pub const LONG_PRESS_MS: u16 = 0x0007;
-    /// Hotkey for the next target: PC1, PC2, the Bluetooth hosts that are ready (protocol 6).
-    pub const HOTKEY_NEXT: u16 = 0x0008;
     pub const LED_BRIGHTNESS: u16 = 0x0010;
     pub const COLOR_PC1: u16 = 0x0011;
     pub const COLOR_PC2: u16 = 0x0012;
@@ -1479,11 +1582,11 @@ pub mod key {
     /// Port modes (Keyboard, Mouse, Other) and name of profile 0–3.
     pub const PROFILE_MODES_BASE: u16 = 0x0080;
     pub const PROFILE_NAME_BASE: u16 = 0x0088;
-    /// Name of Bluetooth host slot 1–4 (UTF-8, at most 12 bytes; empty = "BT n"), protocol 6.
+    /// Name of Bluetooth host slot 1–4 (UTF-8, at most 12 bytes; empty = "BT n").
     pub const BT_NAME_BASE: u16 = 0x0090;
     /// What the module does with host slot 1–4 while another target is active ([`Policy`](super::BtPolicy)).
     pub const BT_POLICY_BASE: u16 = 0x0098;
-    /// Screen hop (protocol 7): the absolute pointer on the KVM's mouse, the acceleration, speed, edge resistance and
+    /// Screen hop: the absolute pointer on the KVM's mouse, the acceleration, speed, edge resistance and
     /// corner, PC1's and PC2's mapping.
     pub const ABS_POINTER: u16 = 0x00A0;
     pub const HOP_ACCEL: u16 = 0x00A1;
@@ -1491,22 +1594,33 @@ pub mod key {
     pub const HOP_RESISTANCE: u16 = 0x00A3;
     pub const HOP_CORNER: u16 = 0x00A4;
     pub const HOP_MAPPING_BASE: u16 = 0x00A6;
-    /// Profile 0–3's arrangement (protocol 9; until 8 its screen-hop switch, whose "on" is now arrangement 0).
+    /// Profile 0–3's arrangement (0: none, n + 1: arrangement n).
     pub const PROFILE_ARRANGEMENT_BASE: u16 = 0x00A8;
-    /// PC1's and PC2's [`Units`](super::Units) for screen hop, protocol 8.
+    /// PC1's and PC2's [`Units`](super::Units) for screen hop.
     pub const HOP_UNITS_BASE: u16 = 0x00AC;
-    /// Screen slot s of arrangement a at `SCREEN_BASE + a × MAX_SCREENS + s` (arrangement 0's slots are protocol 8's
-    /// one arrangement).
+    /// Screen slot s of arrangement a at `SCREEN_BASE + a × MAX_SCREENS + s`.
     pub const SCREEN_BASE: u16 = 0x00B0;
-    /// Name of arrangement 0–3 (protocol 9).
+    /// Name of arrangement 0–3.
     pub const ARRANGEMENT_NAME_BASE: u16 = 0x00D0;
-    /// Bluetooth host slot 1–4's mapping and units (protocol 9).
+    /// Bluetooth host slot 1–4's mapping and units.
     pub const HOP_MAPPING_BT_BASE: u16 = 0x00D8;
     pub const HOP_UNITS_BT_BASE: u16 = 0x00DC;
-    /// Bluetooth host slot 1–4's pointer for screen hop (protocol 9, [`BtPointer`](super::BtPointer)).
+    /// Bluetooth host slot 1–4's pointer for screen hop ([`BtPointer`](super::BtPointer)).
     pub const BT_POINTER_BASE: u16 = 0x00E0;
+    /// Entry 0–15 of the hotkey list ([`HotkeyBinding`](super::HotkeyBinding)).
+    pub const HOTKEY_BASE: u16 = 0x00F0;
 
-    use super::{Host, MAX_ARRANGEMENTS, MAX_SCREENS};
+    use super::{Host, MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_SCREENS};
+
+    /// The key of entry `i` of the hotkey list.
+    pub const fn hotkey(i: u8) -> u16 {
+        HOTKEY_BASE + i as u16
+    }
+
+    /// The entry of the hotkey list a key is.
+    pub const fn hotkey_of(k: u16) -> Option<u8> {
+        if k >= HOTKEY_BASE && k < HOTKEY_BASE + MAX_HOTKEYS as u16 { Some((k - HOTKEY_BASE) as u8) } else { None }
+    }
 
     pub const fn hop_mapping(h: Host) -> u16 {
         match h.bt_slot() {
@@ -1539,9 +1653,6 @@ pub mod key {
     }
 
     const BASE: &[u16] = &[
-        HOTKEY_TOGGLE,
-        HOTKEY_PC1,
-        HOTKEY_PC2,
         DOUBLE_TAP_MS,
         KEY_TAP,
         KEY_LONG,
@@ -1562,7 +1673,7 @@ pub mod key {
         STANDBY_WAKE,
         STANDBY_GLOW,
         // The count before the active profile, which must be one of those in use; the profiles' modes after the
-        // port modes, which a config item also holds (for older firmware) and which go to the active profile.
+        // port modes (the active profile's).
         PROFILE_COUNT,
         PROFILE,
         REMEMBER_PROFILE,
@@ -1574,7 +1685,6 @@ pub mod key {
         PROFILE_NAME_BASE + 1,
         PROFILE_NAME_BASE + 2,
         PROFILE_NAME_BASE + 3,
-        HOTKEY_NEXT,
         BT_NAME_BASE,
         BT_NAME_BASE + 1,
         BT_NAME_BASE + 2,
@@ -1609,12 +1719,17 @@ pub mod key {
         PROFILE_ARRANGEMENT_BASE + 2,
         PROFILE_ARRANGEMENT_BASE + 3,
     ];
-    const ALL_LEN: usize = BASE.len() + MAX_ARRANGEMENTS * (1 + MAX_SCREENS);
+    const ALL_LEN: usize = MAX_HOTKEYS + BASE.len() + MAX_ARRANGEMENTS * (1 + MAX_SCREENS);
     const ALL_KEYS: [u16; ALL_LEN] = {
         let mut out = [0u16; ALL_LEN];
         let mut i = 0;
-        while i < BASE.len() {
-            out[i] = BASE[i];
+        // The hotkey list first, where the fixed hotkeys were.
+        while i < MAX_HOTKEYS {
+            out[i] = hotkey(i as u8);
+            i += 1;
+        }
+        while i < MAX_HOTKEYS + BASE.len() {
+            out[i] = BASE[i - MAX_HOTKEYS];
             i += 1;
         }
         let mut a = 0;
@@ -1638,9 +1753,8 @@ pub mod key {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ConfigValue {
-    HotkeyToggle(Hotkey),
-    HotkeyPc1(Hotkey),
-    HotkeyPc2(Hotkey),
+    /// Entry 0–15 of the hotkey list.
+    Hotkey(u8, HotkeyBinding),
     DoubleTapMs(u16),
     LedBrightness(u8),
     ColorPc1(Rgb),
@@ -1664,7 +1778,6 @@ pub enum ConfigValue {
     ProfileModes(u8, [PortMode; 3]),
     ProfileName(u8, ProfileName),
     RememberProfile(bool),
-    HotkeyNext(Hotkey),
     /// Bluetooth host slot 0–3 (slot n = index n−1) and its name (empty = "BT n").
     BtName(u8, ProfileName),
     /// Bluetooth host slot 0–3 and what the module does with it while another target is active.
@@ -1679,18 +1792,17 @@ pub enum ConfigValue {
     /// The stretch at each end of such an edge where the pointer never hops (logical pixels), so a corner stays easy to
     /// hit.
     HopCorner(u16),
-    /// How the host maps the absolute pointer onto its screens (a Bluetooth host's since protocol 9).
+    /// How the host maps the absolute pointer onto its screens.
     HopMapping(Host, Mapping),
-    /// What the host's desktop coordinates count (protocol 8; a Bluetooth host's since 9).
+    /// What the host's desktop coordinates count.
     HopUnits(Host, Units),
-    /// Profile index, and the arrangement screen hop uses in it (None: screen hop is off there). Protocol 9; until 8 a
-    /// switch, whose "on" reads as arrangement 0.
+    /// Profile index, and the arrangement screen hop uses in it (None: screen hop is off there).
     ProfileArrangement(u8, Option<u8>),
     /// Arrangement 0–3, screen slot 0–7.
     Screen(u8, u8, Screen),
-    /// Arrangement 0–3 and its name (protocol 9).
+    /// Arrangement 0–3 and its name.
     ArrangementName(u8, ProfileName),
-    /// Bluetooth host slot 0–3 (slot n = index n−1) and how screen hop moves its pointer (protocol 9).
+    /// Bluetooth host slot 0–3 (slot n = index n−1) and how screen hop moves its pointer.
     BtPointer(u8, BtPointer),
 }
 
@@ -1699,9 +1811,7 @@ pub use crate::link::bt::Policy as BtPolicy;
 impl ConfigValue {
     pub fn key(&self) -> u16 {
         match self {
-            ConfigValue::HotkeyToggle(_) => key::HOTKEY_TOGGLE,
-            ConfigValue::HotkeyPc1(_) => key::HOTKEY_PC1,
-            ConfigValue::HotkeyPc2(_) => key::HOTKEY_PC2,
+            ConfigValue::Hotkey(i, _) => key::hotkey(*i),
             ConfigValue::DoubleTapMs(_) => key::DOUBLE_TAP_MS,
             ConfigValue::LedBrightness(_) => key::LED_BRIGHTNESS,
             ConfigValue::ColorPc1(_) => key::COLOR_PC1,
@@ -1724,7 +1834,6 @@ impl ConfigValue {
             ConfigValue::ProfileCount(_) => key::PROFILE_COUNT,
             ConfigValue::ProfileModes(i, _) => key::PROFILE_MODES_BASE + *i as u16,
             ConfigValue::ProfileName(i, _) => key::PROFILE_NAME_BASE + *i as u16,
-            ConfigValue::HotkeyNext(_) => key::HOTKEY_NEXT,
             ConfigValue::BtName(i, _) => key::BT_NAME_BASE + *i as u16,
             ConfigValue::BtPolicy(i, _) => key::BT_POLICY_BASE + *i as u16,
             ConfigValue::AbsPointer(_) => key::ABS_POINTER,
@@ -1744,10 +1853,9 @@ impl ConfigValue {
     pub fn encode(&self, w: &mut Writer) -> Result<(), WireError> {
         w.u16(self.key())?;
         match *self {
-            ConfigValue::HotkeyToggle(h)
-            | ConfigValue::HotkeyPc1(h)
-            | ConfigValue::HotkeyPc2(h)
-            | ConfigValue::HotkeyNext(h) => {
+            ConfigValue::Hotkey(_, b) => {
+                b.action.encode(w)?;
+                let h = b.hotkey;
                 w.u8(h.kind as u8)?;
                 w.u8(h.modifiers)?;
                 w.u8(h.key)?;
@@ -1806,9 +1914,10 @@ impl ConfigValue {
         let bt_slots = |base: u16| base..base + BT_HOSTS as u16;
         let arrangements = |base: u16| base..base + MAX_ARRANGEMENTS as u16;
         Ok(match k {
-            key::HOTKEY_TOGGLE => ConfigValue::HotkeyToggle(hotkey(r)?),
-            key::HOTKEY_PC1 => ConfigValue::HotkeyPc1(hotkey(r)?),
-            key::HOTKEY_PC2 => ConfigValue::HotkeyPc2(hotkey(r)?),
+            k if let Some(i) = key::hotkey_of(k) => {
+                let action = HotkeyAction::decode(r)?;
+                ConfigValue::Hotkey(i, HotkeyBinding { action, hotkey: hotkey(r)? })
+            }
             key::DOUBLE_TAP_MS => ConfigValue::DoubleTapMs(r.u16()?),
             key::LED_BRIGHTNESS => ConfigValue::LedBrightness(r.u8()?),
             key::COLOR_PC1 => ConfigValue::ColorPc1(rgb(r)?),
@@ -1853,7 +1962,6 @@ impl ConfigValue {
                     ConfigValue::ProfileName((k - key::PROFILE_NAME_BASE) as u8, ProfileName::new(s))
                 }
             }
-            key::HOTKEY_NEXT => ConfigValue::HotkeyNext(hotkey(r)?),
             k if bt_slots(key::BT_POLICY_BASE).contains(&k) => {
                 ConfigValue::BtPolicy((k - key::BT_POLICY_BASE) as u8, r.u8()?.try_into()?)
             }
@@ -1938,9 +2046,9 @@ pub enum Request {
     /// Learn a hotkey from the next keys pressed on the KVM's keyboards (true), or stop (false); software.md §4.5.
     /// The keys go to neither PC meanwhile, and the result comes as `Event::HotkeyLearned`. Changes no setting.
     LearnHotkey(bool),
-    /// One page of the diagnostics ([`diag`]), from 0; `Response::Diag` says how many pages there are. Protocol 5.
+    /// One page of the diagnostics ([`diag`]), from 0; `Response::Diag` says how many pages there are.
     GetDiag(u8),
-    /// The state of Bluetooth host slot 1–4 (protocol 6): `Response::BtHost`.
+    /// The state of Bluetooth host slot 1–4: `Response::BtHost`.
     GetBtHost(u8),
     /// Open (true) or close Bluetooth pairing; it closes by itself after `BT_PAIR_SECONDS`.
     BtPair(bool),
@@ -1948,10 +2056,10 @@ pub enum Request {
     BtForget(u8),
     /// The passkey a pairing host shows, typed in software instead of on the KVM's keyboard.
     BtPasskey(u32),
-    /// Where the asking PC's own cursor is, in its display arrangement's pixels (protocol 7). With screen hop, the KVM
+    /// Where the asking PC's own cursor is, in its display arrangement's pixels. With screen hop, the KVM
     /// takes it over while it isn't moving the pointer itself: a touchpad or a program moved it.
     PointerAt([i16; 2]),
-    /// The asking PC's host software places its cursor on these screens (protocol 10), for [`PLACE_LEASE_MS`] from
+    /// The asking PC's host software places its cursor on these screens, for [`PLACE_LEASE_MS`] from
     /// now: it asks again before then while it can, and says `Off` when it can't (a screen it may not place on, as
     /// Windows' sign-in screen) or stops. Screen hop then sends it `Event::PlaceCursor` there.
     PlaceCursor(Placement),
@@ -2191,9 +2299,9 @@ pub enum Event {
     HotkeyLearned(LearnEnd, Hotkey),
     /// Bluetooth host slot 1–4 changed (connected, bonded, ...), or 0: pairing opened, closed, or wants a passkey.
     BtChanged(u8),
-    /// Input now goes to Bluetooth host slot 1–4, or 0: back to a PC (then `Switched` follows). Protocol 6.
+    /// Input now goes to Bluetooth host slot 1–4, or 0: back to a PC (then `Switched` follows).
     BtActive(u8),
-    /// Put the cursor here, in this PC's own pixels (protocol 10): only to a PC whose host software asked for it
+    /// Put the cursor here, in this PC's own pixels: only to a PC whose host software asked for it
     /// (`Request::PlaceCursor`), at most once a millisecond, the latest position.
     PlaceCursor([i16; 2]),
 }
@@ -2418,8 +2526,7 @@ impl DeviceMsg {
                 hw: r.u32()?,
                 serial: r.array()?,
                 caps: r.u16()?,
-                // Protocol 6; the report is zero-padded.
-                bt_fw: if r.remaining() >= 4 { r.u32()? } else { 0 },
+                bt_fw: r.u32()?,
             }),
             req::GET_STATUS => {
                 let mut st = Status {
@@ -2438,17 +2545,12 @@ impl DeviceMsg {
                     uptime_s: r.u32()?,
                     link_errors: [r.u16()?, r.u16()?],
                     selftest: r.u16()? as u32,
-                    // Protocol 6; the report is zero-padded, so older firmware reads as "no Bluetooth".
-                    bt_active: if r.remaining() > 0 { r.u8()? } else { 0 },
-                    bt_ready: if r.remaining() > 0 { r.u8()? } else { 0 },
-                    bt_bonded: if r.remaining() > 0 { r.u8()? } else { 0 },
-                    bt_pairing: if r.remaining() > 0 { r.u8()? } else { 0 },
-                    bt_passkey: if r.remaining() > 0 { r.u8()? } else { 0 },
-                    bt_module: if r.remaining() > 0 {
-                        diag::BtModule::from_u8(r.u8()?).unwrap_or(diag::BtModule::Absent)
-                    } else {
-                        diag::BtModule::Absent
-                    },
+                    bt_active: r.u8()?,
+                    bt_ready: r.u8()?,
+                    bt_bonded: r.u8()?,
+                    bt_pairing: r.u8()?,
+                    bt_passkey: r.u8()?,
+                    bt_module: diag::BtModule::from_u8(r.u8()?).ok_or(WireError::Invalid)?,
                     hop: HopState::Off,
                     pointer: [0, 0],
                     bt_passkey_digits: 0,
@@ -2458,26 +2560,16 @@ impl DeviceMsg {
                     supply_lowest_mv: 0,
                     declared_ma: 0,
                 };
-                if r.remaining() >= 2 {
-                    st.selftest |= (r.u16()? as u32) << 16;
-                }
-                // Protocol 7.
-                if r.remaining() >= 5 {
-                    st.hop = HopState::from_u8(r.u8()?).unwrap_or(HopState::Off);
-                    st.pointer = [r.u16()? as i16, r.u16()? as i16];
-                }
-                // Protocol 9.
-                if r.remaining() >= 5 {
-                    st.bt_passkey_digits = r.u8()?;
-                    st.bt_passkey_typed = r.u32()?;
-                }
-                // Protocol 10: zero from older firmware, which reads as `Unknown`.
-                if r.remaining() >= 7 {
-                    st.supply = Supply::from_u8(r.u8()?).unwrap_or(Supply::Unknown);
-                    st.supply_mv = r.u16()?;
-                    st.supply_lowest_mv = r.u16()?;
-                    st.declared_ma = r.u16()?;
-                }
+                // The self-test's bits 16–31, then screen hop, the passkey typed and the supply.
+                st.selftest |= (r.u16()? as u32) << 16;
+                st.hop = HopState::from_u8(r.u8()?).ok_or(WireError::Invalid)?;
+                st.pointer = [r.u16()? as i16, r.u16()? as i16];
+                st.bt_passkey_digits = r.u8()?;
+                st.bt_passkey_typed = r.u32()?;
+                st.supply = Supply::from_u8(r.u8()?).ok_or(WireError::Invalid)?;
+                st.supply_mv = r.u16()?;
+                st.supply_lowest_mv = r.u16()?;
+                st.declared_ma = r.u16()?;
                 Response::Status(st)
             }
             req::GET_PORT => Response::Port(PortInfo {
@@ -2552,7 +2644,7 @@ mod tests {
             ConfigValue::Screen(0, 3, s).encode(&mut w).unwrap();
             w.finish().to_vec()
         };
-        // A slot stored before protocol 8 has neither, at protocol 8's key for slot 3.
+        // Neither flag: the host alone, at arrangement 0's key for slot 3.
         let plain = enc(s);
         assert_eq!((u16::from_le_bytes([plain[0], plain[1]]), plain[2]), (0x00B3, 1));
         assert_eq!(enc(Screen { off: true, ..s })[2], 0x81);
@@ -2562,14 +2654,14 @@ mod tests {
             ConfigValue::decode(&mut Reader::new(&both)),
             Ok(ConfigValue::Screen(0, 3, Screen { off: true, fixed: true, ..s }))
         );
-        // A Bluetooth host's screen, with both flags (protocol 9).
+        // A Bluetooth host's screen, with both flags.
         let bt = Screen { host: Some(Host::Bt3), off: true, fixed: true, ..s };
         assert_eq!(enc(bt)[2], 0x13 | 0x80 | 0x40);
         assert_eq!(ConfigValue::decode(&mut Reader::new(&enc(bt))), Ok(ConfigValue::Screen(0, 3, bt)));
     }
 
     #[test]
-    fn arrangement_keys_follow_protocol_8s_one_arrangement() {
+    fn arrangement_keys() {
         assert_eq!(key::screen(0, 0), 0x00B0);
         assert_eq!(key::screen(3, 7), 0x00CF);
         assert_eq!(key::arrangement_of(0x00B7), Some(0));
@@ -2581,9 +2673,9 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), key::ALL.len());
-        // Protocol 8's switch: off is no arrangement, on is arrangement 0.
+        // A profile's arrangement: 0 none, n + 1 arrangement n.
         let k = key::PROFILE_ARRANGEMENT_BASE + 2;
-        for (stored, want) in [(0u8, None), (1, Some(0))] {
+        for (stored, want) in [(0u8, None), (1, Some(0)), (4, Some(3))] {
             let raw = [k as u8, (k >> 8) as u8, stored];
             assert_eq!(ConfigValue::decode(&mut Reader::new(&raw)), Ok(ConfigValue::ProfileArrangement(2, want)));
         }
@@ -2596,6 +2688,24 @@ mod tests {
     }
 
     #[test]
+    fn hotkey_actions_roundtrip_by_wire_and_by_name() {
+        for a in HotkeyAction::ALL {
+            let mut buf = [0u8; 2];
+            let mut w = Writer::new(&mut buf);
+            a.encode(&mut w).unwrap();
+            assert_eq!(HotkeyAction::decode(&mut Reader::new(&buf)), Ok(a), "{a:?}");
+            assert_eq!(HotkeyAction::from_name(a.name()), Some(a));
+        }
+        assert_eq!(HotkeyAction::from_name("pc2"), None);
+        // A profile past the last, or a host that isn't one, does not decode.
+        assert_eq!(HotkeyAction::decode(&mut Reader::new(&[7, 4])), Err(WireError::Invalid));
+        assert!(HotkeyAction::decode(&mut Reader::new(&[4, 3])).is_err());
+        // The list's keys, first in `ALL`.
+        assert_eq!(key::ALL[..MAX_HOTKEYS], core::array::from_fn::<u16, MAX_HOTKEYS, _>(|i| 0x00F0 + i as u16));
+        assert_eq!((key::hotkey_of(0x00FF), key::hotkey_of(0x0100), key::hotkey_of(0x0001)), (Some(15), None, None));
+    }
+
+    #[test]
     fn requests_roundtrip() {
         let reqs = [
             Request::GetInfo,
@@ -2605,7 +2715,11 @@ mod tests {
             Request::SetActive(Target::Toggle),
             Request::SetPortMode(Port::Mouse, PortMode::MirroredIdentity),
             Request::GetConfig(key::COLOR_PC2),
-            Request::SetConfig(ConfigValue::HotkeyToggle(Hotkey::double_tap(0x47, true))),
+            Request::SetConfig(ConfigValue::Hotkey(
+                3,
+                HotkeyBinding::new(HotkeyAction::SelectHost(Host::Bt2), Hotkey::double_tap(0x47, true)),
+            )),
+            Request::SetConfig(ConfigValue::Hotkey(15, HotkeyBinding::NONE)),
             Request::SetConfig(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc2)),
             Request::SetConfig(ConfigValue::ColorPc1(Rgb::new(1, 2, 3))),
             Request::SetConfig(ConfigValue::KeyLong(KeyAction::OtherPortMode)),

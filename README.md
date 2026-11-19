@@ -75,6 +75,10 @@ automatically when their image changed. A board whose firmware doesn't come up t
 pinhole held while plugging in (or `odkvmctl reboot bootloader`), then *Install* on the page's bootloader card, or
 `odkvmctl update` with no KVM on a PC port; or copy `kvm-rp2354.uf2` onto the drive by hand.
 
+The app and the firmware go together: a KVM whose firmware is another version than the app's gets only the update
+(every page says so, the Firmware page installs the firmware that came with the app, and `odkvmctl` refuses every
+command but `update`).
+
 ### Install the host software
 
 `opendyn-kvm` (window and tray icon) and `odkvmctl` (command line) control the KVM from either PC.
@@ -114,11 +118,16 @@ Windows needs no drivers.
 - **Switch PCs:** tap the key on the KVM, double-tap Scroll Lock (the default hotkey, invisible to both PCs), or
   `odkvmctl switch pc1|pc2|toggle`. Keys held during a switch are released on the old PC and stay hidden on the new one
   until you let go.
-- **Hotkeys:** `odkvmctl hotkey toggle double:scrolllock`, `odkvmctl hotkey pc1 ctrl+alt+1`, `none` to clear. Or
-  press it instead of typing it: `odkvmctl hotkey pc1 learn`, or **Learn** on the GUI's Keyboard page, then the hotkey
-  on the KVM's keyboard within 10 s. The KVM itself reads the keys, so it learns exactly what it will recognise, and
-  they reach neither PC meanwhile (Alt+F4 closes nothing). It works from the active PC, with a keyboard in Auto,
-  Normalized or Mirrored mode; one in Passthrough goes straight to the PC, so no hotkey works on it.
+- **Hotkeys:** a list of up to 16, each an action and its hotkey, on the GUI's Keyboard page (**Add hotkey**, the
+  action, the hotkey, **Apply**; × removes one) or with `odkvmctl hotkey`. Out of the box there is one: double-tap
+  Scroll Lock toggles the PC. Actions: toggle PC, next / previous host (PC1, PC2, then the Bluetooth hosts that are
+  connected), select a host (PC1, PC2, Bluetooth host 1–4), next / previous profile, select a profile, cycle the Other
+  port's mode. On the command line: `odkvmctl hotkey add select-pc1 ctrl+alt+1`, `odkvmctl hotkey` lists them,
+  `odkvmctl hotkey set 2 none`, `odkvmctl hotkey remove 2`. Or press a hotkey instead of typing it: `learn` in place of
+  it, or **Learn** on the Keyboard page, then the hotkey on the KVM's keyboard within 10 s. The KVM itself reads the
+  keys, so it learns exactly what it will recognise, and they reach neither PC meanwhile (Alt+F4 closes nothing). It
+  works from the active PC, with a keyboard in Auto, Normalized or Mirrored mode; one in Passthrough goes straight to
+  the PC, so no hotkey works on it.
 - **Profiles:** a profile sets the mode of all three ports at once. A long press (1 s) on the KVM's key selects the
   next one. The KVM powers up in profile 0, as it loses power only when both PCs are off; `odkvmctl config set
   remember-profile on` makes it power up in the profile last active. Out of the box, profile 0 *work* runs every port

@@ -6,7 +6,7 @@
 //!
 //! | Item | Key | Contents |
 //! |---|---|---|
-//! | settings | 0x0100 | version 1, then [`Settings`] as [`Settings::encode`] lays it out (13 bytes before the dynamic entries, 47 since) |
+//! | settings | 0x0100 | version 1, then [`Settings`] as [`Settings::encode`] lays it out ([`SETTINGS_LEN`] bytes) |
 //! | macros | 0x0101 | the macro buffer up to its last used byte |
 //! | tap dances | 0x0102 | version 1, then [`TAP_DANCES`] × 10 bytes |
 //! | combos | 0x0103 | version 1, then [`COMBOS`] × 10 bytes |
@@ -270,7 +270,6 @@ impl Settings {
         b[8] = flags;
         b[9..11].copy_from_slice(&self.oneshot_timeout_ms.to_le_bytes());
         b[11..13].copy_from_slice(&self.tap_code_delay_ms.to_le_bytes());
-        // Appended with the dynamic entries; a shorter item from before reads with the defaults here.
         b[13] = self.grave_esc_override;
         b[14..16].copy_from_slice(&self.combo_term_ms.to_le_bytes());
         b[16] = self.auto_shift;
@@ -290,7 +289,7 @@ impl Settings {
     }
 
     fn decode(d: &[u8]) -> Option<Settings> {
-        if d.len() < 13 || d[0] != VERSION {
+        if d.len() != SETTINGS_LEN || d[0] != VERSION {
             return None;
         }
         let u16_at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
@@ -306,25 +305,23 @@ impl Settings {
             tap_code_delay_ms: u16_at(11).min(1000),
             ..Settings::DEFAULT
         };
-        if d.len() >= SETTINGS_LEN {
-            // Through `set`, so a damaged value is kept within its limits like one from Vial.
-            let mut set = |q: u16, b: &[u8]| {
-                s.set(q, b);
-            };
-            set(qsid::GRAVE_ESC_OVERRIDE, &d[13..14]);
-            set(qsid::COMBO_TERM, &d[14..16]);
-            set(qsid::AUTO_SHIFT, &d[16..17]);
-            set(qsid::AUTO_SHIFT_TIMEOUT, &d[17..19]);
-            set(qsid::ONESHOT_TAP_TOGGLE, &d[19..20]);
-            for n in 0..9 {
-                set(qsid::MOUSE_FIRST + n as u16, &d[20 + 2 * n..22 + 2 * n]);
-            }
-            set(qsid::TAP_HOLD_CAPS_DELAY, &d[38..40]);
-            set(qsid::TAPPING_TOGGLE, &d[40..41]);
-            set(qsid::MAGIC, &d[41..43]);
-            set(qsid::QUICK_TAP_TERM, &d[43..45]);
-            set(qsid::FLOW_TAP_TERM, &d[45..47]);
+        // Through `set`, so a damaged value is kept within its limits like one from Vial.
+        let mut set = |q: u16, b: &[u8]| {
+            s.set(q, b);
+        };
+        set(qsid::GRAVE_ESC_OVERRIDE, &d[13..14]);
+        set(qsid::COMBO_TERM, &d[14..16]);
+        set(qsid::AUTO_SHIFT, &d[16..17]);
+        set(qsid::AUTO_SHIFT_TIMEOUT, &d[17..19]);
+        set(qsid::ONESHOT_TAP_TOGGLE, &d[19..20]);
+        for n in 0..9 {
+            set(qsid::MOUSE_FIRST + n as u16, &d[20 + 2 * n..22 + 2 * n]);
         }
+        set(qsid::TAP_HOLD_CAPS_DELAY, &d[38..40]);
+        set(qsid::TAPPING_TOGGLE, &d[40..41]);
+        set(qsid::MAGIC, &d[41..43]);
+        set(qsid::QUICK_TAP_TERM, &d[43..45]);
+        set(qsid::FLOW_TAP_TERM, &d[45..47]);
         Some(s)
     }
 }
@@ -798,20 +795,6 @@ mod tests {
         assert_eq!(copy.alt_repeats()[31].alt_keycode, 0x0119);
         assert!(!copy.is_identity() && !copy.is_dirty());
         assert!(!k.is_dirty());
-    }
-
-    #[test]
-    fn settings_from_before_the_dynamic_entries_keep_the_new_defaults() {
-        // A settings item from before the dynamic entries: 13 bytes, tapping term 150, permissive hold.
-        let old = [1, 0, 0, 0, 0, 0, 150, 0, 1, 0, 0, 0, 0];
-        let mut k = Keymap::new();
-        k.restore(item::SETTINGS, &old);
-        assert_eq!(k.settings.tapping_term_ms, 150);
-        assert!(k.settings.permissive_hold);
-        assert_eq!(
-            (k.settings.combo_term_ms, k.settings.mouse, k.settings.tapping_toggle),
-            (50, MouseKeys::DEFAULT, 5)
-        );
     }
 
     #[test]

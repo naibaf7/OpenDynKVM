@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use kvm_core::hop::main_screen;
 use kvm_core::hotkey::format_spec;
 use kvm_proto::ctrl::{
-    ConfigValue, ErrorCode, Event, FwState, Host, LearnEnd, MAX_ARRANGEMENTS, MAX_PROFILES, Mapping, Pc, Port,
-    PortMode, RebootTarget, Target, diag, key, selftest, status_flags,
+    ConfigValue, ErrorCode, Event, FwState, Host, Hotkey, HotkeyAction, HotkeyBinding, LearnEnd, MAX_ARRANGEMENTS,
+    MAX_HOTKEYS, MAX_PROFILES, Mapping, Pc, Port, PortMode, RebootTarget, Target, diag, key, selftest, status_flags,
 };
 use odkvmctl::bootsel::{self, Board};
 use odkvmctl::client::{BtHostView, HopView, ProfileView, Snapshot};
@@ -42,8 +42,8 @@ enum Cmd {
         #[arg(value_enum)]
         target: TargetArg,
     },
-    /// The wireless hosts (the Bluetooth module); `bt` is its former name.
-    #[command(about = fl!("cli-wireless"), alias = "bt")]
+    /// The wireless hosts (the Bluetooth module).
+    #[command(about = fl!("cli-wireless"))]
     Wireless {
         #[command(subcommand)]
         action: Option<HostAction>,
@@ -65,9 +65,8 @@ enum Cmd {
     },
     #[command(about = fl!("cli-hotkey"))]
     Hotkey {
-        #[arg(value_enum)]
-        which: HotkeyArg,
-        spec: Option<String>,
+        #[command(subcommand)]
+        action: Option<HotkeyCmd>,
     },
     #[command(about = fl!("cli-config"))]
     Config {
@@ -166,14 +165,10 @@ enum TargetArg {
     Toggle,
     #[value(help = fl!("cli-target-next"))]
     Next,
-    // The wireless hosts' slots; bt1–bt4 are their former names.
-    #[value(alias = "bt1")]
+    // The wireless hosts' slots.
     Host1,
-    #[value(alias = "bt2")]
     Host2,
-    #[value(alias = "bt3")]
     Host3,
-    #[value(alias = "bt4")]
     Host4,
 }
 
@@ -187,13 +182,31 @@ enum PortArg {
     Other,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum HotkeyArg {
-    Toggle,
-    Pc1,
-    Pc2,
-    #[value(help = fl!("cli-target-next"))]
-    Next,
+#[derive(Subcommand)]
+enum HotkeyCmd {
+    #[command(about = fl!("cli-hotkey-list"))]
+    List,
+    #[command(about = fl!("cli-hotkey-add"))]
+    Add {
+        #[arg(help = fl!("cli-hotkey-action"))]
+        action: String,
+        #[arg(help = fl!("cli-hotkey-spec"))]
+        hotkey: String,
+    },
+    #[command(about = fl!("cli-hotkey-set"))]
+    Set {
+        #[arg(help = fl!("cli-hotkey-entry"))]
+        entry: u8,
+        #[arg(help = fl!("cli-hotkey-spec"))]
+        hotkey: String,
+        #[arg(long, help = fl!("cli-hotkey-new-action"))]
+        action: Option<String>,
+    },
+    #[command(about = fl!("cli-hotkey-remove"))]
+    Remove {
+        #[arg(help = fl!("cli-hotkey-entry"))]
+        entry: u8,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -204,7 +217,7 @@ enum RebootArg {
     At32Dfu2,
     #[value(help = fl!("cli-reboot-at32-retry"))]
     At32Retry,
-    #[value(help = fl!("cli-reboot-wireless-retry"), alias = "bt-retry")]
+    #[value(help = fl!("cli-reboot-wireless-retry"))]
     WirelessRetry,
 }
 
@@ -319,9 +332,7 @@ fn print_status(c: &Client, s: &Snapshot) {
         power += &format!("  ({short})");
     }
     println!("{}", fl!("cli-power", power = power));
-    if s.has_hop() {
-        println!("{}", fl!("hop-line", state = names::hop_state(st.hop)));
-    }
+    println!("{}", fl!("hop-line", state = names::hop_state(st.hop)));
     println!("{}", fl!("cli-selftest", result = names::selftest(st.selftest)));
     if st.selftest & (selftest::AT32_GAVE_UP1 | selftest::AT32_GAVE_UP2) != 0 {
         println!("  {}", fl!("cli-try-again", command = "odkvmctl reboot at32-retry"));
@@ -369,10 +380,7 @@ fn find_arrangement(which: &str, hop: &HopView) -> Result<u8> {
 /// Screen hop: what it does now, the arrangements (those with screens or a profile using them, or `only`), slot by slot,
 /// each host's mapping and the pointer settings.
 fn print_screens(s: &Snapshot, only: Option<u8>) {
-    let Some(hop) = s.hop() else {
-        println!("{}", fl!("hop-firmware-too-old"));
-        return;
-    };
+    let hop = s.hop();
     println!("{}", fl!("hop-line", state = names::hop_state(s.status.hop)));
     let profiles: Vec<ProfileView> =
         s.profiles().map(|(_, count, list)| list.into_iter().take(count as usize).collect()).unwrap_or_default();
@@ -427,7 +435,8 @@ fn print_screens(s: &Snapshot, only: Option<u8>) {
 /// Whether the KVM's copies of this computer's screens and units are what its display settings say (only when the KVM
 /// says which PC this is): a warning naming the arrangements that are not.
 fn check_screens(s: &Snapshot) {
-    let (Some(hop), Some(pc)) = (s.hop(), s.this_pc()) else { return };
+    let Some(pc) = s.this_pc() else { return };
+    let hop = s.hop();
     let host = Host::pc(pc);
     // The simulator's screens aren't this computer's.
     if hop.simulated {
@@ -476,16 +485,15 @@ fn print_hosts(s: &Snapshot) {
     }
 }
 
-fn print_profiles(active: u8, count: u8, list: &[ProfileView], hop: Option<&HopView>) {
+fn print_profiles(active: u8, count: u8, list: &[ProfileView], hop: &HopView) {
     for (i, p) in list.iter().enumerate().take(count as usize) {
         let mark = if i == active as usize { '*' } else { ' ' };
         let modes: Vec<String> =
             Port::ALL.iter().map(|port| format!("{} {}", port.name(), p.modes[port.index()].name())).collect();
-        // Screen hop: the arrangement the profile uses, where the firmware has it.
-        let hop = match (hop, p.arrangement) {
-            (None, _) => String::new(),
-            (Some(_), None) => format!("; {}", fl!("cli-profile-no-hop")),
-            (Some(h), Some(a)) => format!("; {}", fl!("cli-profile-hop", name = h.arrangements[a as usize].title(a))),
+        // Screen hop: the arrangement the profile uses.
+        let hop = match p.arrangement {
+            None => format!("; {}", fl!("cli-profile-no-hop")),
+            Some(a) => format!("; {}", fl!("cli-profile-hop", name = hop.arrangements[a as usize].title(a))),
         };
         println!("{mark} {i}  {:<12}  {}{hop}", p.name, modes.join(", "));
     }
@@ -510,9 +518,46 @@ fn find_profile(which: &str, list: &[ProfileView]) -> Result<u8> {
     }
 }
 
-/// Learns the hotkey for setting `k` from the KVM's keyboard; on a terminal, asks before it is used. None: not used.
-fn learn_hotkey(c: &mut Client, k: u16) -> Result<Option<ConfigValue>> {
+/// The hotkey list as the KVM has it, entry by entry.
+fn hotkey_list(c: &mut Client) -> Result<Vec<HotkeyBinding>> {
+    (0..MAX_HOTKEYS as u8)
+        .map(|i| match c.get_config(key::hotkey(i))? {
+            ConfigValue::Hotkey(_, b) => Ok(b),
+            v => bail!("{v:?}"),
+        })
+        .collect()
+}
+
+/// The entry `n` (1–16) names, as an index.
+fn hotkey_entry(n: u8) -> Result<u8> {
+    match n {
+        1..=16 => Ok(n - 1),
+        _ => bail!(fl!("cli-hotkey-no-entry", n = n, max = MAX_HOTKEYS)),
+    }
+}
+
+/// Prints entry `i` of the list as `hotkey list` does.
+fn print_hotkey(i: u8, b: &HotkeyBinding) {
+    println!("{:>2}  {:<16} {}", i + 1, b.action.name(), format_spec(&b.hotkey));
+}
+
+/// The hotkey for entry `i` (doing `action`): learned from the KVM's keyboard when `spec` is `learn`, else read from
+/// it. Learning warns of a plain key or one another entry has, and on a terminal asks before it is used (None: not
+/// used).
+fn hotkey_for(
+    c: &mut Client,
+    list: &[HotkeyBinding],
+    i: u8,
+    action: HotkeyAction,
+    spec: &str,
+) -> Result<Option<Hotkey>> {
     use std::io::IsTerminal as _;
+    if spec != "learn" {
+        return Ok(Some(
+            kvm_core::hotkey::parse_spec(spec)
+                .map_err(|e| anyhow::anyhow!(fl!("parse-hotkey", value = spec, error = format!("{e:?}"))))?,
+        ));
+    }
     if c.simulated_keyboard().is_some() {
         bail!(fl!("cli-learn-sim"));
     }
@@ -520,39 +565,25 @@ fn learn_hotkey(c: &mut Client, k: u16) -> Result<Option<ConfigValue>> {
         let seconds: u32 = kvm_core::engine::LEARN_MS / 1000;
         eprintln!("{}", fl!("cli-learn-press", seconds = seconds))
     });
-    let (end, h) = match learned {
-        Err(odkvmctl::Error::Device(ErrorCode::Malformed)) => {
-            bail!(fl!("cli-learn-unsupported"))
-        }
-        r => r?,
-    };
+    let (end, h) = learned?;
     if end != LearnEnd::Learned {
         bail!(fl!("cli-nothing-changed-why", why = names::learn_end(end)));
     }
-    let v = names::parse_value(k, &format_spec(&h)).map_err(anyhow::Error::msg)?;
     eprintln!("{}", fl!("ev-hotkey-learned", hotkey = format_spec(&h).to_string()));
-    let others: Vec<(&str, kvm_proto::ctrl::Hotkey)> =
-        [key::HOTKEY_TOGGLE, key::HOTKEY_PC1, key::HOTKEY_PC2, key::HOTKEY_NEXT]
-            .into_iter()
-            .filter(|o| *o != k)
-            .filter_map(|o| match c.get_config(o) {
-                Ok(
-                    ConfigValue::HotkeyToggle(h)
-                    | ConfigValue::HotkeyPc1(h)
-                    | ConfigValue::HotkeyPc2(h)
-                    | ConfigValue::HotkeyNext(h),
-                ) => Some((names::config_name(o), h)),
-                _ => None,
-            })
-            .collect();
+    let others: Vec<(&str, Hotkey)> = list
+        .iter()
+        .enumerate()
+        .filter(|(j, b)| *j != i as usize && b.is_used())
+        .map(|(_, b)| (b.action.name(), b.hotkey))
+        .collect();
     if let Some(w) = names::hotkey_warning(&h, &others) {
         eprintln!("{w}");
     }
     if !std::io::stdin().is_terminal() {
-        return Ok(Some(v));
+        return Ok(Some(h));
     }
-    eprint!("{} ", fl!("cli-use-it-for", name = names::config_name(k)));
-    Ok(yes()?.then_some(v))
+    eprint!("{} ", fl!("cli-use-it-for", name = action.name()));
+    Ok(yes()?.then_some(h))
 }
 
 /// Asks before a software lock goes on; without a terminal to ask on (a script), the warning alone.
@@ -761,6 +792,8 @@ fn main() -> Result<()> {
         return update(cli.sim, file.clone());
     }
     let mut c = Client::connect(cli.sim).context(fl!("cli-connecting"))?;
+    // Every command but `update` needs firmware that speaks this program's protocol.
+    c.info_checked()?;
 
     match cli.cmd.unwrap_or(Cmd::Status) {
         Cmd::Status => {
@@ -770,7 +803,7 @@ fn main() -> Result<()> {
         Cmd::List | Cmd::Display { .. } | Cmd::Update { .. } => unreachable!(),
         Cmd::Screens { arrangement, action } => {
             let s = c.snapshot()?;
-            let Some(hop) = s.hop() else { bail!(fl!("hop-firmware-too-old")) };
+            let hop = s.hop();
             let named = arrangement.as_deref().map(|w| find_arrangement(w, &hop)).transpose()?;
             match action {
                 Some(ScreensAction::Detect) => {
@@ -804,12 +837,7 @@ fn main() -> Result<()> {
             check_screens(&s);
         }
         Cmd::Diag => {
-            let items = match c.diag() {
-                Err(odkvmctl::Error::Device(ErrorCode::Malformed)) => {
-                    bail!(fl!("no-diagnostics"))
-                }
-                r => r?,
-            };
+            let items = c.diag()?;
             if print_diag(&items) {
                 std::process::exit(1);
             }
@@ -927,9 +955,9 @@ fn main() -> Result<()> {
                     let v = if setting == "name" {
                         ConfigValue::ProfileName(i, names::parse_profile_name(&value).map_err(anyhow::Error::msg)?)
                     } else if setting == "arrangement" {
-                        let Some(hop) = s.hop() else { bail!(fl!("hop-firmware-too-old")) };
+                        let hop = s.hop();
                         let a = match value.as_str() {
-                            "none" | "off" => None,
+                            "none" => None,
                             v => Some(find_arrangement(v, &hop)?),
                         };
                         ConfigValue::ProfileArrangement(i, a)
@@ -950,27 +978,57 @@ fn main() -> Result<()> {
             }
             let s = c.snapshot()?;
             let (active, count, list) = s.profiles().context("profiles")?;
-            print_profiles(active, count, &list, s.hop().as_ref());
+            print_profiles(active, count, &list, &s.hop());
         }
-        Cmd::Hotkey { which, spec } => {
-            let k = match which {
-                HotkeyArg::Toggle => key::HOTKEY_TOGGLE,
-                HotkeyArg::Pc1 => key::HOTKEY_PC1,
-                HotkeyArg::Pc2 => key::HOTKEY_PC2,
-                HotkeyArg::Next => key::HOTKEY_NEXT,
-            };
-            let v = match spec.as_deref() {
-                Some("learn") => match learn_hotkey(&mut c, k)? {
-                    Some(v) => c.set_config(v)?,
-                    None => {
-                        eprintln!("{}", fl!("cli-nothing-changed"));
-                        return Ok(());
+        Cmd::Hotkey { action } => {
+            let list = hotkey_list(&mut c)?;
+            let (i, binding) = match action.unwrap_or(HotkeyCmd::List) {
+                HotkeyCmd::List => {
+                    let used: Vec<_> = list.iter().enumerate().filter(|(_, b)| b.is_used()).collect();
+                    if used.is_empty() {
+                        println!("{}", fl!("cli-hotkeys-none"));
                     }
-                },
-                Some(s) => c.set_config(names::parse_value(k, s).map_err(anyhow::Error::msg)?)?,
-                None => c.get_config(k)?,
+                    for (i, b) in used {
+                        print_hotkey(i as u8, b);
+                    }
+                    return Ok(());
+                }
+                HotkeyCmd::Add { action, hotkey } => {
+                    let action = names::parse_action(&action).map_err(anyhow::Error::msg)?;
+                    // After the last entry in use, else in the first free one.
+                    let after = list.iter().rposition(HotkeyBinding::is_used).map_or(0, |j| j + 1);
+                    let free = (after..MAX_HOTKEYS).chain(0..after).find(|j| !list[*j].is_used());
+                    let Some(i) = free.map(|j| j as u8) else { bail!(fl!("cli-hotkeys-full", max = MAX_HOTKEYS)) };
+                    match hotkey_for(&mut c, &list, i, action, &hotkey)? {
+                        Some(h) => (i, HotkeyBinding::new(action, h)),
+                        None => {
+                            eprintln!("{}", fl!("cli-nothing-changed"));
+                            return Ok(());
+                        }
+                    }
+                }
+                HotkeyCmd::Set { entry, hotkey, action } => {
+                    let i = hotkey_entry(entry)?;
+                    let action = match action {
+                        Some(a) => names::parse_action(&a).map_err(anyhow::Error::msg)?,
+                        None if list[i as usize].is_used() => list[i as usize].action,
+                        None => bail!(fl!("cli-hotkey-unused", n = entry)),
+                    };
+                    match hotkey_for(&mut c, &list, i, action, &hotkey)? {
+                        Some(h) => (i, HotkeyBinding::new(action, h)),
+                        None => {
+                            eprintln!("{}", fl!("cli-nothing-changed"));
+                            return Ok(());
+                        }
+                    }
+                }
+                HotkeyCmd::Remove { entry } => (hotkey_entry(entry)?, HotkeyBinding::NONE),
             };
-            println!("{} = {}", names::config_name(k), names::format_value(&v));
+            let n: u32 = i as u32 + 1;
+            match c.set_config(ConfigValue::Hotkey(i, binding))? {
+                ConfigValue::Hotkey(i, b) if b.is_used() => print_hotkey(i, &b),
+                _ => println!("{}", fl!("cli-hotkey-removed", n = n)),
+            }
         }
         Cmd::Config { action } => match action {
             ConfigAction::Get { name: None } => {
