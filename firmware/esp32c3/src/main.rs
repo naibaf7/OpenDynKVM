@@ -4,12 +4,15 @@
 //! The module is a Bluetooth LE keyboard and mouse towards up to four bonded hosts (PCs, tablets, phones), all
 //! connected at once. The RP2354B decides which host gets input and sends it the reports over UART0
 //! ([`kvm_proto::link::bt`]); this firmware only keeps the hosts: advertising, pairing (LE Secure Connections,
-//! passkey typed on the KVM's keyboard), bonds in flash, HID over GATT, and the keyboard LEDs back.
+//! passkey typed on the KVM's keyboard), bonds in flash, HID over GATT, and the keyboard LEDs back. At the same time it
+//! is the central of up to four Bluetooth devices (keyboards, mice), whose reports it passes to the RP2354B.
 //!
 //! - [`link`]: UART0 (RXD0/IO20, TXD0/IO21: the ROM bootloader's pins, which the RP2354B also programs it through), the
 //!   AT32F405 links' frames and ARQ, the module answering each frame the RP2354B sends.
 //! - [`ble`]: the trouble-host stack on esp-radio's controller.
-//! - [`bonds`]: the four host slots in the last two sectors of the flash, which the RP2354B's image never reaches.
+//! - [`devices`]: the Bluetooth devices: looking for them, pairing, reconnecting, their reports.
+//! - [`bonds`]: the four host slots in the last two sectors of the flash, the four device slots in the two before,
+//!   which the RP2354B's image never reaches.
 //!
 //! IO9 (the BOOT strap) is on the RP2354B's TX line: it is never driven here. IO3 carries a plain-text log (UART1 TX,
 //! 115200) to the board's test pad TP1601.
@@ -21,6 +24,7 @@ extern crate alloc;
 
 mod ble;
 mod bonds;
+mod devices;
 mod link;
 mod log;
 
@@ -71,8 +75,8 @@ async fn watchdog(mut wdt: Wdt<esp_hal::peripherals::TIMG0<'static>>) {
 async fn main(spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let p = esp_hal::init(config);
-    // The Bluetooth controller's own memory (esp-radio allocates it).
-    esp_alloc::heap_allocator!(size: 72 * 1024);
+    // The Bluetooth controller's own memory (esp-radio allocates it), for ten activities at once.
+    esp_alloc::heap_allocator!(size: 96 * 1024);
     let timg0 = TimerGroup::new(p.TIMG0);
     let mut wdt = timg0.wdt;
     esp_rtos::start(timg0.timer0, p.FROM_CPU_INTR0);
@@ -93,6 +97,10 @@ async fn main(spawner: Spawner) {
     let lines = link::Lines { uart: p.UART0, rx: p.GPIO20, tx: p.GPIO21, usb: p.USB_DEVICE, log: p.UART1, log_pin: p.GPIO3 };
     link_spawner.spawn(link::run(lines).expect("link task"));
 
+    // Two handles on the flash, used one at a time on the Bluetooth side's executor: the hosts' sectors and the
+    // devices'.
+    let device_flash = unsafe { p.FLASH.clone_unchecked() };
     let bonds = bonds::Bonds::load(esp_storage::FlashStorage::new(p.FLASH));
-    ble::run(spawner, p.BT, bonds).await
+    let device_bonds = bonds::DeviceBonds::load(esp_storage::FlashStorage::new(device_flash));
+    ble::run(spawner, p.BT, bonds, device_bonds).await
 }

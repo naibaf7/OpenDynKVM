@@ -24,7 +24,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, Frame, Margin, RichText};
-use kvm_proto::ctrl::{ConfigValue, MAX_PROFILES, Pc, Port, Rgb, Target, caps, status_flags};
+use kvm_proto::ctrl::{ConfigValue, Device, MAX_PROFILES, Pc, Rgb, Target, caps, status_flags};
 use odkvmctl::client::Snapshot;
 use odkvmctl::local::{self, Local};
 use odkvmctl::{autostart, fl, icon};
@@ -122,6 +122,8 @@ struct App {
     /// Profile names as typed, and the one being edited (the others follow the KVM).
     profile_names: [String; MAX_PROFILES],
     profile_editing: Option<usize>,
+    /// The profile the Ports page shows (None: the active one).
+    profile_tab: Option<usize>,
     /// A software lock waiting for "are you sure" before it is sent.
     confirm_lock: Option<ConfigValue>,
     /// Allowing software control again: since when the KVM waits for its key, and the status flag that says it's done.
@@ -177,24 +179,36 @@ pub(crate) fn optimistic(shared: &Mutex<Shared>, v: ConfigValue) {
     let Some(s) = sh.snap.as_mut() else { return };
     put(&mut s.config, v);
     let Some((active, count, list)) = s.profiles() else {
-        if let ConfigValue::PortMode(p, m) = v {
+        if let ConfigValue::Mode(d, m) = v
+            && let Some(p) = d.port()
+        {
             s.ports[p.index()].mode = m;
         }
         return;
     };
-    // The port modes are the active profile's.
-    let mut modes = list[active as usize].modes;
-    if let ConfigValue::PortMode(p, m) = v {
-        modes[p.index()] = m;
-        put(&mut s.config, ConfigValue::ProfileModes(active, modes));
+    // The modes and routings in force are the active profile's.
+    let (mut modes, mut routes) = (list[active as usize].modes, list[active as usize].routes);
+    match v {
+        ConfigValue::Mode(d, m) => {
+            modes[d.index()] = m;
+            put(&mut s.config, ConfigValue::ProfileModes(active, modes));
+        }
+        ConfigValue::Route(d, r) => {
+            routes[d.index()] = r;
+            put(&mut s.config, ConfigValue::ProfileRoutes(active, routes));
+        }
+        _ => {}
     }
     if active >= count {
         put(&mut s.config, ConfigValue::Profile(0));
-        modes = list[0].modes;
+        (modes, routes) = (list[0].modes, list[0].routes);
     }
-    for p in Port::ALL {
-        s.ports[p.index()].mode = modes[p.index()];
-        put(&mut s.config, ConfigValue::PortMode(*p, modes[p.index()]));
+    for d in Device::ALL {
+        if let Some(p) = d.port() {
+            s.ports[p.index()].mode = modes[d.index()];
+        }
+        put(&mut s.config, ConfigValue::Mode(*d, modes[d.index()]));
+        put(&mut s.config, ConfigValue::Route(*d, routes[d.index()]));
     }
 }
 
@@ -247,6 +261,7 @@ impl App {
             sim_keys: None,
             profile_names: Default::default(),
             profile_editing: None,
+            profile_tab: None,
             confirm_lock: None,
             unlock_wait: None,
             unlock_note: None,
@@ -1267,6 +1282,19 @@ mod tests {
                 shot(&mut app, format!("{theme_name}-bluetooth-pairing.ppm"), h);
                 app.send(UiCmd::BtPair(false));
                 wait("pairing closed", &|s| s.status.bt_pairing == 0);
+                // Looking for devices: two found; then pairing the keyboard among them, which asks for its passkey.
+                app.send(UiCmd::BtScan(true));
+                wait("two devices found", &|s| s.status.bt_scan > 0 && s.found.len() >= 2);
+                shot(&mut app, format!("{theme_name}-bluetooth-devices.ppm"), 1100);
+                let keyboard = shared.lock().unwrap().snap.as_ref().and_then(|s| {
+                    s.found.iter().find(|f| f.appearance == kvm_proto::link::bt::appearance::KEYBOARD).map(|f| f.addr)
+                });
+                app.send(UiCmd::BtPairDevice(keyboard.expect("a keyboard found")));
+                wait("the passkey to type", &|s| s.status.bt_device_passkey.is_some());
+                shot(&mut app, format!("{theme_name}-bluetooth-device-passkey.ppm"), 1100);
+                wait("the keyboard paired", &|s| s.status.bt_device_pairing == kvm_proto::ctrl::DevicePairing::Paired);
+                app.send(UiCmd::BtForgetDevice(2));
+                wait("the keyboard forgotten", &|s| s.status.bt_devices_bonded == 0b1);
             }
             // The diagnostics, scrolled into view, healthy and then with a warning and a fault.
             app.page = Page::Firmware;

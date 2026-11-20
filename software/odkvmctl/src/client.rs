@@ -6,12 +6,12 @@ use std::fmt;
 
 use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::{
-    Accel, BT_HOSTS, BtHostInfo, BtPointer, BtPolicy, ConfigValue, DeviceMsg, ErrorCode, Event, FW_CHUNK, FwState,
-    FwTarget, HOSTS, Host, Hotkey, Info, LearnEnd, MAX_ARRANGEMENTS, MAX_PROFILES, MAX_SCREENS, Mapping,
-    PROTOCOL_VERSION, Pc, Port, PortInfo, PortMode, PortState, RebootTarget, Request, Response, Screen, Status,
-    StringKind, Target, Units, caps, diag, key, status_flags,
+    Accel, BT_DEVICES, BT_HOSTS, BtDeviceInfo, BtFound, BtHostInfo, BtPointer, BtPolicy, ConfigValue, DEVICES, Device,
+    DeviceMsg, ErrorCode, Event, FW_CHUNK, FwState, FwTarget, HOSTS, Host, Hotkey, Info, LearnEnd, MAX_ARRANGEMENTS,
+    MAX_PROFILES, MAX_SCREENS, Mapping, PROTOCOL_VERSION, Pc, Port, PortInfo, PortMode, PortState, RebootTarget,
+    Request, Response, Routing, Screen, Status, StringKind, Target, Units, caps, diag, key, status_flags,
 };
-use kvm_proto::link::bt::host_flags;
+use kvm_proto::link::bt::{device_flags, host_flags};
 
 use crate::fl;
 use crate::transport::Transport;
@@ -68,6 +68,39 @@ pub struct Snapshot {
     /// The Bluetooth host slots 1–4, read only from a KVM with the Bluetooth module (`caps::BLUETOOTH`); empty
     /// otherwise, which is how the UIs know to show the two PCs alone.
     pub bt: Vec<BtHostView>,
+    /// The Bluetooth device slots 1–4, the same way.
+    pub devices: Vec<BtDeviceInfo>,
+    /// The devices found while the KVM looks for devices to pair (`Status.bt_found` of them).
+    pub found: Vec<BtFound>,
+}
+
+/// What a Bluetooth device slot holds, from its flags.
+pub trait DeviceSlot {
+    fn bonded(&self) -> bool;
+    fn connected(&self) -> bool;
+    /// Connected and reporting, and the KVM holds its report map: its input reaches the KVM.
+    fn ready(&self) -> bool;
+    /// The KVM can't parse its report map: connected or not, its input goes nowhere.
+    fn unreadable(&self) -> bool;
+}
+
+impl DeviceSlot for BtDeviceInfo {
+    fn bonded(&self) -> bool {
+        self.flags & device_flags::BONDED != 0
+    }
+
+    fn connected(&self) -> bool {
+        self.flags & device_flags::CONNECTED != 0
+    }
+
+    fn ready(&self) -> bool {
+        let need = device_flags::READY | device_flags::MAP_HELD;
+        self.flags & need == need
+    }
+
+    fn unreadable(&self) -> bool {
+        self.flags & device_flags::MAP_UNREADABLE != 0
+    }
 }
 
 /// One Bluetooth host slot as the UIs show it: the module's view plus the KVM's settings for it.
@@ -111,8 +144,9 @@ impl BtHostView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileView {
     pub name: String,
-    /// Keyboard, Mouse, Other.
-    pub modes: [PortMode; 3],
+    /// Every device's mode and routing, in [`Device`] order.
+    pub modes: [PortMode; DEVICES],
+    pub routes: [Routing; DEVICES],
     /// The arrangement screen hop uses in it; None: screen hop is off there.
     pub arrangement: Option<u8>,
 }
@@ -188,6 +222,21 @@ impl Snapshot {
         self.bt.iter().filter(|h| h.bonded())
     }
 
+    /// Bluetooth device slot `n`, if the KVM has the module.
+    pub fn device(&self, n: u8) -> Option<&BtDeviceInfo> {
+        self.devices.iter().find(|d| d.slot == n)
+    }
+
+    /// The devices the UIs list for modes and routings: the three front ports, and each Bluetooth device slot that
+    /// holds a bond (a free slot is nothing to set).
+    pub fn routed_devices(&self) -> Vec<Device> {
+        Device::ALL
+            .iter()
+            .copied()
+            .filter(|d| d.wireless().is_none_or(|n| self.device(n).is_some_and(|i| i.bonded())))
+            .collect()
+    }
+
     /// Screen hop's settings and arrangements.
     pub fn hop(&self) -> HopView {
         let empty = ArrangementView { name: String::new(), screens: [Screen::NONE; MAX_SCREENS] };
@@ -244,13 +293,17 @@ impl Snapshot {
                 };
                 let modes = match find(key::PROFILE_MODES_BASE + i) {
                     Some(ConfigValue::ProfileModes(_, m)) => *m,
-                    _ => [PortMode::Auto; 3],
+                    _ => [PortMode::Auto; DEVICES],
+                };
+                let routes = match find(key::PROFILE_ROUTES_BASE + i) {
+                    Some(ConfigValue::ProfileRoutes(_, r)) => *r,
+                    _ => [Routing::Follow; DEVICES],
                 };
                 let arrangement = match find(key::PROFILE_ARRANGEMENT_BASE + i) {
                     Some(ConfigValue::ProfileArrangement(_, a)) => *a,
                     _ => None,
                 };
-                ProfileView { name, modes, arrangement }
+                ProfileView { name, modes, routes, arrangement }
             })
             .collect();
         Some((*active, *count, list))
@@ -397,8 +450,14 @@ impl Client {
         self.ok(Request::SetActive(t))
     }
 
-    pub fn set_port_mode(&mut self, p: Port, m: PortMode) -> Result<()> {
-        self.ok(Request::SetPortMode(p, m))
+    /// The active profile's mode of `d`.
+    pub fn set_mode(&mut self, d: Device, m: PortMode) -> Result<()> {
+        self.set_config(ConfigValue::Mode(d, m)).map(|_| ())
+    }
+
+    /// The active profile's routing of `d`.
+    pub fn set_route(&mut self, d: Device, r: Routing) -> Result<()> {
+        self.set_config(ConfigValue::Route(d, r)).map(|_| ())
     }
 
     pub fn redetect(&mut self, p: Port) -> Result<()> {
@@ -512,7 +571,72 @@ impl Client {
                 other => other?,
             },
         };
-        Ok(Snapshot { info, status, ports, products, config, bt })
+        let (devices, found) = match info.caps & caps::BLUETOOTH {
+            0 => (Vec::new(), Vec::new()),
+            _ => match self.bt_devices().and_then(|d| Ok((d, self.bt_found(status.bt_found)?))) {
+                Err(Error::Device(ErrorCode::Unsupported)) => (Vec::new(), Vec::new()),
+                other => other?,
+            },
+        };
+        Ok(Snapshot { info, status, ports, products, config, bt, devices, found })
+    }
+
+    /// Every Bluetooth device slot.
+    pub fn bt_devices(&mut self) -> Result<Vec<BtDeviceInfo>> {
+        (1..=BT_DEVICES as u8)
+            .map(|n| {
+                self.expect(Request::GetBtDevice(n), |r| if let Response::BtDevice(d) = r { Some(d) } else { None })
+            })
+            .collect()
+    }
+
+    /// The report map the KVM holds for device slot `n` (empty while it holds none), piece by piece.
+    pub fn bt_device_map(&mut self, n: u8) -> Result<Vec<u8>> {
+        let mut map = Vec::new();
+        loop {
+            let (total, data) = self.expect(Request::GetBtDeviceMap { slot: n, offset: map.len() as u16 }, |r| {
+                if let Response::BtDeviceMap { total, data, .. } = r { Some((total, data)) } else { None }
+            })?;
+            if data.is_empty() || map.len() + data.len() > total as usize {
+                // Done, or the map changed under the reading (another device paired): read what is there now.
+                if map.len() == total as usize {
+                    return Ok(map);
+                }
+                map.clear();
+                if total == 0 {
+                    return Ok(map);
+                }
+                continue;
+            }
+            map.extend_from_slice(&data);
+        }
+    }
+
+    /// The first `count` devices found while looking for devices to pair (fewer if the list shrank meanwhile).
+    pub fn bt_found(&mut self, count: u8) -> Result<Vec<BtFound>> {
+        let mut out = Vec::new();
+        for i in 0..count {
+            match self.expect(Request::GetBtFound(i), |r| if let Response::BtFound(f) = r { Some(f) } else { None })? {
+                Some(f) => out.push(f),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Starts (or stops) looking for Bluetooth devices to pair.
+    pub fn bt_scan(&mut self, on: bool) -> Result<()> {
+        self.ok(Request::BtScan(on))
+    }
+
+    /// Pairs the device found at `addr` into a free device slot.
+    pub fn bt_pair_device(&mut self, addr: [u8; 7]) -> Result<()> {
+        self.ok(Request::BtPairDevice(addr))
+    }
+
+    /// Forgets device slot 1–4, or every one (0xFF).
+    pub fn bt_forget_device(&mut self, slot: u8) -> Result<()> {
+        self.ok(Request::BtForgetDevice(slot))
     }
 
     /// Every Bluetooth host slot, with its name and policy from `config`.

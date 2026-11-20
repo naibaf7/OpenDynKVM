@@ -36,6 +36,8 @@ pub mod misfit {
     pub const GAMEPAD: u16 = 1 << 3;
     pub const DIGITIZER: u16 = 1 << 4;
     pub const UNKNOWN_USAGE: u16 = 1 << 5;
+    /// The descriptor didn't fit the parser's capacities, and what didn't fit was left out (`Layout::incomplete`).
+    pub const INCOMPLETE: u16 = 1 << 6;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +145,9 @@ impl Translator {
         let mut v = Verdict::default();
         if !channels.is_empty() {
             v.caps |= caps::VENDOR_CHANNEL;
+        }
+        if layout.incomplete {
+            v.misfit |= misfit::INCOMPLETE;
         }
         let mut kinds = Vec::new();
         for f in layout.fields.iter() {
@@ -505,6 +510,28 @@ mod tests {
         let v = tr(MOUSE_VENDOR_BUTTONS).verdict();
         assert_eq!(v.misfit, misfit::VENDOR_INPUT);
         assert!(v.caps & caps::MOUSE != 0);
+    }
+
+    #[test]
+    fn a_media_key_past_the_eighth_usage_range_is_read() {
+        let t = tr(&crate::parser::tests::media_bitmap(20));
+        assert!(t.verdict().fits());
+        // Bit 19 (byte 2, bit 3): the 20th usage.
+        let c = t.translate(&[3, 0, 0, 0x08]).consumer.unwrap();
+        assert_eq!(c.usages[0], 0x100 + 38);
+        let c = t.translate(&[3, 0x01, 0x02, 0]).consumer.unwrap();
+        assert_eq!(c.usages[..2], [0x100, 0x112]);
+    }
+
+    #[test]
+    fn an_incomplete_layout_does_not_fit() {
+        let mut d = std::vec![0x05, 0x07, 0x09, 0x06, 0xA1, 0x01, 0x15, 0x00, 0x25, 0x45, 0x75, 0x08, 0x95, 0x01];
+        for i in 0..70u8 {
+            d.extend([0x09, 0x04 + 2 * i]);
+        }
+        d.extend([0x81, 0x00, 0xC0]);
+        let v = tr(&d).verdict();
+        assert!(!v.fits() && v.misfit & misfit::INCOMPLETE != 0 && v.caps & caps::KEYBOARD != 0);
     }
 
     #[test]

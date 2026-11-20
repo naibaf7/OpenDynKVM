@@ -28,10 +28,10 @@
 //!   and kept in RAM. The sector header is written once per erase, together with the sector's first use.
 //! - **Unchanged values cost nothing:** writing the value already stored programs nothing ([`Store::write`]).
 //!
-//! The cost of a save is its item's size: at most 0.6 KB for the config. With everything the firmware stores at its
-//! largest (7.8 KB of keymap, macros, Vial's dynamic entries, records and the four screen-hop arrangements, carried
-//! around the ring), each sector is erased once per about 90 config saves, which makes about 9 million saves before
-//! the first sector reaches its rated cycles
+//! The cost of a save is its item's size: at most 0.7 KB for the config (eight profiles of seven devices). With
+//! everything the firmware stores at its largest (7.8 KB of keymap, macros, Vial's dynamic entries, records and the
+//! four screen-hop arrangements, carried around the ring), each sector is erased once per about 75 config saves, which
+//! makes about 7.5 million saves before the first sector reaches its rated cycles
 //! (`endurance_with_the_firmware_items`). How often saves come is the engine's business: it saves 5 s after the last
 //! change and caps the rate of saves (`kvm_core::engine`, `SAVE_BURST`), so even a host script that changes a setting
 //! every few seconds for years cannot wear the flash out.
@@ -568,8 +568,8 @@ mod tests {
         assert!(max - min <= 2, "erases per sector: {:?}", f.erases);
         let per_erase = saves / max;
         let lifetime = u64::from(saves) * RATED_ERASES / u64::from(max);
-        assert!((85..=100).contains(&per_erase), "{per_erase} config saves per erase of a sector");
-        assert!(lifetime >= 8_500_000, "{lifetime} config saves before a sector reaches its rated erases");
+        assert!((70..=80).contains(&per_erase), "{per_erase} config saves per erase of a sector");
+        assert!(lifetime >= 7_000_000, "{lifetime} config saves before a sector reaches its rated erases");
         // The cold items went round the ring with it.
         let s = Store::mount(&mut f, FIRMWARE_SECTORS).unwrap();
         assert_eq!(get(&s, &mut f, 0x0117).unwrap(), [8; kvm_vial::keymap::LAYER_ITEM_LEN]);

@@ -121,21 +121,22 @@ Windows needs no drivers.
 - **Hotkeys:** a list of up to 16, each an action and its hotkey, on the GUI's Keyboard page (**Add hotkey**, the
   action, the hotkey, **Apply**; × removes one) or with `odkvmctl hotkey`. Out of the box there is one: double-tap
   Scroll Lock toggles the PC. Actions: toggle PC, next / previous host (PC1, PC2, then the Bluetooth hosts that are
-  connected), select a host (PC1, PC2, Bluetooth host 1–4), next / previous profile, select a profile, cycle the Other
-  port's mode. On the command line: `odkvmctl hotkey add select-pc1 ctrl+alt+1`, `odkvmctl hotkey` lists them,
+  connected), select a host (PC1, PC2, Bluetooth host 1–4), next / previous profile, select a profile (0–7), cycle the
+  Other port's mode. On the command line: `odkvmctl hotkey add select-pc1 ctrl+alt+1`, `odkvmctl hotkey` lists them,
   `odkvmctl hotkey set 2 none`, `odkvmctl hotkey remove 2`. Or press a hotkey instead of typing it: `learn` in place of
   it, or **Learn** on the Keyboard page, then the hotkey on the KVM's keyboard within 10 s. The KVM itself reads the
   keys, so it learns exactly what it will recognise, and they reach neither PC meanwhile (Alt+F4 closes nothing). It
   works from the active PC, with a keyboard in Auto, Normalized or Mirrored mode; one in Passthrough goes straight to
   the PC, so no hotkey works on it.
-- **Profiles:** a profile sets the mode of all three ports at once. A long press (1 s) on the KVM's key selects the
-  next one. The KVM powers up in profile 0, as it loses power only when both PCs are off; `odkvmctl config set
+- **Profiles:** up to eight. A profile sets every device's mode and where its input goes, all at once: the three
+  front ports' and the paired Bluetooth devices'. A long press (1 s) on the KVM's key selects the next one. The KVM powers up in profile 0, as it loses power only when both PCs are off; `odkvmctl config set
   remember-profile on` makes it power up in the profile last active. Out of the box, profile 0 *work* runs every port
   in auto (emulated, instant switching) and profile 1 *gaming* runs every port in passthrough (the real devices, about
   1 s per switch). `odkvmctl profile` lists them,
   `odkvmctl profile next|1|gaming` selects one, `odkvmctl profile 1 name games` renames it,
-  `odkvmctl profile 1 mouse mirrored` changes a mode, and `odkvmctl config set profiles 1-4` sets how many are in use.
-  The GUI has them on the Ports page and in the sidebar. In passthrough the KVM can't see the keyboard, so the hotkey
+  `odkvmctl profile 1 mouse mirrored` changes a mode, `odkvmctl profile 1 other passthrough pc2` a mode and where it
+  goes, and `odkvmctl config set profiles 1-8` sets how many are in use. The GUI has them on the Ports page (a tab per
+  profile, a row per device with its mode and where its input goes) and in the sidebar. In passthrough the KVM can't see the keyboard, so the hotkey
   doesn't switch there: use the key or the software.
 - **The key's actions:** `odkvmctl config set key-tap|key-long toggle-pc|next-profile|other-port|none` and
   `odkvmctl config set long-press-ms 800-3000` (GUI: Keyboard page). By default a tap switches PCs and a 1 s long
@@ -148,13 +149,24 @@ Windows needs no drivers.
   | `normalized` | the KVM's own keyboard/mouse | ordinary keyboards and mice; switching is seamless |
   | `mirrored` | the device's own HID interfaces, copied | extra buttons, dials, gamepads |
   | `identity` | as mirrored, plus the device's VID/PID and name | the device maker's own configuration software on the active PC |
-  | `passthrough`, `passthrough-pc1`, `passthrough-pc2` | the real device on that PC's hub | webcams, storage, firmware updates of a device |
+  | `passthrough` | the real device on that PC's hub | webcams, storage, firmware updates of a device |
+  | `off` | nothing: its input goes nowhere | a device kept plugged in but not wanted in this profile |
 
   Mirrored devices share 3 USB endpoints, one per HID interface (2 with Vial on). While the keyboard and the mouse
   are both mirrored, the KVM gives up its own keyboard and mouse interfaces for them, and they share 6 (5). A device
   that doesn't fit runs normalized where it can, otherwise passthrough; `odkvmctl status` and the GUI say why.
 
   After swapping the device on a passthrough port, run `odkvmctl port <port> redetect`.
+- **Where a device's input goes** (`odkvmctl port <port> route follow|pc1|pc2|host1-host4`, also per profile): by
+  default every device follows the active PC or Bluetooth host. Pinned, it types into its host whichever is active:
+  a webcam that stays with the work PC, a second keyboard that always goes to the tablet. A pinned keyboard's keys go
+  as they are (the keymap and screen hop are the active host's), its hotkeys still work, and its Caps Lock LED is its
+  host's. A device in passthrough can be pinned to a PC only.
+- **Bluetooth devices** (boards with the module): up to four Bluetooth LE keyboards, mice and other input devices pair
+  with the KVM (`odkvmctl device scan`, `odkvmctl device pair 1`, or the GUI's Wireless page: *Look for devices*,
+  *Pair*; a keyboard that asks for it gets six digits to type on it). Each is then a device like a front port's, with
+  its mode (auto, normalized, off) and routing in every profile, and works with the PCs and the Bluetooth hosts at
+  the same time. Bluetooth Classic devices can't pair: the module is Bluetooth LE only.
 - **Settings:** `odkvmctl config get`, `odkvmctl config set <name> <value>`, `odkvmctl config save` (they are also saved 5 s
   after the last change), `odkvmctl config reset`. The GUI has the same on its settings page.
 - **Software control:** switching and configuration from software can be turned off, from either PC

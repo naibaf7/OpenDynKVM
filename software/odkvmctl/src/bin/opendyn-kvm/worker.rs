@@ -14,16 +14,15 @@ use std::thread::JoinHandle;
 
 use kvm_core::hotkey::format_spec;
 use kvm_proto::ctrl::{
-    ConfigValue, ErrorCode, Event, FwState, HopState, Hotkey, LearnEnd, Port, PortMode, RebootTarget, Target, diag,
+    ConfigValue, ErrorCode, Event, FwState, HopState, Hotkey, LearnEnd, Port, RebootTarget, Target, diag,
 };
 use odkvmctl::bootsel::{self, BootDevice};
-use odkvmctl::client::Snapshot;
+use odkvmctl::client::{DeviceSlot, Snapshot};
 use odkvmctl::ddc::KvmState;
 use odkvmctl::{Client, Error, firmware, fl, image, names};
 
 pub enum UiCmd {
     Switch(Target),
-    PortMode(Port, PortMode),
     Redetect(Port),
     Config(ConfigValue),
     Save,
@@ -44,6 +43,12 @@ pub enum UiCmd {
     BtForget(u8),
     /// The passkey a pairing host shows.
     BtPasskey(u32),
+    /// Look for Bluetooth devices to pair (true), or stop.
+    BtScan(bool),
+    /// Pair the device found at this address.
+    BtPairDevice([u8; 7]),
+    /// Forget the Bluetooth device in a slot.
+    BtForgetDevice(u8),
 }
 
 #[derive(Default)]
@@ -132,7 +137,7 @@ fn describe(e: &Event) -> Option<String> {
         Event::ConfigChanged(k) => fl!("ev-setting-changed", name = names::config_name(*k)),
         Event::HotkeyLearned(LearnEnd::Learned, h) => fl!("ev-hotkey-learned", hotkey = format_spec(h).to_string()),
         Event::HotkeyLearned(end, _) => fl!("ev-hotkey-not-learned", why = names::learn_end(*end)),
-        Event::BtActive(_) | Event::BtChanged(_) | Event::PlaceCursor(_) => return None,
+        Event::BtActive(_) | Event::BtChanged(_) | Event::BtDeviceChanged(_) | Event::PlaceCursor(_) => return None,
     })
 }
 
@@ -172,6 +177,34 @@ fn bt_changes(old: &Snapshot, new: &Snapshot) -> Vec<String> {
     if n.bt_active != 0 && n.bt_active != o.bt_active {
         let name = new.bt.iter().find(|h| h.slot == n.bt_active).map_or_else(|| fl!("a-host"), |h| h.name.clone());
         out.push(fl!("ev-switched-host", host = name));
+    }
+    out.extend(device_changes(old, new));
+    out
+}
+
+/// The same for the Bluetooth devices: paired, forgotten, connected, gone.
+fn device_changes(old: &Snapshot, new: &Snapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    let name = |d: &kvm_proto::ctrl::BtDeviceInfo| {
+        if d.name.is_empty() { names::device_kind(d.appearance) } else { d.name.to_string() }
+    };
+    for d in &new.devices {
+        let before = old.devices.iter().find(|b| b.slot == d.slot);
+        let was = |f: fn(&kvm_proto::ctrl::BtDeviceInfo) -> bool| before.is_some_and(f);
+        if d.bonded() && !was(|b| b.bonded()) {
+            out.push(fl!("ev-device-paired", device = name(d), slot = d.slot));
+        } else if !d.bonded() && was(|b| b.bonded()) {
+            out.push(fl!("ev-device-forgot", device = before.map_or_else(|| name(d), name)));
+        } else if d.bonded() && d.ready() && !was(|b| b.ready()) {
+            out.push(fl!("ev-host-connected", host = name(d)));
+        } else if d.bonded() && !d.connected() && was(|b| b.connected()) {
+            out.push(fl!("ev-host-disconnected", host = name(d)));
+        }
+    }
+    if old.status.bt_device_pairing != new.status.bt_device_pairing
+        && new.status.bt_device_pairing == kvm_proto::ctrl::DevicePairing::Failed
+    {
+        out.push(names::device_pairing(kvm_proto::ctrl::DevicePairing::Failed));
     }
     out
 }
@@ -225,7 +258,6 @@ fn is_disconnect(e: &Error) -> bool {
 fn run(c: &mut Client, cmd: UiCmd, shared: &Mutex<Shared>, wake: &Wake) -> Result<(), Error> {
     match cmd {
         UiCmd::Switch(t) => c.switch(t),
-        UiCmd::PortMode(p, m) => c.set_port_mode(p, m),
         UiCmd::Redetect(p) => c.redetect(p),
         UiCmd::Config(v) => match c.set_config(v) {
             // Allowing software control again: the KVM now waits for its key, and the Settings page says so.
@@ -236,6 +268,9 @@ fn run(c: &mut Client, cmd: UiCmd, shared: &Mutex<Shared>, wake: &Wake) -> Resul
         UiCmd::BtPair(on) => c.bt_pair(on),
         UiCmd::BtForget(n) => c.bt_forget(n),
         UiCmd::BtPasskey(v) => c.bt_passkey(v),
+        UiCmd::BtScan(on) => c.bt_scan(on),
+        UiCmd::BtPairDevice(addr) => c.bt_pair_device(addr),
+        UiCmd::BtForgetDevice(n) => c.bt_forget_device(n),
         UiCmd::FactoryReset => c.factory_reset(),
         UiCmd::Identify => c.identify(5),
         UiCmd::RetryAt32 => c.reboot(RebootTarget::At32Retry),

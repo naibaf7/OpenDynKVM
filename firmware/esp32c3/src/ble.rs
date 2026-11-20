@@ -14,6 +14,9 @@
 //!   their connection events take little of the radio's time (they may refuse; some hosts only accept multiples of 15 ms).
 //! - **TX power:** +9 dBm at most: 190 mA peaks (datasheet table 6-5) instead of 340 mA at +20 dBm, for the board's
 //!   power budget (design.md §6.1); a desk is a few metres.
+//! - **Pinned hosts:** a host devices are pinned to ([`BtMsg::Select`]'s `pinned`) takes input as the selected one
+//!   does, and stays connected and asked for the short interval whatever its policy.
+//! - **Devices:** the same stack is the central of the Bluetooth devices ([`crate::devices`]).
 
 use core::cell::RefCell;
 
@@ -29,15 +32,21 @@ use kvm_proto::link::bt::{BtMsg, EventKind, HostState, MAX_HOSTS, Motion, Policy
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 
-use crate::bonds::{Bonds, Slot, notify};
-use crate::{link, log};
+use crate::bonds::{Bonds, DeviceBonds, Slot, notify};
+use crate::{devices, link, log};
 
 /// Hosts at once: the four slots, and one more while a new host pairs into a free slot.
-const CONNS: usize = MAX_HOSTS + 1;
+const HOST_CONNS: usize = MAX_HOSTS + 1;
+/// Connections in all: the hosts', and one per device slot (a device pairs only into a free slot).
+const CONNS: usize = HOST_CONNS + kvm_proto::link::bt::MAX_DEVICES;
 const L2CAP: usize = CONNS * 2;
-/// Keys the Bluetooth stack can hold: the slots' and one pairing's under way per connection ([`tidy_keys`]). It was
-/// [`MAX_HOSTS`].
-const KEYS: usize = MAX_HOSTS + CONNS;
+/// Keys the Bluetooth stack can hold: the host and device slots', and one pairing's under way per connection
+/// ([`tidy_keys`]).
+const KEYS: usize = MAX_HOSTS + kvm_proto::link::bt::MAX_DEVICES + CONNS;
+/// The controller's activities at once (connections, advertising, scanning): its most, 10. Five host connections,
+/// four devices, advertising and a scan would be 11, which takes every slot of both kinds filled and a host pairing
+/// and a device sought at once: the one that doesn't get its activity tries again later.
+const ACTIVITIES: u8 = 10;
 const NAME: &str = "OpenDynKVM";
 
 const MAP_LEN: usize = report::MAP.len();
@@ -56,7 +65,7 @@ const HID_INFO: [u8; 4] = [0x11, 0x01, 0x00, 0x02];
 const PNP_ID: [u8; 7] = [0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01];
 const MAKER: [u8; 10] = *b"OpenDynKVM";
 
-#[gatt_server(connections_max = CONNS, attribute_table_size = 64)]
+#[gatt_server(connections_max = HOST_CONNS, attribute_table_size = 64)]
 #[allow(dead_code)] // the Device Information and Battery services are only read by the hosts
 struct Server {
     hid: HidService,
@@ -112,6 +121,8 @@ struct State {
     hosts: [HostState; MAX_HOSTS],
     /// The slot that gets input (1–4), 0 = none.
     selected: u8,
+    /// Bit n−1: devices are pinned to slot n (it takes input too, and stays connected).
+    pinned: u8,
     policies: [Policy; MAX_HOSTS],
     pairing_until: Option<Instant>,
     /// Each slot's current connection, numbered when it is let in. A bonded host that connects anew before the module
@@ -151,8 +162,10 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
 }
 
 /// Input reports for each slot's connection task: (report id, data, length).
-static REPORTS: [Channel<CriticalSectionRawMutex, (u8, [u8; 8], u8), 16>; MAX_HOSTS] =
-    [const { Channel::new() }; MAX_HOSTS];
+/// A report on its way: its ID, its bytes, and how many of them count.
+type Queued = (u8, [u8; 8], u8);
+
+static REPORTS: [Channel<CriticalSectionRawMutex, Queued, 16>; MAX_HOSTS] = [const { Channel::new() }; MAX_HOSTS];
 /// Each slot's motion, coalesced until the host takes it at a connection event ([`Motion`]): a mouse reports far more
 /// often than a host takes notifications, and a queue of them was late and then dropped motion (first dongle,
 /// 2026-11-14: the pointer crawled).
@@ -198,10 +211,14 @@ fn set_flags(slot: usize, f: impl FnOnce(&mut HostState)) {
     }
 }
 
-/// The hosts the module should be connected to now: bonded, and either always connected or the one selected.
+/// A host in use: the selected one, or one devices are pinned to.
+fn in_use(s: &State, slot: usize) -> bool {
+    s.selected as usize == slot + 1 || s.pinned & (1 << slot) != 0
+}
+
+/// The hosts the module should be connected to now: bonded, and either always connected or in use.
 fn wanted(s: &State, slot: usize) -> bool {
-    s.hosts[slot].bonded()
-        && (s.policies[slot] == Policy::StayConnected || s.selected as usize == slot + 1)
+    s.hosts[slot].bonded() && (s.policies[slot] == Policy::StayConnected || in_use(s, slot))
 }
 
 /// Pairing closed (ran out, closed by the RP2354B, or a host bonded): a connection without a bond that hasn't started
@@ -216,19 +233,24 @@ fn drop_unpaired() {
     }
 }
 
-type Controller = ExternalController<BleConnector<'static>, 20>;
-type St = Stack<'static, Controller, DefaultPacketPool>;
+pub type Controller = ExternalController<BleConnector<'static>, 20>;
+pub type St = Stack<'static, Controller, DefaultPacketPool>;
 
 /// Keeps the Bluetooth stack's keys to the slots' bonds and the pairings under way. The stack stores a pairing's keys
 /// as soon as it encrypts, whether or not the module keeps the host, and never lets them go by itself: keys left from
 /// a pairing that broke off, or from a host forgotten here that didn't match its identity (`bonds::Slot::identity`),
 /// filled the four places it had, and from then on every pairing failed just after its passkey, on keys it had no room
 /// to store (first dongle, 2026-11-15: "it accepts the code, connects for a moment and drops off").
-fn tidy_keys(stack: &St) {
+pub fn tidy_keys(stack: &St) {
     let (ltks, peers) = with(|s| (s.bonds.slots.map(|b| b.map(|b| b.ltk)), s.pairing_peer));
+    let (device_ltks, device_peer) = devices::kept_keys();
     let keep = |b: &BondInformation| {
-        ltks.iter().flatten().any(|k| *k == b.ltk.0)
-            || peers.iter().flatten().any(|p| p.match_identity(&b.identity) || b.identity.match_identity(p))
+        ltks.iter().chain(device_ltks.iter()).flatten().any(|k| *k == b.ltk.0)
+            || peers
+                .iter()
+                .chain(core::iter::once(&device_peer))
+                .flatten()
+                .any(|p| p.match_identity(&b.identity) || b.identity.match_identity(p))
     };
     let (kept, stray) = stack.with_bond_information(|keys| {
         let kept: heapless::Vec<BondInformation, KEYS> = keys.iter().filter(|b| keep(b)).cloned().collect();
@@ -256,9 +278,16 @@ static STACK: StaticCell<St> = StaticCell::new();
 static SERVER: StaticCell<Server<'static>> = StaticCell::new();
 static BONDS: StaticCell<Bonds> = StaticCell::new();
 
-pub async fn run(spawner: Spawner, bt: esp_hal::peripherals::BT<'static>, bonds: Bonds) -> ! {
+static DEVICE_BONDS: StaticCell<DeviceBonds> = StaticCell::new();
+
+pub async fn run(
+    spawner: Spawner,
+    bt: esp_hal::peripherals::BT<'static>,
+    bonds: Bonds,
+    device_bonds: DeviceBonds,
+) -> ! {
     let config = esp_radio::ble::Config::default()
-        .with_max_connections(CONNS as u8)
+        .with_max_connections(ACTIVITIES)
         .with_default_tx_power(esp_radio::ble::TxPower::P9);
     let connector = BleConnector::new(bt, config).expect("Bluetooth controller");
     let controller: Controller = ExternalController::new(connector);
@@ -272,6 +301,8 @@ pub async fn run(spawner: Spawner, bt: esp_hal::peripherals::BT<'static>, bonds:
         trouble_host::new(controller, resources)
             .set_random_address(Address::random(addr))
             .set_io_capabilities(IoCapabilities::KeyboardOnly)
+            // Hosts pair with LE Secure Connections only; legacy pairing is let in while a device pairs.
+            .set_secure_connections_only(true)
             .build(),
     );
     let bonds = BONDS.init(bonds);
@@ -290,6 +321,7 @@ pub async fn run(spawner: Spawner, bt: esp_hal::peripherals::BT<'static>, bonds:
             bonds,
             hosts,
             selected: 0,
+            pinned: 0,
             policies: [Policy::StayConnected; MAX_HOSTS],
             pairing_until: None,
             conn_gen: [0; MAX_HOSTS],
@@ -313,10 +345,13 @@ pub async fn run(spawner: Spawner, bt: esp_hal::peripherals::BT<'static>, bonds:
     for slot in 0..MAX_HOSTS {
         report_host(slot);
     }
+    devices::start(DEVICE_BONDS.init(device_bonds), stack);
     spawner.spawn(control(stack).expect("control task"));
+    spawner.spawn(devices::central(spawner, stack).expect("central task"));
     let mut runner = stack.runner();
     let mut peripheral = stack.peripheral();
-    let _ = select(runner.run(), advertise(spawner, &mut peripheral, stack, server)).await;
+    let _ =
+        select(runner.run_with_handler(&devices::Handler), advertise(spawner, &mut peripheral, stack, server)).await;
     panic!("Bluetooth host stopped");
 }
 
@@ -526,7 +561,7 @@ fn set_subscribed(slot: usize, bits: u8) {
     });
 }
 
-#[embassy_executor::task(pool_size = CONNS)]
+#[embassy_executor::task(pool_size = HOST_CONNS)]
 async fn connection(
     slot: usize,
     new: bool,
@@ -564,9 +599,8 @@ async fn connection(
     // Notification settings changed by the host, and when they go to flash.
     let mut unsaved: Option<(u8, Instant)> = None;
     loop {
-        let passkey = async {
-            if waiting_passkey { PASSKEY[slot].wait().await } else { core::future::pending().await }
-        };
+        let passkey =
+            async { if waiting_passkey { PASSKEY[slot].wait().await } else { core::future::pending().await } };
         let save = async {
             match unsaved {
                 Some((_, at)) => Timer::at(at).await,
@@ -618,7 +652,7 @@ async fn connection(
                         // Pairing is closed now: other hosts let in to pair go, and keys left from earlier attempts.
                         drop_unpaired();
                         tidy_keys(stack);
-                        let selected = with(|s| s.selected == host);
+                        let selected = with(|s| in_use(s, slot));
                         let _ = conn.raw().update_connection_params(stack, &params(selected)).await;
                     } else if !with(|s| s.hosts[slot].bonded()) {
                         // Paired without a bond (the host didn't ask for one): nothing to reconnect with, so not a host.
@@ -659,7 +693,7 @@ async fn connection(
                     // A pairing exchanges its keys from here on: the parameters wait for its end (`PairingComplete`),
                     // so that this task keeps taking the stack's events meanwhile.
                     if with(|s| s.pairing_peer[slot].is_none()) {
-                        let selected = with(|s| s.selected == host);
+                        let selected = with(|s| in_use(s, slot));
                         let _ = conn.raw().update_connection_params(stack, &params(selected)).await;
                     }
                 }
@@ -733,7 +767,7 @@ async fn connection(
             }
             Either4::Third(Ctl::Disconnect) => conn.raw().disconnect(),
             Either4::Third(Ctl::Params) => {
-                let selected = with(|s| s.selected == host);
+                let selected = with(|s| in_use(s, slot));
                 let _ = conn.raw().update_connection_params(stack, &params(selected)).await;
             }
             Either4::Fourth(Either::Second(())) => {
@@ -783,7 +817,7 @@ async fn control(stack: &'static St) {
         match msg {
             BtMsg::Input { host, id, data } => {
                 let slot = host as usize;
-                if (1..=MAX_HOSTS).contains(&slot) && with(|s| s.selected == host) {
+                if (1..=MAX_HOSTS).contains(&slot) && with(|s| in_use(s, slot - 1)) {
                     let i = slot - 1;
                     if Motion::is_motion(id) {
                         if let Some((_, id, d)) = MOTION[i].lock(|m| m.borrow_mut().add(host, id, data)) {
@@ -802,18 +836,20 @@ async fn control(stack: &'static St) {
                     }
                 }
             }
-            BtMsg::Select { host } => {
-                let old = with(|s| core::mem::replace(&mut s.selected, host));
-                for slot in 0..MAX_HOSTS {
+            BtMsg::Select { host, pinned } => {
+                let (old, old_pinned) =
+                    with(|s| (core::mem::replace(&mut s.selected, host), core::mem::replace(&mut s.pinned, pinned)));
+                for (slot, ctl) in CTL.iter().enumerate() {
                     let n = slot as u8 + 1;
-                    if n != old && n != host {
+                    let bit = 1 << slot;
+                    if n != old && n != host && (old_pinned ^ pinned) & bit == 0 {
                         continue;
                     }
                     let (connected, keep) = with(|s| (s.hosts[slot].connected(), wanted(s, slot)));
                     if connected && !keep {
-                        CTL[slot].signal(Ctl::Disconnect);
+                        ctl.signal(Ctl::Disconnect);
                     } else if connected {
-                        CTL[slot].signal(Ctl::Params);
+                        ctl.signal(Ctl::Params);
                     }
                 }
                 ADVERTISE.signal(());
@@ -867,12 +903,18 @@ async fn control(stack: &'static St) {
                 for slot in 0..MAX_HOSTS {
                     report_host(slot);
                 }
+                devices::report_all();
                 // The RP2354B may have restarted and forgotten.
                 let held = with(|s| s.settings_held);
                 for slot in (0..MAX_HOSTS).filter(|i| held & (1 << i) != 0) {
                     event(EventKind::SettingsHeld, slot as u8 + 1, 0);
                 }
             }
+            BtMsg::Scan { .. }
+            | BtMsg::PairDevice { .. }
+            | BtMsg::ForgetDevice { .. }
+            | BtMsg::RequestMap { .. }
+            | BtMsg::DeviceOutput { .. } => devices::handle(&msg, stack),
             _ => {}
         }
     }

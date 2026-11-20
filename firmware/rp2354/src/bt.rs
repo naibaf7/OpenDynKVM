@@ -49,6 +49,10 @@ use crate::uartlog::uart_log;
 use crate::{kvm, storage};
 
 const KEEPALIVE: Duration = Duration::from_millis(5);
+/// While a Bluetooth device is connected: the module can only answer, so its reports wait for the next exchange.
+const KEEPALIVE_DEVICES: Duration = Duration::from_millis(1);
+/// Bit n−1: device slot n's reports come (its last `Device` state said ready).
+static DEVICES_LIVE: AtomicU8 = AtomicU8::new(0);
 /// A frame takes 0.24 ms at 3 Mbaud; the module answers within a millisecond.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(4);
 /// On a dongle a frame is two USB packets each way, one per millisecond (`dongle.rs`): about 4 ms an exchange, more
@@ -192,12 +196,17 @@ pub fn send(o: BtOut) {
     }
     let m = match &o {
         BtOut::Input { host, id, data } => BtMsg::Input { host: *host, id: *id, data },
-        BtOut::Select(host) => BtMsg::Select { host: *host },
+        BtOut::Select { host, pinned } => BtMsg::Select { host: *host, pinned: *pinned },
         BtOut::Pair { on, seconds } => BtMsg::Pair { on: *on, seconds: *seconds },
         BtOut::Forget(host) => BtMsg::Forget { host: *host },
         BtOut::Passkey { host, value } => BtMsg::Passkey { host: *host, value: *value },
         BtOut::Policy { host, policy } => BtMsg::Policy { host: *host, policy: *policy },
         BtOut::RequestState => BtMsg::RequestState,
+        BtOut::Scan { on, seconds } => BtMsg::Scan { on: *on, seconds: *seconds },
+        BtOut::PairDevice(addr) => BtMsg::PairDevice { addr: *addr },
+        BtOut::ForgetDevice(dev) => BtMsg::ForgetDevice { dev: *dev },
+        BtOut::RequestMap(dev) => BtMsg::RequestMap { dev: *dev },
+        BtOut::DeviceOutput { dev, id, data } => BtMsg::DeviceOutput { dev: *dev, id: *id, data },
     };
     queue(&m);
 }
@@ -213,6 +222,22 @@ fn deliver(m: &[u8]) {
         BtMsg::Host(h) => kvm::with(|e| e.bt_host(h)),
         BtMsg::Output { host, id, data } => kvm::with(|e| e.bt_output(host, id, data)),
         BtMsg::Event { kind, host, value } => kvm::with(|e| e.bt_event(kind, host, value)),
+        BtMsg::DeviceInput { dev, id, data } => {
+            let now = Instant::now().as_millis() as u32;
+            kvm::with(|e| e.bt_device_input(dev, id, data, now));
+        }
+        BtMsg::Device { state, name } => {
+            if let Some(bit) = state.dev.checked_sub(1).filter(|i| *i < 8).map(|i| 1u8 << i) {
+                if state.ready() {
+                    DEVICES_LIVE.fetch_or(bit, Ordering::Relaxed);
+                } else {
+                    DEVICES_LIVE.fetch_and(!bit, Ordering::Relaxed);
+                }
+            }
+            kvm::with(|e| e.bt_device(state, name));
+        }
+        BtMsg::DeviceMap { dev, offset, total, data } => kvm::with(|e| e.bt_device_map(dev, offset, total, data)),
+        BtMsg::Found { addr, rssi, appearance, name } => kvm::with(|e| e.bt_found(addr, rssi, appearance, name)),
         _ => {}
     }
 }
@@ -285,6 +310,8 @@ async fn link_loop<L: Line>(
     push(&mut arq, &BtMsg::Hello { proto: PROTOCOL_VERSION, fw_version: crate::FW_VERSION, role: 0, flags: 0 });
     // Set once the module on the board runs another version: `EnterRom` is on its way, return once it is acknowledged.
     let mut leaving: Option<(u32, Instant)> = None;
+    let mut more = false;
+    DEVICES_LIVE.store(0, Ordering::Relaxed);
     loop {
         if let Some((found, since)) = leaving
             && (!arq.has_pending() || since.elapsed() > Duration::from_millis(300))
@@ -311,18 +338,21 @@ async fn link_loop<L: Line>(
         {
             push(&mut arq, &BtMsg::Input { host, id, data: &data });
         }
-        if !arq.has_pending() {
+        // The module had something to say last time: it may have more, so ask again at once.
+        if !arq.has_pending() && !more {
+            let idle = if DEVICES_LIVE.load(Ordering::Relaxed) != 0 { KEEPALIVE_DEVICES } else { KEEPALIVE };
             let woke = select4(
                 TO_BT_HI.ready_to_receive(),
                 TO_BT_LO.ready_to_receive(),
                 MOTION_READY.wait(),
-                Timer::after(KEEPALIVE),
+                Timer::after(idle),
             )
             .await;
             if !matches!(woke, Either4::Fourth(())) {
                 continue;
             }
         }
+        more = false;
         arq.next_frame().encode(&mut tx);
         if line.write_all(&tx).await.is_err() {
             // A dongle that has no room (or is going away): try again after a while.
@@ -338,6 +368,7 @@ async fn link_loop<L: Line>(
             LINK_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(m) = got {
+            more = true;
             if let Ok(BtMsg::Hello { fw_version, role, .. }) = BtMsg::decode(&m) {
                 if role != ROLE {
                     continue;

@@ -11,8 +11,8 @@ use odkvmctl::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use kvm_proto::ctrl::{
-    Accel, BT_HOSTS, BtPointer, ConfigValue, HOP_CORNER_MAX, HOP_SPEED, HOSTS, HopState, Host, MAX_ARRANGEMENTS,
-    MAX_SCREENS, Mapping, Pc, Placement, Port, PortMode, ProfileName, SCREEN_PX, Screen, Units,
+    Accel, BT_HOSTS, BtPointer, ConfigValue, Device, HOP_CORNER_MAX, HOP_SPEED, HOSTS, HopState, Host,
+    MAX_ARRANGEMENTS, MAX_SCREENS, Mapping, Pc, Placement, PortMode, ProfileName, SCREEN_PX, Screen, Units,
 };
 use odkvmctl::client::{HopView, Snapshot};
 use odkvmctl::screens::Detection;
@@ -407,7 +407,7 @@ impl App {
             let fix = match s.status.hop {
                 HopState::NoAbsolute => Some((fl!("hop-turn-on-absolute"), ConfigValue::AbsPointer(true))),
                 HopState::NotNormalized => {
-                    Some((fl!("hop-mouse-normalized"), ConfigValue::PortMode(Port::Mouse, PortMode::Normalized)))
+                    Some((fl!("hop-mouse-normalized"), ConfigValue::Mode(Device::Mouse, PortMode::Normalized)))
                 }
                 _ => None,
             };

@@ -11,14 +11,15 @@ use kvm_hid::{KeyState, Layout, MouseInput, Translator};
 use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::diag::{self as cdiag, BtModule, ClockSource, Grade, Item, id};
 use kvm_proto::ctrl::{
-    self, Advertised, AutoReason, BtPointer, ConfigValue, ErrorCode, Event, FaultKind, FwState, HopState, Host, Hotkey,
-    HotkeyAction, Info, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, Pc, Port, PortInfo, PortMode, PortState,
-    PowerSource, RebootTarget, Request, Response, Speed, StringKind, SwitchSource, Target, VialMode, status_flags,
+    self, Advertised, AutoReason, BtPointer, ConfigValue, DEVICES, Device, DevicePairing, ErrorCode, Event, FaultKind,
+    FwState, HOSTS, HopState, Host, Hotkey, HotkeyAction, Info, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, Pc,
+    Port, PortInfo, PortMode, PortState, PowerSource, RebootTarget, Request, Response, Routing, Speed, StringKind,
+    SwitchSource, Target, VialMode, status_flags,
 };
-use kvm_proto::link::bt::{EventKind as BtEventKind, HostState as BtHostState, report as btreport};
+use kvm_proto::link::bt::{DeviceState, EventKind as BtEventKind, HostState as BtHostState, report as btreport};
 use kvm_proto::link::msg::{Status as AtStatus, UsbSpeed, UsbState};
 
-use crate::bt::{self, BtOut, BtState, PasskeyStep};
+use crate::bt::{self, BtOut, BtState, Devices, PasskeyStep};
 use crate::config::{self, Config, Origin};
 use crate::diag::{self, BoardDiag};
 use crate::hop;
@@ -51,7 +52,7 @@ const AUTOSAVE_MS: u32 = 5000;
 /// Flash wear cap (the `store` module documentation has the numbers): saves go ahead as they come up to `SAVE_BURST`
 /// in a row, then at most one per `SAVE_PACE_MS`, which is also how fast the allowance comes back. Setting the KVM up
 /// never meets it. A host script that changes, or changes and saves, the config every few seconds, day and night, is
-/// held to one save a minute: 1 440 a day, about 17 years before a sector reaches its rated erases with the config at
+/// held to one save a minute: 1 440 a day, about 14 years before a sector reaches its rated erases with the config at
 /// its largest. Unpaced, a change every 6 s would take under two years, and `SaveConfig` in a loop days.
 const SAVE_BURST: u8 = 30;
 const SAVE_PACE_MS: u32 = 60_000;
@@ -214,6 +215,8 @@ struct PortSlot {
     state: PortState,
     effective: PortMode,
     reason: AutoReason,
+    /// The PC its router sends it to, while in passthrough.
+    routed: Option<Pc>,
     dev: Option<Hosted>,
     /// Plugged into Hub-0 anew: empty at this time unless Hub-0 sees a device by then ([`REPROBE_MS`]).
     probe_until: Option<u32>,
@@ -228,6 +231,7 @@ impl PortSlot {
             state: PortState::Empty,
             effective: PortMode::Auto,
             reason: AutoReason::NotAuto,
+            routed: None,
             dev: None,
             probe_until: None,
             reports: 0,
@@ -243,6 +247,41 @@ impl PortSlot {
     fn is_normalized(&self) -> bool {
         self.state == PortState::Hosted && self.effective == PortMode::Normalized
     }
+}
+
+/// The devices pinned to a host while it isn't the active one (software.md §4.3): their input goes there as it comes,
+/// without the keymap or screen hop, which are the active target's. (Pinned to the active host, a device's input goes
+/// with the devices that follow it.)
+struct Pinned {
+    /// Normalized devices (and, for a Bluetooth host, mirrored ones: it only has the KVM's own reports), and devices
+    /// mirrored to a PC (raw to its mirror endpoints; merged for the hotkeys).
+    norm: Merger,
+    mirr: Merger,
+    /// What went out last, so that only changes go.
+    keys: KeyState,
+    consumer: ConsumerState,
+    system: u8,
+    buttons: u16,
+    bt_keyboard: [u8; btreport::KEYBOARD_LEN],
+    bt_consumer: u16,
+    /// Held when a device's input came here, hidden until released.
+    suppressed_keys: KeyState,
+    suppressed_buttons: u16,
+}
+
+impl Pinned {
+    const NEW: Pinned = Pinned {
+        norm: Merger::new(),
+        mirr: Merger::new(),
+        keys: KeyState::EMPTY,
+        consumer: ConsumerState { usages: [0; kvm_hid::normalized::CONSUMER_SLOTS] },
+        system: 0,
+        buttons: 0,
+        bt_keyboard: [0; btreport::KEYBOARD_LEN],
+        bt_consumer: 0,
+        suppressed_keys: KeyState::EMPTY,
+        suppressed_buttons: 0,
+    };
 }
 
 struct PcSlot {
@@ -294,9 +333,14 @@ pub struct Engine {
     vial: kvm_vial::Vial,
     keymap_changes: u32,
     hotkeys: HotkeyEngine,
-    /// Normalized sources (forwarded through the KVM's interfaces) and mirrored ones (forwarded raw).
+    /// The devices whose input goes to the active target: normalized ones (forwarded through the KVM's interfaces)
+    /// and mirrored ones (forwarded raw).
     norm: Merger,
     mirr: Merger,
+    /// Each host's pinned devices while it isn't the active one ([`Host::index`]).
+    pinned: [Pinned; HOSTS],
+    /// Where each device's input is merged now: with the active target's (None), or a host's pinned devices.
+    group: [Option<Host>; DEVICES],
     active: Pc,
     suppressed_keys: KeyState,
     suppressed_buttons: u16,
@@ -346,6 +390,8 @@ pub struct Engine {
     supply: crate::supply::Tracker,
     /// The Bluetooth module and its hosts (software.md §4.13).
     bt: BtState,
+    /// Its devices.
+    wireless: Devices,
     /// Screen hop's pointer (software.md §4.14).
     hop: hop::Pointer,
 }
@@ -419,6 +465,8 @@ impl Engine {
             hotkeys: HotkeyEngine::EMPTY,
             norm: Merger::new(),
             mirr: Merger::new(),
+            pinned: [Pinned::NEW, Pinned::NEW, Pinned::NEW, Pinned::NEW, Pinned::NEW, Pinned::NEW],
+            group: [None; DEVICES],
             active: Pc::Pc1,
             suppressed_keys: KeyState::EMPTY,
             suppressed_buttons: 0,
@@ -454,6 +502,7 @@ impl Engine {
             standby: Tracker::new(),
             supply: crate::supply::Tracker::new(),
             bt: BtState::EMPTY,
+            wireless: Devices::EMPTY,
             hop: hop::Pointer::NEW,
         }
     }
@@ -510,12 +559,21 @@ impl Engine {
         &self.bt
     }
 
+    pub fn wireless(&self) -> &Devices {
+        &self.wireless
+    }
+
     pub fn port_info(&self, port: Port) -> PortInfo {
         let s = &self.ports[port.index()];
-        let mut p = PortInfo::empty(port, self.config.port_modes()[port.index()]);
+        let mut p = PortInfo::empty(port, self.config.mode(port.into()));
         p.state = s.state;
         p.effective = s.effective;
         p.reason = s.reason;
+        p.target = match s.state {
+            PortState::Passthrough => s.routed.map(Host::pc),
+            PortState::Hosted if s.effective != PortMode::Off => Some(self.target_of(port.into())),
+            _ => None,
+        };
         p.report_rate_hz = s.rate_hz;
         p.faults = s.faults;
         if let Some(d) = &s.dev {
@@ -526,7 +584,7 @@ impl Engine {
             // A high-speed device runs at high speed there unless the hub's own link to the PC is full speed: the
             // AT32F405 on that hub shows it.
             if s.state == PortState::Passthrough && d.probed.high_speed {
-                let pc = self.passthrough_pc(s.effective);
+                let pc = self.passthrough_pc(port);
                 p.speed = match self.pcs[pc.index()].status.map(|st| st.speed) {
                     Some(UsbSpeed::Full) => Speed::Full,
                     _ => Speed::High,
@@ -602,7 +660,55 @@ impl Engine {
             bt_module: self.bt_module,
             hop: self.hop_state(),
             pointer: self.hop.position_on(self.config.layout(), self.active_host()),
+            bt_devices_bonded: if self.bt.present { self.wireless.mask(|w| w.state.bonded()) } else { 0 },
+            bt_devices_ready: if self.bt.present { self.wireless.mask(|w| w.live()) } else { 0 },
+            bt_scan: self.wireless.scan_seconds(self.now),
+            bt_found: self.wireless.found.len() as u8,
+            bt_device_pairing: self.wireless.pairing,
+            bt_device_passkey: self.wireless.passkey,
         }
+    }
+
+    /// Where `d`'s input goes now: the host it is pinned to, or the active one.
+    pub fn target_of(&self, d: Device) -> Host {
+        match self.config.route(d) {
+            Routing::Pin(h) => h,
+            Routing::Follow => self.active_host(),
+        }
+    }
+
+    /// What `d` runs as now: a front port's effective mode while the KVM hosts its device, a Bluetooth device's
+    /// setting (normalized, or off) while it is one of the KVM's devices; Off otherwise.
+    fn running(&self, d: Device) -> PortMode {
+        match (d.port(), d.wireless()) {
+            (Some(p), _) => {
+                let s = &self.ports[p.index()];
+                if s.state == PortState::Hosted { s.effective } else { PortMode::Off }
+            }
+            (None, Some(n)) => {
+                let usable = self.bt.present && self.wireless.slot(n).is_some_and(|w| w.usable());
+                match self.config.mode(d) {
+                    _ if !usable => PortMode::Off,
+                    PortMode::Off => PortMode::Off,
+                    _ => PortMode::Normalized,
+                }
+            }
+            (None, None) => PortMode::Off,
+        }
+    }
+
+    /// The translator of `d`'s interface `iface` (a Bluetooth device has one, interface 0).
+    fn translator(&self, d: Device, iface: u8) -> Option<&Translator> {
+        match (d.port(), d.wireless()) {
+            (Some(p), _) => self.ports[p.index()].dev.as_ref()?.translator(iface),
+            (None, Some(n)) => self.wireless.slot(n)?.translator.as_ref(),
+            (None, None) => None,
+        }
+    }
+
+    /// A Bluetooth device is normalized: the KVM's own interfaces are needed for it.
+    fn wireless_normalized(&self) -> bool {
+        Device::ALL.iter().any(|d| d.wireless().is_some() && self.running(*d) == PortMode::Normalized)
     }
 
     /// The host that has the input: a Bluetooth host, or the active PC.
@@ -643,7 +749,11 @@ impl Engine {
     }
 
     pub fn led_inputs(&self) -> LedInputs {
-        let port = |i: usize| (self.ports[i].state, self.ports[i].effective);
+        let pinned = |i: usize| match Device::from_index(i).map(|d| self.config.route(d)) {
+            Some(Routing::Pin(h)) => h.as_pc(),
+            _ => None,
+        };
+        let port = |i: usize| (self.ports[i].state, self.ports[i].effective, pinned(i));
         LedInputs {
             active: self.active,
             links: [self.pcs[0].link, self.pcs[1].link],
@@ -663,7 +773,7 @@ impl Engine {
                 .filter(|t| self.now.wrapping_sub(*t) < PROFILE_SHOW_MS)
                 .map(|_| self.config.profile),
             bt_active: self.bt.active.is_some(),
-            bt_pairing: self.bt.pairing_until.is_some(),
+            bt_pairing: self.bt.pairing_until.is_some() || self.wireless.scan_until.is_some(),
             bt_passkey: self.bt.passkey.is_some(),
         }
     }
@@ -743,7 +853,7 @@ impl Engine {
             .filter_map(|p| p.dev.as_ref())
             .map(|d| d.summary.mirror_cost().0)
             .sum();
-        policy::wide(modes, mirror_in, self.config.vial == VialMode::On)
+        policy::wide(modes, mirror_in, self.wireless_normalized(), self.config.vial == VialMode::On)
     }
 
     fn rebuild_presentation(&mut self) {
@@ -870,7 +980,7 @@ impl Engine {
             self.leave_bt();
             if pc == self.active {
                 // Back on the home PC: it was released when the host was selected, and keeps its passthrough ports.
-                self.apply_leds();
+                self.after_switch();
                 self.event(Event::BtActive(0));
                 self.event(Event::Switched(pc, source));
                 return;
@@ -885,15 +995,16 @@ impl Engine {
             self.release_pc(old);
         }
         self.active = pc;
-        let _ = old;
-        // 3. The keyboard shows the new PC's lock LEDs.
-        self.apply_leds();
+        // 3. Devices pinned to either PC change hands, the keyboards show their PC's lock LEDs.
+        self.after_switch();
         // 4. Passthrough ports that follow the active PC move along.
-        for i in 0..3 {
-            if self.ports[i].state == PortState::Passthrough && self.ports[i].effective == PortMode::Passthrough {
-                let port = Port::from_index(i).unwrap_or(Port::Other);
+        for &port in Port::ALL {
+            let i = port.index();
+            let to = self.passthrough_pc(port);
+            if self.ports[i].state == PortState::Passthrough && self.ports[i].routed != Some(to) {
+                self.ports[i].routed = Some(to);
                 let power_cycle = self.config.power_cycle_on_switch;
-                self.emit(Output::Route { port, route: Route::Pc(pc), power_cycle });
+                self.emit(Output::Route { port, route: Route::Pc(to), power_cycle });
             }
         }
         // 5. Tell both PCs.
@@ -966,9 +1077,90 @@ impl Engine {
         self.bt.sent_keyboard = [0; btreport::KEYBOARD_LEN];
         self.bt.sent_consumer = 0;
         self.bt_mouse_buttons = 0;
-        self.emit(Output::Bt(BtOut::Select(n)));
-        self.apply_leds();
+        self.after_switch();
         self.event(Event::BtActive(n));
+    }
+
+    /// After the active target changed: devices pinned to the host left, or to the one now active, change hands
+    /// ([`Engine::regroup`]), the module hears which hosts take input, the keyboards show their targets' LEDs.
+    fn after_switch(&mut self) {
+        self.regroup();
+        self.bt_select();
+        self.apply_leds();
+    }
+
+    /// Tells the module which host is the active target and which ones devices are pinned to, if that changed.
+    fn bt_select(&mut self) {
+        let host = self.bt.active.unwrap_or(0);
+        let mut pinned = 0u8;
+        for d in Device::ALL {
+            if let Routing::Pin(h) = self.config.route(*d)
+                && let Some(n) = h.bt_slot()
+                && self.running(*d) != PortMode::Off
+            {
+                pinned |= 1 << (n - 1);
+            }
+        }
+        if self.bt.present && self.bt.selected != Some((host, pinned)) {
+            self.bt.selected = Some((host, pinned));
+            self.emit(Output::Bt(BtOut::Select { host, pinned }));
+        }
+    }
+
+    /// Puts every device's input where its routing says ([`Engine::join`]): with the devices that follow the active
+    /// target, or with the devices pinned to a host that isn't it.
+    fn regroup(&mut self) {
+        let active = self.active_host();
+        for d in Device::ALL.iter().copied() {
+            if self.running(d) == PortMode::Off {
+                // Its input goes nowhere now: what it held is let go.
+                self.release_dev(d);
+                continue;
+            }
+            let to = Some(self.target_of(d)).filter(|h| *h != active);
+            self.join(d, to);
+        }
+    }
+
+    /// Moves `d`'s input to the devices that follow the active target (None) or to those pinned to `to`. What it holds
+    /// is let go where it was, and stays hidden where it goes until released, as across a switch.
+    fn join(&mut self, d: Device, to: Option<Host>) {
+        let from = self.group[d.index()];
+        if from == to {
+            return;
+        }
+        self.group[d.index()] = to;
+        let (keys, buttons) = match from {
+            None => {
+                let (nk, nb) = self.norm.held_by(d);
+                let (mk, mb) = self.mirr.held_by(d);
+                let m = self.norm.remove(d);
+                self.mirr.remove(d);
+                self.forward_merged(m, None);
+                (nk.union(&mk), nb | mb)
+            }
+            Some(h) => {
+                let p = &mut self.pinned[h.index()];
+                let (nk, nb) = p.norm.held_by(d);
+                let (mk, mb) = p.mirr.held_by(d);
+                let m = p.norm.remove(d);
+                p.mirr.remove(d);
+                let hidden = self.hidden_keys();
+                self.send_pinned(h, m.mouse, hidden);
+                (nk.union(&mk), nb | mb)
+            }
+        };
+        match to {
+            None => {
+                self.suppressed_keys = self.suppressed_keys.union(&keys);
+                self.suppressed_buttons |= buttons;
+            }
+            Some(h) => {
+                let p = &mut self.pinned[h.index()];
+                p.suppressed_keys = p.suppressed_keys.union(&keys);
+                p.suppressed_buttons |= buttons;
+            }
+        }
     }
 
     /// Releases everything on the active Bluetooth host and deselects it.
@@ -982,7 +1174,7 @@ impl Engine {
         }
         self.bt_input(n, btreport::CONSUMER, &[0; btreport::CONSUMER_LEN]);
         self.hold_over();
-        self.emit(Output::Bt(BtOut::Select(0)));
+        self.bt_select();
     }
 
     fn bt_input(&mut self, host: u8, id: u8, data: &[u8]) {
@@ -1020,28 +1212,61 @@ impl Engine {
         }
     }
 
-    /// Sends the active PC's LED report to every hosted keyboard.
+    /// A host's keyboard LEDs (its lock state, from its output reports).
+    fn leds_of(&self, h: Host) -> u8 {
+        match (h.as_pc(), h.bt_slot()) {
+            (Some(pc), _) => self.pcs[pc.index()].out.leds,
+            (None, Some(n)) => self.bt.leds[n as usize - 1],
+            (None, None) => 0,
+        }
+    }
+
+    /// Sends every keyboard the LEDs of the host its input goes to.
     fn apply_leds(&mut self) {
-        let leds = match self.bt.active {
-            Some(n) => self.bt.leds[n as usize - 1],
-            None => self.pcs[self.active.index()].out.leds,
-        };
-        for i in 0..3 {
-            let Some(d) = self.ports[i].dev.as_ref().filter(|_| self.ports[i].state == PortState::Hosted) else {
+        self.apply_leds_of(None);
+    }
+
+    /// The same for the keyboards whose input goes to `only` (None: every keyboard).
+    fn apply_leds_of(&mut self, only: Option<Host>) {
+        for d in Device::ALL.iter().copied() {
+            if self.running(d) == PortMode::Off {
                 continue;
-            };
-            let port = Port::from_index(i).unwrap_or(Port::Other);
+            }
+            let target = self.target_of(d);
+            if only.is_some_and(|h| h != target) {
+                continue;
+            }
+            let leds = self.leds_of(target);
             let mut targets: Vec<(u8, u8), 4> = Vec::new();
-            for (iface, t) in &d.translators {
-                if t.verdict().caps & caps::KEYBOARD_LEDS == 0 {
-                    continue;
+            match (d.port(), d.wireless()) {
+                (Some(p), _) => {
+                    let Some(dev) = self.ports[p.index()].dev.as_ref() else { continue };
+                    for (iface, t) in &dev.translators {
+                        if t.verdict().caps & caps::KEYBOARD_LEDS != 0 {
+                            let id = t.layout().report_ids(ReportType::Output).next().unwrap_or(0);
+                            let _ = targets.push((*iface, id));
+                        }
+                    }
                 }
-                let id = t.layout().report_ids(ReportType::Output).next().unwrap_or(0);
-                let _ = targets.push((*iface, id));
+                (None, Some(_)) => {
+                    if let Some(t) = self.translator(d, 0).filter(|t| t.verdict().caps & caps::KEYBOARD_LEDS != 0) {
+                        let _ = targets.push((0, t.layout().report_ids(ReportType::Output).next().unwrap_or(0)));
+                    }
+                }
+                (None, None) => {}
             }
             for (iface, id) in targets {
-                let data = if id != 0 { report(&[id, leds]) } else { report(&[leds]) };
-                self.emit(Output::DeviceSetReport { port, iface, report_type: 2, report_id: id, data });
+                match (d.port(), d.wireless()) {
+                    (Some(port), _) => {
+                        let data = if id != 0 { report(&[id, leds]) } else { report(&[leds]) };
+                        self.emit(Output::DeviceSetReport { port, iface, report_type: 2, report_id: id, data });
+                    }
+                    (None, Some(dev)) => {
+                        let data = Vec::from_slice(&[leds]).unwrap_or_default();
+                        self.emit(Output::Bt(BtOut::DeviceOutput { dev, id, data }));
+                    }
+                    (None, None) => {}
+                }
             }
         }
     }
@@ -1113,7 +1338,7 @@ impl Engine {
     fn takes_dongle(&self, port: Port, probed: &Probed) -> bool {
         !self.bt_fitted
             && self.dongle == Dongle::None
-            && !self.config.port_modes()[port.index()].is_passthrough()
+            && !self.config.mode(port.into()).is_passthrough()
             && bt::dongle_endpoints(&probed.device, &probed.config).is_some()
     }
 
@@ -1157,7 +1382,7 @@ impl Engine {
     /// setting asks for (`takes_dongle` leaves it alone then).
     fn release_dongle_for_passthrough(&mut self) {
         if let Dongle::Probing(p) | Dongle::Claimed(p) = self.dongle
-            && self.config.port_modes()[p.index()].is_passthrough()
+            && self.config.mode(p.into()).is_passthrough()
         {
             self.reprobe(p);
         }
@@ -1174,7 +1399,8 @@ impl Engine {
         };
         let mut order: Vec<Port, 3> = Port::ALL.iter().copied().collect();
         order.sort_unstable_by_key(|p| (rank(&self.ports[p.index()]), p.index()));
-        let settings = self.config.port_modes();
+        let settings = self.config.modes();
+        let wireless = self.wireless_normalized();
         let decided = {
             let candidates: Vec<Candidate, 3> = order
                 .iter()
@@ -1184,32 +1410,40 @@ impl Engine {
                     Some(Candidate { port, setting: settings[port.index()], dev: &d.summary })
                 })
                 .collect();
-            policy::decide_all(&candidates, self.config.vial == VialMode::On)
+            policy::decide_all(&candidates, wireless, self.config.vial == VialMode::On)
         };
         let mut changed = [false; 3];
         for &port in Port::ALL {
             let i = port.index();
             let Some((eff, reason)) = decided[i] else { continue };
-            let was = (self.ports[i].state, self.ports[i].effective, self.ports[i].reason);
+            let s = &self.ports[i];
+            let was = (s.state, s.effective, s.reason, s.routed);
             self.ports[i].effective = eff;
             self.ports[i].reason = reason;
             if eff.is_passthrough() {
-                let target = self.passthrough_pc(eff);
+                let target = self.passthrough_pc(port);
                 self.ports[i].state = PortState::Passthrough;
                 self.release_port(port);
-                if was.0 != PortState::Passthrough || was.1 != eff {
+                if self.ports[i].routed != Some(target) {
+                    self.ports[i].routed = Some(target);
                     self.emit(Output::Route { port, route: Route::Pc(target), power_cycle: false });
                 }
             } else if was.0 == PortState::Passthrough {
                 // Coming back from passthrough: the KVM has to see the device again first.
+                self.ports[i].routed = None;
                 self.reprobe(port);
+            } else if eff == PortMode::Off {
+                self.release_port(port);
             }
-            changed[i] = was != (self.ports[i].state, eff, reason);
+            let s = &self.ports[i];
+            changed[i] = was != (s.state, eff, reason, s.routed);
         }
         // Always, against what the PCs have: a port coming back from passthrough is marked mirrored while it is still
         // probing, so on attach its mode looked unchanged, the set kept no mirror for it, and its reports went
         // nowhere (first board, 2026-11-12). The PCs only hear of a set whose bytes changed.
         self.rebuild_presentation();
+        // Modes changed, so may where the devices' input goes.
+        self.after_switch();
         for &port in Port::ALL {
             if changed[port.index()] || touched[port.index()] {
                 self.event(Event::PortChanged(port));
@@ -1217,19 +1451,37 @@ impl Engine {
         }
     }
 
-    /// The PC a port in passthrough mode `eff` is routed to: pinned, or the active one.
-    fn passthrough_pc(&self, eff: PortMode) -> Pc {
-        match eff {
-            PortMode::PassthroughPc1 => Pc::Pc1,
-            PortMode::PassthroughPc2 => Pc::Pc2,
+    /// The PC a port in passthrough is routed to: the one it is pinned to, else the active one (the home PC while a
+    /// Bluetooth host is active: a device in passthrough can't go to one).
+    fn passthrough_pc(&self, port: Port) -> Pc {
+        match self.config.route(port.into()) {
+            Routing::Pin(Host::Pc1) => Pc::Pc1,
+            Routing::Pin(Host::Pc2) => Pc::Pc2,
             _ => self.active,
         }
     }
 
     fn release_port(&mut self, port: Port) {
-        let m = self.norm.remove_port(port);
-        self.forward_merged(m, None);
-        self.mirr.remove_port(port);
+        self.release_dev(port.into());
+    }
+
+    /// Lets go of everything `d` holds, wherever its input went.
+    fn release_dev(&mut self, d: Device) {
+        if self.norm.has(d) || self.mirr.has(d) {
+            let m = self.norm.remove(d);
+            self.mirr.remove(d);
+            self.forward_merged(m, None);
+        }
+        for h in Host::ALL.iter().copied() {
+            let p = &mut self.pinned[h.index()];
+            if p.norm.has(d) || p.mirr.has(d) {
+                let m = p.norm.remove(d);
+                p.mirr.remove(d);
+                let hidden = self.hidden_keys();
+                self.send_pinned(h, m.mouse, hidden);
+            }
+        }
+        self.group[d.index()] = None;
     }
 
     pub fn port_detached(&mut self, port: Port) {
@@ -1283,7 +1535,6 @@ impl Engine {
             return;
         }
         self.ports[i].reports += 1;
-        let normalized = self.ports[i].is_normalized();
         let Some(d) = self.ports[i].dev.as_mut() else { return };
         match d.last_len.iter_mut().find(|(n, _)| *n == iface) {
             Some(e) => e.1 = data.len() as u8,
@@ -1292,7 +1543,40 @@ impl Engine {
             }
         }
         let t = d.translator(iface).map(|t| t.translate(data)).unwrap_or_default();
-        let merged = if normalized { self.norm.apply(port, iface, &t) } else { self.mirr.apply(port, iface, &t) };
+        self.input(port.into(), iface, &t, data, now);
+    }
+
+    /// An input report of Bluetooth device slot `dev`, as the module passes it on (without its report ID, `id`).
+    pub fn bt_device_input(&mut self, dev: u8, id: u8, data: &[u8], now: u32) {
+        self.now = now;
+        self.place_waiting();
+        let Some(d) = Device::wireless_slot(dev) else { return };
+        let w = &mut self.wireless.slots[dev as usize - 1];
+        let Some(tr) = w.translator.as_ref().filter(|_| w.state.ready()) else { return };
+        // As a USB device sends it: its report ID first when the map has them.
+        let mut raw = [0u8; 1 + kvm_proto::link::bt::REPORT_MAX];
+        let at = tr.layout().uses_report_ids as usize;
+        raw[0] = id;
+        let n = data.len().min(raw.len() - at);
+        raw[at..at + n].copy_from_slice(&data[..n]);
+        let t = tr.translate(&raw[..at + n]);
+        w.reports += 1;
+        self.input(d, 0, &t, &raw[..at + n], now);
+    }
+
+    /// A device's report, translated: to the devices that follow the active target, or to the host it is pinned to.
+    fn input(&mut self, d: Device, iface: u8, t: &kvm_hid::translate::Translation, data: &[u8], now: u32) {
+        let mode = self.running(d);
+        if mode == PortMode::Off {
+            return;
+        }
+        let normalized = mode == PortMode::Normalized;
+        let target = self.target_of(d);
+        if target != self.active_host() {
+            return self.pinned_input(d, target, iface, t, data, normalized, now);
+        }
+        self.join(d, None);
+        let merged = if normalized { self.norm.apply(d, iface, t) } else { self.mirr.apply(d, iface, t) };
 
         // A passkey for a pairing Bluetooth host is being typed: the keyboard goes to nobody else meanwhile.
         if self.bt.passkey.is_some() && merged.keyboard.is_some() {
@@ -1320,15 +1604,148 @@ impl Engine {
         }
         if normalized {
             self.forward_merged(merged, Some(swallowed));
-        } else if let Some(m) = self.presentation.mirror_of(port, iface).copied() {
-            let mut raw = report(data);
+        } else if let Some(m) = d.port().and_then(|p| self.presentation.mirror_of(p, iface)).copied() {
             let mask = swallowed.union(&self.suppressed_keys);
-            if let Some(t) = self.ports[i].dev.as_ref().and_then(|d| d.translator(iface)) {
-                t.strip(&mut raw, &mask, self.suppressed_buttons);
-            }
             let pc = self.active;
-            self.send(pc, m.f.ep_in, raw);
+            self.send_mirrored(d, pc, m.f.ep_in, iface, data, &mask, self.suppressed_buttons);
         }
+    }
+
+    /// A mirrored device's raw report for `pc`'s mirror endpoint `ep`, without the keys and buttons in `mask` and
+    /// `buttons` (a hotkey's, those held over).
+    #[allow(clippy::too_many_arguments)]
+    fn send_mirrored(&mut self, d: Device, pc: Pc, ep: u8, iface: u8, data: &[u8], mask: &KeyState, buttons: u16) {
+        let mut raw = report(data);
+        if let Some(t) = self.translator(d, iface) {
+            t.strip(&mut raw, mask, buttons);
+        }
+        self.send(pc, ep, raw);
+    }
+
+    /// Every key held on every keyboard, wherever its input goes: the hotkeys, learning one and a passkey being typed
+    /// take them all.
+    fn all_keys(&self) -> KeyState {
+        self.pinned
+            .iter()
+            .fold(self.norm.keys().union(&self.mirr.keys()), |k, p| k.union(&p.norm.keys()).union(&p.mirr.keys()))
+    }
+
+    /// A report of `d`, pinned to `h`, which isn't the active host: it goes there as it is, without the keymap or
+    /// screen hop. A device mirrored to a PC goes to that PC's mirror of it; any other goes as the KVM's own keyboard
+    /// and mouse.
+    #[allow(clippy::too_many_arguments)]
+    fn pinned_input(
+        &mut self,
+        d: Device,
+        h: Host,
+        iface: u8,
+        t: &kvm_hid::translate::Translation,
+        data: &[u8],
+        normalized: bool,
+        now: u32,
+    ) {
+        self.join(d, Some(h));
+        let mirrored = !normalized && h.as_pc().is_some();
+        let p = &mut self.pinned[h.index()];
+        let merged = if mirrored { p.mirr.apply(d, iface, t) } else { p.norm.apply(d, iface, t) };
+        if merged.keyboard.is_some() {
+            if self.bt.passkey.is_some() {
+                self.passkey_keys();
+                return;
+            }
+            let _ = self.run_hotkeys(now);
+            if self.group[d.index()] != Some(h) {
+                // A hotkey made its host the active one: the report is gone with what it held.
+                return;
+            }
+        }
+        let hidden = self.hidden_keys();
+        let p = &mut self.pinned[h.index()];
+        p.suppressed_keys = p.suppressed_keys.intersect(&p.norm.keys().union(&p.mirr.keys()));
+        p.suppressed_buttons &= p.norm.buttons() | p.mirr.buttons();
+        if let Some(pc) = h.as_pc() {
+            if let Presence::Asleep { wake } = self.standby.presence(pc) {
+                self.pinned_asleep(h, pc, wake, now);
+                return;
+            }
+            if mirrored {
+                if let Some(m) = d.port().and_then(|port| self.presentation.mirror_of(port, iface)).copied() {
+                    let p = &self.pinned[h.index()];
+                    let (mask, buttons) = (hidden.union(&p.suppressed_keys), p.suppressed_buttons);
+                    self.send_mirrored(d, pc, m.f.ep_in, iface, data, &mask, buttons);
+                }
+                return;
+            }
+        }
+        self.send_pinned(h, merged.mouse, hidden);
+    }
+
+    /// The state of the devices pinned to `h` (not the active host) as the KVM's own reports: keyboard and media keys
+    /// if they changed, and a mouse report with `mouse`'s motion. `hidden`: the hotkeys' keys.
+    fn send_pinned(&mut self, h: Host, mouse: Option<MouseInput>, hidden: KeyState) {
+        let p = &self.pinned[h.index()];
+        let keys = p.norm.keys().without(&hidden).without(&p.suppressed_keys);
+        let buttons = p.norm.buttons() & !p.suppressed_buttons;
+        let (consumer, system) = (p.norm.consumer(), p.norm.system());
+        let mouse = mouse.or((buttons != p.buttons).then(MouseInput::default));
+        match (h.as_pc(), h.bt_slot()) {
+            (Some(pc), _) => {
+                let out = self.pcs[pc.index()].out;
+                let p = &self.pinned[h.index()];
+                let (send_keys, send_consumer, send_system) =
+                    (keys != p.keys, consumer != p.consumer, system != p.system);
+                let p = &mut self.pinned[h.index()];
+                (p.keys, p.consumer, p.system, p.buttons) = (keys, consumer, system, buttons);
+                if send_keys {
+                    let (ep, r) = out.keyboard(&keys, &self.presentation);
+                    self.send(pc, ep, r);
+                }
+                if send_consumer {
+                    let (ep, r) = out.consumer(&consumer, &self.presentation);
+                    self.send(pc, ep, r);
+                }
+                if send_system {
+                    let (ep, r) = out.system(system, &self.presentation);
+                    self.send(pc, ep, r);
+                }
+                if let Some(m) = mouse {
+                    self.send_pointer_report(pc, hop::Report::Rel([m.x, m.y]), buttons, m.wheel, m.pan);
+                }
+            }
+            (None, Some(n)) => {
+                let kb = bt::keyboard(&keys);
+                let usage = bt::consumer(&consumer);
+                let p = &mut self.pinned[h.index()];
+                let (send_kb, send_usage) = (kb != p.bt_keyboard, usage != p.bt_consumer);
+                (p.bt_keyboard, p.bt_consumer, p.buttons) = (kb, usage, buttons);
+                if send_kb {
+                    self.bt_input(n, btreport::KEYBOARD, &kb);
+                }
+                if send_usage {
+                    self.bt_input(n, btreport::CONSUMER, &usage.to_le_bytes());
+                }
+                if let Some(m) = mouse {
+                    let r = kvm_proto::link::bt::mouse_report(buttons, m.x, m.y, m.wheel, m.pan);
+                    self.bt_input(n, btreport::MOUSE, &r);
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Pinned input while `pc` sleeps: nothing reaches it; a newly pressed key or button wakes it if it allowed that,
+    /// and what is held then stays hidden from it until released (as `input_while_asleep` does for the active PC).
+    fn pinned_asleep(&mut self, h: Host, pc: Pc, wake: bool, now: u32) {
+        let p = &self.pinned[h.index()];
+        let keys = p.norm.keys().union(&p.mirr.keys());
+        let buttons = p.norm.buttons() | p.mirr.buttons();
+        let pressed = !keys.without(&p.suppressed_keys).is_empty() || buttons & !p.suppressed_buttons != 0;
+        if pressed && wake && self.standby.may_wake(now, pc) {
+            self.emit(Output::RemoteWakeup(pc));
+        }
+        let p = &mut self.pinned[h.index()];
+        p.suppressed_keys = keys;
+        p.suppressed_buttons = buttons;
     }
 
     /// A mirrored device's input for the active Bluetooth host: its keys with the normalized ones (no keymap: it applies
@@ -1366,7 +1783,7 @@ impl Engine {
     /// The keyboard while a passkey is typed: digits, Backspace, Enter, Escape; nothing reaches any target. What is
     /// held when it ends stays hidden until released.
     fn passkey_keys(&mut self) {
-        let keys = self.norm.keys().union(&self.mirr.keys());
+        let keys = self.all_keys();
         let Some(entry) = self.bt.passkey.as_mut() else { return };
         let host = entry.host;
         let typed = (entry.digits, entry.value);
@@ -1383,6 +1800,9 @@ impl Engine {
         };
         self.bt.passkey = None;
         self.suppressed_keys = keys;
+        for p in self.pinned.iter_mut() {
+            p.suppressed_keys = p.norm.keys().union(&p.mirr.keys());
+        }
         self.emit(Output::Bt(BtOut::Passkey { host, value }));
         self.event(Event::BtChanged(0));
     }
@@ -1404,7 +1824,7 @@ impl Engine {
     /// Runs the hotkey engine on the combined keyboard state, or the learner while a hotkey is being learned; returns
     /// the keys it is hiding.
     fn run_hotkeys(&mut self, now: u32) -> KeyState {
-        let union = self.norm.keys().union(&self.mirr.keys());
+        let union = self.all_keys();
         if let Some(l) = self.learning.as_mut() {
             let learned = l.learner.process(&union, now);
             let hidden = l.learner.withheld();
@@ -1435,7 +1855,7 @@ impl Engine {
     /// Learning a hotkey ended: tells the PC that asked. Keys pressed meanwhile stay hidden until released.
     fn end_learning(&mut self, end: LearnEnd, hotkey: Hotkey) {
         let Some(l) = self.learning.take() else { return };
-        let held = self.norm.keys().union(&self.mirr.keys());
+        let held = self.all_keys();
         self.suppressed_keys = self.suppressed_keys.union(&l.learner.withheld());
         self.hotkeys.resume(&held);
         let e = Event::HotkeyLearned(end, hotkey);
@@ -1874,9 +2294,7 @@ impl Engine {
                 let leds = data.get(if report_id != 0 && data.len() > 1 { 1 } else { 0 }).copied().unwrap_or(0);
                 if s.out.leds != leds {
                     s.out.leds = leds;
-                    if pc == self.active {
-                        self.apply_leds();
-                    }
+                    self.apply_leds_of(Some(Host::pc(pc)));
                 }
             }
             (Some(Role::Mouse), 3) => {
@@ -1909,11 +2327,16 @@ impl Engine {
                 self.send(pc, ep_in, report(&resp));
             }
         } else if let Some(m) = self.presentation.mirror_by_out_ep(ep).copied() {
-            // Rumble, LEDs and vendor commands reach the device only from the active PC.
-            if pc == self.active {
+            // Rumble, LEDs and vendor commands reach the device only from the PC its input goes to.
+            if pc == self.mirror_pc(m.port) {
                 self.emit(Output::DeviceOut { port: m.port, iface: m.src_iface, data: report(data) });
             }
         }
+    }
+
+    /// The PC a mirrored device's own requests come from: the one it is pinned to, else the active (home) PC.
+    fn mirror_pc(&self, port: Port) -> Pc {
+        self.passthrough_pc(port)
     }
 
     /// A control request the AT32F405 forwarded (class/vendor request on a mirrored interface).
@@ -1937,7 +2360,7 @@ impl Engine {
             setup[4] = m.src_iface;
         }
         let device_to_host = setup[0] & 0x80 != 0;
-        if pc == self.active {
+        if pc == self.mirror_pc(m.port) {
             let data = CtrlData::from_slice(&data[..data.len().min(MAX_CTRL_DATA)]).unwrap_or_default();
             self.emit(Output::DeviceControl { pc, tag, port: m.port, setup, data });
         } else if !device_to_host {
@@ -2065,15 +2488,24 @@ impl Engine {
         let _ = self.set_config(ConfigValue::Profile(n), Origin::Device);
     }
 
-    /// The Other port's mode: Auto → Passthrough → pinned PC1 → pinned PC2 → Auto.
+    /// The Other port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2 → Auto, in one
+    /// step (the router flips once).
     fn cycle_other_port(&mut self) {
-        let next = match self.config.port_modes()[Port::Other.index()] {
-            PortMode::Auto => PortMode::Passthrough,
-            PortMode::Passthrough => PortMode::PassthroughPc1,
-            PortMode::PassthroughPc1 => PortMode::PassthroughPc2,
-            _ => PortMode::Auto,
+        let d = Device::Other;
+        let (mode, route) = match (self.config.mode(d), self.config.route(d)) {
+            (PortMode::Auto, _) => (PortMode::Passthrough, Routing::Follow),
+            (PortMode::Passthrough, Routing::Follow) => (PortMode::Passthrough, Routing::Pin(Host::Pc1)),
+            (PortMode::Passthrough, Routing::Pin(Host::Pc1)) => (PortMode::Passthrough, Routing::Pin(Host::Pc2)),
+            _ => (PortMode::Auto, Routing::Follow),
         };
-        let _ = self.set_config(ConfigValue::PortMode(Port::Other, next), Origin::Device);
+        let before = self.config;
+        let changed = [ConfigValue::Mode(d, mode), ConfigValue::Route(d, route)];
+        for v in changed {
+            let _ = self.config.set(v, Origin::Device);
+        }
+        if self.config != before {
+            self.config_effects(&before, &changed);
+        }
     }
 
     pub fn set_power(&mut self, p: PowerInfo) {
@@ -2314,7 +2746,8 @@ impl Engine {
         let learn_tap = self.learning.as_ref().and_then(|l| l.learner.deadline());
         // A place waiting for the next millisecond.
         let place = self.place_pending.iter().any(Option::is_some).then(|| self.now.wrapping_add(1));
-        [self.hotkeys.deadline(), save, keymap, unlock, learn, learn_tap, self.bt.pairing_until, place]
+        let scan = self.wireless.scan_until;
+        [self.hotkeys.deadline(), save, keymap, unlock, learn, learn_tap, self.bt.pairing_until, scan, place]
             .into_iter()
             .flatten()
             .min_by_key(|t| t.wrapping_sub(self.now) as i32)
@@ -2336,9 +2769,16 @@ impl Engine {
         }
         if now.wrapping_sub(self.rate_epoch) >= 1000 {
             let dt = now.wrapping_sub(self.rate_epoch);
+            let rate = |n: &mut u32| {
+                let r = (*n as u64 * 1000 / dt as u64).min(u16::MAX as u64) as u16;
+                *n = 0;
+                r
+            };
             for p in self.ports.iter_mut() {
-                p.rate_hz = (p.reports as u64 * 1000 / dt as u64).min(u16::MAX as u64) as u16;
-                p.reports = 0;
+                p.rate_hz = rate(&mut p.reports);
+            }
+            for w in self.wireless.slots.iter_mut() {
+                w.rate_hz = rate(&mut w.reports);
             }
             self.rate_epoch = now;
         }
@@ -2367,6 +2807,15 @@ impl Engine {
             self.bt.pairing_until = None;
             self.bt.passkey = None;
             self.event(Event::BtChanged(0));
+        }
+        if self.wireless.scan_until.is_some_and(|t| now.wrapping_sub(t) as i32 >= 0) {
+            // As for pairing: the module stops by itself.
+            self.wireless.scan_until = None;
+            self.event(Event::BtDeviceChanged(0));
+        }
+        let again = if self.bt.present { self.wireless.maps_overdue(now) } else { 0 };
+        for i in (0..self.wireless.slots.len()).filter(|i| again & 1 << i != 0) {
+            self.emit(Output::Bt(BtOut::RequestMap(i as u8 + 1)));
         }
         self.pace_saves();
         if self.dirty_since.is_some_and(|t| now.wrapping_sub(t) >= AUTOSAVE_MS) && self.save_allowance > 0 {
@@ -2452,9 +2901,44 @@ impl Engine {
     pub fn set_config(&mut self, v: ConfigValue, origin: Origin) -> Result<ConfigValue, ErrorCode> {
         let before = self.config;
         let v = self.config.set(v, origin)?;
-        if self.config == before {
-            return Ok(v);
+        if self.config != before {
+            self.config_effects(&before, &[v]);
         }
+        Ok(v)
+    }
+
+    /// What follows from config values `changed` (already set; the config was `before`).
+    fn config_effects(&mut self, before: &Config, changed: &[ConfigValue]) {
+        for v in changed.iter().copied() {
+            self.config_effect(v);
+        }
+        // A mode or routing, the active profile or its settings changed: the ports are decided again together, so a
+        // profile switch moves every port at once (a port still probing is decided when that finishes), and every
+        // device's input goes where it goes now.
+        let ports = |c: &Config, i: usize| (c.modes()[i], c.route(Device::from_index(i).unwrap_or(Device::Other)));
+        let devices = |c: &Config| core::array::from_fn::<_, DEVICES, _>(|i| ports(c, i));
+        if devices(before) != devices(&self.config) {
+            self.redecide(core::array::from_fn(|i| ports(before, i) != ports(&self.config, i)));
+            self.release_dongle_for_passthrough();
+        }
+        if self.config.arrangement() != before.arrangement() {
+            // Another arrangement: the pointer starts over on the active host's main screen there.
+            self.hop.forget_all();
+        }
+        if self.config.profile != before.profile {
+            self.profile_changed_at = Some(self.now);
+            if changed.iter().all(|v| v.key() != ctrl::key::PROFILE) {
+                // Fewer profiles in use than the active one's number.
+                self.config_changed(ctrl::key::PROFILE);
+            }
+        }
+        for v in changed {
+            self.config_changed(v.key());
+        }
+    }
+
+    /// What a single value's change does beyond the general ones.
+    fn config_effect(&mut self, v: ConfigValue) {
         match v {
             ConfigValue::Hotkey(..) | ConfigValue::DoubleTapMs(_) => self.hotkeys.configure(&self.config),
             ConfigValue::BtPolicy(i, policy) => self.emit(Output::Bt(BtOut::Policy { host: i + 1, policy })),
@@ -2474,26 +2958,6 @@ impl Engine {
             }
             _ => {}
         }
-        // A port mode, the active profile or its modes changed: the ports are decided again together, so a profile
-        // switch moves every port at once. (A port still probing is decided when that finishes.)
-        let (was, now) = (before.port_modes(), self.config.port_modes());
-        if was != now {
-            self.redecide(core::array::from_fn(|i| was[i] != now[i]));
-            self.release_dongle_for_passthrough();
-        }
-        if self.config.arrangement() != before.arrangement() {
-            // Another arrangement: the pointer starts over on the active host's main screen there.
-            self.hop.forget_all();
-        }
-        if self.config.profile != before.profile {
-            self.profile_changed_at = Some(self.now);
-            if v.key() != ctrl::key::PROFILE {
-                // Fewer profiles in use than the active one's number.
-                self.config_changed(ctrl::key::PROFILE);
-            }
-        }
-        self.config_changed(v.key());
-        Ok(v)
     }
 
     // ── control protocol ─────────────────────────────────────────────────────
@@ -2561,10 +3025,6 @@ impl Engine {
                 self.switch(*t, SwitchSource::Software);
                 Response::Ok
             }
-            Request::SetPortMode(p, m) => {
-                self.set_config(ConfigValue::PortMode(*p, *m), Origin::Software)?;
-                Response::Ok
-            }
             Request::GetConfig(k) => Response::Config(self.config.get(*k).ok_or(ErrorCode::InvalidValue)?),
             Request::SetConfig(v @ (ConfigValue::SwSwitchAllowed(_) | ConfigValue::SwConfigAllowed(_))) => {
                 self.request_lock(*v)?
@@ -2577,7 +3037,7 @@ impl Engine {
             }
             Request::FactoryReset => {
                 let keep_locks = (self.config.sw_switch_allowed, self.config.sw_config_allowed);
-                let was = self.config.port_modes();
+                let before = self.config;
                 self.config = Config::default();
                 (self.config.sw_switch_allowed, self.config.sw_config_allowed) = keep_locks;
                 self.hotkeys.configure(&self.config);
@@ -2585,8 +3045,9 @@ impl Engine {
                 let _ = self.vial.remap.release_all();
                 self.keymap_buttons = 0;
                 self.keymap_changes = self.vial.keymap.changes();
-                let now = self.config.port_modes();
-                self.redecide(core::array::from_fn(|i| was[i] != now[i]));
+                let port =
+                    |c: &Config, i: usize| (c.modes()[i], c.route(Device::from_index(i).unwrap_or(Device::Other)));
+                self.redecide(core::array::from_fn(|i| port(&before, i) != port(&self.config, i)));
                 self.rebuild_presentation();
                 self.hop.forget_all();
                 self.config_dirty = true;
@@ -2661,7 +3122,7 @@ impl Engine {
                 if let Some(old) = self.learning.take() {
                     self.suppressed_keys = self.suppressed_keys.union(&old.learner.withheld());
                 }
-                let held = self.norm.keys().union(&self.mirr.keys());
+                let held = self.all_keys();
                 self.hotkeys.resume(&held);
                 let learner = Learner::new(self.config.double_tap_ms as u32, &held);
                 self.learning = Some(Learning { pc, until: self.now.wrapping_add(LEARN_MS), learner });
@@ -2683,6 +3144,10 @@ impl Engine {
             Request::BtPair(on) => {
                 if !self.bt.present {
                     return Err(ErrorCode::Unsupported);
+                }
+                if *on {
+                    // The module pairs one way at a time.
+                    self.stop_scan();
                 }
                 let seconds = if *on { ctrl::BT_PAIR_SECONDS } else { 0 };
                 self.emit(Output::Bt(BtOut::Pair { on: *on, seconds }));
@@ -2716,6 +3181,78 @@ impl Engine {
                 self.event(Event::BtChanged(0));
                 Response::Ok
             }
+            Request::GetBtDevice(n) => {
+                if !self.bt.present {
+                    return Err(ErrorCode::Unsupported);
+                }
+                Response::BtDevice(self.wireless.info(*n).ok_or(ErrorCode::InvalidValue)?)
+            }
+            Request::BtScan(on) => {
+                if !self.bt.present {
+                    return Err(ErrorCode::Unsupported);
+                }
+                if !*on {
+                    self.stop_scan();
+                    return Ok(Response::Ok);
+                }
+                if self.bt.pairing_until.is_some() {
+                    // Host pairing closes: the module pairs one way at a time.
+                    self.emit(Output::Bt(BtOut::Pair { on: false, seconds: 0 }));
+                    self.bt.pairing_until = None;
+                    self.bt.passkey = None;
+                    self.event(Event::BtChanged(0));
+                }
+                let seconds = ctrl::BT_PAIR_SECONDS;
+                self.emit(Output::Bt(BtOut::Scan { on: true, seconds }));
+                self.wireless.scan_until = Some(self.now.wrapping_add(seconds as u32 * 1000));
+                self.wireless.found.clear();
+                if !self.device_pairing_busy() {
+                    self.wireless.pairing = DevicePairing::Idle;
+                    self.wireless.passkey = None;
+                }
+                self.event(Event::BtDeviceChanged(0));
+                Response::Ok
+            }
+            Request::GetBtFound(i) => Response::BtFound(self.wireless.found.get(*i as usize).cloned()),
+            Request::GetBtDeviceMap { slot, offset } => {
+                if self.wireless.slot(*slot).is_none() {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                let map = self.wireless.map_of(*slot);
+                let from = (*offset as usize).min(map.len());
+                let data = &map[from..(from + ctrl::BT_MAP_PIECE).min(map.len())];
+                Response::BtDeviceMap {
+                    slot: *slot,
+                    total: map.len() as u16,
+                    offset: from as u16,
+                    data: Vec::from_slice(data).unwrap_or_default(),
+                }
+            }
+            Request::BtPairDevice(addr) => {
+                if !self.bt.present {
+                    return Err(ErrorCode::Unsupported);
+                }
+                if self.device_pairing_busy() {
+                    return Err(ErrorCode::Busy);
+                }
+                // The module stops looking to connect.
+                self.wireless.scan_until = None;
+                self.wireless.pairing = DevicePairing::Connecting;
+                self.wireless.passkey = None;
+                self.emit(Output::Bt(BtOut::PairDevice(*addr)));
+                self.event(Event::BtDeviceChanged(0));
+                Response::Ok
+            }
+            Request::BtForgetDevice(n) => {
+                if !self.bt.present {
+                    return Err(ErrorCode::Unsupported);
+                }
+                if *n != 0xFF && self.wireless.slot(*n).is_none() {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                self.emit(Output::Bt(BtOut::ForgetDevice(*n)));
+                Response::Ok
+            }
             Request::PlaceCursor(placement) => {
                 // Only a PC has a cursor (not the service port).
                 let pc = pc.ok_or(ErrorCode::NotActive)?;
@@ -2742,6 +3279,60 @@ impl Engine {
 
     // ── Bluetooth module (software.md §4.13) ─────────────────────────────────
 
+    /// A device is being paired (connecting, pairing, reading its map).
+    fn device_pairing_busy(&self) -> bool {
+        matches!(self.wireless.pairing, DevicePairing::Connecting | DevicePairing::Pairing | DevicePairing::Reading)
+    }
+
+    /// Stops looking for devices, if the module is looking.
+    fn stop_scan(&mut self) {
+        if self.wireless.scan_until.take().is_some() {
+            self.emit(Output::Bt(BtOut::Scan { on: false, seconds: 0 }));
+            self.event(Event::BtDeviceChanged(0));
+        }
+    }
+
+    /// A device slot changed on the module (`name`: what the device calls itself).
+    pub fn bt_device(&mut self, state: DeviceState, name: &str) {
+        let Some(d) = Device::wireless_slot(state.dev) else { return };
+        let Some(c) = self.wireless.update(state, name, self.now) else { return };
+        if c.stopped || !state.bonded() {
+            self.release_dev(d);
+        }
+        if c.want_map {
+            self.emit(Output::Bt(BtOut::RequestMap(state.dev)));
+        }
+        if c.usable {
+            // One of the KVM's devices now, or no longer: the endpoint budget, where input goes, the pinned hosts.
+            self.redecide([false; 3]);
+        } else if c.started {
+            let target = self.target_of(d);
+            self.apply_leds_of(Some(target));
+        }
+        if c.changed || c.usable {
+            self.event(Event::BtDeviceChanged(state.dev));
+        }
+    }
+
+    /// A piece of device slot `dev`'s report map.
+    pub fn bt_device_map(&mut self, dev: u8, offset: u16, total: u16, data: &[u8]) {
+        match self.wireless.map_piece(dev, offset, total, data) {
+            Some(crate::bt::MapState::Held) => {
+                self.redecide([false; 3]);
+                self.event(Event::BtDeviceChanged(dev));
+            }
+            Some(_) => self.event(Event::BtDeviceChanged(dev)),
+            None => {}
+        }
+    }
+
+    /// A device found while looking for devices to pair.
+    pub fn bt_found(&mut self, addr: [u8; 7], rssi: i8, appearance: u16, name: &str) {
+        if self.wireless.scan_until.is_some() && self.wireless.found(addr, rssi, appearance, name) {
+            self.event(Event::BtDeviceChanged(0));
+        }
+    }
+
     /// The module answered (its `Hello`, after a reset or once programmed): tell it the policies, ask for the hosts,
     /// and select the active host again (a module that restarted forgot it).
     pub fn bt_hello(&mut self, fw: u32) {
@@ -2754,8 +3345,16 @@ impl Engine {
             self.emit(Output::Bt(BtOut::Policy { host: i as u8 + 1, policy }));
         }
         self.emit(Output::Bt(BtOut::RequestState));
-        self.emit(Output::Bt(BtOut::Select(self.bt.active.unwrap_or(0))));
+        self.bt.selected = None;
+        self.bt_select();
+        // A module that restarted looks for no devices and pairs none.
+        self.wireless.scan_until = None;
+        if self.device_pairing_busy() {
+            self.wireless.pairing = DevicePairing::Failed;
+            self.wireless.passkey = None;
+        }
         self.event(Event::BtChanged(0));
+        self.event(Event::BtDeviceChanged(0));
     }
 
     /// The module stopped answering (or is being reprogrammed): no Bluetooth targets until it says hello again; input
@@ -2769,7 +3368,14 @@ impl Engine {
         }
         let active = self.bt.active;
         self.bt = BtState { active, ..BtState::EMPTY };
+        // Its devices go with it.
+        for d in Device::ALL.iter().copied().filter(|d| d.wireless().is_some()) {
+            self.release_dev(d);
+        }
+        self.wireless = Devices::EMPTY;
+        self.redecide([false; 3]);
         self.event(Event::BtChanged(0));
+        self.event(Event::BtDeviceChanged(0));
     }
 
     /// A host slot changed on the module.
@@ -2793,14 +3399,18 @@ impl Engine {
         }
         let Some(slot) = (host as usize).checked_sub(1).filter(|i| *i < ctrl::BT_HOSTS) else { return };
         self.bt.leds[slot] = data[0];
-        if self.bt.active == Some(host) {
-            self.apply_leds();
+        if let Some(h) = Host::bt(host) {
+            self.apply_leds_of(Some(h));
         }
     }
 
     /// A pairing or bond event from the module.
     pub fn bt_event(&mut self, kind: BtEventKind, host: u8, value: u32) {
-        let held = self.norm.keys().union(&self.mirr.keys());
+        if self.wireless.event(kind, value, self.now) {
+            self.event(Event::BtDeviceChanged(if kind == BtEventKind::DeviceBondLost { host } else { 0 }));
+            return;
+        }
+        let held = self.all_keys();
         let settings_held = self.bt.settings_held;
         self.bt.event(kind, host, value, self.now, held);
         self.event(Event::BtChanged(host));
@@ -3195,7 +3805,7 @@ mod tests {
     fn mirrored_port_forwards_raw_and_rebuilds_the_descriptor_set() {
         let mut e = engine();
         drain(&mut e);
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
         let out = drain(&mut e);
         assert!(out.contains(&Output::DescriptorSetChanged));
@@ -3223,17 +3833,17 @@ mod tests {
         // the PCs never got a descriptor set with its mirror again, so they went nowhere.
         let mut e = engine();
         drain(&mut e);
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
         drain(&mut e);
         assert_eq!(e.presentation().mirrors.len(), 2);
 
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Passthrough), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Passthrough), Origin::Software).unwrap();
         assert!(drain(&mut e).contains(&Output::DescriptorSetChanged));
         assert!(e.presentation().mirrors.is_empty());
 
         // Back: the KVM probes the device again (it attaches anew on Hub-0), then mirrors it.
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
         assert!(drain(&mut e).contains(&Output::Reprobe(Port::Mouse)));
         e.port_probing(Port::Mouse);
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
@@ -3248,7 +3858,7 @@ mod tests {
     #[test]
     fn forwarded_requests_go_to_the_device_only_from_the_active_pc() {
         let mut e = engine();
-        e.set_config(ConfigValue::PortMode(Port::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
         e.port_attached(Port::Keyboard, &keyboard_and_mouse());
         drain(&mut e);
         let iface = e.presentation().mirror_of(Port::Keyboard, 0).unwrap().f.iface;
@@ -3295,7 +3905,7 @@ mod tests {
             power_cycle: false
         }));
         // Pinning it to PC1 moves it back once and then it stays.
-        e.set_config(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc1), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
         assert!(drain(&mut e).contains(&Output::Route {
             port: Port::Other,
             route: Route::Pc(Pc::Pc1),
@@ -3323,7 +3933,7 @@ mod tests {
         // PC2's hub runs at full speed, and so does everything on it.
         e.switch(Target::Toggle, SwitchSource::Key);
         assert_eq!(e.port_info(Port::Other).speed, Speed::Full);
-        e.set_config(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc1), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
         assert_eq!(e.port_info(Port::Other).speed, Speed::High, "pinned to PC1");
         // A full-speed device stays at full speed.
         e.port_attached(Port::Other, &webcam(false));
@@ -3361,10 +3971,10 @@ mod tests {
         e.port_attached(Port::Other, &drive);
         assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
         // Back from passthrough with the device gone: empty as well.
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Passthrough), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Passthrough), Origin::Software).unwrap();
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
         assert_eq!(e.port_info(Port::Mouse).state, PortState::Passthrough);
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Auto), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Auto), Origin::Software).unwrap();
         assert_eq!(e.port_info(Port::Mouse).state, PortState::Probing);
         e.tick(T0 + 4 * REPROBE_MS);
         assert_eq!(e.port_info(Port::Mouse).state, PortState::Empty);
@@ -3398,7 +4008,7 @@ mod tests {
         let serial = decode_string::<64>(set.find(tag::STRING, strings::SERIAL).unwrap());
         assert_eq!(serial.as_str(), "TEST0001 vial:f64c2b3c");
         // Auto: mirrors come first. A mirrored mouse (2 IN) leaves one endpoint, which Vial takes...
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
         assert!(e.presentation().vial.is_some());
         // ...until an XInput pad needs it; unplugging the pad gives it back.
@@ -3513,8 +4123,8 @@ mod tests {
         let mut e = engine();
         e.port_attached(Port::Keyboard, &keyboard_and_mouse());
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
-        e.set_config(ConfigValue::PortMode(Port::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
         // 2 + 2 IN endpoints don't fit EP5–EP7: the KVM's own keyboard, mouse and media interfaces make way.
         for port in [Port::Keyboard, Port::Mouse] {
             let p = e.port_info(port);
@@ -3527,7 +4137,7 @@ mod tests {
         let set = DescSet::parse(e.descriptor_set()).unwrap();
         assert_eq!(crate::usbdesc::parse_config(set.config().unwrap()).unwrap().interfaces.len(), 5);
         // The keyboard back to Normalized: the interfaces return, and the mouse alone fits EP5–EP7.
-        e.set_config(ConfigValue::PortMode(Port::Keyboard, PortMode::Normalized), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Normalized), Origin::Software).unwrap();
         assert_eq!(e.port_info(Port::Mouse).effective, PortMode::Mirrored);
         assert_eq!(e.presentation().boot_keyboard.ep_in, 0x81);
         let eps: std::vec::Vec<_> = e.presentation().mirrors.iter().map(|m| m.f.ep_in).collect();
@@ -3538,20 +4148,20 @@ mod tests {
     fn a_mirror_squeezed_out_comes_back_when_the_endpoints_free_up() {
         // A normalized device on Other keeps the KVM's own interfaces: two 2-endpoint mirrors don't both fit.
         let mut e = engine();
-        e.set_config(ConfigValue::PortMode(Port::Other, PortMode::Normalized), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
         e.port_attached(Port::Other, &keyboard_and_mouse());
         e.port_attached(Port::Keyboard, &keyboard_and_mouse());
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
-        e.set_config(ConfigValue::PortMode(Port::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
         let mouse = e.port_info(Port::Mouse);
         assert_eq!((mouse.effective, mouse.reason), (PortMode::Normalized, AutoReason::EndpointBudget));
         // The keyboard lets go of its mirror: the mouse gets it.
-        e.set_config(ConfigValue::PortMode(Port::Keyboard, PortMode::Normalized), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Normalized), Origin::Software).unwrap();
         assert_eq!(e.port_info(Port::Mouse).effective, PortMode::Mirrored);
         // Back to Mirrored: the mouse keeps its endpoints, the keyboard is the one left out.
         drain(&mut e);
-        e.set_config(ConfigValue::PortMode(Port::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
         assert_eq!(e.port_info(Port::Keyboard).reason, AutoReason::EndpointBudget);
         // Unplugging the normalized device on Other makes room for both.
         e.port_detached(Port::Other);
@@ -3564,17 +4174,17 @@ mod tests {
         let mut e = engine();
         e.port_attached(Port::Keyboard, &keyboard_and_mouse());
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
-        e.set_config(ConfigValue::PortMode(Port::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::MirroredIdentity), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::MirroredIdentity), Origin::Software).unwrap();
         assert_eq!(e.presentation().identity, Some(Port::Mouse));
         // The keyboard asks for identity too: one VID/PID per device, and the mouse had it first.
-        e.set_config(ConfigValue::PortMode(Port::Keyboard, PortMode::MirroredIdentity), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::MirroredIdentity), Origin::Software).unwrap();
         let kb = e.port_info(Port::Keyboard);
         assert_eq!((kb.effective, kb.reason), (PortMode::Mirrored, AutoReason::IdentityTaken));
         assert_eq!(e.port_info(Port::Mouse).effective, PortMode::MirroredIdentity);
         assert_eq!(e.presentation().identity, Some(Port::Mouse));
         // The mouse lets go of it: the keyboard gets it.
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
         assert_eq!(e.port_info(Port::Keyboard).effective, PortMode::MirroredIdentity);
         assert_eq!(e.presentation().identity, Some(Port::Keyboard));
     }
@@ -3725,8 +4335,10 @@ mod tests {
         assert_eq!((e.config().profile, e.active()), (1, Pc::Pc1));
         // The long press changes the Other port's mode in the active profile only.
         e.key(KeyEvent::Long);
-        assert_eq!(e.config().profiles[1].port_modes[Port::Other.index()], PortMode::PassthroughPc1);
-        assert_eq!(e.config().profiles[0].port_modes[Port::Other.index()], PortMode::Auto);
+        let other = Device::Other.index();
+        let p = e.config().profiles;
+        assert_eq!((p[1].modes[other], p[1].routes[other]), (PortMode::Passthrough, Routing::Pin(Host::Pc1)));
+        assert_eq!((p[0].modes[other], p[0].routes[other]), (PortMode::Auto, Routing::Follow));
         e.set_config(ConfigValue::KeyTap(KeyAction::None), Origin::Software).unwrap();
         e.key(KeyEvent::Tap);
         assert_eq!((e.config().profile, e.active()), (1, Pc::Pc1));
@@ -3821,7 +4433,7 @@ mod tests {
         bind(&mut e, 5, HotkeyAction::PrevHost, 0x13);
         chord(&mut e, 0x1F, 100);
         assert_eq!((e.active(), e.bt_active()), (Pc::Pc1, Some(2)));
-        assert!(drain(&mut e).contains(&Output::Bt(BtOut::Select(2))));
+        assert!(drain(&mut e).contains(&Output::Bt(BtOut::Select { host: 2, pinned: 0 })));
         // Host 3 is bonded but not connected: selected all the same, as from the app.
         chord(&mut e, 0x20, 200);
         assert_eq!(e.bt_active(), Some(3));
@@ -3878,7 +4490,7 @@ mod tests {
         assert_eq!(press(&mut e, 0x1F), 2);
         assert_eq!(press(&mut e, 0x20), 2, "profile 3 isn't in use");
         press(&mut e, 0x12);
-        assert_eq!(e.config().port_modes()[Port::Other.index()], PortMode::Passthrough);
+        assert_eq!(e.config().mode(Device::Other), PortMode::Passthrough);
     }
 
     #[test]
@@ -4039,7 +4651,7 @@ mod tests {
         assert_eq!(fitted.port_info(Port::Other).state, PortState::Passthrough);
         // Nor a port set to passthrough: one's own ESP32 board stays reachable from a PC.
         let mut pinned = engine();
-        pinned.set_config(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc2), Origin::Software).unwrap();
+        pinned.set_config(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
         pinned.port_attached(Port::Other, &esp_board());
         assert!(!pinned.dongle_wanted(Port::Other));
         // Setting the module's port to passthrough plugs it in anew, as the ordinary device it then is.
@@ -4047,7 +4659,7 @@ mod tests {
         e.port_attached(Port::Other, &esp_board());
         e.dongle_claimed(Port::Other);
         drain(&mut e);
-        e.set_config(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc1), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
         assert!(drain(&mut e).contains(&Output::Reprobe(Port::Other)));
         e.port_detached(Port::Other);
         e.port_attached(Port::Other, &esp_board());
@@ -4068,7 +4680,7 @@ mod tests {
         assert!(bt.contains(&&BtOut::Policy { host: 4, policy: ctrl::BtPolicy::ConnectWhenSelected }));
         assert!(bt.contains(&&BtOut::Policy { host: 1, policy: ctrl::BtPolicy::StayConnected }));
         assert!(bt.contains(&&BtOut::RequestState));
-        assert!(bt.contains(&&BtOut::Select(0)));
+        assert!(bt.contains(&&BtOut::Select { host: 0, pinned: 0 }));
         let Response::Info(i) = ask(&mut e, Request::GetInfo) else { panic!() };
         assert_ne!(i.caps & ctrl::caps::BLUETOOTH, 0);
     }
@@ -4081,7 +4693,7 @@ mod tests {
         drain(&mut e);
         assert_eq!(ask(&mut e, Request::SetActive(Target::Bt2)), Response::Ok);
         let out = drain(&mut e);
-        assert!(out.contains(&Output::Bt(BtOut::Select(2))));
+        assert!(out.contains(&Output::Bt(BtOut::Select { host: 2, pinned: 0 })));
         let r = reports(&out);
         assert!(r.iter().any(|(pc, ep, d)| *pc == Pc::Pc1 && *ep == 0x83 && d[1..].iter().all(|b| *b == 0)));
         assert!(events_to(&out, Pc::Pc1).contains(&Event::BtActive(2)));
@@ -4119,7 +4731,7 @@ mod tests {
         e.switch(Target::Toggle, SwitchSource::Key);
         let out = drain(&mut e);
         assert_eq!((e.active(), e.bt_active()), (Pc::Pc2, None));
-        assert!(out.contains(&Output::Bt(BtOut::Select(0))));
+        assert!(out.contains(&Output::Bt(BtOut::Select { host: 0, pinned: 0 })));
         let bt = bt_inputs(&out);
         assert!(bt.contains(&(2, btreport::KEYBOARD, vec![0; 8])), "the host gets every key released");
         assert!(events_to(&out, Pc::Pc2).contains(&Event::BtActive(0)));
@@ -4430,7 +5042,7 @@ mod tests {
         e.pc_protocol(Pc::Pc1, 1, 0);
         assert_eq!(e.hop_state(), HopState::BootProtocol);
         e.pc_protocol(Pc::Pc1, 1, 1);
-        e.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Passthrough), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Passthrough), Origin::Software).unwrap();
         assert_eq!(e.hop_state(), HopState::NotNormalized);
         // The feature report of the multipliers carries the report ID too.
         e.pc_set_report(Pc::Pc1, 1, 3, normalized::MOUSE_REL_ID, &[normalized::MOUSE_REL_ID, 0x05]);
@@ -4544,7 +5156,7 @@ mod tests {
         let mut e = hopping_with_a_tablet(ctrl::BtPointer::Absolute);
         assert_eq!(e.hop_state(), HopState::Active);
         let out = push_until(&mut e, -100, T0 + 1, |e| e.bt_active() == Some(2));
-        assert!(out.contains(&Output::Bt(BtOut::Select(2))));
+        assert!(out.contains(&Output::Bt(BtOut::Select { host: 2, pinned: 0 })));
         assert_eq!(events_to(&out, Pc::Pc1).last(), Some(&Event::BtActive(2)));
         // The tablet gets its absolute pointer at its right edge, at the same height: 540 of its 768 lines.
         let to_tablet = bt_inputs(&out);
@@ -4602,7 +5214,7 @@ mod tests {
             ConfigValue::Screen(1, 1, ctrl::Screen::new(Host::Pc2, 1920, 1080, [-1920, 0])),
             ConfigValue::ArrangementName(1, ctrl::ProfileName::new("left")),
             ConfigValue::ProfileArrangement(1, Some(1)),
-            ConfigValue::ProfileModes(1, [PortMode::Auto; 3]),
+            ConfigValue::ProfileModes(1, [PortMode::Auto; DEVICES]),
         ] {
             e.set_config(v, Origin::Software).unwrap();
         }
@@ -4643,5 +5255,188 @@ mod tests {
         assert_eq!(e.config().arrangements[0], stored.arrangements[0]);
         assert!(e.take_save_item(&mut buf).is_none());
         assert_eq!(Engine::item_keys().filter(|k| (0x0010..0x0014).contains(k)).count(), MAX_ARRANGEMENTS);
+    }
+
+    /// The boot keyboard of `keyboard_and_mouse`, as a Bluetooth keyboard's report map (no report IDs).
+    const KB_MAP: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+        0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x95, 0x05, 0x75, 0x01, 0x05, 0x08, 0x19, 0x01,
+        0x29, 0x05, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91, 0x01, 0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0x65,
+        0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00, 0xC0,
+    ];
+
+    fn wireless_state(n: u8, map: &[u8]) -> DeviceState {
+        use kvm_proto::link::bt::device_flags as f;
+        DeviceState {
+            dev: n,
+            flags: f::BONDED | f::CONNECTED | f::ENCRYPTED | f::READY,
+            rssi: -50,
+            battery: 90,
+            appearance: kvm_proto::link::bt::appearance::KEYBOARD,
+            addr: [0, 9, 9, 9, 9, 9, n],
+            map_len: map.len() as u16,
+            map_crc: crc32(map),
+        }
+    }
+
+    /// Bluetooth device slot `n` bonded and connected, with `map`: the engine asks for the map, and it comes in pieces.
+    fn wireless(e: &mut Engine, n: u8, map: &[u8]) {
+        e.bt_device(wireless_state(n, map), "Desk keyboard");
+        assert!(drain(e).contains(&Output::Bt(BtOut::RequestMap(n))));
+        let chunk = kvm_proto::link::bt::MAP_CHUNK;
+        for (i, piece) in map.chunks(chunk).enumerate() {
+            e.bt_device_map(n, (i * chunk) as u16, map.len() as u16, piece);
+        }
+    }
+
+    fn nkro_has(r: &[u8], k: u8) -> bool {
+        r[2 + k as usize / 8] & (1 << (k % 8)) != 0
+    }
+
+    /// The last NKRO report each PC got.
+    fn last_keys(out: &[Output], pc: Pc) -> Option<std::vec::Vec<u8>> {
+        reports(out).into_iter().rev().find(|(p, ep, _)| *p == pc && *ep == 0x83).map(|(_, _, d)| d)
+    }
+
+    #[test]
+    fn a_bluetooth_keyboard_types_into_the_active_target_as_a_front_port_keyboard_does() {
+        let mut e = with_bt();
+        wireless(&mut e, 1, KB_MAP);
+        let out = drain(&mut e);
+        assert!(events_to(&out, Pc::Pc1).contains(&Event::BtDeviceChanged(1)));
+        let Response::Status(st) = ask(&mut e, Request::GetStatus) else { panic!() };
+        assert_eq!((st.bt_devices_bonded, st.bt_devices_ready), (0b0001, 0b0001));
+        let Response::BtDevice(info) = ask(&mut e, Request::GetBtDevice(1)) else { panic!() };
+        assert_eq!((info.name.as_str(), info.battery, info.slot), ("Desk keyboard", 90, 1));
+        // 'a' on it reaches PC1 through the KVM's keyboard.
+        e.bt_device_input(1, 0, &[0, 0, 0x04, 0, 0, 0, 0, 0], 10);
+        assert!(nkro_has(&last_keys(&drain(&mut e), Pc::Pc1).unwrap(), 0x04));
+        // Released, then to Bluetooth host 2 once it is the target.
+        e.bt_device_input(1, 0, &[0; 8], 20);
+        assert_eq!(ask(&mut e, Request::SetActive(Target::Bt2)), Response::Ok);
+        drain(&mut e);
+        e.bt_device_input(1, 0, &[0, 0, 0x05, 0, 0, 0, 0, 0], 30);
+        let out = drain(&mut e);
+        assert_eq!(bt_inputs(&out).last().unwrap(), &(2, btreport::KEYBOARD, std::vec![0, 0, 0x05, 0, 0, 0, 0, 0]));
+        // Off in this profile: what it holds is let go, and its input goes nowhere.
+        e.set_config(ConfigValue::Mode(Device::Wireless1, PortMode::Off), Origin::Software).unwrap();
+        assert_eq!(bt_inputs(&drain(&mut e)).last().unwrap().2, std::vec![0; 8]);
+        e.bt_device_input(1, 0, &[0, 0, 0x06, 0, 0, 0, 0, 0], 40);
+        let out = drain(&mut e);
+        assert!(bt_inputs(&out).is_empty() && reports(&out).is_empty());
+        // Forgotten: no longer one of the KVM's devices.
+        e.bt_device(DeviceState { flags: 0, map_len: 0, map_crc: 0, ..wireless_state(1, KB_MAP) }, "");
+        let Response::Status(st) = ask(&mut e, Request::GetStatus) else { panic!() };
+        assert_eq!(st.bt_devices_bonded, 0);
+    }
+
+    #[test]
+    fn a_keyboard_pinned_to_pc2_types_there_whichever_pc_is_active() {
+        let mut e = engine();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        e.set_config(ConfigValue::Route(Device::Keyboard, Routing::Pin(Host::Pc2)), Origin::Software).unwrap();
+        drain(&mut e);
+        assert_eq!(e.port_info(Port::Keyboard).target, Some(Host::Pc2));
+        e.device_report(Port::Keyboard, 0, &[0, 0, 0x04, 0, 0, 0, 0, 0], 10);
+        let out = drain(&mut e);
+        assert!(nkro_has(&last_keys(&out, Pc::Pc2).unwrap(), 0x04));
+        assert!(last_keys(&out, Pc::Pc1).is_none(), "nothing for PC1");
+        // A switch to PC2 puts it with the devices that follow the active target: 'a', held across, is let go there and
+        // stays hidden until released.
+        e.switch(Target::Pc2, SwitchSource::Software);
+        assert!(!nkro_has(&last_keys(&drain(&mut e), Pc::Pc2).unwrap(), 0x04));
+        e.device_report(Port::Keyboard, 0, &[0, 0, 0x04, 0x05, 0, 0, 0, 0], 20);
+        let keys = last_keys(&drain(&mut e), Pc::Pc2).unwrap();
+        assert!(!nkro_has(&keys, 0x04) && nkro_has(&keys, 0x05));
+        // Back on PC1 it stays with PC2.
+        e.device_report(Port::Keyboard, 0, &[0; 8], 30);
+        e.switch(Target::Pc1, SwitchSource::Software);
+        drain(&mut e);
+        e.device_report(Port::Keyboard, 0, &[0, 0, 0x06, 0, 0, 0, 0, 0], 40);
+        let out = drain(&mut e);
+        assert!(nkro_has(&last_keys(&out, Pc::Pc2).unwrap(), 0x06) && last_keys(&out, Pc::Pc1).is_none());
+        // PC2's Caps Lock reaches the keyboard, PC1's doesn't.
+        let kb_iface = (0..8).find(|i| matches!(e.presentation().role_of_iface(*i), Some(Role::BootKeyboard))).unwrap();
+        e.pc_set_report(Pc::Pc1, kb_iface, 2, 0, &[0b10]);
+        assert!(!drain(&mut e).iter().any(|o| matches!(o, Output::DeviceSetReport { .. })));
+        e.pc_set_report(Pc::Pc2, kb_iface, 2, 0, &[0b10]);
+        let leds = drain(&mut e);
+        assert!(leds.iter().any(|o| matches!(o, Output::DeviceSetReport { data, .. } if data.as_slice() == [0b10])));
+        // Its hotkeys work wherever its input goes: double Scroll Lock toggles to PC2.
+        e.device_report(Port::Keyboard, 0, &[0; 8], 50);
+        for t in [100, 200] {
+            e.device_report(Port::Keyboard, 0, &[0, 0, 0x47, 0, 0, 0, 0, 0], t);
+            e.device_report(Port::Keyboard, 0, &[0; 8], t + 20);
+        }
+        assert_eq!(e.active(), Pc::Pc2);
+    }
+
+    #[test]
+    fn a_mouse_pinned_to_a_bluetooth_host_moves_its_pointer_while_a_pc_is_active() {
+        let mut e = with_bt();
+        e.set_config(ConfigValue::Route(Device::Keyboard, Routing::Pin(Host::Bt3)), Origin::Software).unwrap();
+        // The module keeps host 3 connected and takes its input.
+        assert!(drain(&mut e).contains(&Output::Bt(BtOut::Select { host: 0, pinned: 0b0100 })));
+        e.device_report(Port::Keyboard, 1, &[0x01, 5, 0xFB], 10);
+        let out = drain(&mut e);
+        assert_eq!(bt_inputs(&out), [(3, btreport::MOUSE, std::vec![1, 0, 5, 0, 0xFB, 0xFF, 0, 0])]);
+        assert!(reports(&out).iter().all(|(_, ep, _)| *ep != 0x82), "no mouse report for a PC");
+        // Following again: the module hears it, and the pointer is PC1's.
+        e.device_report(Port::Keyboard, 1, &[0, 0, 0], 20);
+        e.set_config(ConfigValue::Route(Device::Keyboard, Routing::Follow), Origin::Software).unwrap();
+        assert!(drain(&mut e).contains(&Output::Bt(BtOut::Select { host: 0, pinned: 0 })));
+        e.device_report(Port::Keyboard, 1, &[0, 1, 0], 30);
+        assert!(reports(&drain(&mut e)).iter().any(|(pc, ep, _)| (*pc, *ep) == (Pc::Pc1, 0x82)));
+    }
+
+    #[test]
+    fn looking_for_devices_and_pairing_one() {
+        let mut e = with_bt();
+        assert_eq!(ask(&mut e, Request::BtPair(true)), Response::Ok);
+        drain(&mut e);
+        // Looking for devices closes host pairing: the module pairs one way at a time.
+        assert_eq!(ask(&mut e, Request::BtScan(true)), Response::Ok);
+        let out = drain(&mut e);
+        assert!(out.contains(&Output::Bt(BtOut::Pair { on: false, seconds: 0 })));
+        assert!(out.contains(&Output::Bt(BtOut::Scan { on: true, seconds: ctrl::BT_PAIR_SECONDS })));
+        e.bt_found([1, 1, 2, 3, 4, 5, 6], -60, kvm_proto::link::bt::appearance::MOUSE, "Travel mouse");
+        e.bt_found([1, 1, 2, 3, 4, 5, 6], -58, kvm_proto::link::bt::appearance::MOUSE, "Travel mouse");
+        let Response::Status(st) = ask(&mut e, Request::GetStatus) else { panic!() };
+        assert_eq!((st.bt_scan, st.bt_found, st.bt_pairing), (ctrl::BT_PAIR_SECONDS, 1, 0));
+        let Response::BtFound(Some(f)) = ask(&mut e, Request::GetBtFound(0)) else { panic!() };
+        assert_eq!((f.rssi, f.name.as_str()), (-58, "Travel mouse"));
+        assert_eq!(ask(&mut e, Request::GetBtFound(1)), Response::BtFound(None));
+        // Pairing it: the module stops looking; a second one waits for the first.
+        assert_eq!(ask(&mut e, Request::BtPairDevice(f.addr)), Response::Ok);
+        assert!(drain(&mut e).contains(&Output::Bt(BtOut::PairDevice(f.addr))));
+        assert_eq!(ask(&mut e, Request::BtPairDevice(f.addr)), Response::Error(ErrorCode::Busy));
+        e.bt_event(BtEventKind::DevicePasskey, 0, 4242);
+        let Response::Status(st) = ask(&mut e, Request::GetStatus) else { panic!() };
+        assert_eq!((st.bt_scan, st.bt_device_pairing, st.bt_device_passkey), (0, DevicePairing::Pairing, Some(4242)));
+        e.bt_event(BtEventKind::DeviceStage, 2, DevicePairing::Paired as u32);
+        let Response::Status(st) = ask(&mut e, Request::GetStatus) else { panic!() };
+        assert_eq!((st.bt_device_pairing, st.bt_device_passkey), (DevicePairing::Paired, None));
+        // Forgetting goes to the module.
+        assert_eq!(ask(&mut e, Request::BtForgetDevice(2)), Response::Ok);
+        assert!(drain(&mut e).contains(&Output::Bt(BtOut::ForgetDevice(2))));
+        assert_eq!(ask(&mut e, Request::BtForgetDevice(5)), Response::Error(ErrorCode::InvalidValue));
+    }
+
+    #[test]
+    fn a_normalized_bluetooth_device_keeps_the_kvms_own_interfaces() {
+        let mut e = with_bt();
+        let mut both = keyboard_and_mouse();
+        both.device.pid = 0x9999;
+        e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        e.port_attached(Port::Mouse, &both);
+        drain(&mut e);
+        // Both mirrored need more IN endpoints than EP5–EP7: the KVM's own interfaces make way.
+        let wide = |e: &Engine| e.presentation().nkro.ep_in == 0;
+        assert!(wide(&e));
+        wireless(&mut e, 2, KB_MAP);
+        drain(&mut e);
+        assert!(!wide(&e), "the Bluetooth keyboard needs the KVM's keyboard interface");
+        assert_eq!(e.wireless().slot(2).map(|w| w.live()), Some(true));
     }
 }

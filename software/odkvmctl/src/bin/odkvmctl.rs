@@ -10,11 +10,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 use kvm_core::hop::main_screen;
 use kvm_core::hotkey::format_spec;
 use kvm_proto::ctrl::{
-    ConfigValue, ErrorCode, Event, FwState, Host, Hotkey, HotkeyAction, HotkeyBinding, LearnEnd, MAX_ARRANGEMENTS,
-    MAX_HOTKEYS, MAX_PROFILES, Mapping, Pc, Port, PortMode, RebootTarget, Target, diag, key, selftest, status_flags,
+    BT_DEVICES, BtDeviceInfo, BtFound, ConfigValue, Device, DevicePairing, ErrorCode, Event, FwState, Host, Hotkey,
+    HotkeyAction, HotkeyBinding, LearnEnd, MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, Mapping, Pc, Port, PortMode,
+    RebootTarget, Routing, Target, diag, key, selftest, status_flags,
 };
 use odkvmctl::bootsel::{self, Board};
-use odkvmctl::client::{BtHostView, HopView, ProfileView, Snapshot};
+use odkvmctl::client::{BtHostView, DeviceSlot, HopView, ProfileView, Snapshot};
 use odkvmctl::ddc::{self, mccs};
 use odkvmctl::{Client, firmware, fl, image, local, names};
 
@@ -55,6 +56,12 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<PortAction>,
     },
+    /// The wireless devices (keyboards, mice) paired with the Bluetooth module.
+    #[command(about = fl!("cli-device"))]
+    Device {
+        #[command(subcommand)]
+        action: Option<DeviceAction>,
+    },
     #[command(about = fl!("cli-profile"))]
     Profile {
         #[arg(help = fl!("cli-profile-which"))]
@@ -62,6 +69,8 @@ enum Cmd {
         #[arg(help = fl!("cli-profile-setting"))]
         setting: Option<String>,
         value: Option<String>,
+        #[arg(help = fl!("cli-profile-route"))]
+        route: Option<String>,
     },
     #[command(about = fl!("cli-hotkey"))]
     Hotkey {
@@ -140,10 +149,33 @@ enum HostAction {
 
 #[derive(Subcommand)]
 enum PortAction {
-    #[command(about = "auto, normalized, mirrored, identity, passthrough, passthrough-pc1, passthrough-pc2")]
+    #[command(about = "auto, normalized, mirrored, identity, passthrough, off")]
     Mode { mode: String },
+    #[command(about = fl!("cli-route"))]
+    Route { route: String },
     #[command(about = fl!("cli-port-redetect"))]
     Redetect,
+}
+
+#[derive(Subcommand)]
+enum DeviceAction {
+    #[command(about = fl!("cli-device-list"))]
+    List,
+    #[command(about = fl!("cli-device-scan"))]
+    Scan {
+        #[arg(help = fl!("cli-device-scan-stop"))]
+        stop: Option<String>,
+    },
+    #[command(about = fl!("cli-device-pair"))]
+    Pair { device: String },
+    #[command(about = fl!("cli-device-forget"))]
+    Forget { slot: String },
+    #[command(about = "auto, normalized, off")]
+    Mode { slot: u8, mode: String },
+    #[command(about = fl!("cli-route"))]
+    Route { slot: u8, route: String },
+    #[command(about = fl!("cli-device-map"))]
+    Map { slot: u8 },
 }
 
 #[derive(Subcommand)]
@@ -231,10 +263,20 @@ impl From<PortArg> for Port {
     }
 }
 
+/// Where a device's input goes now, and its routing when it is pinned (" → PC2, pinned").
+fn target_line(s: &Snapshot, d: Device, target: Option<Host>) -> String {
+    let Some(h) = target else { return String::new() };
+    let pinned = s.profiles().and_then(|(a, _, list)| list.get(a as usize).map(|p| p.routes[d.index()]));
+    match pinned {
+        Some(Routing::Pin(_)) => format!(" → {} ({})", host_label(s, h), fl!("cli-pinned")),
+        _ => format!(" → {}", host_label(s, h)),
+    }
+}
+
 fn print_port(s: &Snapshot, p: Port) {
     let i = &s.ports[p.index()];
     let product = &s.products[p.index()];
-    print!("  {:<9} {:<12}", names::port_short(p), names::port_state(i.state));
+    print!("  {:<9} {:<12}", Device::of_port(p).name(), names::port_state(i.state));
     if i.vid != 0 || i.pid != 0 {
         print!(" {:04x}:{:04x} {:<11}", i.vid, i.pid, names::speed(i.speed));
     }
@@ -253,7 +295,7 @@ fn print_port(s: &Snapshot, p: Port) {
     } else if i.mode != i.effective {
         print!(" ({})", fl!("cli-port-set-to", mode = names::mode(i.mode), why = names::reason(i.reason)));
     }
-    println!();
+    println!("{}", target_line(s, Device::of_port(p), i.target));
     if i.state != kvm_proto::ctrl::PortState::Empty {
         print!("            {}", names::classes(i.classes));
         if i.report_rate_hz > 0 {
@@ -327,6 +369,12 @@ fn print_status(c: &Client, s: &Snapshot) {
     if st.bt_passkey != 0 {
         println!("  {}", fl!("cli-passkey-waits"));
     }
+    for d in s.devices.iter().filter(|d| d.bonded()) {
+        println!("  {}  {:<14} {}", fl!("cli-device-slot", slot = d.slot), device_state(d), device_label(d));
+    }
+    if st.bt_scan != 0 {
+        println!("  {}", fl!("cli-scan-open", seconds = st.bt_scan, found = st.bt_found));
+    }
     let mut power = names::power_line(st);
     if let Some((short, _)) = names::power_warning(st, true) {
         power += &format!("  ({short})");
@@ -343,6 +391,9 @@ fn print_status(c: &Client, s: &Snapshot) {
     println!("{}", fl!("cli-ports"));
     for p in Port::ALL {
         print_port(s, *p);
+    }
+    for d in s.devices.iter().filter(|d| d.bonded()) {
+        print_device(s, d);
     }
     let mut locks = vec![];
     if st.flags & status_flags::SW_SWITCH_ALLOWED == 0 {
@@ -485,11 +536,143 @@ fn print_hosts(s: &Snapshot) {
     }
 }
 
-fn print_profiles(active: u8, count: u8, list: &[ProfileView], hop: &HopView) {
+/// A wireless device by its own name, and what it says it is.
+fn device_label(d: &BtDeviceInfo) -> String {
+    let kind = names::device_kind(d.appearance);
+    if d.name.is_empty() { kind } else { format!("{} ({kind})", d.name) }
+}
+
+/// A device's report map as hex, 16 bytes a line, and what the KVM's parser makes of it (the same parser as the
+/// KVM's, run here): to send along when a device shows as not supported.
+fn print_device_map(map: &[u8]) {
+    if map.is_empty() {
+        println!("{}", fl!("cli-device-map-none"));
+        return;
+    }
+    let bytes = map.len();
+    println!("{}", fl!("cli-device-map-bytes", bytes = bytes));
+    for line in map.chunks(16) {
+        let hex: Vec<String> = line.iter().map(|b| format!("{b:02x}")).collect();
+        println!("{}", hex.join(" "));
+    }
+    match kvm_hid::Layout::parse(map) {
+        Ok(l) => {
+            let fields = l.fields.len();
+            let fits = kvm_hid::Translator::new(l.clone()).verdict();
+            if l.incomplete {
+                println!("{}", fl!("cli-device-map-incomplete", fields = fields));
+            } else {
+                println!("{}", fl!("cli-device-map-ok", fields = fields));
+            }
+            println!("caps {:#06x}, misfit {:#06x}", fits.caps, fits.misfit);
+        }
+        Err(e) => println!("{}", fl!("cli-device-map-error", error = format!("{e:?}"))),
+    }
+}
+
+fn device_state(d: &BtDeviceInfo) -> String {
+    if d.unreadable() {
+        fl!("device-unsupported")
+    } else if d.ready() {
+        fl!("cli-device-ready")
+    } else if d.connected() {
+        fl!("link-enumerating")
+    } else {
+        fl!("link-detached")
+    }
+}
+
+/// A Bluetooth address as devices show it ("C4:21:3B:6E:5A:01").
+fn bt_address(a: &[u8; 7]) -> String {
+    a[1..].iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+}
+
+/// A wireless device as `status` and `device list` show it, as a front port is.
+fn print_device(s: &Snapshot, d: &BtDeviceInfo) {
+    let dev = Device::wireless_slot(d.slot).unwrap_or(Device::Wireless1);
+    print!("  {:<9} {:<12} {}", dev.name(), device_state(d), device_label(d));
+    if d.battery <= 100 {
+        print!(", {}", fl!("cli-battery", percent = d.battery));
+    }
+    if d.rssi != 0 {
+        print!(", {} dBm", d.rssi);
+    }
+    println!();
+    let mode = s.profiles().map_or(PortMode::Auto, |(a, _, list)| list[a as usize].modes[dev.index()]);
+    let target = (d.ready() && mode != PortMode::Off).then(|| route_target(s, dev)).flatten();
+    // Over Bluetooth, Auto is Normalized.
+    let shown = match mode {
+        PortMode::Auto => format!("{} ({})", names::mode(PortMode::Normalized), names::mode(PortMode::Auto)),
+        m => names::mode(m),
+    };
+    println!("            {shown}{}", target_line(s, dev, target));
+}
+
+/// Where `d`'s input goes now: its pin, or the active host.
+fn route_target(s: &Snapshot, d: Device) -> Option<Host> {
+    let (a, _, list) = s.profiles()?;
+    Some(match list[a as usize].routes[d.index()] {
+        Routing::Pin(h) => h,
+        Routing::Follow => match s.status.bt_active {
+            0 => Host::pc(s.status.active),
+            n => Host::bt(n)?,
+        },
+    })
+}
+
+fn print_devices(s: &Snapshot) {
+    for d in &s.devices {
+        if !d.bonded() {
+            println!("  {}  ({})", d.slot, fl!("slot-free"));
+            continue;
+        }
+        println!("  {}  {:<14} {}  {}", d.slot, device_state(d), device_label(d), bt_address(&d.addr));
+    }
+    let st = &s.status;
+    if st.bt_scan != 0 {
+        println!("{}", fl!("cli-scan-open", seconds = st.bt_scan, found = st.bt_found));
+    }
+    print_found(&s.found);
+    print_device_pairing(st.bt_device_pairing, st.bt_device_passkey);
+}
+
+fn print_found(found: &[BtFound]) {
+    for (i, f) in found.iter().enumerate() {
+        let name = if f.name.is_empty() { names::device_kind(f.appearance) } else { f.name.to_string() };
+        println!(
+            "  [{}] {:<24} {:<14} {} dBm  {}",
+            i + 1,
+            name,
+            names::device_kind(f.appearance),
+            f.rssi,
+            bt_address(&f.addr)
+        );
+    }
+}
+
+fn print_device_pairing(p: DevicePairing, passkey: Option<u32>) {
+    if p != DevicePairing::Idle {
+        println!("{}", names::device_pairing(p));
+    }
+    if let Some(v) = passkey.filter(|_| p == DevicePairing::Pairing) {
+        println!("{}", fl!("device-passkey", passkey = format!("{v:06}")));
+    }
+}
+
+fn print_profiles(s: &Snapshot, active: u8, count: u8, list: &[ProfileView], hop: &HopView) {
+    let devices = s.routed_devices();
     for (i, p) in list.iter().enumerate().take(count as usize) {
         let mark = if i == active as usize { '*' } else { ' ' };
-        let modes: Vec<String> =
-            Port::ALL.iter().map(|port| format!("{} {}", port.name(), p.modes[port.index()].name())).collect();
+        let modes: Vec<String> = devices
+            .iter()
+            .map(|d| {
+                let route = match p.routes[d.index()] {
+                    Routing::Follow => String::new(),
+                    r => format!(" → {}", names::route_name(r)),
+                };
+                format!("{} {}{route}", d.name(), p.modes[d.index()].name())
+            })
+            .collect();
         // Screen hop: the arrangement the profile uses.
         let hop = match p.arrangement {
             None => format!("; {}", fl!("cli-profile-no-hop")),
@@ -500,6 +683,57 @@ fn print_profiles(active: u8, count: u8, list: &[ProfileView], hop: &HopView) {
     if (count as usize) < MAX_PROFILES {
         println!("  ({})", fl!("cli-profiles-in-use", count = count, max = MAX_PROFILES));
     }
+}
+
+/// Looks for wireless devices to pair, and lists them as they show up, until the KVM stops looking (Ctrl-C leaves it
+/// looking: `device pair` picks from the list meanwhile).
+fn scan(c: &mut Client) -> Result<()> {
+    c.bt_scan(true)?;
+    println!("{}", fl!("cli-scan-started", seconds = kvm_proto::ctrl::BT_PAIR_SECONDS));
+    let mut shown = 0;
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let st = c.status()?;
+        let found = c.bt_found(st.bt_found)?;
+        if found.len() > shown {
+            print_found(&found[shown..]);
+            shown = found.len();
+        }
+        if st.bt_scan == 0 {
+            break;
+        }
+    }
+    println!("{}", fl!("cli-scan-ended"));
+    Ok(())
+}
+
+/// Pairs the device `which` names (its number in the list `device scan` prints, or its address), and follows the
+/// pairing to its end, with the passkey to type on a keyboard that asks for one.
+fn pair_device(c: &mut Client, s: &Snapshot, which: &str) -> Result<()> {
+    let found = &s.found;
+    let pick = match which.parse::<usize>() {
+        Ok(n) if (1..=found.len()).contains(&n) => found.get(n - 1),
+        _ => found.iter().find(|f| bt_address(&f.addr).eq_ignore_ascii_case(which)),
+    };
+    let Some(f) = pick else { bail!(fl!("cli-device-not-found", which = which)) };
+    c.bt_pair_device(f.addr)?;
+    let mut last = (DevicePairing::Idle, None);
+    let until = std::time::Instant::now() + Duration::from_secs(90);
+    while std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(300));
+        let st = c.status()?;
+        let now = (st.bt_device_pairing, st.bt_device_passkey);
+        if now != last {
+            print_device_pairing(now.0, now.1);
+            last = now;
+        }
+        match now.0 {
+            DevicePairing::Paired => return Ok(()),
+            DevicePairing::Failed => std::process::exit(1),
+            _ => {}
+        }
+    }
+    bail!(fl!("error-timeout"))
 }
 
 /// A profile by number or (case-insensitive) name.
@@ -656,6 +890,8 @@ fn print_event(e: &Event) {
         Event::BtActive(n) => println!("{}", fl!("cli-ev-host-active", slot = u32::from(*n))),
         Event::BtChanged(0) => println!("{}", fl!("cli-ev-pairing-changed")),
         Event::BtChanged(n) => println!("{}", fl!("cli-ev-host-changed", slot = u32::from(*n))),
+        Event::BtDeviceChanged(0) => println!("{}", fl!("cli-ev-devices-changed")),
+        Event::BtDeviceChanged(n) => println!("{}", fl!("cli-ev-device-changed", slot = u32::from(*n))),
         // Screen hop's placements, for the window's placer: `Client` keeps none.
         Event::PlaceCursor(_) => {}
     }
@@ -924,10 +1160,13 @@ fn main() -> Result<()> {
             match action {
                 None => {}
                 Some(PortAction::Mode { mode }) => {
-                    let m = PortMode::from_name(&mode)
-                        .with_context(|| fl!("parse-mode", value = mode.as_str(), modes = names::mode_names()))?;
-                    c.set_port_mode(port, m)?;
+                    let m = names::parse_mode(port.into(), &mode).map_err(anyhow::Error::msg)?;
+                    c.set_mode(port.into(), m)?;
                     // Re-detection and re-enumeration take a moment.
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                Some(PortAction::Route { route }) => {
+                    c.set_route(port.into(), names::parse_route(&route).map_err(anyhow::Error::msg)?)?;
                     std::thread::sleep(Duration::from_millis(300));
                 }
                 Some(PortAction::Redetect) => {
@@ -937,7 +1176,45 @@ fn main() -> Result<()> {
             }
             print_port(&c.snapshot()?, port);
         }
-        Cmd::Profile { which, setting, value } => {
+        Cmd::Device { action } => {
+            let s = c.snapshot()?;
+            if !s.has_bluetooth() {
+                bail!(fl!("cli-no-module-boards"));
+            }
+            match action.unwrap_or(DeviceAction::List) {
+                DeviceAction::List => print_devices(&s),
+                DeviceAction::Scan { stop } => match stop.as_deref() {
+                    Some("stop") => c.bt_scan(false)?,
+                    Some(other) => bail!(fl!("cli-scan-usage", value = other)),
+                    None => scan(&mut c)?,
+                },
+                DeviceAction::Pair { device } => pair_device(&mut c, &s, &device)?,
+                DeviceAction::Forget { slot } => {
+                    let n = if slot == "all" {
+                        0xFF
+                    } else {
+                        slot.parse::<u8>()
+                            .ok()
+                            .filter(|n| (1..=BT_DEVICES as u8).contains(n))
+                            .context(fl!("cli-slot-or-all"))?
+                    };
+                    c.bt_forget_device(n)?;
+                }
+                DeviceAction::Mode { slot, mode } => {
+                    let d = Device::wireless_slot(slot).context(fl!("cli-slot"))?;
+                    c.set_mode(d, names::parse_mode(d, &mode).map_err(anyhow::Error::msg)?)?;
+                }
+                DeviceAction::Route { slot, route } => {
+                    let d = Device::wireless_slot(slot).context(fl!("cli-slot"))?;
+                    c.set_route(d, names::parse_route(&route).map_err(anyhow::Error::msg)?)?;
+                }
+                DeviceAction::Map { slot } => {
+                    Device::wireless_slot(slot).context(fl!("cli-slot"))?;
+                    print_device_map(&c.bt_device_map(slot)?);
+                }
+            }
+        }
+        Cmd::Profile { which, setting, value, route } => {
             let s = c.snapshot()?;
             let Some((active, count, list)) = s.profiles() else { bail!(fl!("cli-no-profiles")) };
             match (which, setting, value) {
@@ -962,14 +1239,20 @@ fn main() -> Result<()> {
                         };
                         ConfigValue::ProfileArrangement(i, a)
                     } else {
-                        let port = Port::from_name(&setting).with_context(|| {
-                            let choices = "name, keyboard, mouse, other, arrangement";
+                        let d = Device::from_name(&setting).with_context(|| {
+                            let choices = "name, arrangement, keyboard, mouse, other, wireless1–wireless4";
                             fl!("parse-one-of", value = setting.as_str(), choices = choices)
                         })?;
-                        let m = PortMode::from_name(&value)
-                            .with_context(|| fl!("parse-mode", value = value.as_str(), modes = names::mode_names()))?;
+                        // The mode (`-` keeps it), then the routing if given.
+                        if let Some(r) = &route {
+                            let mut routes = list[i as usize].routes;
+                            routes[d.index()] = names::parse_route(r).map_err(anyhow::Error::msg)?;
+                            c.set_config(ConfigValue::ProfileRoutes(i, routes))?;
+                        }
                         let mut modes = list[i as usize].modes;
-                        modes[port.index()] = m;
+                        if value != "-" {
+                            modes[d.index()] = names::parse_mode(d, &value).map_err(anyhow::Error::msg)?;
+                        }
                         ConfigValue::ProfileModes(i, modes)
                     };
                     c.set_config(v)?;
@@ -978,7 +1261,7 @@ fn main() -> Result<()> {
             }
             let s = c.snapshot()?;
             let (active, count, list) = s.profiles().context("profiles")?;
-            print_profiles(active, count, &list, &s.hop());
+            print_profiles(&s, active, count, &list, &s.hop());
         }
         Cmd::Hotkey { action } => {
             let list = hotkey_list(&mut c)?;

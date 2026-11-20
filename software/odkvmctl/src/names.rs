@@ -4,12 +4,13 @@ use kvm_core::hotkey::{format_spec, parse_spec};
 
 use crate::{fl, i18n};
 use kvm_proto::ctrl::{
-    Accel, Advertised, AutoReason, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, ErrorCode, FaultKind, FwState,
-    HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Host, Hotkey, HotkeyAction, HotkeyBinding, HotkeyKind,
-    KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, MAX_PROFILES, Mapping, PROFILE_NAME_MAX, Polling, Port, PortMode,
-    PortState, PowerSource, ProfileName, Rgb, Screen, Speed, Status, Supply, SwitchSource, Units, VialMode, class,
-    diag, key,
+    Accel, Advertised, AutoReason, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, DEVICES, Device, DevicePairing,
+    ErrorCode, FaultKind, FwState, HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Host, Hotkey, HotkeyAction,
+    HotkeyBinding, HotkeyKind, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, MAX_PROFILES, Mapping,
+    PROFILE_NAME_MAX, Polling, Port, PortMode, PortState, PowerSource, ProfileName, Rgb, Routing, Screen, Speed,
+    Status, Supply, SwitchSource, Units, VialMode, class, diag, key,
 };
+use kvm_proto::link::bt::appearance;
 
 pub fn error(c: ErrorCode) -> String {
     match c {
@@ -60,12 +61,62 @@ pub fn port_title(p: Port) -> String {
     }
 }
 
-/// The port's name in a column of port modes.
-pub fn port_short(p: Port) -> String {
+/// A device by where it is: a front port, or Bluetooth device slot n.
+pub fn device_title(d: Device) -> String {
+    match (d.port(), d.wireless()) {
+        (Some(p), _) => port_title(p),
+        (None, Some(n)) => fl!("device-wireless-n", n = n),
+        (None, None) => String::new(),
+    }
+}
+
+/// What a Bluetooth device says it is, by its appearance.
+pub fn device_kind(a: u16) -> String {
+    match a {
+        appearance::KEYBOARD => fl!("device-kind-keyboard"),
+        appearance::MOUSE => fl!("device-kind-mouse"),
+        appearance::JOYSTICK | appearance::GAMEPAD => fl!("device-kind-gamepad"),
+        appearance::DIGITIZER | appearance::DIGITAL_PEN => fl!("device-kind-pen"),
+        appearance::TOUCHPAD => fl!("device-kind-touchpad"),
+        appearance::PRESENTER => fl!("device-kind-presenter"),
+        _ => fl!("device-kind-other"),
+    }
+}
+
+/// How far pairing a Bluetooth device got.
+pub fn device_pairing(p: DevicePairing) -> String {
     match p {
-        Port::Keyboard => fl!("port-short-keyboard"),
-        Port::Mouse => fl!("port-short-mouse"),
-        Port::Other => fl!("port-short-other"),
+        DevicePairing::Idle => String::new(),
+        DevicePairing::Connecting => fl!("device-pairing-connecting"),
+        DevicePairing::Pairing => fl!("device-pairing-pairing"),
+        DevicePairing::Reading => fl!("device-pairing-reading"),
+        DevicePairing::Paired => fl!("device-pairing-paired"),
+        DevicePairing::Failed => fl!("device-pairing-failed"),
+    }
+}
+
+/// A routing as the UIs say it, with `host` naming the host it is pinned to.
+pub fn route(r: Routing, host: impl Fn(Host) -> String) -> String {
+    match r {
+        Routing::Follow => fl!("route-follow"),
+        Routing::Pin(h) => fl!("route-pin", host = host(h)),
+    }
+}
+
+/// A routing as the CLI writes it: `follow`, or the host it is pinned to ([`host_name`]).
+pub fn route_name(r: Routing) -> String {
+    match r {
+        Routing::Follow => "follow".into(),
+        Routing::Pin(h) => host_name(h),
+    }
+}
+
+pub fn parse_route(s: &str) -> Result<Routing, String> {
+    match s.trim() {
+        "follow" => Ok(Routing::Follow),
+        h => parse_host(h)
+            .map(Routing::Pin)
+            .ok_or_else(|| fl!("parse-one-of", value = s, choices = "follow, pc1, pc2, host1, host2, host3, host4")),
     }
 }
 
@@ -111,21 +162,7 @@ pub fn mode(m: PortMode) -> String {
         PortMode::Mirrored => fl!("mode-mirrored"),
         PortMode::MirroredIdentity => fl!("mode-mirrored-identity"),
         PortMode::Passthrough => fl!("mode-passthrough"),
-        PortMode::PassthroughPc1 => fl!("mode-passthrough-pc1"),
-        PortMode::PassthroughPc2 => fl!("mode-passthrough-pc2"),
-    }
-}
-
-/// The short form, for the profile overview.
-pub fn mode_short(m: PortMode) -> String {
-    match m {
-        PortMode::Auto => fl!("mode-short-auto"),
-        PortMode::Normalized => fl!("mode-short-normalized"),
-        PortMode::Mirrored => fl!("mode-short-mirrored"),
-        PortMode::MirroredIdentity => fl!("mode-short-identity"),
-        PortMode::Passthrough => fl!("mode-short-passthrough"),
-        PortMode::PassthroughPc1 => fl!("mode-short-pinned-pc1"),
-        PortMode::PassthroughPc2 => fl!("mode-short-pinned-pc2"),
+        PortMode::Off => fl!("mode-off"),
     }
 }
 
@@ -665,9 +702,20 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("color-pc2", key::COLOR_PC2),
     ("polling", key::PC_POLLING),
     ("power-cycle", key::POWER_CYCLE_ON_SWITCH),
-    ("mode-keyboard", key::PORT_MODE_BASE),
-    ("mode-mouse", key::PORT_MODE_BASE + 1),
-    ("mode-other", key::PORT_MODE_BASE + 2),
+    ("mode-keyboard", key::MODE_BASE),
+    ("mode-mouse", key::MODE_BASE + 1),
+    ("mode-other", key::MODE_BASE + 2),
+    ("mode-wireless1", key::MODE_BASE + 3),
+    ("mode-wireless2", key::MODE_BASE + 4),
+    ("mode-wireless3", key::MODE_BASE + 5),
+    ("mode-wireless4", key::MODE_BASE + 6),
+    ("route-keyboard", key::ROUTE_BASE),
+    ("route-mouse", key::ROUTE_BASE + 1),
+    ("route-other", key::ROUTE_BASE + 2),
+    ("route-wireless1", key::ROUTE_BASE + 3),
+    ("route-wireless2", key::ROUTE_BASE + 4),
+    ("route-wireless3", key::ROUTE_BASE + 5),
+    ("route-wireless4", key::ROUTE_BASE + 6),
     ("software-switching", key::SW_SWITCH_ALLOWED),
     ("software-config", key::SW_CONFIG_ALLOWED),
     ("vial", key::VIAL),
@@ -678,14 +726,38 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("profiles", key::PROFILE_COUNT),
     ("profile", key::PROFILE),
     ("remember-profile", key::REMEMBER_PROFILE),
-    ("profile0-modes", key::PROFILE_MODES_BASE),
-    ("profile1-modes", key::PROFILE_MODES_BASE + 1),
-    ("profile2-modes", key::PROFILE_MODES_BASE + 2),
-    ("profile3-modes", key::PROFILE_MODES_BASE + 3),
     ("profile0-name", key::PROFILE_NAME_BASE),
+    ("profile0-modes", key::PROFILE_MODES_BASE),
+    ("profile0-routes", key::PROFILE_ROUTES_BASE),
+    ("profile0-arrangement", key::PROFILE_ARRANGEMENT_BASE),
     ("profile1-name", key::PROFILE_NAME_BASE + 1),
+    ("profile1-modes", key::PROFILE_MODES_BASE + 1),
+    ("profile1-routes", key::PROFILE_ROUTES_BASE + 1),
+    ("profile1-arrangement", key::PROFILE_ARRANGEMENT_BASE + 1),
     ("profile2-name", key::PROFILE_NAME_BASE + 2),
+    ("profile2-modes", key::PROFILE_MODES_BASE + 2),
+    ("profile2-routes", key::PROFILE_ROUTES_BASE + 2),
+    ("profile2-arrangement", key::PROFILE_ARRANGEMENT_BASE + 2),
     ("profile3-name", key::PROFILE_NAME_BASE + 3),
+    ("profile3-modes", key::PROFILE_MODES_BASE + 3),
+    ("profile3-routes", key::PROFILE_ROUTES_BASE + 3),
+    ("profile3-arrangement", key::PROFILE_ARRANGEMENT_BASE + 3),
+    ("profile4-name", key::PROFILE_NAME_BASE + 4),
+    ("profile4-modes", key::PROFILE_MODES_BASE + 4),
+    ("profile4-routes", key::PROFILE_ROUTES_BASE + 4),
+    ("profile4-arrangement", key::PROFILE_ARRANGEMENT_BASE + 4),
+    ("profile5-name", key::PROFILE_NAME_BASE + 5),
+    ("profile5-modes", key::PROFILE_MODES_BASE + 5),
+    ("profile5-routes", key::PROFILE_ROUTES_BASE + 5),
+    ("profile5-arrangement", key::PROFILE_ARRANGEMENT_BASE + 5),
+    ("profile6-name", key::PROFILE_NAME_BASE + 6),
+    ("profile6-modes", key::PROFILE_MODES_BASE + 6),
+    ("profile6-routes", key::PROFILE_ROUTES_BASE + 6),
+    ("profile6-arrangement", key::PROFILE_ARRANGEMENT_BASE + 6),
+    ("profile7-name", key::PROFILE_NAME_BASE + 7),
+    ("profile7-modes", key::PROFILE_MODES_BASE + 7),
+    ("profile7-routes", key::PROFILE_ROUTES_BASE + 7),
+    ("profile7-arrangement", key::PROFILE_ARRANGEMENT_BASE + 7),
     ("host1-name", key::BT_NAME_BASE),
     ("host2-name", key::BT_NAME_BASE + 1),
     ("host3-name", key::BT_NAME_BASE + 2),
@@ -715,10 +787,6 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("host2-pointer", key::BT_POINTER_BASE + 1),
     ("host3-pointer", key::BT_POINTER_BASE + 2),
     ("host4-pointer", key::BT_POINTER_BASE + 3),
-    ("profile0-arrangement", key::PROFILE_ARRANGEMENT_BASE),
-    ("profile1-arrangement", key::PROFILE_ARRANGEMENT_BASE + 1),
-    ("profile2-arrangement", key::PROFILE_ARRANGEMENT_BASE + 2),
-    ("profile3-arrangement", key::PROFILE_ARRANGEMENT_BASE + 3),
     ("arrangement0-name", key::ARRANGEMENT_NAME_BASE),
     ("arrangement0-screen0", key::screen(0, 0)),
     ("arrangement0-screen1", key::screen(0, 1)),
@@ -825,11 +893,13 @@ pub fn format_value(v: &ConfigValue) -> String {
         ConfigValue::ColorPc1(c) | ConfigValue::ColorPc2(c) => color(*c),
         ConfigValue::PcPolling(Polling::Us125) => "125us".into(),
         ConfigValue::PcPolling(Polling::Ms1) => "1ms".into(),
-        ConfigValue::PortMode(_, m) => m.name().into(),
+        ConfigValue::Mode(_, m) => m.name().into(),
+        ConfigValue::Route(_, r) => route_name(*r),
         ConfigValue::Vial(m) => m.name().into(),
         ConfigValue::KeyTap(a) | ConfigValue::KeyLong(a) => a.name().into(),
         ConfigValue::Profile(i) | ConfigValue::ProfileCount(i) => i.to_string(),
         ConfigValue::ProfileModes(_, m) => m.map(|m| m.name()).join(","),
+        ConfigValue::ProfileRoutes(_, r) => r.map(route_name).join(","),
         ConfigValue::ProfileName(_, n) => n.as_str().into(),
         ConfigValue::PowerCycleOnSwitch(b)
         | ConfigValue::SwSwitchAllowed(b)
@@ -878,10 +948,12 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
             _ => return Err(fl!("parse-one-of", value = s, choices = "125us, 1ms")),
         }),
         key::POWER_CYCLE_ON_SWITCH => ConfigValue::PowerCycleOnSwitch(parse_bool(s)?),
-        k if (key::PORT_MODE_BASE..key::PORT_MODE_BASE + 3).contains(&k) => ConfigValue::PortMode(
-            Port::from_index((k - key::PORT_MODE_BASE) as usize).unwrap_or(Port::Other),
-            PortMode::from_name(s).ok_or_else(|| fl!("parse-mode", value = s, modes = mode_names()))?,
-        ),
+        k if let Some(d) = key::mode_of(k).and_then(|d| Device::from_index(d as usize)) => {
+            ConfigValue::Mode(d, parse_mode(d, s)?)
+        }
+        k if let Some(d) = key::route_of(k).and_then(|d| Device::from_index(d as usize)) => {
+            ConfigValue::Route(d, parse_route(s)?)
+        }
         key::SW_SWITCH_ALLOWED => ConfigValue::SwSwitchAllowed(parse_bool(s)?),
         key::SW_CONFIG_ALLOWED => ConfigValue::SwConfigAllowed(parse_bool(s)?),
         key::VIAL => ConfigValue::Vial(
@@ -898,8 +970,11 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
         }
         key::PROFILE => ConfigValue::Profile(num(MAX_PROFILES as u32 - 1)? as u8),
         key::PROFILE_COUNT => ConfigValue::ProfileCount(num(MAX_PROFILES as u32)? as u8),
-        k if (key::PROFILE_MODES_BASE..key::PROFILE_MODES_BASE + MAX_PROFILES as u16).contains(&k) => {
-            ConfigValue::ProfileModes((k - key::PROFILE_MODES_BASE) as u8, parse_profile_modes(s)?)
+        k if let Some(i) = key::profile_of(k, key::PROFILE_MODES_BASE) => {
+            ConfigValue::ProfileModes(i, parse_profile_modes(s)?)
+        }
+        k if let Some(i) = key::profile_of(k, key::PROFILE_ROUTES_BASE) => {
+            ConfigValue::ProfileRoutes(i, parse_profile_routes(s)?)
         }
         k if (key::PROFILE_NAME_BASE..key::PROFILE_NAME_BASE + MAX_PROFILES as u16).contains(&k) => {
             ConfigValue::ProfileName((k - key::PROFILE_NAME_BASE) as u8, parse_profile_name(s)?)
@@ -931,8 +1006,8 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
             BtPointer::from_name(s.trim())
                 .ok_or_else(|| fl!("parse-one-of", value = s, choices = "absolute, relative"))?,
         ),
-        k if (key::PROFILE_ARRANGEMENT_BASE..key::PROFILE_ARRANGEMENT_BASE + MAX_PROFILES as u16).contains(&k) => {
-            ConfigValue::ProfileArrangement((k - key::PROFILE_ARRANGEMENT_BASE) as u8, parse_arrangement(s)?)
+        k if let Some(i) = key::profile_of(k, key::PROFILE_ARRANGEMENT_BASE) => {
+            ConfigValue::ProfileArrangement(i, parse_arrangement(s)?)
         }
         k if (key::ARRANGEMENT_NAME_BASE..key::ARRANGEMENT_NAME_BASE + MAX_ARRANGEMENTS as u16).contains(&k) => {
             let s = s.trim();
@@ -948,8 +1023,7 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
     })
 }
 
-/// A profile's arrangement: `none` (screen hop off), or its number 0–3. `off` and `on` (arrangement 0) are what the
-/// setting `profileN-hop` took before there were several.
+/// A profile's arrangement: `none` (screen hop off), or its number 0–3.
 pub fn parse_arrangement(s: &str) -> Result<Option<u8>, String> {
     match s.trim() {
         "none" => Ok(None),
@@ -962,13 +1036,38 @@ pub fn parse_arrangement(s: &str) -> Result<Option<u8>, String> {
     }
 }
 
-/// Three modes, Keyboard, Mouse and Other: `auto,auto,passthrough`.
-pub fn parse_profile_modes(s: &str) -> Result<[PortMode; 3], String> {
-    let modes: Vec<PortMode> = s
-        .split(',')
-        .map(|m| PortMode::from_name(m.trim()).ok_or_else(|| fl!("parse-mode", value = m.trim(), modes = mode_names())))
-        .collect::<Result<_, _>>()?;
-    modes.try_into().map_err(|_| fl!("parse-profile-modes", value = s))
+/// A mode for `d`: one it can have (a Bluetooth device takes `auto`, `normalized` and `off`).
+pub fn parse_mode(d: Device, s: &str) -> Result<PortMode, String> {
+    let names = || d.modes().iter().map(|m| m.name()).collect::<Vec<_>>().join(", ");
+    PortMode::from_name(s.trim())
+        .filter(|m| d.takes(*m))
+        .ok_or_else(|| fl!("parse-mode", value = s.trim(), modes = names()))
+}
+
+/// Every device's mode, in the order Keyboard, Mouse, Other, wireless 1–4: `auto,auto,passthrough,auto,auto,off,auto`.
+pub fn parse_profile_modes(s: &str) -> Result<[PortMode; DEVICES], String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != DEVICES {
+        return Err(fl!("parse-profile-modes", value = s));
+    }
+    let mut out = [PortMode::Auto; DEVICES];
+    for (i, (m, d)) in parts.iter().zip(Device::ALL).enumerate() {
+        out[i] = parse_mode(*d, m)?;
+    }
+    Ok(out)
+}
+
+/// Every device's routing, in the same order: `follow,follow,pc2,host1,follow,follow,follow`.
+pub fn parse_profile_routes(s: &str) -> Result<[Routing; DEVICES], String> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != DEVICES {
+        return Err(fl!("parse-profile-routes", value = s));
+    }
+    let mut out = [Routing::Follow; DEVICES];
+    for (i, r) in parts.iter().enumerate() {
+        out[i] = parse_route(r)?;
+    }
+    Ok(out)
 }
 
 pub fn parse_profile_name(s: &str) -> Result<ProfileName, String> {
@@ -1032,7 +1131,20 @@ mod tests {
             assert_eq!(parse_value(v.key(), &text), Ok(v), "{}", config_name(v.key()));
         }
         assert!(parse_value(key::COLOR_PC1, "#12345").is_err());
-        assert_eq!(config_key("mode-mouse"), Some(key::PORT_MODE_BASE + 1));
+        assert_eq!(config_key("mode-mouse"), Some(key::MODE_BASE + 1));
+        assert_eq!(config_key("route-wireless3"), Some(key::ROUTE_BASE + 5));
+        assert_eq!(config_key("profile7-routes"), Some(key::PROFILE_ROUTES_BASE + 7));
+        assert_eq!(
+            parse_value(key::MODE_BASE + 3, "passthrough").map(|_| ()),
+            Err(fl!("parse-mode", value = "passthrough", modes = "auto, normalized, off"))
+        );
+        assert_eq!(
+            parse_value(key::ROUTE_BASE, "host2"),
+            Ok(ConfigValue::Route(Device::Keyboard, Routing::Pin(Host::Bt2)))
+        );
+        let routes = parse_profile_routes("follow,pc1,pc2,host1,follow,follow,host4").unwrap();
+        assert_eq!(format_value(&ConfigValue::ProfileRoutes(0, routes)), "follow,pc1,pc2,host1,follow,follow,host4");
+        assert!(parse_profile_modes("auto,auto,passthrough").is_err(), "all seven");
         // An entry of the hotkey list: an action and a hotkey, or none.
         let k = config_key("hotkey3").unwrap();
         let v = parse_value(k, "select-host3 ctrl+alt+3").unwrap();

@@ -66,8 +66,8 @@ pub struct DisplayBinding {
     pub name: String,
     /// The input (MCCS VCP 0x60 value) that shows PC1 and PC2: how the monitor is wired.
     pub inputs: [Option<u16>; 2],
-    /// What it does in each of the KVM's profiles.
-    pub profiles: [DisplayMode; MAX_PROFILES],
+    /// What it does in each of the KVM's profiles, from profile 0 (a profile past the list leaves it alone).
+    pub profiles: Vec<DisplayMode>,
     /// Optional: the input that shows a Bluetooth host (a laptop or tablet wired to the monitor too), by the host's
     /// address (`BtHostView::address`). A host without one leaves the monitor on the PC.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -124,7 +124,7 @@ impl Local {
                     id: id.into(),
                     name: name.into(),
                     inputs: [None, None],
-                    profiles: [DisplayMode::Off; MAX_PROFILES],
+                    profiles: vec![DisplayMode::Off; MAX_PROFILES],
                     bt_inputs: BTreeMap::new(),
                 };
                 self.displays.push(b);
@@ -323,6 +323,8 @@ mod tests {
         let l: Local = serde_json::from_str(newer).unwrap();
         assert_eq!(l.theme, Theme::System);
         assert_eq!(l.displays[0].profiles, [DisplayMode::Follow, DisplayMode::Off, DisplayMode::Pc2, DisplayMode::Off]);
+        // Profiles past the list (there are eight) leave the monitor alone.
+        assert_eq!(l.displays[0].target(&KvmState { pc: 0, bt: None, profile: 6 }), None);
         assert_eq!(l.displays[0].inputs, [Some(15), Some(17)], "the binding itself is kept");
     }
 
@@ -344,7 +346,7 @@ mod tests {
         let mut l = Local::default();
         let b = l.binding_mut("m", "M");
         b.inputs = [Some(0x0F), Some(0x11)];
-        b.profiles = [DisplayMode::Follow, DisplayMode::Pc2, DisplayMode::Off, DisplayMode::Follow];
+        b.profiles = vec![DisplayMode::Follow, DisplayMode::Pc2, DisplayMode::Off, DisplayMode::Follow];
         b.bt_inputs.insert("C4:21:3B:6E:5A:01".into(), 0x12);
         let host = |addr: &str, profile| KvmState { pc: 0, bt: Some(addr.into()), profile };
         assert_eq!(b.target(&host("C4:21:3B:6E:5A:01", 0)), Some(0x12));

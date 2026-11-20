@@ -23,7 +23,8 @@ pub mod chain {
 pub struct LedInputs {
     pub active: Pc,
     pub links: [LinkState; 2],
-    pub ports: [(PortState, PortMode); 3],
+    /// Each port's state, effective mode, and the PC it is pinned to.
+    pub ports: [(PortState, PortMode, Option<Pc>); 3],
     pub color_pc1: Rgb,
     pub color_pc2: Rgb,
     pub brightness: u8,
@@ -151,7 +152,7 @@ pub fn render(i: &LedInputs, now_ms: u32) -> [Rgb; COUNT] {
         };
     }
 
-    for (k, (state, mode)) in i.ports.iter().enumerate() {
+    for (k, (state, mode, pinned)) in i.ports.iter().enumerate() {
         out[chain::PORTS[k]] = match state {
             PortState::Empty => OFF,
             PortState::Probing => scale(YELLOW, wave(now_ms, 400)),
@@ -166,21 +167,25 @@ pub fn render(i: &LedInputs, now_ms: u32) -> [Rgb; COUNT] {
             PortState::Unsupported => scale(AMBER, 80),
             // The Bluetooth module on this port (a dongle): the Bluetooth hosts' colour.
             PortState::Module => scale(BT_VIOLET, 160),
-            PortState::Hosted | PortState::Passthrough => match mode {
-                PortMode::Normalized | PortMode::Auto => GREEN,
-                PortMode::Mirrored => CYAN,
-                PortMode::MirroredIdentity => MAGENTA,
-                PortMode::Passthrough => WHITE,
-                PortMode::PassthroughPc1 => i.color_pc1,
-                PortMode::PassthroughPc2 => i.color_pc2,
+            PortState::Hosted | PortState::Passthrough => match (mode, pinned) {
+                (PortMode::Normalized | PortMode::Auto, _) => GREEN,
+                (PortMode::Mirrored, _) => CYAN,
+                (PortMode::MirroredIdentity, _) => MAGENTA,
+                // Passthrough pinned to a PC in that PC's colour, following the active PC in white.
+                (PortMode::Passthrough, Some(Pc::Pc1)) => i.color_pc1,
+                (PortMode::Passthrough, Some(Pc::Pc2)) => i.color_pc2,
+                (PortMode::Passthrough, None) => WHITE,
+                (PortMode::Off, _) => OFF,
             },
         };
     }
 
-    // A profile just made active: the front LEDs count it from the left, one for profile 0, two for profile 1, …
+    // A profile just made active: the front LEDs count it from the left, one for profile 0, two for profile 1, …, in
+    // white for the first five and in cyan for profiles 5–7 (one for profile 5).
     if let Some(k) = i.profile {
+        let (count, colour) = if (k as usize) < chain::KEY { (k as usize + 1, WHITE) } else { (k as usize - 4, CYAN) };
         for (n, c) in out[..chain::KEY].iter_mut().enumerate() {
-            *c = if n <= k as usize { WHITE } else { OFF };
+            *c = if n < count { colour } else { OFF };
         }
     }
 
@@ -203,9 +208,9 @@ mod tests {
             active: Pc::Pc2,
             links: [LinkState::Connected, LinkState::Connected],
             ports: [
-                (PortState::Hosted, PortMode::Normalized),
-                (PortState::Hosted, PortMode::MirroredIdentity),
-                (PortState::Empty, PortMode::Auto),
+                (PortState::Hosted, PortMode::Normalized, None),
+                (PortState::Hosted, PortMode::MirroredIdentity, None),
+                (PortState::Empty, PortMode::Auto, None),
             ],
             color_pc1: Rgb::new(0, 0, 255),
             color_pc2: Rgb::new(255, 0, 0),
@@ -299,6 +304,23 @@ mod tests {
         let c = render(&i, 0);
         assert_eq!(c[..chain::KEY], [WHITE, WHITE, OFF, OFF, OFF]);
         assert_eq!(c[chain::KEY], Rgb::new(255, 0, 0), "the key keeps the active PC's colour");
+        i.profile = Some(4);
+        assert_eq!(render(&i, 0)[..chain::KEY], [WHITE; 5]);
+        i.profile = Some(5);
+        assert_eq!(render(&i, 0)[..chain::KEY], [CYAN, OFF, OFF, OFF, OFF]);
+        i.profile = Some(7);
+        assert_eq!(render(&i, 0)[..chain::KEY], [CYAN, CYAN, CYAN, OFF, OFF]);
+    }
+
+    #[test]
+    fn passthrough_shows_where_it_is_pinned() {
+        let mut i = inputs();
+        i.ports[2] = (PortState::Passthrough, PortMode::Passthrough, Some(Pc::Pc1));
+        assert_eq!(render(&i, 0)[chain::OTHER], Rgb::new(0, 0, 255));
+        i.ports[2].2 = None;
+        assert_eq!(render(&i, 0)[chain::OTHER], WHITE);
+        i.ports[0] = (PortState::Hosted, PortMode::Off, None);
+        assert_eq!(render(&i, 0)[chain::KEYBOARD], OFF);
     }
 
     #[test]

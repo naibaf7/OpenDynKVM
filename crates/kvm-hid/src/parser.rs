@@ -1,7 +1,11 @@
 //! HID report-descriptor parser (HID 1.11 §6.2.2) producing a flat list of data fields with bit positions.
 //!
-//! Constant (padding) main items are not stored but still advance the bit offset. Fixed capacities keep it `no_std`;
-//! a descriptor that exceeds them is rejected, and the port falls back to forwarding raw reports (Mirrored).
+//! Constant (padding) main items are not stored but still advance the bit offset. Fixed capacities keep it `no_std`.
+//! What doesn't fit them is left out, not the whole descriptor, and the layout says so ([`Layout::incomplete`]): a USB
+//! device's port then mirrors it as before, while a Bluetooth device, which can only be normalized, works with what was
+//! read. A variable field with more usage ranges than a field holds (a bitmap of media keys, each usage listed on its
+//! own) is split into several fields instead, which reads it exactly. Until 0.1.32 any of these rejected the
+//! descriptor: a Bluetooth keyboard paired and showed as not supported (2026-11-20).
 
 use heapless::Vec;
 
@@ -11,7 +15,7 @@ pub const MAX_FIELDS: usize = 64;
 pub const MAX_RANGES: usize = 8;
 pub const MAX_REPORTS: usize = 24;
 pub const MAX_APPLICATIONS: usize = 8;
-const MAX_LOCAL_USAGES: usize = 24;
+const MAX_LOCAL_USAGES: usize = 64;
 const MAX_DEPTH: usize = 8;
 const MAX_PUSH: usize = 4;
 
@@ -52,9 +56,6 @@ pub mod flags {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ParseError {
     Truncated,
-    TooManyFields,
-    TooManyUsages,
-    TooManyReports,
     UnbalancedCollection,
     PushPop,
     ReportTooLong,
@@ -223,6 +224,8 @@ pub struct Layout {
     /// Usages of the top-level application collections, in order.
     pub applications: Vec<u32, MAX_APPLICATIONS>,
     sizes: Vec<ReportSize, MAX_REPORTS>,
+    /// Something in the descriptor didn't fit the capacities and was left out (fields, usages, reports, collections).
+    pub incomplete: bool,
 }
 
 impl Layout {
@@ -276,10 +279,14 @@ struct Parser {
     globals: Globals,
     stack: Vec<Globals, MAX_PUSH>,
     usages: Vec<LocalUsage, MAX_LOCAL_USAGES>,
+    /// More local usages came than `usages` holds: the next data item's elements past those kept have none.
+    usages_lost: bool,
     usage_min: Option<(u32, bool)>,
     delimiter_depth: u8,
     delimiter_seen: bool,
     collections: Vec<u32, MAX_DEPTH>,
+    /// Collections nested deeper than `collections` holds, still open.
+    deeper: u8,
     layout: Layout,
 }
 
@@ -317,7 +324,7 @@ impl Parser {
             }
             i += 1 + size;
         }
-        if !self.collections.is_empty() {
+        if !self.collections.is_empty() || self.deeper > 0 {
             return Err(ParseError::UnbalancedCollection);
         }
         Ok(self.layout)
@@ -329,6 +336,7 @@ impl Parser {
 
     fn reset_locals(&mut self) {
         self.usages.clear();
+        self.usages_lost = false;
         self.usage_min = None;
         self.delimiter_seen = false;
     }
@@ -344,14 +352,21 @@ impl Parser {
                     Some(LocalUsage::Range(min, _, ext)) => self.resolve(*min, *ext),
                     None => 0,
                 };
-                // Collection type 1 = application; only top-level ones are recorded.
+                // Collection type 1 = application; only top-level ones are recorded (beyond the list's room, their
+                // fields still carry their application).
                 if self.collections.is_empty() && (v & 0xFF) == 1 && self.layout.applications.push(u).is_err() {
-                    return Err(ParseError::TooManyReports);
+                    self.layout.incomplete = true;
                 }
-                self.collections.push(u).map_err(|_| ParseError::UnbalancedCollection)?;
+                if self.collections.push(u).is_err() {
+                    self.deeper += 1;
+                }
             }
             0xC => {
-                self.collections.pop().ok_or(ParseError::UnbalancedCollection)?;
+                if self.deeper > 0 {
+                    self.deeper -= 1;
+                } else {
+                    self.collections.pop().ok_or(ParseError::UnbalancedCollection)?;
+                }
             }
             _ => {}
         }
@@ -365,7 +380,11 @@ impl Parser {
         let pos = match self.layout.sizes.iter().position(|s| s.ty == ty && s.id == id) {
             Some(p) => p,
             None => {
-                self.layout.sizes.push(ReportSize { ty, id, bits: 0 }).map_err(|_| ParseError::TooManyReports)?;
+                if self.layout.sizes.push(ReportSize { ty, id, bits: 0 }).is_err() {
+                    // A report more than the layout holds: where its fields sit can't be kept, so they are left out.
+                    self.layout.incomplete = true;
+                    return Ok(());
+                }
                 self.layout.sizes.len() - 1
             }
         };
@@ -381,7 +400,7 @@ impl Parser {
             return Ok(());
         }
 
-        let mut usages = Vec::new();
+        let mut ranges: Vec<UsageRange, MAX_LOCAL_USAGES> = Vec::new();
         for lu in self.usages.iter() {
             let r = match *lu {
                 LocalUsage::Single(u, ext) => {
@@ -390,10 +409,12 @@ impl Parser {
                 }
                 LocalUsage::Range(a, b, ext) => UsageRange { min: self.resolve(a, ext), max: self.resolve(b, ext) },
             };
-            // Merge consecutive single usages into ranges to save space.
-            match usages.last_mut() {
+            // Merge consecutive single usages into ranges to save space (as many as there are local usages: fits).
+            match ranges.last_mut() {
                 Some(UsageRange { max, .. }) if *max + 1 == r.min && r.min == r.max => *max = r.min,
-                _ => usages.push(r).map_err(|_| ParseError::TooManyUsages)?,
+                _ => {
+                    let _ = ranges.push(r);
+                }
             }
         }
 
@@ -403,7 +424,7 @@ impl Parser {
             logical_max = g.logical_max_raw as i32;
         }
 
-        let field = Field {
+        let template = Field {
             ty,
             report_id: id,
             bit_offset: offset as u16,
@@ -414,10 +435,55 @@ impl Parser {
             logical_max,
             physical_min: g.physical_min,
             physical_max: g.physical_max,
-            usages,
+            usages: Vec::new(),
             application: self.collections.first().copied().unwrap_or(0),
         };
-        self.layout.fields.push(field).map_err(|_| ParseError::TooManyFields)
+        let total: u32 = ranges.iter().map(UsageRange::len).sum();
+        let is_variable = flags & flags::VARIABLE != 0;
+        let mut count = template.count as u32;
+        if self.usages_lost {
+            // The elements past the usages kept have none known: a variable field keeps only those it has usages for.
+            self.layout.incomplete = true;
+            if is_variable {
+                count = count.min(total);
+            }
+        }
+        if ranges.len() <= MAX_RANGES || !is_variable {
+            if ranges.len() > MAX_RANGES {
+                // An array: values past the ranges kept select nothing.
+                self.layout.incomplete = true;
+            }
+            let usages = ranges.iter().take(MAX_RANGES).copied().collect();
+            return self.push_field(Field { count: count as u16, usages, ..template });
+        }
+        // A variable field's element i has the i-th usage: split it into fields of MAX_RANGES ranges each, in order.
+        // The last one also takes elements past the usages, which repeat the last usage as in one field.
+        let mut done = 0u32;
+        let chunks = ranges.len().div_ceil(MAX_RANGES);
+        for (k, chunk) in ranges.chunks(MAX_RANGES).enumerate() {
+            if done >= count {
+                break;
+            }
+            let have: u32 = chunk.iter().map(UsageRange::len).sum();
+            let n = if k + 1 == chunks { count - done } else { have.min(count - done) };
+            let field = Field {
+                bit_offset: (offset + done * g.report_size) as u16,
+                count: n as u16,
+                usages: Vec::from_slice(chunk).unwrap_or_default(),
+                ..template.clone()
+            };
+            self.push_field(field)?;
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// A field into the layout; one more than it holds is left out.
+    fn push_field(&mut self, field: Field) -> Result<(), ParseError> {
+        if self.layout.fields.push(field).is_err() {
+            self.layout.incomplete = true;
+        }
+        Ok(())
     }
 
     fn global(&mut self, tag: u8, v: u32, size: usize) -> Result<(), ParseError> {
@@ -452,7 +518,9 @@ impl Parser {
         let extended = size == 4;
         match tag {
             0x0 => {
-                self.usages.push(LocalUsage::Single(v, extended)).map_err(|_| ParseError::TooManyUsages)?;
+                if self.usages.push(LocalUsage::Single(v, extended)).is_err() {
+                    self.usages_lost = true;
+                }
             }
             0x1 => self.usage_min = Some((v, extended)),
             0x2 => {
@@ -465,7 +533,9 @@ impl Parser {
                 } else {
                     (min, v)
                 };
-                self.usages.push(LocalUsage::Range(min, max, ext)).map_err(|_| ParseError::TooManyUsages)?;
+                if self.usages.push(LocalUsage::Range(min, max, ext)).is_err() {
+                    self.usages_lost = true;
+                }
             }
             0xA => {
                 if v == 1 {
@@ -557,7 +627,7 @@ pub(crate) mod fixtures {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::fixtures::*;
     use super::*;
     use crate::usage::{gd, page};
@@ -623,6 +693,65 @@ mod tests {
         assert_eq!(l.report_len(ReportType::Output, 0x11), 19);
         assert_eq!(l.report_ids(ReportType::Input).collect::<std::vec::Vec<_>>(), [0x10, 0x11]);
         assert_eq!(l.split_report(&[0x11, 1, 2]), Some((0x11, &[1u8, 2][..])));
+    }
+
+    /// A consumer bitmap of `n` 1-bit elements, report ID 3, each with its own usage 0x100, 0x102, … (none
+    /// consecutive), padded to whole bytes.
+    pub(crate) fn media_bitmap(n: u8) -> std::vec::Vec<u8> {
+        let mut d =
+            std::vec![0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, n];
+        for i in 0..n as u16 {
+            let [lo, hi] = (0x100 + 2 * i).to_le_bytes();
+            d.extend([0x0A, lo, hi]);
+        }
+        d.extend([0x81, 0x02]);
+        let pad = (8 - n % 8) % 8;
+        if pad > 0 {
+            d.extend([0x95, pad, 0x81, 0x01]);
+        }
+        d.push(0xC0);
+        d
+    }
+
+    #[test]
+    fn a_long_bitmap_is_split_into_fields_and_reads_exactly() {
+        let l = Layout::parse(&media_bitmap(20)).unwrap();
+        assert!(!l.incomplete);
+        let f: std::vec::Vec<_> = l.fields_of(ReportType::Input, 3).collect();
+        let parts: std::vec::Vec<_> = f.iter().map(|f| (f.bit_offset, f.count)).collect();
+        assert_eq!(parts, [(0, 8), (8, 8), (16, 4)]);
+        // Element 19 is the third field's fourth: the 20th usage.
+        assert_eq!(f[2].usage(3), Some(usage(0x0C, 0x100 + 38)));
+        assert_eq!(f[1].usage(0), Some(usage(0x0C, 0x110)));
+        assert_eq!(l.report_len(ReportType::Input, 3), 3);
+    }
+
+    #[test]
+    fn what_doesnt_fit_is_left_out_and_said() {
+        // 70 usages on an array: the first 64 kept, and of them the first ranges.
+        let mut d = std::vec![0x05, 0x07, 0xA1, 0x01, 0x15, 0x00, 0x25, 0x45, 0x75, 0x08, 0x95, 0x01];
+        for i in 0..70u8 {
+            d.extend([0x09, 0x04 + 2 * i]);
+        }
+        d.extend([0x81, 0x00, 0xC0]);
+        let l = Layout::parse(&d).unwrap();
+        assert!(l.incomplete && l.fields.len() == 1 && l.fields[0].usages.len() == MAX_RANGES);
+        // 70 one-byte fields: 64 kept, the report keeps its whole length.
+        let mut d = std::vec![0x06, 0x00, 0xFF, 0xA1, 0x01, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x01];
+        for _ in 0..70 {
+            d.extend([0x09, 0x01, 0x81, 0x02]);
+        }
+        d.push(0xC0);
+        let l = Layout::parse(&d).unwrap();
+        assert!(l.incomplete && l.fields.len() == MAX_FIELDS && l.report_len(ReportType::Input, 0) == 70);
+        // Collections ten deep: balanced, nothing lost.
+        let mut d = std::vec![0x05, 0x01, 0x09, 0x02];
+        d.extend([0xA1, 0x00].repeat(10));
+        d.extend([0x09, 0x30, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06]);
+        d.extend([0xC0].repeat(10));
+        let l = Layout::parse(&d).unwrap();
+        assert!(!l.incomplete && l.fields.len() == 1);
+        assert_eq!(Layout::parse(&d[..d.len() - 1]), Err(ParseError::UnbalancedCollection));
     }
 
     #[test]

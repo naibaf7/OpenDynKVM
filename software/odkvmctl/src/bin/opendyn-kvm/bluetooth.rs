@@ -1,5 +1,6 @@
 //! Bluetooth hosts in the window (KVMs with the Bluetooth module, boards from 0.16.0): the Bluetooth page, the
-//! compact row on the Overview, and the small host buttons under PC1 | PC2 in the sidebar.
+//! compact row on the Overview, and the small host buttons under PC1 | PC2 in the sidebar. The Bluetooth page also
+//! pairs and lists the module's devices (keyboards, mice), whose modes and routings are on the Ports page.
 //!
 //! Bluetooth hosts are lesser targets than the two PCs: nothing about them shows unless the KVM has the module, and
 //! outside the Bluetooth page only the hosts that are paired show, smaller than the PCs and in one colour.
@@ -7,8 +8,10 @@
 use eframe::egui::{self, Color32, RichText, Ui};
 use kvm_core::leds::BT_VIOLET;
 use kvm_proto::ctrl::diag::BtModule;
-use kvm_proto::ctrl::{BT_PAIR_SECONDS, BtPolicy, ConfigValue, ProfileName, selftest, status_flags};
-use odkvmctl::client::{BtHostView, Snapshot};
+use kvm_proto::ctrl::{
+    BT_PAIR_SECONDS, BtDeviceInfo, BtPolicy, ConfigValue, DevicePairing, ProfileName, selftest, status_flags,
+};
+use odkvmctl::client::{BtHostView, DeviceSlot, Snapshot};
 use odkvmctl::{fl, names};
 
 use crate::look::{self, BAD, GOOD, WARN, card, chip, ink, note};
@@ -18,6 +21,22 @@ use crate::{App, optimistic};
 /// The Bluetooth hosts' colour, as the KVM's key shows it.
 pub fn violet() -> Color32 {
     look::color32(BT_VIOLET)
+}
+
+pub(crate) fn device_state_text(d: &BtDeviceInfo) -> (String, Color32) {
+    if d.unreadable() {
+        (fl!("device-unsupported"), BAD)
+    } else if d.ready() {
+        (fl!("link-connected"), GOOD)
+    } else if d.connected() {
+        (fl!("host-connecting"), WARN)
+    } else {
+        (fl!("device-away"), Color32::GRAY)
+    }
+}
+
+fn device_name(d: &BtDeviceInfo) -> String {
+    if d.name.is_empty() { names::device_kind(d.appearance) } else { d.name.to_string() }
 }
 
 fn state_text(h: &BtHostView) -> (String, Color32) {
@@ -308,6 +327,126 @@ impl App {
                     if forget.clicked() {
                         self.send(UiCmd::BtForget(h.slot));
                         self.bt_names[i] = None;
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        // The devices after the hosts: each kind's pairing card above its slots.
+        ui.add_space(8.0);
+        self.bt_devices(ui, s, locked);
+    }
+}
+
+impl App {
+    /// Pairing a device (looking for one, the ones found, how far its pairing got, its passkey), and the device slots.
+    fn bt_devices(&mut self, ui: &mut Ui, s: &Snapshot, locked: bool) {
+        let st = &s.status;
+        let free = s.devices.iter().any(|d| !d.bonded());
+        let pairing =
+            matches!(st.bt_device_pairing, DevicePairing::Connecting | DevicePairing::Pairing | DevicePairing::Reading);
+        card(ui, &fl!("pair-new-device"), |ui| {
+            note(ui, fl!("pair-device-note"));
+            ui.horizontal(|ui| {
+                if st.bt_scan == 0 {
+                    let b = egui::Button::new(RichText::new(fl!("look-for-devices")).strong());
+                    let b = ui.add_enabled(!locked && free && !pairing, b);
+                    if b.on_disabled_hover_text(fl!("device-slots-full")).clicked() {
+                        self.send(UiCmd::BtScan(true));
+                        if let Some(snap) = self.shared.lock().unwrap().snap.as_mut() {
+                            snap.status.bt_scan = BT_PAIR_SECONDS;
+                            snap.found.clear();
+                        }
+                    }
+                } else {
+                    chip(ui, &fl!("looking", seconds = st.bt_scan), violet());
+                    if ui.button(fl!("stop")).clicked() {
+                        self.send(UiCmd::BtScan(false));
+                    }
+                }
+            });
+            if st.bt_scan != 0 || pairing {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+            }
+            if st.bt_scan != 0 && s.found.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    note(ui, fl!("found-none"));
+                });
+            }
+            if !s.found.is_empty() && st.bt_scan != 0 {
+                ui.add_space(4.0);
+                egui::Grid::new("bt-found").num_columns(4).spacing([12.0, 6.0]).show(ui, |ui| {
+                    for f in &s.found {
+                        let kind = names::device_kind(f.appearance);
+                        let name = if f.name.is_empty() { kind.clone() } else { f.name.to_string() };
+                        ui.label(RichText::new(name).strong());
+                        ui.label(kind);
+                        ui.label(RichText::new(fl!("link-signal", dbm = f.rssi)).small());
+                        let b = ui.add_enabled(!locked && !pairing, egui::Button::new(fl!("pair")));
+                        if b.clicked() {
+                            self.send(UiCmd::BtPairDevice(f.addr));
+                            if let Some(snap) = self.shared.lock().unwrap().snap.as_mut() {
+                                snap.status.bt_scan = 0;
+                                snap.status.bt_device_pairing = DevicePairing::Connecting;
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            }
+            if st.bt_device_pairing != DevicePairing::Idle {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if pairing {
+                        ui.spinner();
+                    }
+                    let color = match st.bt_device_pairing {
+                        DevicePairing::Paired => GOOD,
+                        DevicePairing::Failed => BAD,
+                        _ => WARN,
+                    };
+                    ui.label(RichText::new(names::device_pairing(st.bt_device_pairing)).color(ink(ui, color)));
+                });
+            }
+            if let Some(v) = st.bt_device_passkey.filter(|_| st.bt_device_pairing == DevicePairing::Pairing) {
+                let text = fl!("device-passkey", passkey = format!("{v:06}"));
+                ui.label(RichText::new(text).monospace().size(18.0).strong().color(ink(ui, violet())));
+            }
+        });
+        ui.add_space(8.0);
+        card(ui, &fl!("devices"), |ui| {
+            note(ui, fl!("devices-note"));
+            ui.add_space(4.0);
+            egui::Grid::new("bt-devices").num_columns(4).spacing([12.0, 8.0]).show(ui, |ui| {
+                for d in &s.devices {
+                    ui.label(RichText::new(format!("{}", d.slot)).strong().color(ink(ui, violet())));
+                    if !d.bonded() {
+                        ui.label(RichText::new(fl!("slot-free")).color(look::palette(ui).weak));
+                        ui.label("");
+                        ui.label("");
+                        ui.end_row();
+                        continue;
+                    }
+                    ui.vertical(|ui| {
+                        ui.set_width(200.0);
+                        ui.add(egui::Label::new(RichText::new(device_name(d)).strong()).truncate());
+                        note(ui, names::device_kind(d.appearance));
+                    });
+                    let (state, color) = device_state_text(d);
+                    let mut line = state;
+                    if d.battery <= 100 {
+                        line += &format!(" · {}", fl!("battery", percent = d.battery));
+                    }
+                    let r = ui.label(RichText::new(line).color(ink(ui, color)));
+                    if d.rssi != 0 {
+                        r.on_hover_text(fl!("link-signal", dbm = d.rssi));
+                    }
+                    let forget = ui
+                        .add_enabled(!locked, egui::Button::new(RichText::new(fl!("forget")).color(ink(ui, BAD))))
+                        .on_hover_text(fl!("forget-device-hover"));
+                    if forget.clicked() {
+                        self.send(UiCmd::BtForgetDevice(d.slot));
                     }
                     ui.end_row();
                 }

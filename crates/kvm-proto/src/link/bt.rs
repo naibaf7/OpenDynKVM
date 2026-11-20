@@ -9,6 +9,11 @@
 //! bond each, and a connection while the host is in range. The RP2354B decides which one gets input
 //! ([`BtMsg::Select`]) and sends it keyboard, mouse and media reports in the fixed Bluetooth report format below
 //! ([`report`]); the coprocessor knows nothing of the KVM's ports, modes or keymap.
+//!
+//! At the same time it is the central of up to [`MAX_DEVICES`] Bluetooth devices (keyboards, mice: HID over GATT), in
+//! device slots 1–4: a bond each, their report map, and a connection while they are on. Their input reports go to the
+//! RP2354B as they come ([`BtMsg::DeviceInput`]), which parses them with the map ([`BtMsg::DeviceMap`]) as it does a
+//! front-port device's.
 
 use super::frame::MAX_MSG;
 use crate::wire::{Reader, WireError, Writer, wire_enum};
@@ -21,6 +26,14 @@ pub const MAX_HOSTS: usize = 4;
 pub const ROLE: u8 = 3;
 /// Largest report body after `host` and `id`.
 pub const REPORT_MAX: usize = MAX_MSG - 3;
+/// Device slots on the coprocessor (one bond each).
+pub const MAX_DEVICES: usize = 4;
+/// Longest report map a device may have: a GATT attribute holds 512 bytes.
+pub const MAP_MAX: usize = 512;
+/// Report map bytes in one [`BtMsg::DeviceMap`].
+pub const MAP_CHUNK: usize = MAX_MSG - 6;
+/// Longest name kept of a device (UTF-8 bytes).
+pub const NAME_MAX: usize = crate::ctrl::BT_NAME_MAX;
 
 pub mod ty {
     pub const HELLO: u8 = 0x01;
@@ -32,9 +45,18 @@ pub mod ty {
     pub const POLICY: u8 = 0x65;
     pub const REQUEST_STATE: u8 = 0x66;
     pub const ENTER_ROM: u8 = 0x67;
+    pub const SCAN: u8 = 0x68;
+    pub const PAIR_DEVICE: u8 = 0x69;
+    pub const FORGET_DEVICE: u8 = 0x6A;
+    pub const REQUEST_MAP: u8 = 0x6B;
+    pub const DEVICE_OUTPUT: u8 = 0x6C;
     pub const OUTPUT: u8 = 0x70;
     pub const HOST: u8 = 0x71;
     pub const EVENT: u8 = 0x72;
+    pub const DEVICE_INPUT: u8 = 0x73;
+    pub const DEVICE: u8 = 0x74;
+    pub const DEVICE_MAP: u8 = 0x75;
+    pub const FOUND: u8 = 0x76;
 }
 
 /// The reports a Bluetooth host gets: one HID service whose report map ([`report::MAP`]) every host accepts
@@ -147,6 +169,16 @@ wire_enum! {
         /// and they reach flash with the next save there is anyway (a pairing, a host forgotten). Once per host and
         /// run of the module.
         SettingsHeld = 7,
+        /// Looking for devices to pair started, `value` = seconds.
+        ScanOpen = 8,
+        /// Looking for devices stopped (ran out, stopped, or a pairing began).
+        ScanClosed = 9,
+        /// Pairing a device moved on: `value` is the [`crate::ctrl::DevicePairing`] stage, `host` the device slot.
+        DeviceStage = 10,
+        /// The device being paired asks for a passkey to be typed on it: `value` (six digits), then Enter.
+        DevicePasskey = 11,
+        /// Device `host` lost its bond (it paired with something else): its slot is free again.
+        DeviceBondLost = 12,
     }
 }
 
@@ -160,6 +192,55 @@ pub mod host_flags {
     pub const ENCRYPTED: u8 = 1 << 2;
     /// The host enabled notifications of the keyboard input report.
     pub const SUBSCRIBED: u8 = 1 << 3;
+}
+
+/// `DeviceState.flags` bits.
+pub mod device_flags {
+    /// A bond is stored in this slot.
+    pub const BONDED: u8 = 1 << 0;
+    /// Connected now.
+    pub const CONNECTED: u8 = 1 << 1;
+    /// The link is encrypted with the bond's key.
+    pub const ENCRYPTED: u8 = 1 << 2;
+    /// Its input reports are subscribed to: input comes.
+    pub const READY: u8 = 1 << 3;
+    /// Set by the RP2354B in `ctrl::BtDeviceInfo` only: it holds the device's report map, so its reports are read.
+    pub const MAP_HELD: u8 = 1 << 6;
+    /// Set by the RP2354B in `ctrl::BtDeviceInfo` only: the device's report map came whole, and the KVM's parser can't
+    /// read it.
+    pub const MAP_UNREADABLE: u8 = 1 << 7;
+}
+
+/// The state of one device slot (coprocessor → RP2354B, on change and on [`BtMsg::RequestState`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct DeviceState {
+    /// 1–[`MAX_DEVICES`].
+    pub dev: u8,
+    /// [`device_flags`].
+    pub flags: u8,
+    /// Received signal strength in dBm (0 = unknown).
+    pub rssi: i8,
+    /// Battery level in % (0xFF = it reports none).
+    pub battery: u8,
+    /// Its GAP appearance (0 = unknown).
+    pub appearance: u16,
+    /// Its identity address, type byte then 6 bytes little-endian.
+    pub addr: [u8; 7],
+    /// Its report map's length and CRC-32 (0, 0: no bond): the RP2354B asks for the map ([`BtMsg::RequestMap`]) when
+    /// it doesn't hold this one.
+    pub map_len: u16,
+    pub map_crc: u32,
+}
+
+impl DeviceState {
+    pub fn bonded(&self) -> bool {
+        self.flags & device_flags::BONDED != 0
+    }
+
+    pub fn ready(&self) -> bool {
+        self.flags & device_flags::READY != 0
+    }
 }
 
 /// The state of one host slot (coprocessor → RP2354B, on change and on [`BtMsg::RequestState`]).
@@ -203,8 +284,9 @@ pub enum BtMsg<'a> {
     Hello { proto: u8, fw_version: u32, role: u8, flags: u8 },
     /// RP → BT: input report `id` ([`report`]) for `host`. Only the selected host takes it.
     Input { host: u8, id: u8, data: &'a [u8] },
-    /// RP → BT: the host that gets input, 0 = none (a PC is active).
-    Select { host: u8 },
+    /// RP → BT: the host that gets input as the active target (0 = none: a PC is), and the hosts devices are pinned to
+    /// (bit n−1 for host n): those take input too, and stay connected whatever their policy.
+    Select { host: u8, pinned: u8 },
     /// RP → BT: open (`on`) or close pairing; it closes by itself after `seconds`.
     Pair { on: bool, seconds: u8 },
     /// RP → BT: forget the bond in `host` (0xFF = all) and drop its connection.
@@ -225,6 +307,24 @@ pub enum BtMsg<'a> {
     Host(HostState),
     /// BT → RP: pairing and bond events.
     Event { kind: EventKind, host: u8, value: u32 },
+    /// RP → BT: look for devices to pair (`on`) for `seconds`, or stop. Host pairing closes meanwhile.
+    Scan { on: bool, seconds: u8 },
+    /// RP → BT: pair the device that advertises from `addr` ([`BtMsg::Found`]) into a free device slot.
+    PairDevice { addr: [u8; 7] },
+    /// RP → BT: forget device slot `dev` (0xFF = all) and drop its connection.
+    ForgetDevice { dev: u8 },
+    /// RP → BT: send device slot `dev`'s report map ([`BtMsg::DeviceMap`]).
+    RequestMap { dev: u8 },
+    /// RP → BT: output report `id` for device `dev` (a keyboard's LEDs), without the ID byte.
+    DeviceOutput { dev: u8, id: u8, data: &'a [u8] },
+    /// BT → RP: input report `id` of device `dev` as it came, without the ID byte (`id` 0: its map has no report IDs).
+    DeviceInput { dev: u8, id: u8, data: &'a [u8] },
+    /// BT → RP: a device slot changed; `name` is what the device calls itself.
+    Device { state: DeviceState, name: &'a str },
+    /// BT → RP: bytes from `offset` of device `dev`'s report map, `total` bytes long.
+    DeviceMap { dev: u8, offset: u16, total: u16, data: &'a [u8] },
+    /// BT → RP: a device that may be paired, found while looking (again at most once a second, with its signal now).
+    Found { addr: [u8; 7], rssi: i8, appearance: u16, name: &'a str },
 }
 
 const PASSKEY_CANCEL: u32 = u32::MAX;
@@ -249,9 +349,10 @@ impl<'a> BtMsg<'a> {
                 w.u8(id)?;
                 w.bytes(data)?;
             }
-            BtMsg::Select { host } => {
+            BtMsg::Select { host, pinned } => {
                 w.u8(ty::SELECT)?;
                 w.u8(host)?;
+                w.u8(pinned)?;
             }
             BtMsg::Pair { on, seconds } => {
                 w.u8(ty::PAIR)?;
@@ -289,6 +390,57 @@ impl<'a> BtMsg<'a> {
                 w.u8(host)?;
                 w.u32(value)?;
             }
+            BtMsg::Scan { on, seconds } => {
+                w.u8(ty::SCAN)?;
+                w.bool(on)?;
+                w.u8(seconds)?;
+            }
+            BtMsg::PairDevice { addr } => {
+                w.u8(ty::PAIR_DEVICE)?;
+                w.bytes(&addr)?;
+            }
+            BtMsg::ForgetDevice { dev } | BtMsg::RequestMap { dev } => {
+                w.u8(if matches!(self, BtMsg::ForgetDevice { .. }) { ty::FORGET_DEVICE } else { ty::REQUEST_MAP })?;
+                w.u8(dev)?;
+            }
+            BtMsg::DeviceOutput { dev, id, data } | BtMsg::DeviceInput { dev, id, data } => {
+                if data.len() > REPORT_MAX {
+                    return Err(WireError::Invalid);
+                }
+                w.u8(if matches!(self, BtMsg::DeviceInput { .. }) { ty::DEVICE_INPUT } else { ty::DEVICE_OUTPUT })?;
+                w.u8(dev)?;
+                w.u8(id)?;
+                w.bytes(data)?;
+            }
+            BtMsg::Device { state: d, name } => {
+                w.u8(ty::DEVICE)?;
+                w.u8(d.dev)?;
+                w.u8(d.flags)?;
+                w.u8(d.rssi as u8)?;
+                w.u8(d.battery)?;
+                w.u16(d.appearance)?;
+                w.bytes(&d.addr)?;
+                w.u16(d.map_len)?;
+                w.u32(d.map_crc)?;
+                w.lv(&name.as_bytes()[..name.len().min(NAME_MAX)])?;
+            }
+            BtMsg::DeviceMap { dev, offset, total, data } => {
+                if data.len() > MAP_CHUNK {
+                    return Err(WireError::Invalid);
+                }
+                w.u8(ty::DEVICE_MAP)?;
+                w.u8(dev)?;
+                w.u16(offset)?;
+                w.u16(total)?;
+                w.bytes(data)?;
+            }
+            BtMsg::Found { addr, rssi, appearance, name } => {
+                w.u8(ty::FOUND)?;
+                w.bytes(&addr)?;
+                w.u8(rssi as u8)?;
+                w.u16(appearance)?;
+                w.lv(&name.as_bytes()[..name.len().min(NAME_MAX)])?;
+            }
         }
         Ok(w.len())
     }
@@ -299,7 +451,7 @@ impl<'a> BtMsg<'a> {
             ty::HELLO => BtMsg::Hello { proto: r.u8()?, fw_version: r.u32()?, role: r.u8()?, flags: r.u8()? },
             ty::INPUT => BtMsg::Input { host: r.u8()?, id: r.u8()?, data: r.rest() },
             ty::OUTPUT => BtMsg::Output { host: r.u8()?, id: r.u8()?, data: r.rest() },
-            ty::SELECT => BtMsg::Select { host: r.u8()? },
+            ty::SELECT => BtMsg::Select { host: r.u8()?, pinned: r.u8()? },
             ty::PAIR => BtMsg::Pair { on: r.bool()?, seconds: r.u8()? },
             ty::FORGET => BtMsg::Forget { host: r.u8()? },
             ty::PASSKEY => {
@@ -319,6 +471,29 @@ impl<'a> BtMsg<'a> {
                 rssi: r.u8()? as i8,
             }),
             ty::EVENT => BtMsg::Event { kind: r.u8()?.try_into()?, host: r.u8()?, value: r.u32()? },
+            ty::SCAN => BtMsg::Scan { on: r.bool()?, seconds: r.u8()? },
+            ty::PAIR_DEVICE => BtMsg::PairDevice { addr: r.array()? },
+            ty::FORGET_DEVICE => BtMsg::ForgetDevice { dev: r.u8()? },
+            ty::REQUEST_MAP => BtMsg::RequestMap { dev: r.u8()? },
+            ty::DEVICE_OUTPUT => BtMsg::DeviceOutput { dev: r.u8()?, id: r.u8()?, data: r.rest() },
+            ty::DEVICE_INPUT => BtMsg::DeviceInput { dev: r.u8()?, id: r.u8()?, data: r.rest() },
+            ty::DEVICE => {
+                let state = DeviceState {
+                    dev: r.u8()?,
+                    flags: r.u8()?,
+                    rssi: r.u8()? as i8,
+                    battery: r.u8()?,
+                    appearance: r.u16()?,
+                    addr: r.array()?,
+                    map_len: r.u16()?,
+                    map_crc: r.u32()?,
+                };
+                BtMsg::Device { state, name: name(&mut r)? }
+            }
+            ty::DEVICE_MAP => BtMsg::DeviceMap { dev: r.u8()?, offset: r.u16()?, total: r.u16()?, data: r.rest() },
+            ty::FOUND => {
+                BtMsg::Found { addr: r.array()?, rssi: r.u8()? as i8, appearance: r.u16()?, name: name(&mut r)? }
+            }
             _ => return Err(WireError::Invalid),
         })
     }
@@ -326,9 +501,32 @@ impl<'a> BtMsg<'a> {
     /// Input reports go ahead of everything else, as on the AT32F405 links.
     pub fn prio(&self) -> super::Prio {
         match self {
-            BtMsg::Input { .. } => super::Prio::High,
+            BtMsg::Input { .. } | BtMsg::DeviceInput { .. } => super::Prio::High,
             _ => super::Prio::Low,
         }
+    }
+}
+
+fn name<'a>(r: &mut Reader<'a>) -> Result<&'a str, WireError> {
+    core::str::from_utf8(r.lv()?).map_err(|_| WireError::Invalid)
+}
+
+/// What a GAP appearance (Bluetooth Assigned Numbers §2.6) says a device is.
+pub mod appearance {
+    pub const KEYBOARD: u16 = 0x03C1;
+    pub const MOUSE: u16 = 0x03C2;
+    pub const JOYSTICK: u16 = 0x03C3;
+    pub const GAMEPAD: u16 = 0x03C4;
+    pub const DIGITIZER: u16 = 0x03C5;
+    pub const CARD_READER: u16 = 0x03C6;
+    pub const DIGITAL_PEN: u16 = 0x03C7;
+    pub const BARCODE: u16 = 0x03C8;
+    pub const TOUCHPAD: u16 = 0x03C9;
+    pub const PRESENTER: u16 = 0x03CA;
+
+    /// The Human Interface Device category (0x03C0–0x03FF).
+    pub const fn is_hid(a: u16) -> bool {
+        a >> 6 == 0x03C0 >> 6
     }
 }
 
@@ -513,7 +711,7 @@ mod tests {
         roundtrip(BtMsg::Hello { proto: 1, fw_version: 0x000100, role: ROLE, flags: 0 });
         roundtrip(BtMsg::Input { host: 2, id: report::KEYBOARD, data: &[2, 0, 4, 0, 0, 0, 0, 0] });
         roundtrip(BtMsg::Output { host: 1, id: report::KEYBOARD, data: &[0b10] });
-        roundtrip(BtMsg::Select { host: 0 });
+        roundtrip(BtMsg::Select { host: 0, pinned: 0b0101 });
         roundtrip(BtMsg::Pair { on: true, seconds: 60 });
         roundtrip(BtMsg::Forget { host: 0xFF });
         roundtrip(BtMsg::Passkey { host: 3, value: Some(123456) });
@@ -531,6 +729,31 @@ mod tests {
         }));
         roundtrip(BtMsg::Event { kind: EventKind::PairFailed, host: 2, value: 5 });
         roundtrip(BtMsg::Event { kind: EventKind::SettingsHeld, host: 3, value: 0 });
+        roundtrip(BtMsg::Event { kind: EventKind::DevicePasskey, host: 0, value: 123456 });
+        roundtrip(BtMsg::Scan { on: true, seconds: 60 });
+        roundtrip(BtMsg::PairDevice { addr: [1, 6, 5, 4, 3, 2, 0xC1] });
+        roundtrip(BtMsg::ForgetDevice { dev: 0xFF });
+        roundtrip(BtMsg::RequestMap { dev: 2 });
+        roundtrip(BtMsg::DeviceOutput { dev: 1, id: 1, data: &[0b10] });
+        roundtrip(BtMsg::DeviceInput { dev: 4, id: 0, data: &[0, 0, 4, 0, 0, 0, 0, 0] });
+        let state = DeviceState {
+            dev: 3,
+            flags: device_flags::BONDED | device_flags::READY,
+            rssi: -55,
+            battery: 80,
+            appearance: appearance::KEYBOARD,
+            addr: [0, 1, 2, 3, 4, 5, 6],
+            map_len: 200,
+            map_crc: 0xDEAD_BEEF,
+        };
+        roundtrip(BtMsg::Device { state, name: "Desk keyboard" });
+        roundtrip(BtMsg::DeviceMap { dev: 3, offset: 59, total: 200, data: &[0x05; MAP_CHUNK] });
+        roundtrip(BtMsg::Found { addr: [1; 7], rssi: -70, appearance: appearance::MOUSE, name: "" });
+        // The longest name fits, with everything else, in one message.
+        let long = "n".repeat(NAME_MAX);
+        roundtrip(BtMsg::Device { state, name: &long });
+        roundtrip(BtMsg::Found { addr: [1; 7], rssi: -70, appearance: 0, name: &long });
+        assert!(appearance::is_hid(appearance::KEYBOARD) && appearance::is_hid(0x03FF) && !appearance::is_hid(0x0400));
     }
 
     #[test]

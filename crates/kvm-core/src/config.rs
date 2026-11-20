@@ -9,9 +9,10 @@
 use core::ops::RangeInclusive;
 
 use kvm_proto::ctrl::{
-    Accel, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, ErrorCode, HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HOSTS,
-    Host, Hotkey, HotkeyAction, HotkeyBinding, KeyAction, MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, MAX_SCREENS,
-    Mapping, PROFILE_NAME_MAX, Polling, Port, PortMode, ProfileName, Rgb, Screen, Units, VialMode, key,
+    Accel, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, DEVICES, Device, ErrorCode, HOP_CORNER_MAX, HOP_RESISTANCE_MAX,
+    HOP_SPEED, HOSTS, Host, Hotkey, HotkeyAction, HotkeyBinding, KeyAction, MAX_ARRANGEMENTS, MAX_HOTKEYS,
+    MAX_PROFILES, MAX_SCREENS, Mapping, PROFILE_NAME_MAX, Polling, PortMode, ProfileName, Rgb, Routing, Screen, Units,
+    VialMode, key,
 };
 use kvm_proto::wire::{Reader, Writer};
 
@@ -20,7 +21,7 @@ pub use crate::hop::Layout;
 /// Store key of the config.
 pub const ITEM: u16 = 0x0001;
 /// Room for every key with margin (`item_roundtrip` keeps the item at its longest 32 bytes short of it).
-pub const ITEM_MAX: usize = 576;
+pub const ITEM_MAX: usize = 704;
 /// Store key of arrangement 0's item; arrangement n's is this + n.
 pub const ARRANGEMENT_ITEM: u16 = 0x0010;
 /// An arrangement's item at its longest: its name (key, length, then the name with its own length) and every screen
@@ -54,7 +55,7 @@ pub struct Config {
     pub key_tap: KeyAction,
     pub key_long: KeyAction,
     pub long_press_ms: u16,
-    /// The active profile, one of the first `profile_count`; its port modes are the ones in force.
+    /// The active profile, one of the first `profile_count`; its modes and routings are the ones in force.
     pub profile: u8,
     pub profile_count: u8,
     /// Power up in the profile last active; otherwise (the default) in profile 0, and choosing a profile writes nothing
@@ -101,20 +102,28 @@ pub struct HopConfig {
     pub bt_pointer: [BtPointer; BT_HOSTS],
 }
 
-/// A set of port modes to switch between with the key, e.g. emulated for work and passthrough for games.
+/// A set of modes and routings to switch between with the key, e.g. emulated for work and passthrough for games.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Profile {
     pub name: ProfileName,
-    /// Keyboard, Mouse, Other.
-    pub port_modes: [PortMode; 3],
+    /// Each device's mode and routing ([`Device`] order: the front ports, then the Bluetooth device slots).
+    pub modes: [PortMode; DEVICES],
+    pub routes: [Routing; DEVICES],
     /// The arrangement screen hop moves the pointer across in this profile; None: screen hop is off.
     pub arrangement: Option<u8>,
 }
 
 impl Profile {
-    const fn new(name: &str, mode: PortMode) -> Profile {
-        Profile { name: ProfileName::new(name), port_modes: [mode; 3], arrangement: None }
+    /// Every front port in `ports`, the Bluetooth devices in Auto, everything following the active target.
+    const fn new(name: &str, ports: PortMode) -> Profile {
+        let mut modes = [PortMode::Auto; DEVICES];
+        let mut i = 0;
+        while i < 3 {
+            modes[i] = ports;
+            i += 1;
+        }
+        Profile { name: ProfileName::new(name), modes, routes: [Routing::Follow; DEVICES], arrangement: None }
     }
 }
 
@@ -163,6 +172,10 @@ impl Config {
             Profile::new("gaming", PortMode::Passthrough),
             Profile::new("profile 2", PortMode::Auto),
             Profile::new("profile 3", PortMode::Auto),
+            Profile::new("profile 4", PortMode::Auto),
+            Profile::new("profile 5", PortMode::Auto),
+            Profile::new("profile 6", PortMode::Auto),
+            Profile::new("profile 7", PortMode::Auto),
         ],
         bt_names: [ProfileName::new(""); BT_HOSTS],
         bt_policies: [BtPolicy::StayConnected; BT_HOSTS],
@@ -181,9 +194,19 @@ impl Config {
         arrangements: [Arrangement::EMPTY; MAX_ARRANGEMENTS],
     };
 
-    /// The port modes in force: the active profile's.
-    pub fn port_modes(&self) -> [PortMode; 3] {
-        self.profiles[self.profile as usize].port_modes
+    /// The modes in force: the active profile's.
+    pub fn modes(&self) -> [PortMode; DEVICES] {
+        self.profiles[self.profile as usize].modes
+    }
+
+    /// The mode in force of `d`.
+    pub fn mode(&self, d: Device) -> PortMode {
+        self.modes()[d.index()]
+    }
+
+    /// The routing in force of `d`.
+    pub fn route(&self, d: Device) -> Routing {
+        self.profiles[self.profile as usize].routes[d.index()]
     }
 
     /// The profile after the active one, among those in use.
@@ -242,9 +265,13 @@ impl Config {
             key::COLOR_PC2 => ConfigValue::ColorPc2(self.color_pc2),
             key::PC_POLLING => ConfigValue::PcPolling(self.polling),
             key::POWER_CYCLE_ON_SWITCH => ConfigValue::PowerCycleOnSwitch(self.power_cycle_on_switch),
-            k if (key::PORT_MODE_BASE..key::PORT_MODE_BASE + 3).contains(&k) => {
-                let p = Port::from_index((k - key::PORT_MODE_BASE) as usize)?;
-                ConfigValue::PortMode(p, self.port_modes()[p.index()])
+            k if let Some(d) = key::mode_of(k) => {
+                let d = Device::from_index(d as usize)?;
+                ConfigValue::Mode(d, self.mode(d))
+            }
+            k if let Some(d) = key::route_of(k) => {
+                let d = Device::from_index(d as usize)?;
+                ConfigValue::Route(d, self.route(d))
             }
             key::SW_SWITCH_ALLOWED => ConfigValue::SwSwitchAllowed(self.sw_switch_allowed),
             key::SW_CONFIG_ALLOWED => ConfigValue::SwConfigAllowed(self.sw_config_allowed),
@@ -259,9 +286,11 @@ impl Config {
             key::REMEMBER_PROFILE => ConfigValue::RememberProfile(self.remember_profile),
             key::PROFILE => ConfigValue::Profile(self.profile),
             key::PROFILE_COUNT => ConfigValue::ProfileCount(self.profile_count),
-            k if (key::PROFILE_MODES_BASE..key::PROFILE_MODES_BASE + MAX_PROFILES as u16).contains(&k) => {
-                let i = k - key::PROFILE_MODES_BASE;
-                ConfigValue::ProfileModes(i as u8, self.profiles[i as usize].port_modes)
+            k if let Some(i) = key::profile_of(k, key::PROFILE_MODES_BASE) => {
+                ConfigValue::ProfileModes(i, self.profiles[i as usize].modes)
+            }
+            k if let Some(i) = key::profile_of(k, key::PROFILE_ROUTES_BASE) => {
+                ConfigValue::ProfileRoutes(i, self.profiles[i as usize].routes)
             }
             k if (key::PROFILE_NAME_BASE..key::PROFILE_NAME_BASE + MAX_PROFILES as u16).contains(&k) => {
                 let i = k - key::PROFILE_NAME_BASE;
@@ -326,7 +355,16 @@ impl Config {
             ConfigValue::ProfileCount(n) if !(1..=MAX_PROFILES as u8).contains(&n) => {
                 return Err(ErrorCode::InvalidValue);
             }
-            ConfigValue::ProfileModes(i, _) | ConfigValue::ProfileName(i, _) if i as usize >= MAX_PROFILES => {
+            ConfigValue::ProfileModes(i, _) | ConfigValue::ProfileRoutes(i, _) | ConfigValue::ProfileName(i, _)
+                if i as usize >= MAX_PROFILES =>
+            {
+                return Err(ErrorCode::InvalidValue);
+            }
+            // A mode the device can't have (passthrough over Bluetooth, …).
+            ConfigValue::Mode(d, m) if !d.takes(m) => return Err(ErrorCode::InvalidValue),
+            ConfigValue::ProfileModes(_, m)
+                if m.iter().enumerate().any(|(i, m)| Device::from_index(i).is_none_or(|d| !d.takes(*m))) =>
+            {
                 return Err(ErrorCode::InvalidValue);
             }
             ConfigValue::BtName(i, _) | ConfigValue::BtPolicy(i, _) if i as usize >= BT_HOSTS => {
@@ -367,8 +405,9 @@ impl Config {
             ConfigValue::ColorPc2(c) => self.color_pc2 = c,
             ConfigValue::PcPolling(p) => self.polling = p,
             ConfigValue::PowerCycleOnSwitch(b) => self.power_cycle_on_switch = b,
-            // The port modes are the active profile's.
-            ConfigValue::PortMode(p, m) => self.profiles[self.profile as usize].port_modes[p.index()] = m,
+            // The modes and routings are the active profile's.
+            ConfigValue::Mode(d, m) => self.profiles[self.profile as usize].modes[d.index()] = m,
+            ConfigValue::Route(d, r) => self.profiles[self.profile as usize].routes[d.index()] = r,
             ConfigValue::SwSwitchAllowed(b) => self.sw_switch_allowed = b,
             ConfigValue::SwConfigAllowed(b) => self.sw_config_allowed = b,
             ConfigValue::Vial(m) => self.vial = m,
@@ -387,7 +426,8 @@ impl Config {
                     self.profile = 0;
                 }
             }
-            ConfigValue::ProfileModes(i, m) => self.profiles[i as usize].port_modes = m,
+            ConfigValue::ProfileModes(i, m) => self.profiles[i as usize].modes = m,
+            ConfigValue::ProfileRoutes(i, r) => self.profiles[i as usize].routes = r,
             ConfigValue::ProfileName(i, n) => self.profiles[i as usize].name = n,
             ConfigValue::BtName(i, n) => self.bt_names[i as usize] = n,
             ConfigValue::BtPolicy(i, p) => self.bt_policies[i as usize] = p,
@@ -411,12 +451,13 @@ impl Config {
         Ok(v)
     }
 
-    /// Encodes the flash item, without the arrangements (their own items) and the port modes (the active profile's);
-    /// returns its length.
+    /// Encodes the flash item, without the arrangements (their own items) and the modes and routings in force (the
+    /// active profile's); returns its length.
     pub fn encode(&self, out: &mut [u8; ITEM_MAX]) -> usize {
         let mut w = Writer::new(out);
-        let stored =
-            |v: &ConfigValue| key::arrangement_of(v.key()).is_none() && !matches!(v, ConfigValue::PortMode(..));
+        let stored = |v: &ConfigValue| {
+            key::arrangement_of(v.key()).is_none() && !matches!(v, ConfigValue::Mode(..) | ConfigValue::Route(..))
+        };
         for v in self.all().filter(stored) {
             entry(&mut w, &v);
         }
@@ -428,7 +469,7 @@ impl Config {
     pub fn decode(item: &[u8]) -> Config {
         let mut cfg = Config::default();
         cfg.apply(item, |k| {
-            key::arrangement_of(k).is_none() && !(key::PORT_MODE_BASE..key::PORT_MODE_BASE + 3).contains(&k)
+            key::arrangement_of(k).is_none() && key::mode_of(k).is_none() && key::route_of(k).is_none()
         });
         if !cfg.remember_profile {
             cfg.profile = 0;
@@ -494,7 +535,8 @@ mod tests {
     #[test]
     fn item_roundtrip() {
         let mut c = Config::default();
-        c.set(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc1), Origin::Software).unwrap();
+        c.set(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
+        c.set(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
         c.set(ConfigValue::ColorPc2(Rgb::new(9, 8, 7)), Origin::Software).unwrap();
         c.set(ConfigValue::SwSwitchAllowed(false), Origin::Software).unwrap();
         c.set(ConfigValue::Vial(VialMode::Auto), Origin::Software).unwrap();
@@ -503,12 +545,18 @@ mod tests {
         c.set(ConfigValue::KeyLong(KeyAction::OtherPortMode), Origin::Software).unwrap();
         // The last profile active (remembered), every name as long as it can be: the item still fits.
         c.set(ConfigValue::RememberProfile(true), Origin::Software).unwrap();
-        c.set(ConfigValue::ProfileCount(4), Origin::Software).unwrap();
-        c.set(ConfigValue::Profile(3), Origin::Software).unwrap();
-        c.set(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
-        for i in 0..4 {
+        c.set(ConfigValue::ProfileCount(MAX_PROFILES as u8), Origin::Software).unwrap();
+        c.set(ConfigValue::Profile(7), Origin::Software).unwrap();
+        c.set(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored), Origin::Software).unwrap();
+        c.set(ConfigValue::Route(Device::Wireless2, Routing::Pin(Host::Bt4)), Origin::Software).unwrap();
+        for i in 0..MAX_PROFILES as u8 {
             c.set(ConfigValue::ProfileName(i, ProfileName::new("twelve bytes")), Origin::Software).unwrap();
-            c.set(ConfigValue::ProfileArrangement(i, (i % 2 == 0).then_some(3 - i)), Origin::Software).unwrap();
+            let a = (i % 2 == 0).then_some(i / 2 % MAX_ARRANGEMENTS as u8);
+            c.set(ConfigValue::ProfileArrangement(i, a), Origin::Software).unwrap();
+            if i < 7 {
+                let routes = core::array::from_fn(|d| Routing::ALL[(d + i as usize) % Routing::ALL.len()]);
+                c.set(ConfigValue::ProfileRoutes(i, routes), Origin::Software).unwrap();
+            }
         }
         // Screen hop, with every host's settings changed and every screen slot of every arrangement used.
         c.set(ConfigValue::AbsPointer(true), Origin::Software).unwrap();
@@ -561,8 +609,10 @@ mod tests {
         }
         assert_eq!(d, c);
         assert!(d.arrangements[2].screens[3].off && d.arrangements[2].screens[4].fixed);
-        assert_eq!(d.port_modes(), [PortMode::Auto, PortMode::Mirrored, PortMode::Auto]);
-        assert_eq!(d.profiles[0].port_modes[Port::Other.index()], PortMode::PassthroughPc1);
+        assert_eq!(d.modes()[..3], [PortMode::Auto, PortMode::Mirrored, PortMode::Auto]);
+        assert_eq!(d.route(Device::Wireless2), Routing::Pin(Host::Bt4));
+        assert_eq!(d.profiles[0].modes[Device::Other.index()], PortMode::Passthrough);
+        assert_eq!(d.profiles[3].routes, c.profiles[3].routes);
         assert_eq!(Config::decode(&[]), Config::default());
     }
 
@@ -587,29 +637,47 @@ mod tests {
         assert_eq!(d.led_brightness, Config::default().led_brightness);
     }
 
-    /// The config item holds neither the arrangements (their own items) nor the port modes (the active profile's): such
-    /// entries in it are left alone.
+    /// The config item holds neither the arrangements (their own items) nor the modes and routings in force (the active
+    /// profile's): such entries in it are left alone.
     #[test]
-    fn the_config_item_leaves_arrangements_and_port_modes_to_their_own_places() {
+    fn the_config_item_leaves_arrangements_and_the_modes_in_force_to_their_own_places() {
         let mut c = Config::default();
         c.set(ConfigValue::Screen(0, 6, Screen::new(Host::Pc2, 3840, 2160, [-2560, 0])), Origin::Software).unwrap();
-        c.set(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc2), Origin::Software).unwrap();
+        c.set(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
+        c.set(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc2)), Origin::Software).unwrap();
         let mut buf = [0u8; ITEM_MAX];
         let n = c.encode(&mut buf);
         let mut r = Reader::new(&buf[..n]);
         while let (Ok(k), Ok(_)) = (r.u16(), r.lv()) {
-            assert!(key::arrangement_of(k).is_none() && !(0x0030..0x0033).contains(&k), "{k:#06x}");
+            assert!(key::arrangement_of(k).is_none() && !(0x0030..0x003F).contains(&k), "{k:#06x}");
         }
         let d = Config::decode(&buf[..n]);
-        assert_eq!(d.port_modes(), c.port_modes(), "from the profile's own modes");
+        assert_eq!((d.modes(), d.route(Device::Other)), (c.modes(), Routing::Pin(Host::Pc2)), "from the profile's own");
         assert_eq!(d.arrangements[0], Arrangement::EMPTY);
         // Written into a config item anyway, they change nothing.
         let mut item = [0u8; 16];
         let mut w = Writer::new(&mut item);
-        w.u16(key::PORT_MODE_BASE + 2).unwrap();
-        w.lv(&[PortMode::PassthroughPc2 as u8]).unwrap();
+        w.u16(key::MODE_BASE + 2).unwrap();
+        w.lv(&[PortMode::Passthrough as u8]).unwrap();
+        w.u16(key::ROUTE_BASE + 2).unwrap();
+        w.lv(&[Routing::Pin(Host::Pc1).to_u8()]).unwrap();
         let n = w.len();
-        assert_eq!(Config::decode(&item[..n]).port_modes(), [PortMode::Auto; 3]);
+        let d = Config::decode(&item[..n]);
+        assert_eq!((d.modes(), d.route(Device::Other)), ([PortMode::Auto; DEVICES], Routing::Follow));
+    }
+
+    #[test]
+    fn a_bluetooth_device_takes_only_the_modes_it_can_have() {
+        let mut c = Config::default();
+        for m in [PortMode::Mirrored, PortMode::MirroredIdentity, PortMode::Passthrough] {
+            assert_eq!(c.set(ConfigValue::Mode(Device::Wireless1, m), Origin::Software), Err(ErrorCode::InvalidValue));
+        }
+        c.set(ConfigValue::Mode(Device::Wireless1, PortMode::Off), Origin::Software).unwrap();
+        let mut modes = [PortMode::Auto; DEVICES];
+        modes[Device::Wireless3.index()] = PortMode::Passthrough;
+        assert_eq!(c.set(ConfigValue::ProfileModes(1, modes), Origin::Software), Err(ErrorCode::InvalidValue));
+        // The gaming profile passes the front ports through and leaves the Bluetooth devices normalized.
+        assert_eq!(c.profiles[1].modes[2..4], [PortMode::Passthrough, PortMode::Auto]);
     }
 
     #[test]
@@ -629,7 +697,7 @@ mod tests {
             ConfigValue::HopSpeed(11),
             ConfigValue::HopResistance(HOP_RESISTANCE_MAX + 1),
             ConfigValue::HopCorner(HOP_CORNER_MAX + 1),
-            ConfigValue::ProfileArrangement(4, None),
+            ConfigValue::ProfileArrangement(8, None),
             ConfigValue::ProfileArrangement(0, Some(4)),
             ConfigValue::ArrangementName(4, ProfileName::new("x")),
             ConfigValue::BtPointer(4, BtPointer::Relative),
@@ -665,7 +733,7 @@ mod tests {
         let mut buf = [0xFFu8; ITEM_MAX];
         let n = c.encode(&mut buf);
         let d = Config::decode(&buf[..n]);
-        assert_eq!((d.profile, d.port_modes()), (0, [PortMode::Auto; 3]));
+        assert_eq!((d.profile, d.modes()), (0, [PortMode::Auto; DEVICES]));
         c.set(ConfigValue::RememberProfile(true), Origin::Software).unwrap();
         let n = c.encode(&mut buf);
         assert_eq!(Config::decode(&buf[..n]).profile, 1);
@@ -682,9 +750,9 @@ mod tests {
         // Fewer profiles than the active one's number: the first becomes active.
         c.set(ConfigValue::ProfileCount(2), Origin::Software).unwrap();
         assert_eq!((c.profile, c.next_profile()), (0, 1));
-        assert_eq!(c.set(ConfigValue::ProfileCount(5), Origin::Software), Err(ErrorCode::InvalidValue));
+        assert_eq!(c.set(ConfigValue::ProfileCount(9), Origin::Software), Err(ErrorCode::InvalidValue));
         assert_eq!(
-            c.set(ConfigValue::ProfileModes(4, [PortMode::Auto; 3]), Origin::Software),
+            c.set(ConfigValue::ProfileModes(8, [PortMode::Auto; DEVICES]), Origin::Software),
             Err(ErrorCode::InvalidValue)
         );
     }

@@ -27,12 +27,15 @@ use kvm_core::config::Config;
 use kvm_core::diag::BoardDiag;
 use kvm_core::engine::{Engine, FwOp, KeyEvent, Output, PowerInfo, Probed};
 use kvm_core::usbdesc::DeviceDesc;
+use kvm_proto::ctrl::DevicePairing;
 use kvm_proto::ctrl::diag::BtModule;
 use kvm_proto::ctrl::{
     Advertised, DeviceMsg, ErrorCode, FwState, Info, Pc, Port, PowerSource, REPORT_LEN, RebootTarget, Response, Speed,
     caps,
 };
-use kvm_proto::link::bt::{EventKind as BtEvent, HostState, host_flags};
+use kvm_proto::link::bt::{
+    DeviceState, EventKind as BtEvent, HostState, MAP_CHUNK, appearance, device_flags, host_flags,
+};
 use kvm_proto::link::msg::{Status, UsbSpeed, UsbState};
 use kvm_proto::version_u32;
 
@@ -247,6 +250,8 @@ pub struct SimTransport {
     dongle: bool,
     /// The protocol `GetInfo` says, if not this program's ([`SimTransport::speaking`]).
     proto: Option<u8>,
+    /// The simulated module's Bluetooth device slots.
+    devices: [Option<SimDevice>; 4],
 }
 
 /// An ESP32-C3 board's USB serial port (303A:1001: IAD, CDC-ACM, CDC data with bulk endpoints, the JTAG interface).
@@ -281,6 +286,63 @@ fn esp_board() -> Probed {
 }
 
 const BT_READY: u8 = host_flags::BONDED | host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED;
+const DEVICE_READY: u8 = device_flags::BONDED | device_flags::CONNECTED | device_flags::ENCRYPTED | device_flags::READY;
+
+/// A 3-button mouse with X, Y and a wheel (no report IDs), as a simulated Bluetooth mouse's report map.
+#[rustfmt::skip]
+const BT_MOUSE: &[u8] = &[
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00,
+    0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30,
+    0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0xC0, 0xC0,
+];
+
+/// A Bluetooth device the simulated module knows: paired from the start, or one to find while looking.
+#[derive(Clone, Copy)]
+struct SimDevice {
+    addr: [u8; 7],
+    name: &'static str,
+    appearance: u16,
+    map: &'static [u8],
+    rssi: i8,
+}
+
+/// The keyboard paired from the start, and the two that show up while looking (a keyboard asks for a passkey).
+const SIM_DEVICES: [SimDevice; 3] = [
+    SimDevice {
+        addr: [1, 0xC2, 0x11, 0x22, 0x33, 0x44, 0x01],
+        name: "Desk keyboard",
+        appearance: appearance::KEYBOARD,
+        map: BOOT_KEYBOARD,
+        rssi: -48,
+    },
+    SimDevice {
+        addr: [1, 0xC2, 0x11, 0x22, 0x33, 0x44, 0x02],
+        name: "Travel mouse",
+        appearance: appearance::MOUSE,
+        map: BT_MOUSE,
+        rssi: -61,
+    },
+    SimDevice {
+        addr: [1, 0xC2, 0x11, 0x22, 0x33, 0x44, 0x03],
+        name: "Compact keyboard",
+        appearance: appearance::KEYBOARD,
+        map: BOOT_KEYBOARD,
+        rssi: -74,
+    },
+];
+
+fn device_state(slot: u8, d: &SimDevice, flags: u8) -> DeviceState {
+    DeviceState {
+        dev: slot,
+        flags,
+        rssi: if flags & device_flags::CONNECTED != 0 { d.rssi } else { 0 },
+        battery: 70,
+        appearance: d.appearance,
+        addr: d.addr,
+        map_len: d.map.len() as u16,
+        map_crc: kvm_proto::crc::crc32(d.map),
+    }
+}
 
 fn sim_host(slot: u8, flags: u8) -> HostState {
     let interval = if flags & host_flags::CONNECTED != 0 { 12 } else { 0 };
@@ -292,6 +354,10 @@ enum Delayed {
     /// The simulated Bluetooth module: a host shows up while pairing, connects, or bonds.
     BtFound,
     BtHost(HostState),
+    /// Looking for devices: one shows up.
+    DeviceFound(SimDevice),
+    /// Pairing a device moves on.
+    DeviceStage(DevicePairing, SimDevice),
     PcsConfigured,
     KeyPress,
     FirmwareDone,
@@ -334,6 +400,7 @@ impl SimTransport {
             if self.engine.dongle_wanted(p) {
                 self.engine.dongle_claimed(p);
                 self.bt = Some(Self::module_up(&mut self.engine));
+                self.devices_up();
             }
         } else {
             self.engine.port_attached(p, &device_for(p));
@@ -378,8 +445,7 @@ impl SimTransport {
             }
             _ => Some(Self::module_up(&mut engine)),
         };
-        while engine.poll_output().is_some() {}
-        Self {
+        let mut sim = Self {
             engine,
             start: Instant::now(),
             last_ms: 0,
@@ -389,7 +455,37 @@ impl SimTransport {
             bt,
             dongle: false,
             proto: None,
+            devices: [None; 4],
+        };
+        if sim.bt.is_some() {
+            sim.devices_up();
         }
+        while sim.engine.poll_output().is_some() {}
+        sim
+    }
+
+    /// The module's devices: the keyboard paired from the start, connected, in slot 1.
+    fn devices_up(&mut self) {
+        self.devices = [Some(SIM_DEVICES[0]), None, None, None];
+        for slot in 1..=4u8 {
+            self.device_to_engine(slot, DEVICE_READY);
+        }
+        // Its report map, as the engine asks for it; nothing else is acted out (as at boot).
+        while let Some(o) = self.engine.poll_output() {
+            if let Output::Bt(b) = o {
+                self.bt_out(b);
+            }
+        }
+    }
+
+    /// Slot `slot`'s state to the engine: with `flags` if a device is in it.
+    fn device_to_engine(&mut self, slot: u8, flags: u8) {
+        let i = slot as usize - 1;
+        let (state, name) = match self.devices[i] {
+            Some(d) => (device_state(slot, &d, flags), d.name),
+            None => (DeviceState { dev: slot, battery: 0xFF, ..DeviceState::default() }, ""),
+        };
+        self.engine.bt_device(state, name);
     }
 
     /// The simulated KVM's firmware speaking protocol `proto` (another than this program's: the programs offer only the
@@ -471,9 +567,10 @@ impl SimTransport {
                     self.engine.bt_host(*h);
                 }
             }
-            BtOut::Select(n) => {
-                // A host that connects only while selected connects now.
-                if let Some(h) = hosts.iter().find(|h| h.host == n && h.bonded() && !h.connected()) {
+            BtOut::Select { host: n, pinned } => {
+                // A host that connects only while selected (or pinned to) connects now.
+                let wanted = |h: &HostState| h.host == n || pinned & (1 << (h.host - 1)) != 0;
+                if let Some(h) = hosts.iter().find(|h| wanted(h) && h.bonded() && !h.connected()) {
                     let h = sim_host(h.host, BT_READY);
                     self.later(800, Delayed::BtHost(h));
                 }
@@ -482,8 +579,83 @@ impl SimTransport {
                 for h in *hosts {
                     self.engine.bt_host(h);
                 }
+                for slot in 1..=4u8 {
+                    let connected = self.devices[slot as usize - 1].is_some();
+                    self.device_to_engine(slot, if connected { DEVICE_READY } else { 0 });
+                }
             }
-            BtOut::Input { .. } | BtOut::Policy { .. } => {}
+            BtOut::Scan { on: true, seconds } => {
+                self.engine.bt_event(BtEvent::ScanOpen, 0, seconds as u32);
+                // The devices not paired yet show up, the nearest first.
+                for (i, d) in SIM_DEVICES.iter().enumerate() {
+                    if !self.devices.iter().flatten().any(|p| p.addr == d.addr) {
+                        self.later(1200 + 900 * i as u32, Delayed::DeviceFound(*d));
+                    }
+                }
+            }
+            BtOut::Scan { on: false, .. } => {
+                self.timeline.retain(|(_, d)| !matches!(d, Delayed::DeviceFound(_)));
+                self.engine.bt_event(BtEvent::ScanClosed, 0, 0);
+            }
+            BtOut::PairDevice(addr) => {
+                self.timeline.retain(|(_, d)| !matches!(d, Delayed::DeviceFound(_)));
+                self.engine.bt_event(BtEvent::ScanClosed, 0, 0);
+                match SIM_DEVICES.iter().find(|d| d.addr == addr) {
+                    Some(d) if self.devices.iter().any(Option::is_none) => {
+                        self.engine.bt_event(BtEvent::DeviceStage, 0, DevicePairing::Connecting as u32);
+                        self.later(700, Delayed::DeviceStage(DevicePairing::Pairing, *d));
+                    }
+                    _ => self.engine.bt_event(BtEvent::DeviceStage, 0, DevicePairing::Failed as u32),
+                }
+            }
+            BtOut::ForgetDevice(n) => {
+                for slot in 1..=4u8 {
+                    if n == 0xFF || n == slot {
+                        self.devices[slot as usize - 1] = None;
+                        self.device_to_engine(slot, 0);
+                    }
+                }
+            }
+            BtOut::RequestMap(dev) => {
+                if let Some(d) = self.devices.get(dev as usize - 1).copied().flatten() {
+                    let total = d.map.len() as u16;
+                    for (i, piece) in d.map.chunks(MAP_CHUNK).enumerate() {
+                        self.engine.bt_device_map(dev, (i * MAP_CHUNK) as u16, total, piece);
+                    }
+                }
+            }
+            BtOut::Input { .. } | BtOut::Policy { .. } | BtOut::DeviceOutput { .. } => {}
+        }
+    }
+
+    /// Pairing a simulated device moves on: a keyboard asks for its passkey to be typed (on it: here nobody types,
+    /// it goes on after a while), then the device is read, then it is in a slot of its own.
+    fn device_stage(&mut self, stage: DevicePairing, d: SimDevice) {
+        match stage {
+            DevicePairing::Pairing => {
+                self.engine.bt_event(BtEvent::DeviceStage, 0, DevicePairing::Pairing as u32);
+                let typing = if d.appearance == appearance::KEYBOARD {
+                    self.engine.bt_event(BtEvent::DevicePasskey, 0, 246_810);
+                    4000
+                } else {
+                    600
+                };
+                self.later(typing, Delayed::DeviceStage(DevicePairing::Reading, d));
+            }
+            DevicePairing::Reading => {
+                self.engine.bt_event(BtEvent::DeviceStage, 0, DevicePairing::Reading as u32);
+                self.later(800, Delayed::DeviceStage(DevicePairing::Paired, d));
+            }
+            DevicePairing::Paired => {
+                let Some(i) = self.devices.iter().position(Option::is_none) else {
+                    self.engine.bt_event(BtEvent::DeviceStage, 0, DevicePairing::Failed as u32);
+                    return;
+                };
+                self.devices[i] = Some(d);
+                self.device_to_engine(i as u8 + 1, DEVICE_READY);
+                self.engine.bt_event(BtEvent::DeviceStage, i as u8 + 1, DevicePairing::Paired as u32);
+            }
+            _ => {}
         }
     }
 
@@ -556,7 +728,12 @@ impl SimTransport {
                 Delayed::KeyPress => self.engine.key(KeyEvent::Tap),
                 Delayed::FirmwareDone => self.engine.set_fw_state(FwState::Done, 0),
                 Delayed::BtProgrammed => self.engine.set_bt_module(BtModule::Starting),
-                Delayed::BtUp => self.bt = Some(Self::module_up(&mut self.engine)),
+                Delayed::BtUp => {
+                    self.bt = Some(Self::module_up(&mut self.engine));
+                    self.devices_up();
+                }
+                Delayed::DeviceFound(d) => self.engine.bt_found(d.addr, d.rssi, d.appearance, d.name),
+                Delayed::DeviceStage(stage, d) => self.device_stage(stage, d),
             }
             self.drain();
         }
@@ -656,8 +833,10 @@ impl Transport for SimTransport {
 mod tests {
     use super::*;
     use crate::Client;
+    use crate::client::DeviceSlot;
     use kvm_proto::ctrl::{
-        ConfigValue, Event, Hotkey, HotkeyAction, HotkeyBinding, LearnEnd, PortMode, PortState, SwitchSource, Target,
+        ConfigValue, Device, Event, Hotkey, HotkeyAction, HotkeyBinding, LearnEnd, PortMode, PortState, SwitchSource,
+        Target,
     };
 
     #[test]
@@ -747,6 +926,52 @@ mod tests {
     }
 
     #[test]
+    fn a_wireless_device_is_found_paired_and_listed_with_its_routing() {
+        let mut c = Client::new(Box::new(SimTransport::with_bluetooth(true)));
+        let s = c.snapshot().unwrap();
+        // The keyboard paired from the start, connected; a free slot is no device to set.
+        assert_eq!(s.devices.iter().filter(|d| d.bonded()).count(), 1);
+        assert!(s.device(1).is_some_and(|d| d.ready() && d.name.as_str() == "Desk keyboard"));
+        assert_eq!(s.routed_devices(), [Device::Keyboard, Device::Mouse, Device::Other, Device::Wireless1]);
+        // The keyboard's report map as the KVM holds it (several pieces), and none for a free slot.
+        let map = c.bt_device_map(1).unwrap();
+        assert!(map.len() > kvm_proto::ctrl::BT_MAP_PIECE && kvm_hid::Layout::parse(&map).is_ok());
+        assert!(c.bt_device_map(3).unwrap().is_empty());
+        c.bt_scan(true).unwrap();
+        let found = loop {
+            let st = c.status().unwrap();
+            if st.bt_found >= 2 {
+                break c.bt_found(st.bt_found).unwrap();
+            }
+            crate::time::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(found[0].name.as_str(), "Travel mouse", "the device paired already isn't offered");
+        c.bt_pair_device(found[0].addr).unwrap();
+        let st = loop {
+            let st = c.status().unwrap();
+            if st.bt_device_pairing == DevicePairing::Paired {
+                break st;
+            }
+            assert_ne!(st.bt_device_pairing, DevicePairing::Failed);
+            crate::time::sleep(Duration::from_millis(50));
+        };
+        assert_eq!((st.bt_scan, st.bt_devices_bonded, st.bt_devices_ready), (0, 0b11, 0b11));
+        // Pinned to host 1 in the active profile, as a front port's device would be.
+        c.set_config(ConfigValue::Route(Device::Wireless2, kvm_proto::ctrl::Routing::Pin(kvm_proto::ctrl::Host::Bt1)))
+            .unwrap();
+        let s = c.snapshot().unwrap();
+        let (active, _, list) = s.profiles().unwrap();
+        assert_eq!(
+            list[active as usize].routes[Device::Wireless2.index()],
+            kvm_proto::ctrl::Routing::Pin(kvm_proto::ctrl::Host::Bt1)
+        );
+        assert_eq!(s.routed_devices().len(), 5);
+        // Forgotten: no longer listed.
+        c.bt_forget_device(2).unwrap();
+        assert_eq!(c.snapshot().unwrap().routed_devices().len(), 4);
+    }
+
+    #[test]
     fn an_esp32_board_on_the_other_port_is_the_module() {
         let mut c = Client::new(Box::new(SimTransport::with_dongle()));
         let s = c.snapshot().unwrap();
@@ -788,8 +1013,8 @@ mod tests {
         // The simulator acts out the key press on the KVM.
         c.update_firmware(&[0x55; 3000], |_, _, _| {}).unwrap();
 
-        let v = c.set_config(ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored)).unwrap();
-        assert_eq!(v, ConfigValue::PortMode(Port::Mouse, PortMode::Mirrored));
+        let v = c.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Mirrored)).unwrap();
+        assert_eq!(v, ConfigValue::Mode(Device::Mouse, PortMode::Mirrored));
         assert_eq!(c.port(Port::Mouse).unwrap().effective, PortMode::Mirrored);
     }
 

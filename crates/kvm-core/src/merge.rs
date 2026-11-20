@@ -1,16 +1,16 @@
-//! Merges normalized input from every source (port, interface, report ID) into one keyboard, one mouse, one consumer
+//! Merges normalized input from every source (device, interface, report ID) into one keyboard, one mouse, one consumer
 //! and one system state. Keyboards that report through several interfaces (boot + NKRO), or several report IDs, end up
 //! as one key set.
 
 use heapless::Vec;
 use kvm_hid::translate::{ConsumerState, Translation};
 use kvm_hid::{KeyState, MouseInput};
-use kvm_proto::ctrl::Port;
+use kvm_proto::ctrl::Device;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Source {
-    pub port: Port,
+    pub dev: Device,
     pub iface: u8,
     pub report_id: u8,
 }
@@ -85,8 +85,8 @@ impl Merger {
         self.last_system
     }
 
-    pub fn apply(&mut self, port: Port, iface: u8, t: &Translation) -> Merged {
-        let src = Source { port, iface, report_id: t.report_id };
+    pub fn apply(&mut self, dev: Device, iface: u8, t: &Translation) -> Merged {
+        let src = Source { dev, iface, report_id: t.report_id };
         if let Some(k) = t.keyboard {
             upsert(&mut self.keys, src, k);
         }
@@ -108,13 +108,29 @@ impl Merger {
         out
     }
 
-    /// Forget everything a port contributed (device unplugged or re-probed); returns the resulting releases.
-    pub fn remove_port(&mut self, port: Port) -> Merged {
-        self.keys.retain(|(s, _)| s.port != port);
-        self.buttons.retain(|(s, _)| s.port != port);
-        self.consumer.retain(|(s, _)| s.port != port);
-        self.system.retain(|(s, _)| s.port != port);
+    /// Forget everything a device contributed (unplugged, re-probed, its input going elsewhere now); returns the
+    /// resulting releases.
+    pub fn remove(&mut self, dev: Device) -> Merged {
+        self.keys.retain(|(s, _)| s.dev != dev);
+        self.buttons.retain(|(s, _)| s.dev != dev);
+        self.consumer.retain(|(s, _)| s.dev != dev);
+        self.system.retain(|(s, _)| s.dev != dev);
         self.recompute()
+    }
+
+    /// Whether anything of `dev` is merged here.
+    pub fn has(&self, dev: Device) -> bool {
+        self.keys.iter().any(|(s, _)| s.dev == dev)
+            || self.buttons.iter().any(|(s, _)| s.dev == dev)
+            || self.consumer.iter().any(|(s, _)| s.dev == dev)
+            || self.system.iter().any(|(s, _)| s.dev == dev)
+    }
+
+    /// The keys and buttons `dev` holds now.
+    pub fn held_by(&self, dev: Device) -> (KeyState, u16) {
+        let keys = self.keys.iter().filter(|(s, _)| s.dev == dev).fold(KeyState::EMPTY, |acc, (_, k)| acc.union(k));
+        let buttons = self.buttons.iter().filter(|(s, _)| s.dev == dev).fold(0, |acc, (_, b)| acc | b);
+        (keys, buttons)
     }
 
     fn recompute(&mut self) -> Merged {
@@ -165,12 +181,12 @@ mod tests {
     #[test]
     fn keys_from_two_interfaces_merge_and_release() {
         let mut m = Merger::new();
-        let a = m.apply(Port::Keyboard, 0, &kb(0, &[0x04]));
+        let a = m.apply(Device::Keyboard, 0, &kb(0, &[0x04]));
         assert_eq!(a.keyboard.unwrap().keys().collect::<std::vec::Vec<_>>(), [0x04]);
-        let b = m.apply(Port::Keyboard, 1, &kb(2, &[0x05]));
+        let b = m.apply(Device::Keyboard, 1, &kb(2, &[0x05]));
         assert_eq!(b.keyboard.unwrap().key_count(), 2);
-        assert!(m.apply(Port::Keyboard, 1, &kb(2, &[0x05])).is_empty(), "unchanged state is not re-sent");
-        let gone = m.remove_port(Port::Keyboard);
+        assert!(m.apply(Device::Keyboard, 1, &kb(2, &[0x05])).is_empty(), "unchanged state is not re-sent");
+        let gone = m.remove(Device::Keyboard);
         assert!(gone.keyboard.unwrap().is_empty());
     }
 
@@ -178,11 +194,11 @@ mod tests {
     fn mouse_motion_carries_merged_buttons() {
         let mut m = Merger::new();
         let press = Translation { mouse: Some(MouseInput { buttons: 1, ..Default::default() }), ..Default::default() };
-        assert_eq!(m.apply(Port::Mouse, 0, &press).mouse.unwrap().buttons, 1);
+        assert_eq!(m.apply(Device::Mouse, 0, &press).mouse.unwrap().buttons, 1);
         let mv =
             Translation { mouse: Some(MouseInput { buttons: 1, x: 5, ..Default::default() }), ..Default::default() };
-        assert_eq!(m.apply(Port::Mouse, 0, &mv).mouse, Some(MouseInput { buttons: 1, x: 5, ..Default::default() }));
+        assert_eq!(m.apply(Device::Mouse, 0, &mv).mouse, Some(MouseInput { buttons: 1, x: 5, ..Default::default() }));
         let idle = Translation { mouse: Some(MouseInput { buttons: 1, ..Default::default() }), ..Default::default() };
-        assert_eq!(m.apply(Port::Mouse, 0, &idle).mouse, None);
+        assert_eq!(m.apply(Device::Mouse, 0, &idle).mouse, None);
     }
 }

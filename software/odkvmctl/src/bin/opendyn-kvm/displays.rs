@@ -331,6 +331,9 @@ impl Displays {
                             chip(ui, &fl!("active"), GOOD);
                         }
                     });
+                    if b.profiles.len() <= *i {
+                        b.profiles.resize(*i + 1, DisplayMode::Off);
+                    }
                     let mode = &mut b.profiles[*i];
                     let before = *mode;
                     egui::ComboBox::from_id_salt(("display-mode", &d.id, *i))
@@ -346,7 +349,7 @@ impl Displays {
                 }
             });
             // An input a profile needs but that isn't chosen.
-            let missing = profiles.iter().any(|(i, ..)| match b.profiles[*i] {
+            let missing = profiles.iter().any(|(i, ..)| match b.profiles.get(*i).copied().unwrap_or_default() {
                 DisplayMode::Follow => b.inputs.iter().any(Option::is_none),
                 DisplayMode::Pc1 => b.inputs[0].is_none(),
                 DisplayMode::Pc2 => b.inputs[1].is_none(),

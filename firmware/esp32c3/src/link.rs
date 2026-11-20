@@ -21,8 +21,13 @@ use kvm_proto::link::{Arq, FRAME_LEN, Frame, MAX_MSG, Msg, PROTOCOL_VERSION, Pri
 
 use crate::log;
 
-/// Messages for the RP2354B (host states, output reports, events).
-pub static TO_RP: Channel<CriticalSectionRawMutex, Msg, 24> = Channel::new();
+/// Messages for the RP2354B: input reports ahead of the rest, as on the RP2354B's side. Until 0.1.31 there was one
+/// queue, and a control message taken from it while the ARQ's low queue was full was lost: one per exchange while more
+/// than 8 waited, which a report map in pieces after a device's state changes was (a keyboard that said connected and
+/// never typed, 2026-11-19).
+static TO_RP_HI: Channel<CriticalSectionRawMutex, Msg, 16> = Channel::new();
+/// Host and device states, events, report maps, devices found.
+static TO_RP_LO: Channel<CriticalSectionRawMutex, Msg, 32> = Channel::new();
 /// Messages from the RP2354B, for the Bluetooth side.
 pub static FROM_RP: Channel<CriticalSectionRawMutex, Msg, 24> = Channel::new();
 
@@ -32,7 +37,10 @@ pub fn send(m: &BtMsg) {
     if let Ok(n) = m.encode(&mut buf)
         && let Ok(msg) = Msg::from_slice(&buf[..n])
     {
-        let _ = TO_RP.try_send(msg);
+        let _ = match m.prio() {
+            Prio::High => TO_RP_HI.try_send(msg),
+            Prio::Low => TO_RP_LO.try_send(msg),
+        };
     }
 }
 
@@ -176,12 +184,13 @@ pub async fn run(lines: Lines) {
                 raw
             }
         };
-        while arq.free(Prio::High) > 0 || arq.free(Prio::Low) > 0 {
-            let Ok(m) = TO_RP.try_receive() else { break };
-            let prio = BtMsg::decode(&m).map_or(Prio::Low, |b| b.prio());
-            if arq.push(&m, prio).is_err() {
-                break;
-            }
+        while arq.free(Prio::High) > 0 {
+            let Ok(m) = TO_RP_HI.try_receive() else { break };
+            let _ = arq.push(&m, Prio::High);
+        }
+        while arq.free(Prio::Low) > 0 {
+            let Ok(m) = TO_RP_LO.try_receive() else { break };
+            let _ = arq.push(&m, Prio::Low);
         }
         let got = arq.receive(&raw);
         arq.next_frame().encode(&mut tx);

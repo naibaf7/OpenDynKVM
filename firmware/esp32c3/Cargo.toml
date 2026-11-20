@@ -17,7 +17,18 @@ critical-section = "1.2"
 # A connection's event queue holds 16 (trouble-host: 2). A full one drops what comes, `PairingComplete` included: a PC
 # changing PHY, data length and connection interval right after encryption filled it, and the bond was lost
 # (first dongle, 2026-11-15: Windows paired, connected for a moment, and the KVM never knew).
-trouble-host = { version = "0.8", features = ["derive", "security", "scan", "connection-event-queue-size-16"] }
+# Legacy pairing: many Bluetooth keyboards and mice have nothing else (hosts still pair with LE Secure Connections
+# only, `ble::run`). A GATT client's notification queue holds 8 (trouble-host: 1, and a full one drops the oldest: a
+# key's press or release lost). 32 packets for nine connections.
+trouble-host = { version = "0.8", features = [
+    "derive",
+    "security",
+    "legacy-pairing",
+    "scan",
+    "connection-event-queue-size-16",
+    "gatt-client-notification-queue-size-8",
+    "default-packet-pool-size-32",
+] }
 bt-hci = "0.11"
 embassy-executor = "0.10"
 embassy-time = "0.5.1"

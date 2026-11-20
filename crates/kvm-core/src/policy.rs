@@ -165,12 +165,14 @@ impl Budget {
 /// keyboard and mouse ports are both mirrored, no port runs Normalized (so nothing uses them), and the mirrors need
 /// more IN endpoints than EP5–EP7 have. A setup that fits without it keeps those interfaces, so a device plugged in
 /// later is normalized without re-enumerating the PCs. `modes`: each port's effective mode while the KVM hosts its
-/// device; `vial`: the Vial interface is on.
-pub fn wide(modes: [Option<PortMode>; 3], mirror_in: u8, vial: bool) -> bool {
+/// device; `wireless`: a Bluetooth device is normalized (it needs the KVM's interfaces as a port would); `vial`: the
+/// Vial interface is on.
+pub fn wide(modes: [Option<PortMode>; 3], mirror_in: u8, wireless: bool, vial: bool) -> bool {
     let mirrored = |p: Port| matches!(modes[p.index()], Some(PortMode::Mirrored | PortMode::MirroredIdentity));
     mirrored(Port::Keyboard)
         && mirrored(Port::Mouse)
         && !modes.contains(&Some(PortMode::Normalized))
+        && !wireless
         && mirror_in > Budget::room(false, vial).free_in
 }
 
@@ -183,8 +185,9 @@ pub struct Candidate<'a> {
 }
 
 /// The effective mode of every port with a device, indexed by port. Candidates are served in order, so the ports
-/// already mirrored go first and keep their endpoints against a newcomer. `vial`: the Vial interface is on.
-pub fn decide_all(candidates: &[Candidate], vial: bool) -> [Option<(PortMode, AutoReason)>; 3] {
+/// already mirrored go first and keep their endpoints against a newcomer. `wireless`: a Bluetooth device is
+/// normalized; `vial`: the Vial interface is on.
+pub fn decide_all(candidates: &[Candidate], wireless: bool, vial: bool) -> [Option<(PortMode, AutoReason)>; 3] {
     let serve = |mut b: Budget| {
         let mut out = [None; 3];
         let mut mirror_in = 0;
@@ -203,7 +206,11 @@ pub fn decide_all(candidates: &[Candidate], vial: bool) -> [Option<(PortMode, Au
     };
     // Try with EP1–EP3 first; keep that only if the result is a layout that actually leaves them out.
     let (out, mirror_in) = serve(Budget::room(true, vial));
-    if wide(out.map(|d| d.map(|(mode, _)| mode)), mirror_in, vial) { out } else { serve(Budget::room(false, vial)).0 }
+    if wide(out.map(|d| d.map(|(mode, _)| mode)), mirror_in, wireless, vial) {
+        out
+    } else {
+        serve(Budget::room(false, vial)).0
+    }
 }
 
 /// The effective mode of a port and why.
@@ -250,7 +257,7 @@ pub fn decide(setting: PortMode, port: Port, d: &DeviceSummary, b: &Budget) -> (
                 (setting, AutoReason::NotAuto)
             }
         }
-        PortMode::Passthrough | PortMode::PassthroughPc1 | PortMode::PassthroughPc2 => (setting, AutoReason::NotAuto),
+        PortMode::Passthrough | PortMode::Off => (setting, AutoReason::NotAuto),
     }
 }
 
@@ -299,9 +306,10 @@ mod tests {
         assert_eq!(decide(PortMode::Auto, Port::Other, &cam, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
         assert_eq!(decide(PortMode::Mirrored, Port::Other, &cam, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
         assert_eq!(
-            decide(PortMode::PassthroughPc1, Port::Other, &cam, &ROOM),
-            (PortMode::PassthroughPc1, AutoReason::NotAuto)
+            decide(PortMode::Passthrough, Port::Other, &cam, &ROOM),
+            (PortMode::Passthrough, AutoReason::NotAuto)
         );
+        assert_eq!(decide(PortMode::Off, Port::Other, &cam, &ROOM), (PortMode::Off, AutoReason::NotAuto));
         assert!(cam.classes() & cls::VIDEO != 0);
 
         let pad = summary(XINPUT_CONFIG, |_| None);
@@ -322,24 +330,26 @@ mod tests {
         let squeezed = Some((PortMode::Normalized, AutoReason::EndpointBudget));
         // 2 + 2 IN endpoints: more than EP5–EP7 have, and nothing runs Normalized.
         let both = [c(Port::Keyboard, PortMode::Mirrored), c(Port::Mouse, PortMode::Mirrored)];
-        assert_eq!(decide_all(&both, false), [mirrored, mirrored, None]);
-        assert!(wide([Some(PortMode::Mirrored), Some(PortMode::Mirrored), None], 4, false));
+        assert_eq!(decide_all(&both, false, false), [mirrored, mirrored, None]);
+        assert!(wide([Some(PortMode::Mirrored), Some(PortMode::Mirrored), None], 4, false, false));
+        // A normalized Bluetooth keyboard needs the KVM's interfaces as a port's would.
+        assert_eq!(decide_all(&both, true, false), [mirrored, squeezed, None]);
         // With Vial on, 5 are left: an XInput pad on Other still fits.
         let with_pad = [both[0], both[1], Candidate { port: Port::Other, setting: PortMode::Auto, dev: &pad }];
-        let all = decide_all(&with_pad, true);
+        let all = decide_all(&with_pad, false, true);
         assert_eq!(all, [mirrored, mirrored, Some((PortMode::Mirrored, AutoReason::XInput))]);
         // A port running Normalized needs the KVM's interfaces: the port served last loses its mirror.
         let other = c(Port::Other, PortMode::Normalized);
         let normalized = Some((PortMode::Normalized, AutoReason::NotAuto));
-        assert_eq!(decide_all(&[both[0], both[1], other], false), [mirrored, squeezed, normalized]);
-        assert_eq!(decide_all(&[both[1], both[0], other], false), [squeezed, mirrored, normalized]);
+        assert_eq!(decide_all(&[both[0], both[1], other], false, false), [mirrored, squeezed, normalized]);
+        assert_eq!(decide_all(&[both[1], both[0], other], false, false), [squeezed, mirrored, normalized]);
         // So does a mouse in Auto that fits the normalized format.
         let auto = [both[0], c(Port::Mouse, PortMode::Auto)];
         assert_eq!(
-            decide_all(&auto, false),
+            decide_all(&auto, false, false),
             [mirrored, Some((PortMode::Normalized, AutoReason::FitsNormalized)), None]
         );
         // A setup that fits EP5–EP7 keeps the KVM's interfaces.
-        assert!(!wide([Some(PortMode::Mirrored), Some(PortMode::Mirrored), None], 3, false));
+        assert!(!wide([Some(PortMode::Mirrored), Some(PortMode::Mirrored), None], 3, false, false));
     }
 }

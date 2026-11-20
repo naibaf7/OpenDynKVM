@@ -13,7 +13,7 @@ pub const PAYLOAD_LEN: usize = REPORT_LEN - 2;
 /// The protocol's version. A host and the firmware talk only when theirs are the same: otherwise the host offers the
 /// firmware it came with, and nothing else (`GetInfo` and the `Fw*` requests are all it uses then). Raised with every
 /// change of a message, a config key or a value.
-pub const PROTOCOL_VERSION: u8 = 11;
+pub const PROTOCOL_VERSION: u8 = 12;
 
 /// Vendor usage page and usage of the control interface; hosts discover it by these, not by VID/PID.
 pub const USAGE_PAGE: u16 = 0xFF4B;
@@ -91,17 +91,115 @@ impl Port {
     }
 }
 
+/// Bluetooth device slots (keyboards, mice and other HID devices bonded to the module, software.md §4.13).
+pub const BT_DEVICES: usize = 4;
+/// The devices the KVM routes: the three front ports, then the Bluetooth device slots ([`Device`]).
+pub const DEVICES: usize = 3 + BT_DEVICES;
+
 wire_enum! {
-    /// Mode setting of a front port (design.md §4).
+    /// A device the KVM takes input from and routes (software.md §4.3): a front port's, or a Bluetooth device slot's.
+    /// Each has a mode and a routing in every profile.
+    pub enum Device {
+        Keyboard = 0,
+        Mouse = 1,
+        Other = 2,
+        Wireless1 = 3,
+        Wireless2 = 4,
+        Wireless3 = 5,
+        Wireless4 = 6,
+    }
+}
+
+impl Device {
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn from_index(i: usize) -> Option<Device> {
+        match i {
+            0 => Some(Device::Keyboard),
+            1 => Some(Device::Mouse),
+            2 => Some(Device::Other),
+            3 => Some(Device::Wireless1),
+            4 => Some(Device::Wireless2),
+            5 => Some(Device::Wireless3),
+            6 => Some(Device::Wireless4),
+            _ => None,
+        }
+    }
+
+    pub const fn port(self) -> Option<Port> {
+        Port::from_index(self as usize)
+    }
+
+    pub const fn of_port(p: Port) -> Device {
+        match p {
+            Port::Keyboard => Device::Keyboard,
+            Port::Mouse => Device::Mouse,
+            Port::Other => Device::Other,
+        }
+    }
+
+    /// The Bluetooth device slot (1–[`BT_DEVICES`]), if it is one.
+    pub const fn wireless(self) -> Option<u8> {
+        match self {
+            Device::Keyboard | Device::Mouse | Device::Other => None,
+            _ => Some(self as u8 - 2),
+        }
+    }
+
+    /// Bluetooth device slot `slot` (1–[`BT_DEVICES`]).
+    pub const fn wireless_slot(slot: u8) -> Option<Device> {
+        if slot >= 1 && slot as usize <= BT_DEVICES { Device::from_index(slot as usize + 2) } else { None }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Device::Keyboard => "keyboard",
+            Device::Mouse => "mouse",
+            Device::Other => "other",
+            Device::Wireless1 => "wireless1",
+            Device::Wireless2 => "wireless2",
+            Device::Wireless3 => "wireless3",
+            Device::Wireless4 => "wireless4",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Device> {
+        Device::ALL.iter().copied().find(|d| d.name() == s).or_else(|| Port::from_name(s).map(Device::of_port))
+    }
+
+    /// The modes it can be set to: all of them on a front port; over Bluetooth only the KVM's own reports
+    /// (`Auto` is `Normalized` there) or none.
+    pub fn modes(self) -> &'static [PortMode] {
+        match self.port() {
+            Some(_) => PortMode::ALL,
+            None => &[PortMode::Auto, PortMode::Normalized, PortMode::Off],
+        }
+    }
+
+    pub fn takes(self, m: PortMode) -> bool {
+        self.modes().contains(&m)
+    }
+}
+
+impl From<Port> for Device {
+    fn from(p: Port) -> Device {
+        Device::of_port(p)
+    }
+}
+
+wire_enum! {
+    /// Mode setting of a device (design.md §4); where its input goes is its [`Routing`].
     pub enum PortMode {
         Auto = 0,
         Normalized = 1,
         Mirrored = 2,
         MirroredIdentity = 3,
-        /// Passthrough that follows the active PC.
+        /// The device on the PC's own USB, through the port's router.
         Passthrough = 4,
-        PassthroughPc1 = 5,
-        PassthroughPc2 = 6,
+        /// Its input goes nowhere (a front port's device stays powered and hosted).
+        Off = 5,
     }
 }
 
@@ -113,22 +211,76 @@ impl PortMode {
             PortMode::Mirrored => "mirrored",
             PortMode::MirroredIdentity => "identity",
             PortMode::Passthrough => "passthrough",
-            PortMode::PassthroughPc1 => "passthrough-pc1",
-            PortMode::PassthroughPc2 => "passthrough-pc2",
+            PortMode::Off => "off",
         }
     }
 
     pub fn from_name(s: &str) -> Option<PortMode> {
-        PortMode::ALL.iter().copied().find(|m| m.name() == s).or(match s {
-            "mirrored-identity" => Some(PortMode::MirroredIdentity),
-            "pinned-pc1" => Some(PortMode::PassthroughPc1),
-            "pinned-pc2" => Some(PortMode::PassthroughPc2),
-            _ => None,
-        })
+        PortMode::ALL.iter().copied().find(|m| m.name() == s)
     }
 
     pub const fn is_passthrough(self) -> bool {
-        matches!(self, PortMode::Passthrough | PortMode::PassthroughPc1 | PortMode::PassthroughPc2)
+        matches!(self, PortMode::Passthrough)
+    }
+}
+
+/// Where a device's input goes (software.md §4.3): to the active target, or always to one host whichever is active.
+/// A device in passthrough can only be pinned to a PC (a Bluetooth host pin makes it follow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Routing {
+    #[default]
+    Follow,
+    Pin(Host),
+}
+
+impl Routing {
+    /// Follow, then a pin to each host in [`Host::index`] order.
+    pub const ALL: [Routing; 1 + HOSTS] = [
+        Routing::Follow,
+        Routing::Pin(Host::Pc1),
+        Routing::Pin(Host::Pc2),
+        Routing::Pin(Host::Bt1),
+        Routing::Pin(Host::Bt2),
+        Routing::Pin(Host::Bt3),
+        Routing::Pin(Host::Bt4),
+    ];
+
+    /// 0: follow; 1 + the host's index: pinned to it.
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Routing::Follow => 0,
+            Routing::Pin(h) => 1 + h.index() as u8,
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Option<Routing> {
+        match v {
+            0 => Some(Routing::Follow),
+            _ => match Host::from_index(v as usize - 1) {
+                Some(h) => Some(Routing::Pin(h)),
+                None => None,
+            },
+        }
+    }
+
+    /// `follow`, or the host's name (`pc1`, `bt3`, …).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Routing::Follow => "follow",
+            Routing::Pin(h) => h.name(),
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Routing> {
+        Routing::ALL.iter().copied().find(|r| r.name() == s)
+    }
+
+    pub const fn pinned(self) -> Option<Host> {
+        match self {
+            Routing::Follow => None,
+            Routing::Pin(h) => Some(h),
+        }
     }
 }
 
@@ -157,7 +309,8 @@ wire_enum! {
         NotAuto = 0,
         /// All inputs fit the normalized keyboard/mouse.
         FitsNormalized = 1,
-        /// Vendor-page inputs, more than 16 buttons, absolute axes or unknown usage pages.
+        /// Vendor-page inputs, more than 16 buttons, absolute axes, unknown usage pages, or a descriptor larger than
+        /// the KVM's parser holds.
         ExtraInputs = 2,
         /// HID device on the Other port.
         OtherPortHid = 3,
@@ -497,7 +650,7 @@ wire_enum! {
         TogglePc = 1,
         /// Make the next profile in use active, after the last one the first.
         NextProfile = 2,
-        /// Cycle the Other port's mode: Auto → Passthrough → pinned PC1 → pinned PC2.
+        /// Cycle the Other port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2.
         OtherPortMode = 3,
         /// The next target: PC1, PC2, then each Bluetooth host that is ready.
         NextTarget = 4,
@@ -520,8 +673,8 @@ impl KeyAction {
     }
 }
 
-/// Profiles the KVM stores: each a name and the three port modes (design.md §4.1).
-pub const MAX_PROFILES: usize = 4;
+/// Profiles the KVM stores: each a name, and every device's mode and routing (design.md §4.1).
+pub const MAX_PROFILES: usize = 8;
 pub const PROFILE_NAME_MAX: usize = 12;
 
 /// A profile's name: UTF-8, at most [`PROFILE_NAME_MAX`] bytes.
@@ -1332,15 +1485,15 @@ pub enum HotkeyAction {
     /// The next profile in use, after the last one the first.
     NextProfile,
     PrevProfile,
-    /// Profile 0–3 (ignored while it isn't one of those in use).
+    /// Profile 0–7 (ignored while it isn't one of those in use).
     SelectProfile(u8),
-    /// Cycle the Other port's mode: Auto → Passthrough → pinned PC1 → pinned PC2.
+    /// Cycle the Other port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2.
     OtherPortMode,
 }
 
 impl HotkeyAction {
     /// Every action, in the order hosts list them.
-    pub const ALL: [HotkeyAction; 17] = [
+    pub const ALL: [HotkeyAction; 21] = [
         HotkeyAction::TogglePc,
         HotkeyAction::NextHost,
         HotkeyAction::PrevHost,
@@ -1356,6 +1509,10 @@ impl HotkeyAction {
         HotkeyAction::SelectProfile(1),
         HotkeyAction::SelectProfile(2),
         HotkeyAction::SelectProfile(3),
+        HotkeyAction::SelectProfile(4),
+        HotkeyAction::SelectProfile(5),
+        HotkeyAction::SelectProfile(6),
+        HotkeyAction::SelectProfile(7),
         HotkeyAction::OtherPortMode,
         HotkeyAction::None,
     ];
@@ -1378,7 +1535,11 @@ impl HotkeyAction {
             HotkeyAction::SelectProfile(0) => "select-profile0",
             HotkeyAction::SelectProfile(1) => "select-profile1",
             HotkeyAction::SelectProfile(2) => "select-profile2",
-            HotkeyAction::SelectProfile(_) => "select-profile3",
+            HotkeyAction::SelectProfile(3) => "select-profile3",
+            HotkeyAction::SelectProfile(4) => "select-profile4",
+            HotkeyAction::SelectProfile(5) => "select-profile5",
+            HotkeyAction::SelectProfile(6) => "select-profile6",
+            HotkeyAction::SelectProfile(_) => "select-profile7",
             HotkeyAction::OtherPortMode => "other-port",
         }
     }
@@ -1505,6 +1666,15 @@ pub struct Status {
     pub supply_lowest_mv: u16,
     /// What the front devices declare they may draw at most (their `bMaxPower`), in mA: information.
     pub declared_ma: u16,
+    /// Bluetooth device slots with a bond, and those ready (connected, encrypted, reporting): bit n−1 for slot n.
+    pub bt_devices_bonded: u8,
+    pub bt_devices_ready: u8,
+    /// Seconds left while the module looks for devices to pair (0: not looking), and how many it found.
+    pub bt_scan: u8,
+    pub bt_found: u8,
+    /// Pairing a device: how far it got, and the passkey to type on a keyboard that asks for one.
+    pub bt_device_pairing: DevicePairing,
+    pub bt_device_passkey: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1513,8 +1683,11 @@ pub struct PortInfo {
     pub port: Port,
     pub state: PortState,
     pub mode: PortMode,
-    /// What actually runs: Normalized, Mirrored, MirroredIdentity or one of the Passthrough variants.
+    /// What actually runs: Normalized, Mirrored, MirroredIdentity, Passthrough or Off.
     pub effective: PortMode,
+    /// Where its input goes now (its routing in the active profile, or the active target): None while it goes
+    /// nowhere (Off, empty, unsupported).
+    pub target: Option<Host>,
     pub reason: AutoReason,
     pub vid: u16,
     pub pid: u16,
@@ -1535,6 +1708,7 @@ impl PortInfo {
             state: PortState::Empty,
             mode,
             effective: mode,
+            target: None,
             reason: AutoReason::NotAuto,
             vid: 0,
             pid: 0,
@@ -1561,7 +1735,9 @@ pub mod key {
     pub const COLOR_PC2: u16 = 0x0012;
     pub const PC_POLLING: u16 = 0x0020;
     pub const POWER_CYCLE_ON_SWITCH: u16 = 0x0021;
-    pub const PORT_MODE_BASE: u16 = 0x0030;
+    /// The active profile's mode and routing of each device ([`Device`](super::Device) order).
+    pub const MODE_BASE: u16 = 0x0030;
+    pub const ROUTE_BASE: u16 = 0x0038;
     pub const SW_SWITCH_ALLOWED: u16 = 0x0040;
     pub const SW_CONFIG_ALLOWED: u16 = 0x0041;
     pub const VIAL: u16 = 0x0050;
@@ -1573,13 +1749,13 @@ pub mod key {
     pub const STANDBY_WAKE: u16 = 0x0061;
     /// In standby, the key LED glows dimly instead of all LEDs going dark.
     pub const STANDBY_GLOW: u16 = 0x0062;
-    /// The active profile; the port modes (`PORT_MODE_BASE`) are its modes.
+    /// The active profile; the modes and routings (`MODE_BASE`, `ROUTE_BASE`) are its.
     pub const PROFILE: u16 = 0x0070;
     /// Profiles in use (1–[`MAX_PROFILES`](super::MAX_PROFILES)): the key and `next` cycle through them.
     pub const PROFILE_COUNT: u16 = 0x0071;
     /// Power up in the profile last active (otherwise in profile 0, and choosing one writes nothing to flash).
     pub const REMEMBER_PROFILE: u16 = 0x0072;
-    /// Port modes (Keyboard, Mouse, Other) and name of profile 0–3.
+    /// Every device's mode, and the name, of profile 0–7.
     pub const PROFILE_MODES_BASE: u16 = 0x0080;
     pub const PROFILE_NAME_BASE: u16 = 0x0088;
     /// Name of Bluetooth host slot 1–4 (UTF-8, at most 12 bytes; empty = "BT n").
@@ -1594,8 +1770,6 @@ pub mod key {
     pub const HOP_RESISTANCE: u16 = 0x00A3;
     pub const HOP_CORNER: u16 = 0x00A4;
     pub const HOP_MAPPING_BASE: u16 = 0x00A6;
-    /// Profile 0–3's arrangement (0: none, n + 1: arrangement n).
-    pub const PROFILE_ARRANGEMENT_BASE: u16 = 0x00A8;
     /// PC1's and PC2's [`Units`](super::Units) for screen hop.
     pub const HOP_UNITS_BASE: u16 = 0x00AC;
     /// Screen slot s of arrangement a at `SCREEN_BASE + a × MAX_SCREENS + s`.
@@ -1609,8 +1783,31 @@ pub mod key {
     pub const BT_POINTER_BASE: u16 = 0x00E0;
     /// Entry 0–15 of the hotkey list ([`HotkeyBinding`](super::HotkeyBinding)).
     pub const HOTKEY_BASE: u16 = 0x00F0;
+    /// Every device's routing in profile 0–7 ([`Routing`](super::Routing)).
+    pub const PROFILE_ROUTES_BASE: u16 = 0x0100;
+    /// Profile 0–7's arrangement (0: none, n + 1: arrangement n).
+    pub const PROFILE_ARRANGEMENT_BASE: u16 = 0x0108;
 
-    use super::{Host, MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_SCREENS};
+    use super::{DEVICES, Host, MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, MAX_SCREENS};
+
+    /// Whether `k` is one of the `n` keys from `base`.
+    pub const fn in_range(k: u16, base: u16, n: usize) -> Option<u8> {
+        if k >= base && k < base + n as u16 { Some((k - base) as u8) } else { None }
+    }
+
+    /// The device whose mode (`MODE_BASE`) or routing (`ROUTE_BASE`) `k` is.
+    pub const fn mode_of(k: u16) -> Option<u8> {
+        in_range(k, MODE_BASE, DEVICES)
+    }
+
+    pub const fn route_of(k: u16) -> Option<u8> {
+        in_range(k, ROUTE_BASE, DEVICES)
+    }
+
+    /// The profile `k` is a key of, from `base` (`PROFILE_MODES_BASE`, …).
+    pub const fn profile_of(k: u16, base: u16) -> Option<u8> {
+        in_range(k, base, MAX_PROFILES)
+    }
 
     /// The key of entry `i` of the hotkey list.
     pub const fn hotkey(i: u8) -> u16 {
@@ -1662,9 +1859,6 @@ pub mod key {
         COLOR_PC2,
         PC_POLLING,
         POWER_CYCLE_ON_SWITCH,
-        PORT_MODE_BASE,
-        PORT_MODE_BASE + 1,
-        PORT_MODE_BASE + 2,
         SW_SWITCH_ALLOWED,
         SW_CONFIG_ALLOWED,
         VIAL,
@@ -1672,19 +1866,10 @@ pub mod key {
         AUTO_SELECT,
         STANDBY_WAKE,
         STANDBY_GLOW,
-        // The count before the active profile, which must be one of those in use; the profiles' modes after the
-        // port modes (the active profile's).
+        // The count before the active profile, which must be one of those in use.
         PROFILE_COUNT,
         PROFILE,
         REMEMBER_PROFILE,
-        PROFILE_MODES_BASE,
-        PROFILE_MODES_BASE + 1,
-        PROFILE_MODES_BASE + 2,
-        PROFILE_MODES_BASE + 3,
-        PROFILE_NAME_BASE,
-        PROFILE_NAME_BASE + 1,
-        PROFILE_NAME_BASE + 2,
-        PROFILE_NAME_BASE + 3,
         BT_NAME_BASE,
         BT_NAME_BASE + 1,
         BT_NAME_BASE + 2,
@@ -1714,16 +1899,18 @@ pub mod key {
         BT_POINTER_BASE + 1,
         BT_POINTER_BASE + 2,
         BT_POINTER_BASE + 3,
-        PROFILE_ARRANGEMENT_BASE,
-        PROFILE_ARRANGEMENT_BASE + 1,
-        PROFILE_ARRANGEMENT_BASE + 2,
-        PROFILE_ARRANGEMENT_BASE + 3,
     ];
-    const ALL_LEN: usize = MAX_HOTKEYS + BASE.len() + MAX_ARRANGEMENTS * (1 + MAX_SCREENS);
+    /// Each profile's keys, after the profile count and the active profile.
+    const PROFILE_BASES: [u16; 4] =
+        [PROFILE_NAME_BASE, PROFILE_MODES_BASE, PROFILE_ROUTES_BASE, PROFILE_ARRANGEMENT_BASE];
+    const ALL_LEN: usize = MAX_HOTKEYS
+        + BASE.len()
+        + 2 * DEVICES
+        + MAX_PROFILES * PROFILE_BASES.len()
+        + MAX_ARRANGEMENTS * (1 + MAX_SCREENS);
     const ALL_KEYS: [u16; ALL_LEN] = {
         let mut out = [0u16; ALL_LEN];
         let mut i = 0;
-        // The hotkey list first, where the fixed hotkeys were.
         while i < MAX_HOTKEYS {
             out[i] = hotkey(i as u8);
             i += 1;
@@ -1731,6 +1918,24 @@ pub mod key {
         while i < MAX_HOTKEYS + BASE.len() {
             out[i] = BASE[i - MAX_HOTKEYS];
             i += 1;
+        }
+        // The active profile's modes and routings, then every profile's.
+        let mut d = 0;
+        while d < DEVICES {
+            out[i] = MODE_BASE + d as u16;
+            out[i + 1] = ROUTE_BASE + d as u16;
+            i += 2;
+            d += 1;
+        }
+        let mut p = 0;
+        while p < MAX_PROFILES {
+            let mut b = 0;
+            while b < PROFILE_BASES.len() {
+                out[i] = PROFILE_BASES[b] + p as u16;
+                i += 1;
+                b += 1;
+            }
+            p += 1;
         }
         let mut a = 0;
         while a < MAX_ARRANGEMENTS {
@@ -1761,7 +1966,9 @@ pub enum ConfigValue {
     ColorPc2(Rgb),
     PcPolling(Polling),
     PowerCycleOnSwitch(bool),
-    PortMode(Port, PortMode),
+    /// The active profile's mode and routing of a device.
+    Mode(Device, PortMode),
+    Route(Device, Routing),
     SwSwitchAllowed(bool),
     SwConfigAllowed(bool),
     Vial(VialMode),
@@ -1775,7 +1982,8 @@ pub enum ConfigValue {
     Profile(u8),
     ProfileCount(u8),
     /// Profile index, then the modes of the Keyboard, Mouse and Other port.
-    ProfileModes(u8, [PortMode; 3]),
+    ProfileModes(u8, [PortMode; DEVICES]),
+    ProfileRoutes(u8, [Routing; DEVICES]),
     ProfileName(u8, ProfileName),
     RememberProfile(bool),
     /// Bluetooth host slot 0–3 (slot n = index n−1) and its name (empty = "BT n").
@@ -1818,7 +2026,8 @@ impl ConfigValue {
             ConfigValue::ColorPc2(_) => key::COLOR_PC2,
             ConfigValue::PcPolling(_) => key::PC_POLLING,
             ConfigValue::PowerCycleOnSwitch(_) => key::POWER_CYCLE_ON_SWITCH,
-            ConfigValue::PortMode(p, _) => key::PORT_MODE_BASE + *p as u16,
+            ConfigValue::Mode(d, _) => key::MODE_BASE + *d as u16,
+            ConfigValue::Route(d, _) => key::ROUTE_BASE + *d as u16,
             ConfigValue::SwSwitchAllowed(_) => key::SW_SWITCH_ALLOWED,
             ConfigValue::SwConfigAllowed(_) => key::SW_CONFIG_ALLOWED,
             ConfigValue::Vial(_) => key::VIAL,
@@ -1833,6 +2042,7 @@ impl ConfigValue {
             ConfigValue::Profile(_) => key::PROFILE,
             ConfigValue::ProfileCount(_) => key::PROFILE_COUNT,
             ConfigValue::ProfileModes(i, _) => key::PROFILE_MODES_BASE + *i as u16,
+            ConfigValue::ProfileRoutes(i, _) => key::PROFILE_ROUTES_BASE + *i as u16,
             ConfigValue::ProfileName(i, _) => key::PROFILE_NAME_BASE + *i as u16,
             ConfigValue::BtName(i, _) => key::BT_NAME_BASE + *i as u16,
             ConfigValue::BtPolicy(i, _) => key::BT_POLICY_BASE + *i as u16,
@@ -1865,11 +2075,13 @@ impl ConfigValue {
             ConfigValue::LedBrightness(v) => w.u8(v),
             ConfigValue::ColorPc1(c) | ConfigValue::ColorPc2(c) => w.bytes(&[c.r, c.g, c.b]),
             ConfigValue::PcPolling(p) => w.u8(p as u8),
-            ConfigValue::PortMode(_, m) => w.u8(m as u8),
+            ConfigValue::Mode(_, m) => w.u8(m as u8),
+            ConfigValue::Route(_, r) => w.u8(r.to_u8()),
             ConfigValue::Vial(m) => w.u8(m as u8),
             ConfigValue::KeyTap(a) | ConfigValue::KeyLong(a) => w.u8(a as u8),
             ConfigValue::Profile(i) | ConfigValue::ProfileCount(i) => w.u8(i),
             ConfigValue::ProfileModes(_, m) => w.bytes(&m.map(|m| m as u8)),
+            ConfigValue::ProfileRoutes(_, r) => w.bytes(&r.map(|r| r.to_u8())),
             ConfigValue::ProfileName(_, n) | ConfigValue::BtName(_, n) | ConfigValue::ArrangementName(_, n) => {
                 w.lv(n.as_str().as_bytes())
             }
@@ -1910,6 +2122,7 @@ impl ConfigValue {
             Ok(Hotkey { kind: r.u8()?.try_into()?, modifiers: r.u8()?, key: r.u8()?, swallow: r.bool()? })
         };
         let rgb = |r: &mut Reader| -> Result<Rgb, WireError> { Ok(Rgb { r: r.u8()?, g: r.u8()?, b: r.u8()? }) };
+        let routing = |r: &mut Reader| Routing::from_u8(r.u8()?).ok_or(WireError::Invalid);
         let profiles = |base: u16| base..base + MAX_PROFILES as u16;
         let bt_slots = |base: u16| base..base + BT_HOSTS as u16;
         let arrangements = |base: u16| base..base + MAX_ARRANGEMENTS as u16;
@@ -1924,10 +2137,14 @@ impl ConfigValue {
             key::COLOR_PC2 => ConfigValue::ColorPc2(rgb(r)?),
             key::PC_POLLING => ConfigValue::PcPolling(r.u8()?.try_into()?),
             key::POWER_CYCLE_ON_SWITCH => ConfigValue::PowerCycleOnSwitch(r.bool()?),
-            k if (key::PORT_MODE_BASE..key::PORT_MODE_BASE + 3).contains(&k) => ConfigValue::PortMode(
-                Port::from_index((k - key::PORT_MODE_BASE) as usize).ok_or(WireError::Invalid)?,
-                r.u8()?.try_into()?,
-            ),
+            k if let Some(d) = key::mode_of(k) => {
+                let d = Device::from_index(d as usize).ok_or(WireError::Invalid)?;
+                ConfigValue::Mode(d, r.u8()?.try_into()?)
+            }
+            k if let Some(d) = key::route_of(k) => {
+                let d = Device::from_index(d as usize).ok_or(WireError::Invalid)?;
+                ConfigValue::Route(d, routing(r)?)
+            }
             key::SW_SWITCH_ALLOWED => ConfigValue::SwSwitchAllowed(r.bool()?),
             key::SW_CONFIG_ALLOWED => ConfigValue::SwConfigAllowed(r.bool()?),
             key::VIAL => ConfigValue::Vial(r.u8()?.try_into()?),
@@ -1941,10 +2158,20 @@ impl ConfigValue {
             key::REMEMBER_PROFILE => ConfigValue::RememberProfile(r.bool()?),
             key::PROFILE => ConfigValue::Profile(r.u8()?),
             key::PROFILE_COUNT => ConfigValue::ProfileCount(r.u8()?),
-            k if profiles(key::PROFILE_MODES_BASE).contains(&k) => ConfigValue::ProfileModes(
-                (k - key::PROFILE_MODES_BASE) as u8,
-                [r.u8()?.try_into()?, r.u8()?.try_into()?, r.u8()?.try_into()?],
-            ),
+            k if let Some(i) = key::profile_of(k, key::PROFILE_MODES_BASE) => {
+                let mut m = [PortMode::Auto; DEVICES];
+                for v in &mut m {
+                    *v = r.u8()?.try_into()?;
+                }
+                ConfigValue::ProfileModes(i, m)
+            }
+            k if let Some(i) = key::profile_of(k, key::PROFILE_ROUTES_BASE) => {
+                let mut m = [Routing::Follow; DEVICES];
+                for v in &mut m {
+                    *v = routing(r)?;
+                }
+                ConfigValue::ProfileRoutes(i, m)
+            }
             k if profiles(key::PROFILE_NAME_BASE).contains(&k)
                 || bt_slots(key::BT_NAME_BASE).contains(&k)
                 || arrangements(key::ARRANGEMENT_NAME_BASE).contains(&k) =>
@@ -2023,7 +2250,6 @@ pub enum Request {
     GetPort(Port),
     GetPortString(Port, StringKind),
     SetActive(Target),
-    SetPortMode(Port, PortMode),
     GetConfig(u16),
     SetConfig(ConfigValue),
     SaveConfig,
@@ -2056,6 +2282,23 @@ pub enum Request {
     BtForget(u8),
     /// The passkey a pairing host shows, typed in software instead of on the KVM's keyboard.
     BtPasskey(u32),
+    /// The state of Bluetooth device slot 1–4: `Response::BtDevice`.
+    GetBtDevice(u8),
+    /// Look for Bluetooth devices to pair (true), or stop; it stops by itself after `BT_PAIR_SECONDS`. Host
+    /// pairing closes meanwhile: the module pairs one way at a time.
+    BtScan(bool),
+    /// Entry n of the devices found while looking (`Status.bt_found` of them): `Response::BtFound`.
+    GetBtFound(u8),
+    /// Pair the device found at this address (`BtFound::addr`) into a free device slot.
+    BtPairDevice([u8; 7]),
+    /// Forget the bond in Bluetooth device slot 1–4 (0xFF = all) and drop its connection.
+    BtForgetDevice(u8),
+    /// The report map the KVM holds for Bluetooth device slot 1–4, from byte `offset`: `Response::BtDeviceMap`, for
+    /// diagnosing a device the KVM can't read (`odkvmctl device map`).
+    GetBtDeviceMap {
+        slot: u8,
+        offset: u16,
+    },
     /// Where the asking PC's own cursor is, in its display arrangement's pixels. With screen hop, the KVM
     /// takes it over while it isn't moving the pointer itself: a touchpad or a program moved it.
     PointerAt([i16; 2]),
@@ -2073,6 +2316,71 @@ pub const PLACE_RENEW_MS: u32 = 300;
 
 /// How long Bluetooth pairing stays open.
 pub const BT_PAIR_SECONDS: u8 = 60;
+
+/// Longest name of a Bluetooth device the KVM keeps (UTF-8 bytes; a longer one is cut).
+pub const BT_NAME_MAX: usize = 29;
+
+/// A Bluetooth device's name, as it calls itself.
+pub type BtDeviceName = String<BT_NAME_MAX>;
+
+/// `name` cut to [`BT_NAME_MAX`] bytes on a character boundary.
+pub fn bt_device_name(name: &str) -> BtDeviceName {
+    let mut end = name.len().min(BT_NAME_MAX);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    String::try_from(&name[..end]).unwrap_or_default()
+}
+
+/// One Bluetooth device slot (`Response::BtDevice`); its mode and routing are config values like a front port's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BtDeviceInfo {
+    /// 1–[`BT_DEVICES`].
+    pub slot: u8,
+    /// `kvm_proto::link::bt::device_flags`.
+    pub flags: u8,
+    pub rssi: i8,
+    /// Battery level in % (0xFF: the device reports none).
+    pub battery: u8,
+    /// Its GAP appearance (0x03C1 keyboard, 0x03C2 mouse, …; 0: unknown).
+    pub appearance: u16,
+    /// Identity address: type byte, then 6 bytes little-endian.
+    pub addr: [u8; 7],
+    pub name: BtDeviceName,
+}
+
+/// Bytes of a device's report map per `Response::BtDeviceMap` (header, slot, total, offset and length come first).
+pub const BT_MAP_PIECE: usize = 48;
+const _: () = assert!(2 + 1 + 2 + 2 + 1 + BT_MAP_PIECE <= REPORT_LEN);
+
+/// A device found while looking for devices to pair (`Response::BtFound`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct BtFound {
+    /// The address it advertises from: type byte, then 6 bytes little-endian.
+    pub addr: [u8; 7],
+    pub rssi: i8,
+    pub appearance: u16,
+    pub name: BtDeviceName,
+}
+
+wire_enum! {
+    /// Pairing a Bluetooth device (`Status.bt_device_pairing`).
+    pub enum DevicePairing {
+        Idle = 0,
+        /// Connecting to the device picked.
+        Connecting = 1,
+        /// Pairing. A keyboard that asks for it gets `Status.bt_device_passkey`: type it on that keyboard, then Enter.
+        Pairing = 2,
+        /// Paired: reading what the device reports, and storing it.
+        Reading = 3,
+        /// Done: the device is in a slot of its own.
+        Paired = 4,
+        /// It didn't work (out of reach, refused, not a HID device, no slot free).
+        Failed = 5,
+    }
+}
 
 /// One Bluetooth host slot (`Response::BtHost`); its name and policy are config values (`BtName`, `BtPolicy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2095,7 +2403,6 @@ pub mod req {
     pub const GET_PORT: u8 = 0x03;
     pub const GET_PORT_STRING: u8 = 0x04;
     pub const SET_ACTIVE: u8 = 0x05;
-    pub const SET_PORT_MODE: u8 = 0x06;
     pub const GET_CONFIG: u8 = 0x07;
     pub const SET_CONFIG: u8 = 0x08;
     pub const SAVE_CONFIG: u8 = 0x09;
@@ -2115,6 +2422,12 @@ pub mod req {
     pub const BT_PASSKEY: u8 = 0x17;
     pub const POINTER_AT: u8 = 0x18;
     pub const PLACE_CURSOR: u8 = 0x19;
+    pub const GET_BT_DEVICE: u8 = 0x1A;
+    pub const BT_SCAN: u8 = 0x1B;
+    pub const GET_BT_FOUND: u8 = 0x1C;
+    pub const BT_PAIR_DEVICE: u8 = 0x1D;
+    pub const BT_FORGET_DEVICE: u8 = 0x1E;
+    pub const GET_BT_DEVICE_MAP: u8 = 0x1F;
     pub const ERROR: u8 = 0xFF;
 }
 
@@ -2127,6 +2440,7 @@ pub mod ev {
     pub const BT_CHANGED: u8 = 0xC5;
     pub const BT_ACTIVE: u8 = 0xC6;
     pub const PLACE_CURSOR: u8 = 0xC7;
+    pub const BT_DEVICE_CHANGED: u8 = 0xC8;
 }
 
 impl Request {
@@ -2137,7 +2451,6 @@ impl Request {
             Request::GetPort(_) => req::GET_PORT,
             Request::GetPortString(..) => req::GET_PORT_STRING,
             Request::SetActive(_) => req::SET_ACTIVE,
-            Request::SetPortMode(..) => req::SET_PORT_MODE,
             Request::GetConfig(_) => req::GET_CONFIG,
             Request::SetConfig(_) => req::SET_CONFIG,
             Request::SaveConfig => req::SAVE_CONFIG,
@@ -2157,6 +2470,12 @@ impl Request {
             Request::BtPasskey(_) => req::BT_PASSKEY,
             Request::PointerAt(_) => req::POINTER_AT,
             Request::PlaceCursor(_) => req::PLACE_CURSOR,
+            Request::GetBtDevice(_) => req::GET_BT_DEVICE,
+            Request::BtScan(_) => req::BT_SCAN,
+            Request::GetBtFound(_) => req::GET_BT_FOUND,
+            Request::GetBtDeviceMap { .. } => req::GET_BT_DEVICE_MAP,
+            Request::BtPairDevice(_) => req::BT_PAIR_DEVICE,
+            Request::BtForgetDevice(_) => req::BT_FORGET_DEVICE,
         }
     }
 
@@ -2164,8 +2483,7 @@ impl Request {
     pub fn is_config_change(&self) -> bool {
         matches!(
             self,
-            Request::SetPortMode(..)
-                | Request::SetConfig(_)
+            Request::SetConfig(_)
                 | Request::SaveConfig
                 | Request::FactoryReset
                 | Request::Redetect(_)
@@ -2176,6 +2494,9 @@ impl Request {
                 | Request::LearnHotkey(true)
                 | Request::BtPair(true)
                 | Request::BtForget(_)
+                | Request::BtScan(true)
+                | Request::BtPairDevice(_)
+                | Request::BtForgetDevice(_)
         )
     }
 
@@ -2197,15 +2518,22 @@ impl Request {
                 w.u8(*k as u8)?;
             }
             Request::SetActive(t) => w.u8(*t as u8)?,
-            Request::SetPortMode(p, m) => {
-                w.u8(*p as u8)?;
-                w.u8(*m as u8)?;
-            }
             Request::GetConfig(k) => w.u16(*k)?,
             Request::SetConfig(v) => v.encode(&mut w)?,
             Request::Reboot(t) => w.u8(*t as u8)?,
-            Request::Identify(s) | Request::GetDiag(s) | Request::GetBtHost(s) | Request::BtForget(s) => w.u8(*s)?,
-            Request::BtPair(on) => w.bool(*on)?,
+            Request::Identify(s)
+            | Request::GetDiag(s)
+            | Request::GetBtHost(s)
+            | Request::BtForget(s)
+            | Request::GetBtDevice(s)
+            | Request::GetBtFound(s)
+            | Request::BtForgetDevice(s) => w.u8(*s)?,
+            Request::BtPair(on) | Request::BtScan(on) => w.bool(*on)?,
+            Request::BtPairDevice(a) => w.bytes(a)?,
+            Request::GetBtDeviceMap { slot, offset } => {
+                w.u8(*slot)?;
+                w.u16(*offset)?;
+            }
             Request::BtPasskey(v) => w.u32(*v)?,
             Request::PointerAt([x, y]) => {
                 w.u16(*x as u16)?;
@@ -2237,7 +2565,6 @@ impl Request {
             req::GET_PORT => Request::GetPort(r.u8()?.try_into()?),
             req::GET_PORT_STRING => Request::GetPortString(r.u8()?.try_into()?, r.u8()?.try_into()?),
             req::SET_ACTIVE => Request::SetActive(r.u8()?.try_into()?),
-            req::SET_PORT_MODE => Request::SetPortMode(r.u8()?.try_into()?, r.u8()?.try_into()?),
             req::GET_CONFIG => Request::GetConfig(r.u16()?),
             req::SET_CONFIG => Request::SetConfig(ConfigValue::decode(&mut r)?),
             req::SAVE_CONFIG => Request::SaveConfig,
@@ -2259,6 +2586,12 @@ impl Request {
             req::BT_PASSKEY => Request::BtPasskey(r.u32()?),
             req::POINTER_AT => Request::PointerAt([r.u16()? as i16, r.u16()? as i16]),
             req::PLACE_CURSOR => Request::PlaceCursor(r.u8()?.try_into()?),
+            req::GET_BT_DEVICE => Request::GetBtDevice(r.u8()?),
+            req::BT_SCAN => Request::BtScan(r.bool()?),
+            req::GET_BT_FOUND => Request::GetBtFound(r.u8()?),
+            req::GET_BT_DEVICE_MAP => Request::GetBtDeviceMap { slot: r.u8()?, offset: r.u16()? },
+            req::BT_PAIR_DEVICE => Request::BtPairDevice(r.array()?),
+            req::BT_FORGET_DEVICE => Request::BtForgetDevice(r.u8()?),
             _ => return Err(WireError::Invalid),
         };
         Ok((id, req))
@@ -2284,6 +2617,17 @@ pub enum Response {
         items: Vec<diag::Item, { diag::PER_PAGE }>,
     },
     BtHost(BtHostInfo),
+    BtDevice(BtDeviceInfo),
+    /// Entry n of the devices found, None past the last.
+    BtFound(Option<BtFound>),
+    /// Bytes `offset`.. of the report map the KVM holds for a device slot, `total` long (0: it holds none: no bond,
+    /// or not read yet).
+    BtDeviceMap {
+        slot: u8,
+        total: u16,
+        offset: u16,
+        data: Vec<u8, BT_MAP_PIECE>,
+    },
     Ok,
     Error(ErrorCode),
 }
@@ -2301,6 +2645,9 @@ pub enum Event {
     BtChanged(u8),
     /// Input now goes to Bluetooth host slot 1–4, or 0: back to a PC (then `Switched` follows).
     BtActive(u8),
+    /// Bluetooth device slot 1–4 changed (paired, connected, its battery, …), or 0: looking for devices started,
+    /// found one, stopped, or a pairing moved on.
+    BtDeviceChanged(u8),
     /// Put the cursor here, in this PC's own pixels: only to a PC whose host software asked for it
     /// (`Request::PlaceCursor`), at most once a millisecond, the latest position.
     PlaceCursor([i16; 2]),
@@ -2316,6 +2663,11 @@ pub enum DeviceMsg {
 
 fn advertised(r: &mut Reader) -> Result<Advertised, WireError> {
     r.u8()?.try_into()
+}
+
+fn device_name(r: &mut Reader) -> Result<BtDeviceName, WireError> {
+    let s = core::str::from_utf8(r.lv()?).map_err(|_| WireError::Invalid)?;
+    String::try_from(s).map_err(|_| WireError::Invalid)
 }
 
 impl Response {
@@ -2374,12 +2726,19 @@ impl Response {
                 w.u16(s.supply_mv)?;
                 w.u16(s.supply_lowest_mv)?;
                 w.u16(s.declared_ma)?;
+                w.u8(s.bt_devices_bonded)?;
+                w.u8(s.bt_devices_ready)?;
+                w.u8(s.bt_scan)?;
+                w.u8(s.bt_found)?;
+                w.u8(s.bt_device_pairing as u8)?;
+                w.u32(s.bt_device_passkey.unwrap_or(u32::MAX))?;
             }
             Response::Port(p) => {
                 w.u8(p.port as u8)?;
                 w.u8(p.state as u8)?;
                 w.u8(p.mode as u8)?;
                 w.u8(p.effective as u8)?;
+                w.u8(p.target.map_or(0, |h| h as u8))?;
                 w.u8(p.reason as u8)?;
                 w.u16(p.vid)?;
                 w.u16(p.pid)?;
@@ -2417,6 +2776,30 @@ impl Response {
                 w.u16(h.latency)?;
                 w.u8(h.rssi as u8)?;
                 w.bytes(&h.addr)?;
+            }
+            Response::BtDevice(d) => {
+                w.u8(d.slot)?;
+                w.u8(d.flags)?;
+                w.u8(d.rssi as u8)?;
+                w.u8(d.battery)?;
+                w.u16(d.appearance)?;
+                w.bytes(&d.addr)?;
+                w.lv(d.name.as_bytes())?;
+            }
+            Response::BtDeviceMap { slot, total, offset, data } => {
+                w.u8(*slot)?;
+                w.u16(*total)?;
+                w.u16(*offset)?;
+                w.lv(data)?;
+            }
+            Response::BtFound(f) => {
+                w.bool(f.is_some())?;
+                if let Some(f) = f {
+                    w.bytes(&f.addr)?;
+                    w.u8(f.rssi as u8)?;
+                    w.u16(f.appearance)?;
+                    w.lv(f.name.as_bytes())?;
+                }
             }
             Response::Ok => {}
             Response::Error(code) => {
@@ -2464,8 +2847,12 @@ impl Event {
                 w.u8(h.key)?;
                 w.bool(h.swallow)?;
             }
-            Event::BtChanged(n) | Event::BtActive(n) => {
-                w.u8(if matches!(self, Event::BtChanged(_)) { ev::BT_CHANGED } else { ev::BT_ACTIVE })?;
+            Event::BtChanged(n) | Event::BtActive(n) | Event::BtDeviceChanged(n) => {
+                w.u8(match self {
+                    Event::BtChanged(_) => ev::BT_CHANGED,
+                    Event::BtActive(_) => ev::BT_ACTIVE,
+                    _ => ev::BT_DEVICE_CHANGED,
+                })?;
                 w.u8(0)?;
                 w.u8(n)?;
             }
@@ -2499,6 +2886,7 @@ impl DeviceMsg {
             ev::CONFIG_CHANGED => return Ok(DeviceMsg::Event(Event::ConfigChanged(r.u16()?))),
             ev::BT_CHANGED => return Ok(DeviceMsg::Event(Event::BtChanged(r.u8()?))),
             ev::BT_ACTIVE => return Ok(DeviceMsg::Event(Event::BtActive(r.u8()?))),
+            ev::BT_DEVICE_CHANGED => return Ok(DeviceMsg::Event(Event::BtDeviceChanged(r.u8()?))),
             ev::PLACE_CURSOR => {
                 return Ok(DeviceMsg::Event(Event::PlaceCursor([r.u16()? as i16, r.u16()? as i16])));
             }
@@ -2559,6 +2947,12 @@ impl DeviceMsg {
                     supply_mv: 0,
                     supply_lowest_mv: 0,
                     declared_ma: 0,
+                    bt_devices_bonded: 0,
+                    bt_devices_ready: 0,
+                    bt_scan: 0,
+                    bt_found: 0,
+                    bt_device_pairing: DevicePairing::Idle,
+                    bt_device_passkey: None,
                 };
                 // The self-test's bits 16–31, then screen hop, the passkey typed and the supply.
                 st.selftest |= (r.u16()? as u32) << 16;
@@ -2570,6 +2964,12 @@ impl DeviceMsg {
                 st.supply_mv = r.u16()?;
                 st.supply_lowest_mv = r.u16()?;
                 st.declared_ma = r.u16()?;
+                st.bt_devices_bonded = r.u8()?;
+                st.bt_devices_ready = r.u8()?;
+                st.bt_scan = r.u8()?;
+                st.bt_found = r.u8()?;
+                st.bt_device_pairing = r.u8()?.try_into()?;
+                st.bt_device_passkey = Some(r.u32()?).filter(|v| *v != u32::MAX);
                 Response::Status(st)
             }
             req::GET_PORT => Response::Port(PortInfo {
@@ -2577,6 +2977,10 @@ impl DeviceMsg {
                 state: r.u8()?.try_into()?,
                 mode: r.u8()?.try_into()?,
                 effective: r.u8()?.try_into()?,
+                target: match r.u8()? {
+                    0 => None,
+                    h => Some(h.try_into()?),
+                },
                 reason: r.u8()?.try_into()?,
                 vid: r.u16()?,
                 pid: r.u16()?,
@@ -2615,6 +3019,30 @@ impl DeviceMsg {
                 latency: r.u16()?,
                 rssi: r.u8()? as i8,
                 addr: r.array()?,
+            }),
+            req::GET_BT_DEVICE => Response::BtDevice(BtDeviceInfo {
+                slot: r.u8()?,
+                flags: r.u8()?,
+                rssi: r.u8()? as i8,
+                battery: r.u8()?,
+                appearance: r.u16()?,
+                addr: r.array()?,
+                name: device_name(&mut r)?,
+            }),
+            req::GET_BT_DEVICE_MAP => Response::BtDeviceMap {
+                slot: r.u8()?,
+                total: r.u16()?,
+                offset: r.u16()?,
+                data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
+            },
+            req::GET_BT_FOUND => Response::BtFound(match r.bool()? {
+                false => None,
+                true => Some(BtFound {
+                    addr: r.array()?,
+                    rssi: r.u8()? as i8,
+                    appearance: r.u16()?,
+                    name: device_name(&mut r)?,
+                }),
             }),
             _ => Response::Ok,
         };
@@ -2698,7 +3126,7 @@ mod tests {
         }
         assert_eq!(HotkeyAction::from_name("pc2"), None);
         // A profile past the last, or a host that isn't one, does not decode.
-        assert_eq!(HotkeyAction::decode(&mut Reader::new(&[7, 4])), Err(WireError::Invalid));
+        assert_eq!(HotkeyAction::decode(&mut Reader::new(&[7, 8])), Err(WireError::Invalid));
         assert!(HotkeyAction::decode(&mut Reader::new(&[4, 3])).is_err());
         // The list's keys, first in `ALL`.
         assert_eq!(key::ALL[..MAX_HOTKEYS], core::array::from_fn::<u16, MAX_HOTKEYS, _>(|i| 0x00F0 + i as u16));
@@ -2713,22 +3141,45 @@ mod tests {
             Request::GetPort(Port::Other),
             Request::GetPortString(Port::Mouse, StringKind::Product),
             Request::SetActive(Target::Toggle),
-            Request::SetPortMode(Port::Mouse, PortMode::MirroredIdentity),
             Request::GetConfig(key::COLOR_PC2),
             Request::SetConfig(ConfigValue::Hotkey(
                 3,
                 HotkeyBinding::new(HotkeyAction::SelectHost(Host::Bt2), Hotkey::double_tap(0x47, true)),
             )),
             Request::SetConfig(ConfigValue::Hotkey(15, HotkeyBinding::NONE)),
-            Request::SetConfig(ConfigValue::PortMode(Port::Other, PortMode::PassthroughPc2)),
+            Request::SetConfig(ConfigValue::Mode(Device::Other, PortMode::Passthrough)),
+            Request::SetConfig(ConfigValue::Mode(Device::Wireless4, PortMode::Off)),
+            Request::SetConfig(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc2))),
+            Request::SetConfig(ConfigValue::Route(Device::Wireless1, Routing::Pin(Host::Bt3))),
+            Request::SetConfig(ConfigValue::Route(Device::Keyboard, Routing::Follow)),
             Request::SetConfig(ConfigValue::ColorPc1(Rgb::new(1, 2, 3))),
             Request::SetConfig(ConfigValue::KeyLong(KeyAction::OtherPortMode)),
             Request::SetConfig(ConfigValue::Profile(1)),
             Request::SetConfig(ConfigValue::LongPressMs(1500)),
             Request::SetConfig(ConfigValue::RememberProfile(false)),
             Request::SetConfig(ConfigValue::ProfileModes(
-                3,
-                [PortMode::Auto, PortMode::Mirrored, PortMode::Passthrough],
+                7,
+                [
+                    PortMode::Auto,
+                    PortMode::Mirrored,
+                    PortMode::Passthrough,
+                    PortMode::Normalized,
+                    PortMode::Off,
+                    PortMode::Auto,
+                    PortMode::Auto,
+                ],
+            )),
+            Request::SetConfig(ConfigValue::ProfileRoutes(
+                5,
+                [
+                    Routing::Follow,
+                    Routing::Pin(Host::Pc1),
+                    Routing::Pin(Host::Pc2),
+                    Routing::Pin(Host::Bt1),
+                    Routing::Follow,
+                    Routing::Pin(Host::Bt4),
+                    Routing::Follow,
+                ],
             )),
             Request::SetConfig(ConfigValue::ProfileName(2, ProfileName::new("gaming"))),
             Request::SaveConfig,
@@ -2772,6 +3223,17 @@ mod tests {
             Request::SetConfig(ConfigValue::Screen(2, 0, Screen::NONE)),
             Request::SetConfig(ConfigValue::ArrangementName(3, ProfileName::new("couch"))),
             Request::SetConfig(ConfigValue::BtPointer(2, BtPointer::Relative)),
+            Request::SetConfig(ConfigValue::Hotkey(
+                0,
+                HotkeyBinding::new(HotkeyAction::SelectProfile(7), Hotkey::NONE),
+            )),
+            Request::GetBtDevice(4),
+            Request::BtScan(true),
+            Request::BtScan(false),
+            Request::GetBtFound(9),
+            Request::GetBtDeviceMap { slot: 2, offset: 96 },
+            Request::BtPairDevice([1, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xC6]),
+            Request::BtForgetDevice(0xFF),
         ];
         for (i, req) in reqs.iter().enumerate() {
             let raw = req.encode(i as u8 + 1).unwrap();
@@ -2818,12 +3280,21 @@ mod tests {
             supply_mv: 4480,
             supply_lowest_mv: 4310,
             declared_ma: 700,
+            bt_devices_bonded: 0b1001,
+            bt_devices_ready: 0b0001,
+            bt_scan: 17,
+            bt_found: 3,
+            bt_device_pairing: DevicePairing::Pairing,
+            bt_device_passkey: Some(0),
         };
+        // The status fits in its report.
+        assert!(Response::Status(status).encode(req::GET_STATUS, 1).is_ok());
         let port = PortInfo {
             port: Port::Mouse,
             state: PortState::Hosted,
             mode: PortMode::Auto,
             effective: PortMode::Normalized,
+            target: Some(Host::Bt2),
             reason: AutoReason::FitsNormalized,
             vid: 0x046D,
             pid: 0xC539,
@@ -2856,7 +3327,37 @@ mod tests {
             (req::GET_CONFIG, Response::Config(ConfigValue::DoubleTapMs(300))),
             (req::FW_STATUS, Response::Fw { state: FwState::AwaitingKey, progress: 1000 }),
             (req::SET_ACTIVE, Response::Ok),
-            (req::SET_PORT_MODE, Response::Error(ErrorCode::Locked)),
+            (req::SET_CONFIG, Response::Error(ErrorCode::Locked)),
+            (
+                req::GET_BT_DEVICE,
+                Response::BtDevice(BtDeviceInfo {
+                    slot: 2,
+                    flags: 0b1111,
+                    rssi: -61,
+                    battery: 0xFF,
+                    appearance: 0x03C2,
+                    addr: [1, 2, 3, 4, 5, 6, 7],
+                    name: bt_device_name(&"m".repeat(40)),
+                }),
+            ),
+            (req::GET_BT_FOUND, Response::BtFound(None)),
+            (
+                req::GET_BT_DEVICE_MAP,
+                Response::BtDeviceMap { slot: 2, total: 312, offset: 288, data: Vec::from_slice(&[0xC0; 24]).unwrap() },
+            ),
+            (
+                req::GET_BT_DEVICE_MAP,
+                Response::BtDeviceMap { slot: 1, total: 512, offset: 0, data: Vec::from_slice(&[0x05; 48]).unwrap() },
+            ),
+            (
+                req::GET_BT_FOUND,
+                Response::BtFound(Some(BtFound {
+                    addr: [0, 9, 8, 7, 6, 5, 4],
+                    rssi: -80,
+                    appearance: 0x03C1,
+                    name: bt_device_name("Tastatur ü"),
+                })),
+            ),
             (req::LEARN_HOTKEY, Response::Ok),
             (req::LEARN_HOTKEY, Response::Error(ErrorCode::NotActive)),
             (
@@ -2902,7 +3403,28 @@ mod tests {
         for m in PortMode::ALL {
             assert_eq!(PortMode::from_name(m.name()), Some(*m));
         }
-        assert_eq!(PortMode::from_name("mirrored-identity"), Some(PortMode::MirroredIdentity));
+        assert_eq!(PortMode::from_name("passthrough-pc1"), None);
+        for d in Device::ALL {
+            assert_eq!((Device::from_name(d.name()), Device::from_index(d.index())), (Some(*d), Some(*d)));
+            assert_eq!(d.port().is_some(), d.wireless().is_none());
+            assert!(d.takes(PortMode::Auto) && d.takes(PortMode::Off));
+        }
+        assert_eq!(Device::wireless_slot(1), Some(Device::Wireless1));
+        assert_eq!((Device::wireless_slot(0), Device::wireless_slot(5)), (None, None));
+        assert!(!Device::Wireless2.takes(PortMode::Passthrough) && Device::Other.takes(PortMode::Passthrough));
+        for r in Routing::ALL {
+            assert_eq!((Routing::from_u8(r.to_u8()), Routing::from_name(r.name())), (Some(r), Some(r)));
+        }
+        assert_eq!(Routing::from_u8(7), None);
+        // Each profile's keys, the active profile's modes and routings: every key once, none an arrangement's.
+        for p in 0..MAX_PROFILES as u8 {
+            for base in [key::PROFILE_MODES_BASE, key::PROFILE_ROUTES_BASE, key::PROFILE_ARRANGEMENT_BASE] {
+                assert_eq!(key::profile_of(base + p as u16, base), Some(p));
+                assert_eq!(key::arrangement_of(base + p as u16), None);
+            }
+        }
+        assert_eq!(key::profile_of(key::PROFILE_MODES_BASE + 8, key::PROFILE_MODES_BASE), None);
+        assert_eq!((key::mode_of(0x0036), key::mode_of(0x0037), key::route_of(0x003E)), (Some(6), None, Some(6)));
         assert_eq!(Advertised::from_cc_mv(0), Advertised::None);
         assert_eq!(Advertised::from_cc_mv(420), Advertised::Default);
         assert_eq!(Advertised::from_cc_mv(940), Advertised::A1_5);

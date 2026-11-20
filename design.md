@@ -282,15 +282,19 @@ where the KVM emulates the device, or straight to Hub-1/Hub-2, where the real de
 
 ## 4. Port modes
 
-Each front port (Keyboard, Mouse, Other) can be set independently, from the host software (§8) or by the Auto policy.
-A set of modes for all three ports is a profile, and the key on the KVM switches between profiles (below).
+Each front port (Keyboard, Mouse, Other) can be set independently, from the host software (§8) or by the Auto policy,
+and so can each Bluetooth device paired with the module (§16: Normalized or Off only, as it reaches the KVM as
+reports). Each also has a routing: it follows the active PC or Bluetooth host, or is **pinned** to one host whichever
+is active. The modes and routings of every device are a profile, and the key on the KVM switches between profiles
+(below).
 
 | Mode | What the PCs see | Switching | The maker's configuration software | Use it for |
 |---|---|---|---|---|
 | **Normalized** | fixed KVM keyboard/mouse interfaces | seamless, under 1 ms | no | default for keyboard/mouse; most stable |
 | **Mirrored** | the device's own HID interfaces, byte-identical, inside the KVM composite (KVM VID/PID) | seamless | only apps that find the device by HID usage page (few do) | extra buttons/keys/dials, unusual report formats, vendor HID reports |
 | **Mirrored + identity** | as Mirrored, plus the device's VID/PID and name strings | seamless | usually works on the **active** PC (validate per device) | vendor software *and* seamless switching. **Max. one port at a time** |
-| **Passthrough** | the real device, behind the PC's hub, 480 Mbit/s | re-enumerates on the other PC (~1 s), optional VBUS power-cycle | always | peripheral firmware updates, non-HID devices. It can follow the active PC (default) or be **pinned** to PC1 or PC2, e.g. a webcam that should stay with the work PC |
+| **Passthrough** | the real device, behind the PC's hub, 480 Mbit/s | re-enumerates on the other PC (~1 s), optional VBUS power-cycle | always | peripheral firmware updates, non-HID devices. It follows the active PC (default) or is **pinned** to PC1 or PC2, e.g. a webcam that should stay with the work PC |
+| **Off** | nothing: the device stays powered, its input goes nowhere | — | — | a device left plugged in but not wanted in a profile |
 
 ### Normalized
 - Reports are translated into fixed interfaces:
@@ -338,7 +342,7 @@ A set of modes for all three ports is a profile, and the key on the KVM switches
 - **Webcam** (UVC video + audio classes): **Passthrough** at full 480 Mbit/s, straight to the PC's hub.
   - The default is to follow the active PC. Each switch re-enumerates it on the new PC, which takes about 1 s; video
     apps typically need re-selecting the camera.
-  - For a webcam that belongs to one PC, set the port to **Passthrough pinned to PC1/PC2**. It then never moves.
+  - For a webcam that belongs to one PC, set the port to **Passthrough** pinned to PC1/PC2. It then never moves.
   - It draws up to about 0.5 A, so use the PWR port if the PCs' ports are weak (§6).
 - **HID gamepad** (DirectInput / generic HID: most console-style and generic PC pads):
   **Mirrored**. It switches seamlessly like the keyboard and mouse. Rumble and LED output reports go to the active
@@ -351,7 +355,8 @@ A set of modes for all three ports is a profile, and the key on the KVM switches
   - It is validated with your pad on the prototype. If a pad refuses, it falls back to Passthrough.
 
 ### Profiles
-- A profile is a name and the mode of each front port. The KVM stores 4, of which 1 to 4 are in use (default 2):
+- A profile is a name and the mode and routing of every device. The KVM stores 8, of which 1 to 8 are in use
+  (default 2):
   - **work:** Auto on all three ports: emulated keyboard and mouse that switch instantly;
   - **gaming:** Passthrough on all three ports: the real devices, with their own polling rate and vendor software,
     each re-enumerating on a switch (about 1 s).
@@ -359,8 +364,8 @@ A set of modes for all three ports is a profile, and the key on the KVM switches
   and the GUI select, rename and edit profiles.
 - Monitors switched over DDC/CI by the host software (software.md §9) can be routed per profile too: follow the
   active PC, stay on one PC, or be left alone. That is a setting of each PC, not of the KVM.
-- Setting a port's mode changes it in the active profile. On a change of profile all three ports are decided again
-  together, so the endpoint budget and identity are settled once for the new set.
+- Setting a device's mode or routing changes it in the active profile. On a change of profile all three ports are
+  decided again together, so the endpoint budget and identity are settled once for the new set.
 - The profiles are saved. By default the KVM powers up in profile 0, and choosing a profile writes nothing to flash:
   it loses power only when both PCs are off (or it is unplugged), and starting over in the first profile is fine then.
   With "power up in the profile last active" on, it remembers the profile, at a flash write per change.
@@ -967,12 +972,14 @@ there; OpenRower itself is never modified.
 Not needed any more with the STM32 dropped: DS11853 (current revision), RM0431, AN4879, AN4286 and ES0360. st.com
 refused all connections from here.
 
-## 16. Bluetooth hosts (0.16.0)
+## 16. Bluetooth hosts and devices (0.16.0)
 
 Up to four extra hosts (PCs, tablets, phones) take the KVM's keyboard and mouse over Bluetooth LE, alongside the two
 USB PCs. They are lesser targets: the KVM's own keyboard, mouse and media reports only (no mirroring, identity or
-passthrough), and the window and the LEDs stay the two-PC KVM until a host is paired. Firmware and control protocol:
-software.md §4.13.
+passthrough), and the window and the LEDs stay the two-PC KVM until a host is paired. At the same time the module
+takes up to four Bluetooth LE keyboards, mice and other input devices (firmware 0.1.33): each is one of the KVM's
+devices as a front port's is, normalized or off, following the active host or pinned to one (§4). Firmware and
+control protocol: software.md §4.13.
 
 - **Module:** ESP32-C3-MINI-1-H4X (LCSC C41349510), pre-certified, with its PCB antenna. Chosen over a bare nRF54L or
   ESP32-C3 for the certification it carries (the board's radio tests reuse the module's) and over an nRF54L15 module

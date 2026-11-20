@@ -282,7 +282,13 @@ mod tests {
     use crate::local::DisplayMode::{self, Follow, Off, Pc1, Pc2};
 
     fn b(id: &str, inputs: [Option<u16>; 2], profiles: [DisplayMode; 4]) -> DisplayBinding {
-        DisplayBinding { id: id.into(), name: id.into(), inputs, profiles, bt_inputs: Default::default() }
+        DisplayBinding {
+            id: id.into(),
+            name: id.into(),
+            inputs,
+            profiles: profiles.to_vec(),
+            bt_inputs: Default::default(),
+        }
     }
 
     /// PC `pc` (0 or 1) active in `profile`.
