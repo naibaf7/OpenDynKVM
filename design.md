@@ -977,7 +977,7 @@ refused all connections from here.
 Up to four extra hosts (PCs, tablets, phones) take the KVM's keyboard and mouse over Bluetooth LE, alongside the two
 USB PCs. They are lesser targets: the KVM's own keyboard, mouse and media reports only (no mirroring, identity or
 passthrough), and the window and the LEDs stay the two-PC KVM until a host is paired. At the same time the module
-takes up to four Bluetooth LE keyboards, mice and other input devices (firmware 0.1.33): each is one of the KVM's
+takes up to four Bluetooth LE keyboards, mice and other input devices (firmware 0.1.47): each is one of the KVM's
 devices as a front port's is, normalized or off, following the active host or pinned to one (§4). Firmware and
 control protocol: software.md §4.13.
 

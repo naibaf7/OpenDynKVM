@@ -146,7 +146,41 @@ impl Bonds {
             best = Some((seq, slots));
         }
         let (seq, slots) = best.unwrap_or((0, [None; MAX_HOSTS]));
-        Bonds { flash, seq, slots }
+        let mut bonds = Bonds { flash, seq, slots };
+        // One peer in two slots puts two entries for it in the controller's resolving list, and the controller
+        // asserted after that peer paired anew (2026-11-20): the later slots go.
+        let twins = drop_twins(&mut bonds.slots, Slot::identity);
+        if twins != 0 {
+            crate::log::line(format_args!("host bonds: the same host in more than one slot, dropped {twins:#06b}"));
+            bonds.save();
+        }
+        bonds
+    }
+
+    /// A host just paired, into `slot`: every other slot holding the same host goes (it paired anew, so its old keys
+    /// are no good, and one host in two slots puts two entries for it in the controller's resolving list). One save.
+    /// Returns the slots cleared (bit i for slot i).
+    pub fn set_new(&mut self, slot: usize, value: Slot) -> u8 {
+        let id = value.identity();
+        let mut cleared = 0;
+        for i in (0..MAX_HOSTS).filter(|&i| i != slot) {
+            if self.slots[i].is_some_and(|o| same_peer(&o.identity(), &id)) {
+                self.slots[i] = None;
+                cleared |= 1 << i;
+            }
+        }
+        if cleared != 0 || self.slots[slot] != Some(value) {
+            self.slots[slot] = Some(value);
+            self.save();
+        }
+        cleared
+    }
+
+    /// Every slot empty, in both sectors' records: nothing older is left to load.
+    pub fn erase_all(&mut self) {
+        self.slots = [None; MAX_HOSTS];
+        self.save();
+        self.save();
     }
 
     /// Puts `value` in `slot` without saving: it reaches flash with the next save, whichever slot that is for (the wear
@@ -206,6 +240,25 @@ impl Bonds {
     pub fn slot_of(&self, id: &Identity) -> Option<usize> {
         self.slots.iter().position(|s| s.as_ref().is_some_and(|s| s.identity().match_identity(id)))
     }
+}
+
+/// Whether two identities are the same peer: the same address, or an IRK of one resolving the other's address, or the
+/// same IRK.
+pub fn same_peer(a: &Identity, b: &Identity) -> bool {
+    a.match_identity(b) || b.match_identity(a)
+}
+
+/// Empties every slot after the first that holds the same peer as an earlier one; returns them (bit i for slot i).
+fn drop_twins<T>(slots: &mut [Option<T>], identity: impl Fn(&T) -> Identity) -> u8 {
+    let mut dropped = 0;
+    for j in 1..slots.len() {
+        let Some(b) = slots[j].as_ref().map(&identity) else { continue };
+        if slots[..j].iter().flatten().any(|a| same_peer(&identity(a), &b)) {
+            slots[j] = None;
+            dropped |= 1 << j;
+        }
+    }
+    dropped
 }
 
 /// The identity in `address`, as [`Address::to_bytes`] gives it (the type, then the address most significant byte
@@ -336,15 +389,35 @@ impl DeviceBonds {
                 *slot = decode_device(&r[8 + i * DEVICE_SLOT_LEN..8 + (i + 1) * DEVICE_SLOT_LEN]);
             }
         }
+        let twins = drop_twins(&mut bonds.slots, Device::identity);
+        if twins != 0 {
+            crate::log::line(format_args!("device bonds: the same device in more than one slot, dropped {twins:#06b}"));
+            bonds.save();
+        }
         bonds
     }
 
-    /// Puts `value` in `slot`, saving only if that changes the slot.
-    pub fn set(&mut self, slot: usize, value: Option<Device>) {
-        if self.slots[slot] != value {
-            self.slots[slot] = value;
-            self.save();
+    /// A device just paired, into `slot`: every other slot holding the same device goes, with one save. Returns the
+    /// slots cleared (bit i for slot i).
+    pub fn set_new(&mut self, slot: usize, value: Device) -> u8 {
+        let id = value.identity();
+        let mut cleared = 0;
+        for i in (0..MAX_DEVICES).filter(|&i| i != slot) {
+            if self.slots[i].as_ref().is_some_and(|o| same_peer(&o.identity(), &id)) {
+                self.slots[i] = None;
+                cleared |= 1 << i;
+            }
         }
+        self.slots[slot] = Some(value);
+        self.save();
+        cleared
+    }
+
+    /// Every slot empty, in both sectors' records.
+    pub fn erase_all(&mut self) {
+        self.slots = Default::default();
+        self.save();
+        self.save();
     }
 
     /// Empties the slots `which` picks, with one save for all of them, and none if they were all free already.
@@ -373,7 +446,9 @@ impl DeviceBonds {
         }
         let crc = crc32(&r[..DEVICE_RECORD_LEN - 4]);
         r[DEVICE_RECORD_LEN - 4..].copy_from_slice(&crc.to_le_bytes());
-        let _ = self.flash.write(DEVICE_BASE + (self.seq % 2) * SECTOR, &self.buf);
+        if let Err(e) = self.flash.write(DEVICE_BASE + (self.seq % 2) * SECTOR, &self.buf) {
+            crate::log::line(format_args!("device bonds: saving failed ({e:?})"));
+        }
     }
 
     /// The slot of a bond with this identity.

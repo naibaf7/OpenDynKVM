@@ -113,6 +113,8 @@ struct App {
     /// The page that was open when it went away for a moment (`Page::shown`), to go back to.
     hidden_page: Option<Page>,
     bt_names: [Option<String>; 4],
+    /// "Erase all pairings" pressed once: the second press erases them.
+    bt_erase_armed: bool,
     hotkeys_loaded: bool,
     /// The hotkey row being learned from the KVM's keyboard, since when; how learning one last ended (Err: not learned).
     learning: Option<(usize, odkvmctl::time::Instant)>,
@@ -255,6 +257,7 @@ impl App {
             bt_passkey: String::new(),
             hidden_page: None,
             bt_names: Default::default(),
+            bt_erase_armed: false,
             hotkeys_loaded: false,
             learning: None,
             learn_note: None,
@@ -1285,7 +1288,7 @@ mod tests {
                 // Looking for devices: two found; then pairing the keyboard among them, which asks for its passkey.
                 app.send(UiCmd::BtScan(true));
                 wait("two devices found", &|s| s.status.bt_scan > 0 && s.found.len() >= 2);
-                shot(&mut app, format!("{theme_name}-bluetooth-devices.ppm"), 1100);
+                shot(&mut app, format!("{theme_name}-bluetooth-devices.ppm"), 1450);
                 let keyboard = shared.lock().unwrap().snap.as_ref().and_then(|s| {
                     s.found.iter().find(|f| f.appearance == kvm_proto::link::bt::appearance::KEYBOARD).map(|f| f.addr)
                 });

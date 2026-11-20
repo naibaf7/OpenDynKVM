@@ -50,12 +50,19 @@ const REPORT_REFERENCE: u16 = 0x2908;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long pairing may stall (a passkey not typed): SMP's own limit is 30 s.
 const SECURE_TIMEOUT: Duration = Duration::from_secs(40);
-/// A bonded device's link not yet encrypted with its key after this long: the module asks again.
-const ENCRYPT_ASK_AGAIN: Duration = Duration::from_secs(2);
-/// ... and after this long the connection goes, so that the device's next advertising gets a fresh one. The stack says
-/// nothing when encrypting with the bond fails, and until 0.1.33 the module waited `SECURE_TIMEOUT` for it: a keyboard
-/// that woke from idle showed as connecting until it dropped the link itself (2026-11-20).
+/// A reconnected device that hasn't started security itself by now is asked for it. A device that sends a Security
+/// Request does so in its first connection events: asking at the same time would collide with it (the stack,
+/// trouble-host 0.8, waiting for encryption with the bond, takes the device's request as an error and answers
+/// "pairing failed"). Short, as a device that never asks (the first board's keyboard and mouse) waits this long.
+const ASK_SECURITY_AFTER: Duration = Duration::from_millis(100);
+/// Asking again this often while the stack refuses (its one pairing state machine busy with another link).
+const ASK_AGAIN: Duration = Duration::from_millis(250);
+/// A bonded device's link not encrypted with its key after this long: the connection goes, so that the device's next
+/// advertising gets a fresh one.
 const ENCRYPT_GIVE_UP: Duration = Duration::from_secs(8);
+/// A reconnection that failed holds off the next one this long, doubling up to 4 s while they keep failing: a device
+/// isn't hammered, and still caught while it advertises.
+const RETRY_FIRST: Duration = Duration::from_millis(500);
 /// Setting a connection up once it is encrypted (the GATT client, the reports switched on, the battery) may take this
 /// long; then the connection goes too, rather than wait out ATT's 30 s for a device that doesn't answer.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -69,6 +76,9 @@ struct State {
     /// A connection holds the slot (its task runs).
     live: [bool; MAX_DEVICES],
     conn_gen: [u32; MAX_DEVICES],
+    /// Reconnections that failed in a row, and when the next may start ([`RETRY_FIRST`]).
+    failures: [u8; MAX_DEVICES],
+    retry_at: [Option<Instant>; MAX_DEVICES],
     scan_until: Option<Instant>,
     /// A device to pair ([`BtMsg::PairDevice`]), for the central task.
     to_pair: Option<[u8; 7]>,
@@ -211,6 +221,8 @@ pub fn start(bonds: &'static mut DeviceBonds, stack: &St) {
             devices,
             live: [false; MAX_DEVICES],
             conn_gen: [0; MAX_DEVICES],
+            failures: [0; MAX_DEVICES],
+            retry_at: [None; MAX_DEVICES],
             scan_until: None,
             to_pair: None,
             pairing: None,
@@ -267,6 +279,11 @@ pub fn handle(msg: &BtMsg, stack: &'static St) {
     }
 }
 
+/// Every device slot empty, in both of their flash sectors (`BtMsg::EraseAll`: the module restarts next).
+pub fn erase_all() {
+    with(|s| s.bonds.erase_all());
+}
+
 /// Slot `dev`'s report map, in pieces.
 fn send_map(dev: u8) {
     let Some(slot) = (dev as usize).checked_sub(1).filter(|i| *i < MAX_DEVICES) else { return };
@@ -285,8 +302,12 @@ fn free_slot(s: &State) -> Option<usize> {
 
 /// The bonded device, not connected, that advertises from `addr`.
 fn bonded_at(s: &State, addr: &Address) -> Option<usize> {
-    (0..MAX_DEVICES)
-        .find(|&i| !s.live[i] && s.bonds.slots[i].as_ref().is_some_and(|d| d.identity().match_address(addr)))
+    let now = Instant::now();
+    (0..MAX_DEVICES).find(|&i| {
+        !s.live[i]
+            && s.retry_at[i].is_none_or(|t| now >= t)
+            && s.bonds.slots[i].as_ref().is_some_and(|d| d.identity().match_address(addr))
+    })
 }
 
 /// A device with a bond that isn't connected: the central task watches for it.
@@ -589,39 +610,61 @@ async fn secure(slot: usize, new: bool, conn: &Conn, stack: &'static St) -> Opti
     }
 }
 
-/// A bonded device reconnected: waits until the link is encrypted with its key, as the stack's state says (its event
-/// doesn't come when encrypting fails, or when both sides asked at once), asks again after `ENCRYPT_ASK_AGAIN`, and
-/// gives up after `ENCRYPT_GIVE_UP`. False: not encrypted, or the device left.
+/// A bonded device reconnected: waits until the link is encrypted with its key, as the stack's state says (its
+/// `Encrypted` event doesn't always come). One that hasn't asked for security itself after `ASK_SECURITY_AFTER` is
+/// asked (again every `ASK_AGAIN` while the stack refuses). A reconnection never becomes a pairing: when the key
+/// doesn't work (`BondLost`, after which the stack would pair anew had the module asked) or the stack wants a passkey,
+/// the module lets the connection go, without telling the device that a pairing failed (which can leave it needing to
+/// be switched off and on). False: not encrypted, or the device left.
 async fn encrypt_bonded(slot: usize, conn: &Conn, stack: &'static St) -> bool {
+    let dev = slot + 1;
     let start = Instant::now();
-    let mut asked_again = false;
+    let mut asked = false;
+    let mut next_ask = ASK_SECURITY_AFTER;
     loop {
         if conn.security_level().is_ok_and(|l| l.encrypted()) {
+            let ms = start.elapsed().as_millis();
+            log::line(format_args!("device {dev}: encrypted after {ms} ms{}", if asked { " (asked)" } else { "" }));
             return true;
         }
         let waited = start.elapsed();
         if waited >= ENCRYPT_GIVE_UP {
-            log::line(format_args!("device {}: not encrypted with its key, letting it go", slot + 1));
+            log::line(format_args!("device {dev}: not encrypted with its key, letting it go"));
             return false;
         }
-        if !asked_again && waited >= ENCRYPT_ASK_AGAIN {
-            asked_again = true;
-            let _ = conn.request_security();
+        if !asked && waited >= next_ask {
+            match conn.request_security() {
+                Ok(()) => asked = true,
+                Err(e) => {
+                    log::line(format_args!("device {dev}: asking for security refused ({e:?}), asking again"));
+                    next_ask = waited + ASK_AGAIN;
+                }
+            }
         }
-        if let Either::First(ev) = select(conn.next(), Timer::after_millis(100)).await {
+        if let Either::First(ev) = select(conn.next(), Timer::after_millis(50)).await {
             match ev {
                 ConnectionEvent::Disconnected { reason } => {
-                    log::line(format_args!("device {}: disconnected while securing ({reason:?})", slot + 1));
+                    log::line(format_args!("device {dev}: disconnected while securing ({reason:?})"));
                     return false;
                 }
-                // Pairing anew is for the window's Pair: a bonded device that asks for it is let go.
+                ConnectionEvent::BondLost => {
+                    log::line(format_args!("device {dev}: its key didn't work this time, letting it go"));
+                    return false;
+                }
+                // A passkey to show, compare or enter: the stack is pairing anew, which a reconnection never does.
                 ConnectionEvent::PassKeyDisplay(_)
                 | ConnectionEvent::PassKeyConfirm(_)
                 | ConnectionEvent::PassKeyInput => {
-                    let _ = conn.pass_key_cancel();
+                    log::line(format_args!("device {dev}: the stack began pairing anew, letting it go"));
+                    return false;
                 }
-                ConnectionEvent::PairingFailed(_) => {
-                    log::line(format_args!("device {}: its key was refused", slot + 1));
+                // Also what the stack says when the link is encrypted with the bond's key (its pairing state machine
+                // ends in success either way): the encryption state, checked above, decides. From 0.1.34 to 0.1.37
+                // it let every reconnection go the moment it was encrypted (2026-11-20, the log: a bond for it,
+                // with the slot's key, and "began pairing anew" 70 ms after asking).
+                ConnectionEvent::PairingComplete { .. } => {}
+                ConnectionEvent::PairingFailed(e) => {
+                    log::line(format_args!("device {dev}: security failed ({e:?})"));
                     return false;
                 }
                 ConnectionEvent::RequestConnectionParams(req) => {
@@ -726,7 +769,9 @@ async fn connection(slot: usize, new: bool, mine: u32, conn: Conn, stack: &'stat
         pairing_devices(stack, true);
     }
     let _ = conn.set_bondable(new);
-    let _ = conn.request_security();
+    if new {
+        let _ = conn.request_security();
+    }
     let secured = select(secure(slot, new, &conn, stack), DROP[slot].wait()).await;
     if new {
         pairing_devices(stack, false);
@@ -754,13 +799,21 @@ async fn connection(slot: usize, new: bool, mine: u32, conn: Conn, stack: &'stat
                         d.reports.len(),
                         d.map.len()
                     ));
-                    // Written once, with everything read.
-                    with(|s| {
-                        s.bonds.set(slot, Some(d));
+                    // Written once, with everything read; the same device in another slot goes.
+                    let twins = with(|s| {
                         s.pairing = None;
+                        s.bonds.set_new(slot, d)
                     });
                     crate::ble::tidy_keys(stack);
                     report(slot);
+                    for i in (0..MAX_DEVICES).filter(|i| twins & (1 << i) != 0) {
+                        log::line(format_args!(
+                            "device {}: the same device as device {dev}, its old pairing goes",
+                            i + 1
+                        ));
+                        DROP[i].signal(());
+                        report(i);
+                    }
                     stage(DevicePairing::Paired, Some(slot));
                 }
                 None => {
@@ -843,6 +896,17 @@ fn end(slot: usize, new: bool, mine: u32, conn: &Conn, stack: &'static St, curre
     }
     let unpaired = with(|s| {
         s.live[slot] = false;
+        if !new {
+            // A connection that never got ready holds off the next one; one that did starts the count again.
+            if s.devices[slot].flags & device_flags::READY != 0 {
+                s.failures[slot] = 0;
+                s.retry_at[slot] = None;
+            } else {
+                s.failures[slot] = s.failures[slot].saturating_add(1);
+                let wait = RETRY_FIRST * (1u32 << (s.failures[slot] - 1).min(3));
+                s.retry_at[slot] = Some(Instant::now() + wait);
+            }
+        }
         let unpaired = new && s.bonds.slots[slot].is_none();
         if s.pairing.is_some_and(|(p, _)| p == slot) {
             s.pairing = None;

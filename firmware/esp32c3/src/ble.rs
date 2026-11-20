@@ -639,15 +639,25 @@ async fn connection(
                         // With the notifications the host may have switched on before it bonded.
                         let s = Slot { notify: notifications(server, &conn), ..Slot::from_bond(&b) };
                         unsaved = None;
-                        // Written only if the keys are new (bonds.rs, "Wear").
-                        with(|st| {
-                            st.bonds.set(slot, Some(s));
+                        // Written only if the keys are new (bonds.rs, "Wear"). The same host in another slot goes
+                        // (it paired anew: one host in two slots polluted the module, 2026-11-20).
+                        let twins = with(|st| {
+                            let twins = st.bonds.set_new(slot, s);
                             st.pairing_until = None;
                             st.pairing_peer[slot] = None;
                             st.pairing_now[slot] = false;
+                            twins
                         });
                         set_flags(slot, |h| h.flags |= host_flags::BONDED | host_flags::ENCRYPTED);
                         log::line(format_args!("host {host}: bonded"));
+                        for (i, ctl) in CTL.iter().enumerate().filter(|(i, _)| twins & (1 << i) != 0) {
+                            log::line(format_args!(
+                                "host {}: the same host as host {host}, its old pairing goes",
+                                i + 1
+                            ));
+                            set_flags(i, |h| h.flags &= !host_flags::BONDED);
+                            ctl.signal(Ctl::Disconnect);
+                        }
                         event(EventKind::Paired, host, 0);
                         // Pairing is closed now: other hosts let in to pair go, and keys left from earlier attempts.
                         drop_unpaired();
@@ -909,6 +919,20 @@ async fn control(stack: &'static St) {
                 for slot in (0..MAX_HOSTS).filter(|i| held & (1 << i) != 0) {
                     event(EventKind::SettingsHeld, slot as u8 + 1, 0);
                 }
+            }
+            BtMsg::EraseAll => {
+                log::line(format_args!("erasing every pairing, then restarting"));
+                with(|s| s.bonds.erase_all());
+                devices::erase_all();
+                while let Some(id) = stack.with_bond_information(|keys| keys.first().map(|b| b.identity)) {
+                    if stack.remove_bond_information(id).is_err() {
+                        break;
+                    }
+                }
+                // The log line and the acknowledgement out first; the restart empties the controller's resolving
+                // list and every connection.
+                Timer::after_millis(300).await;
+                esp_hal::system::software_reset();
             }
             BtMsg::Scan { .. }
             | BtMsg::PairDevice { .. }

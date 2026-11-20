@@ -913,6 +913,8 @@ cli-device-scan = 60 s lang nach Geräten zum Koppeln suchen und sie auflisten, 
 cli-device-scan-stop = stop beendet die Suche vorzeitig
 cli-device-pair = Ein gefundenes Gerät koppeln: seine Nummer in der Liste oder seine Adresse
 cli-device-forget = Die Kopplung eines Geräts aufheben: Platz 1-4, oder all
+cli-device-log = Das jüngste Protokoll des Funkmoduls anzeigen, wie der KVM es aufbewahrt: Verbindungen, Kopplung, warum ein Gerät getrennt wurde
+cli-device-log-empty = Der KVM hat noch keine Zeilen aus dem Protokoll des Moduls.
 cli-device-map = Die Report-Map anzeigen, die der KVM für Platz 1-4 hat, und was sein Parser daraus liest
 cli-device-map-none = Der KVM hat für diesen Platz keine Report-Map (kein Gerät gekoppelt, oder seine Map noch nicht gelesen).
 cli-device-map-bytes = Report-Map, { $bytes } Bytes:
@@ -951,3 +953,12 @@ battery = Akku { $percent } %
 forget-device-hover = Hebt die Kopplung auf. Um es wieder zu koppeln, das Gerät in den Kopplungsmodus bringen.
 ev-device-paired = Gekoppelt: { $device } ({ -wireless(case: "prefix") }-Gerät { $slot })
 ev-device-forgot = { -wireless(case: "prefix") }-Gerät { $device } entfernt
+
+## Erasing every wireless pairing
+bt-erase-title = Alle Kopplungen löschen
+bt-erase-note = Vergisst alle Hosts und Geräte, die das Funkmodul gekoppelt hat, und alle Schlüssel, die es hält, und startet es neu: für den Fall, dass das Koppeln immer wieder scheitert oder ein Host sich koppelt und gleich wieder abfällt. Den KVM auch auf den Hosts und Geräten entfernen und sie dann neu koppeln.
+bt-erase-button = Alle Kopplungen löschen…
+bt-erase-really = Alle Hosts und Geräte müssen danach neu gekoppelt werden.
+bt-erase-confirm = Löschen
+cli-wireless-erase = Alle Hosts und Geräte vergessen, die das Funkmodul gekoppelt hat, und alle Schlüssel, die es hält, und es neu starten (wenn das Koppeln immer wieder scheitert)
+cli-wireless-erased = Das Modul vergisst alle Kopplungen und startet neu. Den KVM auch auf den Hosts und Geräten entfernen und sie dann neu koppeln.

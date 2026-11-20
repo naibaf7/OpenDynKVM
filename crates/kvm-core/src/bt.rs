@@ -58,6 +58,8 @@ pub enum BtOut {
     },
     PairDevice([u8; 7]),
     ForgetDevice(u8),
+    /// Forget every host and device, and restart the module (`Request::BtEraseAll`).
+    EraseAll,
     RequestMap(u8),
     /// An output report for device slot `dev` (a keyboard's LEDs), without its ID byte.
     DeviceOutput {
@@ -280,6 +282,57 @@ impl BtState {
 
 /// Devices found while looking for devices to pair, at most.
 pub const MAX_FOUND: usize = 8;
+
+/// Bytes of the module's log the engine keeps (`ModuleLog`): some 40 lines.
+pub const MODULE_LOG_LEN: usize = 2048;
+
+/// The wireless module's recent log, as its lines come over the link (`BtMsg::Log`), each with the engine time it came
+/// at, and lines of the engine's own about the module: on a dongle the module's log pin goes nowhere. Kept across
+/// module restarts; the oldest lines make room. Positions count bytes since the engine started.
+pub struct ModuleLog {
+    buf: heapless::Deque<u8, MODULE_LOG_LEN>,
+    /// Bytes dropped from the front so far.
+    first: u32,
+}
+
+impl ModuleLog {
+    pub const EMPTY: ModuleLog = ModuleLog { buf: heapless::Deque::new(), first: 0 };
+
+    /// Adds a line, `now` ms after the engine started.
+    pub fn push(&mut self, now: u32, text: &str) {
+        let mut line: heapless::String<96> = heapless::String::new();
+        let _ = core::fmt::Write::write_fmt(&mut line, format_args!("[{:>5}.{:03}] ", now / 1000, now % 1000));
+        for c in text.chars() {
+            if line.len() + c.len_utf8() + 1 > line.capacity() {
+                break;
+            }
+            let _ = line.push(if c.is_control() { ' ' } else { c });
+        }
+        let _ = line.push('\n');
+        // Whole lines make room.
+        while MODULE_LOG_LEN - self.buf.len() < line.len() {
+            while let Some(b) = self.buf.pop_front() {
+                self.first = self.first.wrapping_add(1);
+                if b == b'\n' {
+                    break;
+                }
+            }
+        }
+        for b in line.bytes() {
+            let _ = self.buf.push_back(b);
+        }
+    }
+
+    /// Up to `n` bytes from position `at` (or from the first kept, if that is gone), and the positions of the first
+    /// byte kept and past the last: (first, end, at, bytes).
+    pub fn read(&self, at: u32, n: usize) -> (u32, u32, u32, Vec<u8, 64>) {
+        let end = self.first.wrapping_add(self.buf.len() as u32);
+        let at = at.clamp(self.first, end);
+        let skip = (at - self.first) as usize;
+        let data = self.buf.iter().skip(skip).take(n.min(64)).copied().collect();
+        (self.first, end, at, data)
+    }
+}
 
 /// A report map asked for and not whole after this long (ms) is asked for again: a piece of it was lost on the way.
 pub const MAP_RETRY_MS: u32 = 2000;
@@ -691,6 +744,31 @@ mod tests {
         assert_eq!(d.maps_overdue(5000 + 10 * MAP_RETRY_MS), 0);
         let flags = d.info(1).unwrap().flags;
         assert!(flags & device_flags::MAP_UNREADABLE != 0 && flags & device_flags::MAP_HELD == 0);
+    }
+
+    #[test]
+    fn the_module_log_keeps_the_latest_whole_lines() {
+        let mut log = ModuleLog::EMPTY;
+        log.push(1234, "device 1: connected");
+        let (first, end, at, data) = log.read(0, 64);
+        assert_eq!((first, at), (0, 0));
+        assert_eq!(core::str::from_utf8(&data).unwrap(), "[    1.234] device 1: connected\n");
+        assert_eq!(end as usize, data.len());
+        for i in 0..200u32 {
+            let mut t: heapless::String<32> = heapless::String::new();
+            let _ = core::fmt::Write::write_fmt(&mut t, format_args!("line {i}"));
+            log.push(2000 + i, &t);
+        }
+        // Older lines made room, whole: reading from 0 starts at the first kept, at the start of a line.
+        let (first, end, at, data) = log.read(0, 64);
+        assert!(first > 0 && at == first && end - first <= MODULE_LOG_LEN as u32);
+        assert!(data.starts_with(b"[    2."));
+        let (_, _, _, tail) = log.read(end - 20, 64);
+        assert!(core::str::from_utf8(&tail).unwrap().ends_with("line 199\n"));
+        // Control characters don't break lines; a long line is cut, not wrapped.
+        log.push(5000, &"x\ny".repeat(100));
+        let (_, end, _, last) = log.read(u32::MAX, 64);
+        assert!(last.is_empty() && end > 0);
     }
 
     #[test]

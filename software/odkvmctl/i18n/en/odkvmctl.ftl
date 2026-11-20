@@ -717,6 +717,8 @@ cli-device-scan = Look for devices to pair for 60 s, and list them as they show 
 cli-device-scan-stop = stop stops looking early
 cli-device-pair = Pair a device found: its number in the list, or its address
 cli-device-forget = Forget a device's pairing: slot 1-4, or all
+cli-device-log = Show the wireless module's recent log as the KVM keeps it: connections, pairing, why a device was let go
+cli-device-log-empty = The KVM holds no lines of the module's log yet.
 cli-device-map = Show the report map the KVM holds for slot 1-4, and what its parser makes of it
 cli-device-map-none = The KVM holds no report map for that slot (no device paired, or its map not read yet).
 cli-device-map-bytes = Report map, { $bytes } bytes:
@@ -953,3 +955,12 @@ cli-profile-no-hop = no { -hop(case: "lower") }
 cli-profile-hop = { -hop(case: "lower") }: { $name }
 hop-out-of-date = This computer's display settings differ from the KVM's copy of its screens, so the pointer lands in the wrong place here: detect its screens again.
 cli-hop-out-of-date = { hop-out-of-date } (odkvmctl screens detect)
+
+## Erasing every wireless pairing
+bt-erase-title = Erase all pairings
+bt-erase-note = Forgets every host and device the wireless module has paired and every key it holds, and restarts it: for when pairing keeps failing, or a host pairs and drops at once. Remove the KVM on the hosts and devices too, then pair them again.
+bt-erase-button = Erase all pairings…
+bt-erase-really = Every host and device will have to be paired again.
+bt-erase-confirm = Erase them
+cli-wireless-erase = Forget every host and device the wireless module has paired and every key it holds, and restart it (for pairings that keep failing)
+cli-wireless-erased = The module forgets every pairing and restarts. Remove the KVM on the hosts and devices too, then pair them again.

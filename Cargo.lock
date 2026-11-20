@@ -2623,7 +2623,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-core"
-version = "0.1.33"
+version = "0.1.47"
 dependencies = [
  "defmt",
  "heapless",
@@ -2634,7 +2634,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-hid"
-version = "0.1.33"
+version = "0.1.47"
 dependencies = [
  "defmt",
  "heapless",
@@ -2642,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-proto"
-version = "0.1.33"
+version = "0.1.47"
 dependencies = [
  "defmt",
  "heapless",
@@ -2650,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-usbdev"
-version = "0.1.33"
+version = "0.1.47"
 dependencies = [
  "defmt",
  "embassy-futures",
@@ -2663,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-vial"
-version = "0.1.33"
+version = "0.1.47"
 dependencies = [
  "defmt",
  "heapless",
@@ -3377,7 +3377,7 @@ dependencies = [
 
 [[package]]
 name = "odkvmctl"
-version = "0.1.33"
+version = "0.1.47"
 dependencies = [
  "anyhow",
  "clap",
@@ -5852,7 +5852,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.33"
+version = "0.1.47"
 dependencies = [
  "anyhow",
  "flate2",

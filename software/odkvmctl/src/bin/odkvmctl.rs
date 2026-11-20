@@ -145,6 +145,8 @@ enum HostAction {
     Name { slot: u8, name: Option<String> },
     #[command(about = fl!("cli-hosts-policy"))]
     Policy { slot: u8, policy: String },
+    #[command(about = fl!("cli-wireless-erase"))]
+    Erase,
 }
 
 #[derive(Subcommand)]
@@ -176,6 +178,8 @@ enum DeviceAction {
     Route { slot: u8, route: String },
     #[command(about = fl!("cli-device-map"))]
     Map { slot: u8 },
+    #[command(about = fl!("cli-device-log"))]
+    Log,
 }
 
 #[derive(Subcommand)]
@@ -1153,6 +1157,10 @@ fn main() -> Result<()> {
                     let k = names::config_key(&format!("host{slot}-policy")).context(fl!("cli-slot"))?;
                     c.set_config(names::parse_value(k, &policy).map_err(anyhow::Error::msg)?)?;
                 }
+                HostAction::Erase => {
+                    c.bt_erase_all()?;
+                    println!("{}", fl!("cli-wireless-erased"));
+                }
             }
         }
         Cmd::Port { port, action } => {
@@ -1207,6 +1215,13 @@ fn main() -> Result<()> {
                 DeviceAction::Route { slot, route } => {
                     let d = Device::wireless_slot(slot).context(fl!("cli-slot"))?;
                     c.set_route(d, names::parse_route(&route).map_err(anyhow::Error::msg)?)?;
+                }
+                DeviceAction::Log => {
+                    let log = c.module_log()?;
+                    if log.is_empty() {
+                        println!("{}", fl!("cli-device-log-empty"));
+                    }
+                    print!("{log}");
                 }
                 DeviceAction::Map { slot } => {
                     Device::wireless_slot(slot).context(fl!("cli-slot"))?;

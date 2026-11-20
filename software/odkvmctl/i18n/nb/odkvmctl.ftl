@@ -921,6 +921,8 @@ cli-device-scan = Let etter enheter å koble til i 60 s, og list dem opp etter h
 cli-device-scan-stop = stop avslutter letingen tidlig
 cli-device-pair = Koble til en enhet som er funnet: nummeret i listen, eller adressen
 cli-device-forget = Glem en enhets sammenkobling: plass 1-4, eller all
+cli-device-log = Vis den trådløse modulens siste logg slik KVM-en tar vare på den: tilkoblinger, paring, hvorfor en enhet ble sluppet
+cli-device-log-empty = KVM-en har ingen linjer fra modulens logg ennå.
 cli-device-map = Vis rapportkartet KVM-en har for plass 1-4, og hva parseren leser ut av det
 cli-device-map-none = KVM-en har ikke noe rapportkart for den plassen (ingen enhet paret, eller kartet ikke lest ennå).
 cli-device-map-bytes = Rapportkart, { $bytes } byte:
@@ -959,3 +961,12 @@ battery = batteri { $percent } %
 forget-device-hover = Fjerner sammenkoblingen. For å koble den til igjen setter du enheten i sammenkoblingsmodus.
 ev-device-paired = Koblet til: { $device } ({ -wireless(case: "lower") } enhet { $slot })
 ev-device-forgot = Glemte den { -wireless(case: "plural") } enheten { $device }
+
+## Erasing every wireless pairing
+bt-erase-title = Slett alle paringer
+bt-erase-note = Glemmer alle verter og enheter den trådløse modulen har paret og alle nøkler den har, og starter den på nytt: når paring stadig mislykkes, eller en vert parer og faller av med en gang. Fjern også KVM-en på vertene og enhetene, og par dem på nytt.
+bt-erase-button = Slett alle paringer…
+bt-erase-really = Alle verter og enheter må pares på nytt.
+bt-erase-confirm = Slett dem
+cli-wireless-erase = Glem alle verter og enheter den trådløse modulen har paret og alle nøkler den har, og start den på nytt (når paring stadig mislykkes)
+cli-wireless-erased = Modulen glemmer alle paringer og starter på nytt. Fjern også KVM-en på vertene og enhetene, og par dem på nytt.

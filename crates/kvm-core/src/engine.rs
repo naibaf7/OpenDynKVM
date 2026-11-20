@@ -392,6 +392,8 @@ pub struct Engine {
     bt: BtState,
     /// Its devices.
     wireless: Devices,
+    /// Its recent log (`Request::GetModuleLog`).
+    module_log: crate::bt::ModuleLog,
     /// Screen hop's pointer (software.md §4.14).
     hop: hop::Pointer,
 }
@@ -503,6 +505,7 @@ impl Engine {
             supply: crate::supply::Tracker::new(),
             bt: BtState::EMPTY,
             wireless: Devices::EMPTY,
+            module_log: crate::bt::ModuleLog::EMPTY,
             hop: hop::Pointer::NEW,
         }
     }
@@ -3214,6 +3217,10 @@ impl Engine {
                 Response::Ok
             }
             Request::GetBtFound(i) => Response::BtFound(self.wireless.found.get(*i as usize).cloned()),
+            Request::GetModuleLog(at) => {
+                let (first, end, at, data) = self.module_log.read(*at, ctrl::BT_MAP_PIECE);
+                Response::ModuleLog { first, end, at, data: Vec::from_slice(&data).unwrap_or_default() }
+            }
             Request::GetBtDeviceMap { slot, offset } => {
                 if self.wireless.slot(*slot).is_none() {
                     return Err(ErrorCode::InvalidValue);
@@ -3251,6 +3258,15 @@ impl Engine {
                     return Err(ErrorCode::InvalidValue);
                 }
                 self.emit(Output::Bt(BtOut::ForgetDevice(*n)));
+                Response::Ok
+            }
+            Request::BtEraseAll => {
+                if !self.bt.present {
+                    return Err(ErrorCode::Unsupported);
+                }
+                self.module_log.push(self.now, "RP2354B: erasing every pairing the module holds");
+                // The module restarts: its hosts and devices come back empty with its next `Hello`.
+                self.emit(Output::Bt(BtOut::EraseAll));
                 Response::Ok
             }
             Request::PlaceCursor(placement) => {
@@ -3314,6 +3330,12 @@ impl Engine {
         }
     }
 
+    /// A line of the module's log (`BtMsg::Log`).
+    pub fn bt_log(&mut self, text: &str, now: u32) {
+        self.now = now;
+        self.module_log.push(now, text);
+    }
+
     /// A piece of device slot `dev`'s report map.
     pub fn bt_device_map(&mut self, dev: u8, offset: u16, total: u16, data: &[u8]) {
         match self.wireless.map_piece(dev, offset, total, data) {
@@ -3336,6 +3358,13 @@ impl Engine {
     /// The module answered (its `Hello`, after a reset or once programmed): tell it the policies, ask for the hosts,
     /// and select the active host again (a module that restarted forgot it).
     pub fn bt_hello(&mut self, fw: u32) {
+        let mut line: heapless::String<64> = heapless::String::new();
+        let (major, minor, patch) = (fw >> 16, fw >> 8 & 0xFF, fw & 0xFF);
+        let _ = core::fmt::Write::write_fmt(
+            &mut line,
+            format_args!("RP2354B: the module said hello, firmware {major}.{minor}.{patch}"),
+        );
+        self.module_log.push(self.now, &line);
         self.bt.present = true;
         self.bt.fw = fw;
         self.bt_module = BtModule::Up;
@@ -3363,6 +3392,7 @@ impl Engine {
         if !self.bt.present {
             return;
         }
+        self.module_log.push(self.now, "RP2354B: the module stopped answering");
         if self.bt.active.is_some() {
             self.switch(Target::Toggle, SwitchSource::Power);
         }
@@ -5419,6 +5449,9 @@ mod tests {
         // Forgetting goes to the module.
         assert_eq!(ask(&mut e, Request::BtForgetDevice(2)), Response::Ok);
         assert!(drain(&mut e).contains(&Output::Bt(BtOut::ForgetDevice(2))));
+        // Every pairing the module holds, and a restart of the module.
+        assert_eq!(ask(&mut e, Request::BtEraseAll), Response::Ok);
+        assert!(drain(&mut e).contains(&Output::Bt(BtOut::EraseAll)));
         assert_eq!(ask(&mut e, Request::BtForgetDevice(5)), Response::Error(ErrorCode::InvalidValue));
     }
 

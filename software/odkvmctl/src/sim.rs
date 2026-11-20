@@ -608,6 +608,15 @@ impl SimTransport {
                     _ => self.engine.bt_event(BtEvent::DeviceStage, 0, DevicePairing::Failed as u32),
                 }
             }
+            BtOut::EraseAll => {
+                // The module forgets every host and device and restarts: its link goes and comes back.
+                for h in hosts.iter_mut() {
+                    *h = sim_host(h.host, 0);
+                }
+                self.devices = [None; 4];
+                self.engine.bt_link_down();
+                self.engine.bt_hello(FW_VERSION);
+            }
             BtOut::ForgetDevice(n) => {
                 for slot in 1..=4u8 {
                     if n == 0xFF || n == slot {
@@ -937,6 +946,8 @@ mod tests {
         let map = c.bt_device_map(1).unwrap();
         assert!(map.len() > kvm_proto::ctrl::BT_MAP_PIECE && kvm_hid::Layout::parse(&map).is_ok());
         assert!(c.bt_device_map(3).unwrap().is_empty());
+        // The module's log as the KVM keeps it: here its own line about the module's hello.
+        assert!(c.module_log().unwrap().contains("the module said hello, firmware"));
         c.bt_scan(true).unwrap();
         let found = loop {
             let st = c.status().unwrap();
@@ -969,6 +980,11 @@ mod tests {
         // Forgotten: no longer listed.
         c.bt_forget_device(2).unwrap();
         assert_eq!(c.snapshot().unwrap().routed_devices().len(), 4);
+        // Every pairing erased: no host and no device left.
+        c.bt_erase_all().unwrap();
+        let s = c.snapshot().unwrap();
+        assert!(s.devices.iter().all(|d| !d.bonded()) && s.bt.iter().all(|h| !h.bonded()));
+        assert_eq!(s.routed_devices().len(), 3);
     }
 
     #[test]

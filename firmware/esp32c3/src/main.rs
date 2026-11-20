@@ -49,11 +49,59 @@ static KVM_ESP_FW_ID: [u8; 12] = {
     [b'K', b'V', b'M', b'E', b'S', b'P', b'3', b'2', v[0], v[1], v[2], v[3]]
 };
 
+/// The last panic's place and message, kept across the reset it ends in (RTC fast RAM is not cleared by it): its line
+/// can't reach the RP2354B before the reset, so the next start sends it (`odkvmctl device log`). Magic, length, text.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static mut LAST_PANIC: [u8; 132] = [0; 132];
+const PANIC_MAGIC: [u8; 4] = *b"PNC!";
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Write;
     log::line(format_args!("panic: {info}"));
+    /// Takes what fits and drops the rest (a dependency's path alone is longer than the room).
+    struct Cut<'a>(&'a mut heapless::String<127>);
+    impl Write for Cut<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for c in s.chars() {
+                if self.0.push(c).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut text: heapless::String<127> = heapless::String::new();
+    let mut w = Cut(&mut text);
+    // The end of the file's path (the crate and file), the line, then the message.
+    if let Some(l) = info.location() {
+        let file = l.file();
+        let mut from = file.len().saturating_sub(48);
+        while !file.is_char_boundary(from) {
+            from += 1;
+        }
+        let _ = write!(w, "{}:{}: ", &file[from..], l.line());
+    }
+    let _ = write!(w, "{}", info.message());
+    // SAFETY: nothing else runs any more; the reset follows.
+    let kept = unsafe { &mut *core::ptr::addr_of_mut!(LAST_PANIC) };
+    kept[..4].copy_from_slice(&PANIC_MAGIC);
+    kept[4] = text.len() as u8;
+    kept[5..5 + text.len()].copy_from_slice(text.as_bytes());
     // The RP2354B sees the link drop and the module come back.
     esp_hal::system::software_reset()
+}
+
+/// The message of the panic the last run ended in, once (it is cleared).
+fn last_panic() -> Option<heapless::String<127>> {
+    // SAFETY: read and cleared at start, before anything else runs.
+    let kept = unsafe { &mut *core::ptr::addr_of_mut!(LAST_PANIC) };
+    if kept[..4] != PANIC_MAGIC {
+        return None;
+    }
+    kept[..4].fill(0);
+    let len = (kept[4] as usize).min(127);
+    heapless::String::try_from(core::str::from_utf8(&kept[5..5 + len]).unwrap_or("(unreadable)")).ok()
 }
 
 static LINK_EXECUTOR: static_cell::StaticCell<InterruptExecutor<1>> = static_cell::StaticCell::new();
@@ -87,6 +135,11 @@ async fn main(spawner: Spawner) {
     spawner.spawn(watchdog(wdt).expect("watchdog task"));
     // Kept until the link says where the module is (`log`): printed on IO3 only on the KVM's board.
     log::line(format_args!("OpenDynKVM Bluetooth module, firmware {FW_VERSION:#08x}"));
+    // A panic or a hang restarts the module: the next start says so (Software or a watchdog).
+    log::line(format_args!("started after a reset: {:?}", esp_hal::system::reset_reason()));
+    if let Some(text) = last_panic() {
+        log::line(format_args!("the last run ended in a panic: {text}"));
+    }
 
     // The link: UART0 on the KVM's board, or the chip's USB serial port on a front port (software.md §4.13).
     // It runs one interrupt level above the Bluetooth side: pairing's P-256 maths and a bond being written can
@@ -98,9 +151,21 @@ async fn main(spawner: Spawner) {
     link_spawner.spawn(link::run(lines).expect("link task"));
 
     // Two handles on the flash, used one at a time on the Bluetooth side's executor: the hosts' sectors and the
-    // devices'.
+    // devices'. Both made before either reads: a handle learns the flash's size from the chip's ID (RDID through SPI1),
+    // and after a read through the ROM's routines that query comes back wrong. Until 0.1.41 the devices' handle was
+    // made after the hosts' bonds were read, took the flash for 0 bytes long, and refused every read and write
+    // (OutOfBounds): no device's bond was ever saved, and every module restart lost them all (2026-11-20).
     let device_flash = unsafe { p.FLASH.clone_unchecked() };
-    let bonds = bonds::Bonds::load(esp_storage::FlashStorage::new(p.FLASH));
-    let device_bonds = bonds::DeviceBonds::load(esp_storage::FlashStorage::new(device_flash));
+    let host_storage = esp_storage::FlashStorage::new(p.FLASH);
+    let device_storage = esp_storage::FlashStorage::new(device_flash);
+    if device_storage.capacity() != host_storage.capacity() {
+        log::line(format_args!(
+            "flash: {} bytes for the hosts' bonds, {} for the devices'",
+            host_storage.capacity(),
+            device_storage.capacity()
+        ));
+    }
+    let bonds = bonds::Bonds::load(host_storage);
+    let device_bonds = bonds::DeviceBonds::load(device_storage);
     ble::run(spawner, p.BT, bonds, device_bonds).await
 }

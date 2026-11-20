@@ -205,6 +205,7 @@ pub fn send(o: BtOut) {
         BtOut::Scan { on, seconds } => BtMsg::Scan { on: *on, seconds: *seconds },
         BtOut::PairDevice(addr) => BtMsg::PairDevice { addr: *addr },
         BtOut::ForgetDevice(dev) => BtMsg::ForgetDevice { dev: *dev },
+        BtOut::EraseAll => BtMsg::EraseAll,
         BtOut::RequestMap(dev) => BtMsg::RequestMap { dev: *dev },
         BtOut::DeviceOutput { dev, id, data } => BtMsg::DeviceOutput { dev: *dev, id: *id, data },
     };
@@ -238,6 +239,10 @@ fn deliver(m: &[u8]) {
         }
         BtMsg::DeviceMap { dev, offset, total, data } => kvm::with(|e| e.bt_device_map(dev, offset, total, data)),
         BtMsg::Found { addr, rssi, appearance, name } => kvm::with(|e| e.bt_found(addr, rssi, appearance, name)),
+        BtMsg::Log { text } => {
+            let now = Instant::now().as_millis() as u32;
+            kvm::with(|e| e.bt_log(text, now));
+        }
         _ => {}
     }
 }

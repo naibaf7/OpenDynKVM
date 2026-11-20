@@ -899,6 +899,8 @@ cli-device-scan = 查找可配对的设备 60 秒，并在出现时列出（请�
 cli-device-scan-stop = stop 提前停止查找
 cli-device-pair = 配对找到的设备：其在列表中的编号或地址
 cli-device-forget = 忘记设备的配对：槽位 1-4，或 all
+cli-device-log = 显示 KVM 保存的无线模块近期日志：连接、配对、设备为何被断开
+cli-device-log-empty = KVM 尚未保存模块日志的任何行。
 cli-device-map = 显示 KVM 为槽位 1-4 保存的报告描述符，以及其解析器读出的内容
 cli-device-map-none = KVM 没有该槽位的报告描述符（未配对设备，或尚未读取）。
 cli-device-map-bytes = 报告描述符，{ $bytes } 字节：
@@ -937,3 +939,12 @@ battery = 电量 { $percent }%
 forget-device-hover = 删除配对。若要重新配对，请让设备进入配对模式。
 ev-device-paired = 已配对：{ $device }（{ -wireless }设备 { $slot }）
 ev-device-forgot = 已忘记{ -wireless }设备 { $device }
+
+## Erasing every wireless pairing
+bt-erase-title = 清除所有配对
+bt-erase-note = 忘记无线模块配对过的所有主机和设备及其保存的所有密钥，然后重启模块：用于配对屡次失败，或主机配对后立即断开的情况。同时在主机和设备上删除此 KVM，然后重新配对。
+bt-erase-button = 清除所有配对…
+bt-erase-really = 所有主机和设备都需要重新配对。
+bt-erase-confirm = 清除
+cli-wireless-erase = 忘记无线模块配对过的所有主机和设备及其保存的所有密钥，然后重启模块（用于配对屡次失败的情况）
+cli-wireless-erased = 模块会忘记所有配对并重启。同时在主机和设备上删除此 KVM，然后重新配对。

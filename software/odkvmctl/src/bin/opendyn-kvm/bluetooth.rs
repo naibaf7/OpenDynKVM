@@ -335,6 +335,32 @@ impl App {
         // The devices after the hosts: each kind's pairing card above its slots.
         ui.add_space(8.0);
         self.bt_devices(ui, s, locked);
+        // Last: erasing every pairing, for state the module shouldn't hold. Two presses.
+        ui.add_space(8.0);
+        card(ui, &fl!("bt-erase-title"), |ui| {
+            note(ui, fl!("bt-erase-note"));
+            ui.add_space(4.0);
+            ui.add_enabled_ui(!locked, |ui| {
+                if !self.bt_erase_armed {
+                    if ui.button(fl!("bt-erase-button")).clicked() {
+                        self.bt_erase_armed = true;
+                    }
+                    return;
+                }
+                ui.label(RichText::new(fl!("bt-erase-really")).color(ink(ui, BAD)));
+                ui.horizontal(|ui| {
+                    let erase = egui::Button::new(RichText::new(fl!("bt-erase-confirm")).color(ink(ui, BAD)));
+                    if ui.add(erase).clicked() {
+                        self.send(UiCmd::BtEraseAll);
+                        self.bt_erase_armed = false;
+                        self.bt_names = Default::default();
+                    }
+                    if ui.button(fl!("cancel")).clicked() {
+                        self.bt_erase_armed = false;
+                    }
+                });
+            });
+        });
     }
 }
 

@@ -4,6 +4,9 @@
 //! IO3 is only driven once the link has come over UART0, i.e. on the KVM's board ([`start`]): on an ESP32-C3 board on
 //! a front port (software.md §4.13) IO3 may be wired to anything. Until then lines are kept (the first [`EARLY`]
 //! bytes), and printed when the log starts.
+//!
+//! Every line also goes to the RP2354B (`BtMsg::Log`), which keeps the latest in RAM for `odkvmctl device log`: on a
+//! dongle IO3 goes nowhere.
 
 use core::cell::RefCell;
 use core::fmt::Write;
@@ -12,6 +15,7 @@ use critical_section::Mutex;
 use esp_hal::Blocking;
 use esp_hal::peripherals::{GPIO3, UART1};
 use esp_hal::uart::{Config, UartTx};
+use kvm_proto::link::bt::{BtMsg, LOG_MAX};
 
 const EARLY: usize = 1024;
 
@@ -55,19 +59,31 @@ impl Write for Writer<'_> {
     }
 }
 
-/// One line of the log.
+/// One line of the log (what doesn't fit 160 bytes is cut).
 pub fn line(args: core::fmt::Arguments) {
+    let mut text: heapless::String<160> = heapless::String::new();
+    let _ = text.write_fmt(args);
     critical_section::with(|cs| match &mut *LOG.borrow_ref_mut(cs) {
         Log::On(tx) => {
             let mut w = Writer(tx);
-            let _ = w.write_fmt(args);
+            let _ = w.write_str(&text);
             let _ = w.write_str("\r\n");
         }
         // What doesn't fit is cut.
         Log::Early(kept) => {
-            let _ = kept.write_fmt(args);
+            let _ = kept.write_str(&text);
             let _ = kept.write_str("\r\n");
         }
         Log::Off => {}
     });
+    // To the RP2354B, in pieces of a link message each (cut at a character's start).
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        let mut n = rest.len().min(LOG_MAX);
+        while !rest.is_char_boundary(n) {
+            n -= 1;
+        }
+        crate::link::send(&BtMsg::Log { text: &rest[..n] });
+        rest = &rest[n..];
+    }
 }

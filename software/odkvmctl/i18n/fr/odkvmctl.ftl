@@ -919,6 +919,8 @@ cli-device-scan = Chercher des appareils à associer pendant 60 s et les lister 
 cli-device-scan-stop = stop arrête la recherche plus tôt
 cli-device-pair = Associer un appareil trouvé : son numéro dans la liste, ou son adresse
 cli-device-forget = Oublier l'association d'un appareil : emplacement 1-4, ou all
+cli-device-log = Afficher le journal récent du module sans fil tel que le KVM le garde : connexions, appairage, pourquoi un appareil a été lâché
+cli-device-log-empty = Le KVM ne détient encore aucune ligne du journal du module.
 cli-device-map = Afficher la table de rapports que le KVM détient pour l'emplacement 1-4, et ce que son analyseur en lit
 cli-device-map-none = Le KVM ne détient aucune table de rapports pour cet emplacement (aucun appareil appairé, ou sa table pas encore lue).
 cli-device-map-bytes = Table de rapports, { $bytes } octets :
@@ -957,3 +959,12 @@ battery = batterie { $percent } %
 forget-device-hover = Supprime l'association. Pour l'associer à nouveau, mettez l'appareil en mode d'association.
 ev-device-paired = Associé : { $device } (appareil { -wireless(case: "lower") } { $slot })
 ev-device-forgot = Appareil { -wireless(case: "lower") } { $device } oublié
+
+## Erasing every wireless pairing
+bt-erase-title = Effacer tous les appairages
+bt-erase-note = Oublie tous les hôtes et appareils que le module sans fil a appairés et toutes les clés qu'il détient, puis le redémarre : quand l'appairage échoue sans cesse, ou qu'un hôte s'appaire et décroche aussitôt. Retirez aussi le KVM sur les hôtes et appareils, puis appairez-les à nouveau.
+bt-erase-button = Effacer tous les appairages…
+bt-erase-really = Tous les hôtes et appareils devront être appairés à nouveau.
+bt-erase-confirm = Les effacer
+cli-wireless-erase = Oublier tous les hôtes et appareils que le module sans fil a appairés et toutes les clés qu'il détient, puis le redémarrer (quand l'appairage échoue sans cesse)
+cli-wireless-erased = Le module oublie tous les appairages et redémarre. Retirez aussi le KVM sur les hôtes et appareils, puis appairez-les à nouveau.

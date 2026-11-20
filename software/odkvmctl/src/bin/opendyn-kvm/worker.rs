@@ -41,6 +41,8 @@ pub enum UiCmd {
     BtPair(bool),
     /// Forget the Bluetooth host in a slot.
     BtForget(u8),
+    /// Erase every pairing the wireless module holds, and restart it.
+    BtEraseAll,
     /// The passkey a pairing host shows.
     BtPasskey(u32),
     /// Look for Bluetooth devices to pair (true), or stop.
@@ -267,6 +269,7 @@ fn run(c: &mut Client, cmd: UiCmd, shared: &Mutex<Shared>, wake: &Wake) -> Resul
         UiCmd::Save => c.save(),
         UiCmd::BtPair(on) => c.bt_pair(on),
         UiCmd::BtForget(n) => c.bt_forget(n),
+        UiCmd::BtEraseAll => c.bt_erase_all(),
         UiCmd::BtPasskey(v) => c.bt_passkey(v),
         UiCmd::BtScan(on) => c.bt_scan(on),
         UiCmd::BtPairDevice(addr) => c.bt_pair_device(addr),

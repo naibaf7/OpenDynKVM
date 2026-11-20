@@ -2299,6 +2299,12 @@ pub enum Request {
         slot: u8,
         offset: u16,
     },
+    /// The wireless module's recent log, which the KVM keeps, from byte `at` (counted since it started keeping it):
+    /// `Response::ModuleLog` (`odkvmctl device log`).
+    GetModuleLog(u32),
+    /// Forget every host and device the wireless module has paired, clear every key it holds, and restart it: for
+    /// pairings that keep failing on state the module shouldn't hold. The hosts keep the KVM in their own lists.
+    BtEraseAll,
     /// Where the asking PC's own cursor is, in its display arrangement's pixels. With screen hop, the KVM
     /// takes it over while it isn't moving the pointer itself: a touchpad or a program moved it.
     PointerAt([i16; 2]),
@@ -2353,6 +2359,8 @@ pub struct BtDeviceInfo {
 /// Bytes of a device's report map per `Response::BtDeviceMap` (header, slot, total, offset and length come first).
 pub const BT_MAP_PIECE: usize = 48;
 const _: () = assert!(2 + 1 + 2 + 2 + 1 + BT_MAP_PIECE <= REPORT_LEN);
+// `Response::ModuleLog` carries as many: header, first, end, at and length come first.
+const _: () = assert!(2 + 4 + 4 + 4 + 1 + BT_MAP_PIECE <= REPORT_LEN);
 
 /// A device found while looking for devices to pair (`Response::BtFound`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2428,6 +2436,8 @@ pub mod req {
     pub const BT_PAIR_DEVICE: u8 = 0x1D;
     pub const BT_FORGET_DEVICE: u8 = 0x1E;
     pub const GET_BT_DEVICE_MAP: u8 = 0x1F;
+    pub const GET_MODULE_LOG: u8 = 0x20;
+    pub const BT_ERASE_ALL: u8 = 0x21;
     pub const ERROR: u8 = 0xFF;
 }
 
@@ -2474,6 +2484,8 @@ impl Request {
             Request::BtScan(_) => req::BT_SCAN,
             Request::GetBtFound(_) => req::GET_BT_FOUND,
             Request::GetBtDeviceMap { .. } => req::GET_BT_DEVICE_MAP,
+            Request::GetModuleLog(_) => req::GET_MODULE_LOG,
+            Request::BtEraseAll => req::BT_ERASE_ALL,
             Request::BtPairDevice(_) => req::BT_PAIR_DEVICE,
             Request::BtForgetDevice(_) => req::BT_FORGET_DEVICE,
         }
@@ -2497,6 +2509,7 @@ impl Request {
                 | Request::BtScan(true)
                 | Request::BtPairDevice(_)
                 | Request::BtForgetDevice(_)
+                | Request::BtEraseAll
         )
     }
 
@@ -2511,7 +2524,8 @@ impl Request {
             | Request::SaveConfig
             | Request::FactoryReset
             | Request::FwCommit
-            | Request::FwStatus => {}
+            | Request::FwStatus
+            | Request::BtEraseAll => {}
             Request::GetPort(p) | Request::Redetect(p) => w.u8(*p as u8)?,
             Request::GetPortString(p, k) => {
                 w.u8(*p as u8)?;
@@ -2534,6 +2548,7 @@ impl Request {
                 w.u8(*slot)?;
                 w.u16(*offset)?;
             }
+            Request::GetModuleLog(at) => w.u32(*at)?,
             Request::BtPasskey(v) => w.u32(*v)?,
             Request::PointerAt([x, y]) => {
                 w.u16(*x as u16)?;
@@ -2590,6 +2605,8 @@ impl Request {
             req::BT_SCAN => Request::BtScan(r.bool()?),
             req::GET_BT_FOUND => Request::GetBtFound(r.u8()?),
             req::GET_BT_DEVICE_MAP => Request::GetBtDeviceMap { slot: r.u8()?, offset: r.u16()? },
+            req::GET_MODULE_LOG => Request::GetModuleLog(r.u32()?),
+            req::BT_ERASE_ALL => Request::BtEraseAll,
             req::BT_PAIR_DEVICE => Request::BtPairDevice(r.array()?),
             req::BT_FORGET_DEVICE => Request::BtForgetDevice(r.u8()?),
             _ => return Err(WireError::Invalid),
@@ -2626,6 +2643,14 @@ pub enum Response {
         slot: u8,
         total: u16,
         offset: u16,
+        data: Vec<u8, BT_MAP_PIECE>,
+    },
+    /// Bytes `at`.. of the module's log, which the KVM holds from byte `first` to `end` (counted since it started
+    /// keeping it; older lines made room for newer ones).
+    ModuleLog {
+        first: u32,
+        end: u32,
+        at: u32,
         data: Vec<u8, BT_MAP_PIECE>,
     },
     Ok,
@@ -2790,6 +2815,12 @@ impl Response {
                 w.u8(*slot)?;
                 w.u16(*total)?;
                 w.u16(*offset)?;
+                w.lv(data)?;
+            }
+            Response::ModuleLog { first, end, at, data } => {
+                w.u32(*first)?;
+                w.u32(*end)?;
+                w.u32(*at)?;
                 w.lv(data)?;
             }
             Response::BtFound(f) => {
@@ -3035,6 +3066,12 @@ impl DeviceMsg {
                 offset: r.u16()?,
                 data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
             },
+            req::GET_MODULE_LOG => Response::ModuleLog {
+                first: r.u32()?,
+                end: r.u32()?,
+                at: r.u32()?,
+                data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
+            },
             req::GET_BT_FOUND => Response::BtFound(match r.bool()? {
                 false => None,
                 true => Some(BtFound {
@@ -3232,6 +3269,8 @@ mod tests {
             Request::BtScan(false),
             Request::GetBtFound(9),
             Request::GetBtDeviceMap { slot: 2, offset: 96 },
+            Request::GetModuleLog(70_000),
+            Request::BtEraseAll,
             Request::BtPairDevice([1, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xC6]),
             Request::BtForgetDevice(0xFF),
         ];
@@ -3348,6 +3387,10 @@ mod tests {
             (
                 req::GET_BT_DEVICE_MAP,
                 Response::BtDeviceMap { slot: 1, total: 512, offset: 0, data: Vec::from_slice(&[0x05; 48]).unwrap() },
+            ),
+            (
+                req::GET_MODULE_LOG,
+                Response::ModuleLog { first: 4096, end: 6144, at: 4096, data: Vec::from_slice(&[b'x'; 48]).unwrap() },
             ),
             (
                 req::GET_BT_FOUND,

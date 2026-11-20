@@ -32,6 +32,8 @@ pub const MAX_DEVICES: usize = 4;
 pub const MAP_MAX: usize = 512;
 /// Report map bytes in one [`BtMsg::DeviceMap`].
 pub const MAP_CHUNK: usize = MAX_MSG - 6;
+/// Bytes of a module log line per [`BtMsg::Log`]; a longer line goes in several.
+pub const LOG_MAX: usize = MAX_MSG - 2;
 /// Longest name kept of a device (UTF-8 bytes).
 pub const NAME_MAX: usize = crate::ctrl::BT_NAME_MAX;
 
@@ -50,6 +52,7 @@ pub mod ty {
     pub const FORGET_DEVICE: u8 = 0x6A;
     pub const REQUEST_MAP: u8 = 0x6B;
     pub const DEVICE_OUTPUT: u8 = 0x6C;
+    pub const ERASE_ALL: u8 = 0x6D;
     pub const OUTPUT: u8 = 0x70;
     pub const HOST: u8 = 0x71;
     pub const EVENT: u8 = 0x72;
@@ -57,6 +60,7 @@ pub mod ty {
     pub const DEVICE: u8 = 0x74;
     pub const DEVICE_MAP: u8 = 0x75;
     pub const FOUND: u8 = 0x76;
+    pub const LOG: u8 = 0x77;
 }
 
 /// The reports a Bluetooth host gets: one HID service whose report map ([`report::MAP`]) every host accepts
@@ -313,6 +317,10 @@ pub enum BtMsg<'a> {
     PairDevice { addr: [u8; 7] },
     /// RP → BT: forget device slot `dev` (0xFF = all) and drop its connection.
     ForgetDevice { dev: u8 },
+    /// RP → BT: forget every host and device, write empty records into both flash sectors of each, drop the stack's
+    /// keys, and restart (which empties the controller's resolving list too): for pairings that keep failing on
+    /// state the module shouldn't hold (`ctrl::Request::BtEraseAll`).
+    EraseAll,
     /// RP → BT: send device slot `dev`'s report map ([`BtMsg::DeviceMap`]).
     RequestMap { dev: u8 },
     /// RP → BT: output report `id` for device `dev` (a keyboard's LEDs), without the ID byte.
@@ -325,6 +333,9 @@ pub enum BtMsg<'a> {
     DeviceMap { dev: u8, offset: u16, total: u16, data: &'a [u8] },
     /// BT → RP: a device that may be paired, found while looking (again at most once a second, with its signal now).
     Found { addr: [u8; 7], rssi: i8, appearance: u16, name: &'a str },
+    /// BT → RP: a line of the module's log (at most [`LOG_MAX`] bytes), which the RP2354B keeps for
+    /// `ctrl::Request::GetModuleLog`: on a dongle the module's own log pin goes nowhere.
+    Log { text: &'a str },
 }
 
 const PASSKEY_CANCEL: u32 = u32::MAX;
@@ -374,6 +385,7 @@ impl<'a> BtMsg<'a> {
                 w.u8(policy as u8)?;
             }
             BtMsg::RequestState => w.u8(ty::REQUEST_STATE)?,
+            BtMsg::EraseAll => w.u8(ty::ERASE_ALL)?,
             BtMsg::EnterRom => w.u8(ty::ENTER_ROM)?,
             BtMsg::Host(h) => {
                 w.u8(ty::HOST)?;
@@ -441,6 +453,10 @@ impl<'a> BtMsg<'a> {
                 w.u16(appearance)?;
                 w.lv(&name.as_bytes()[..name.len().min(NAME_MAX)])?;
             }
+            BtMsg::Log { text } => {
+                w.u8(ty::LOG)?;
+                w.lv(text.as_bytes())?;
+            }
         }
         Ok(w.len())
     }
@@ -461,6 +477,7 @@ impl<'a> BtMsg<'a> {
             }
             ty::POLICY => BtMsg::Policy { host: r.u8()?, policy: r.u8()?.try_into()? },
             ty::REQUEST_STATE => BtMsg::RequestState,
+            ty::ERASE_ALL => BtMsg::EraseAll,
             ty::ENTER_ROM => BtMsg::EnterRom,
             ty::HOST => BtMsg::Host(HostState {
                 host: r.u8()?,
@@ -491,6 +508,7 @@ impl<'a> BtMsg<'a> {
                 BtMsg::Device { state, name: name(&mut r)? }
             }
             ty::DEVICE_MAP => BtMsg::DeviceMap { dev: r.u8()?, offset: r.u16()?, total: r.u16()?, data: r.rest() },
+            ty::LOG => BtMsg::Log { text: name(&mut r)? },
             ty::FOUND => {
                 BtMsg::Found { addr: r.array()?, rssi: r.u8()? as i8, appearance: r.u16()?, name: name(&mut r)? }
             }
@@ -733,6 +751,7 @@ mod tests {
         roundtrip(BtMsg::Scan { on: true, seconds: 60 });
         roundtrip(BtMsg::PairDevice { addr: [1, 6, 5, 4, 3, 2, 0xC1] });
         roundtrip(BtMsg::ForgetDevice { dev: 0xFF });
+        roundtrip(BtMsg::EraseAll);
         roundtrip(BtMsg::RequestMap { dev: 2 });
         roundtrip(BtMsg::DeviceOutput { dev: 1, id: 1, data: &[0b10] });
         roundtrip(BtMsg::DeviceInput { dev: 4, id: 0, data: &[0, 0, 4, 0, 0, 0, 0, 0] });
@@ -753,6 +772,10 @@ mod tests {
         let long = "n".repeat(NAME_MAX);
         roundtrip(BtMsg::Device { state, name: &long });
         roundtrip(BtMsg::Found { addr: [1; 7], rssi: -70, appearance: 0, name: &long });
+        roundtrip(BtMsg::Log { text: "device 1: encrypted after 42 ms" });
+        roundtrip(BtMsg::Log { text: &"l".repeat(LOG_MAX) });
+        let mut buf = [0u8; MAX_MSG];
+        assert!(BtMsg::Log { text: &"l".repeat(LOG_MAX + 1) }.encode(&mut buf).is_err());
         assert!(appearance::is_hid(appearance::KEYBOARD) && appearance::is_hid(0x03FF) && !appearance::is_hid(0x0400));
     }
 

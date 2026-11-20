@@ -651,6 +651,7 @@ The RP2354B side runs on core 0 (`bt::run`); core 1 keeps to the AT32F405 links.
 | 0x6A | RP → BT | `ForgetDevice`: a device's bond, 0xFF = all |
 | 0x6B | RP → BT | `RequestMap`: send a device's report map |
 | 0x6C | RP → BT | `DeviceOutput`: a device's output report (a keyboard's LEDs), report ID, data |
+| 0x6D | RP → BT | `EraseAll`: forget every host and device, write empty records into both flash sectors of each, drop the stack's keys, and restart |
 | 0x70 | BT → RP | `Output`: a host's keyboard LEDs |
 | 0x71 | BT → RP | `Host`: a slot's flags (bonded, connected, encrypted, subscribed), interval, latency, address, RSSI |
 | 0x72 | BT → RP | `Event`: pairing open / closed, passkey wanted, paired, pairing failed, bond lost, settings held in RAM; looking for devices open / closed, how far a device's pairing got, the passkey to type on it, a device's bond lost |
@@ -658,6 +659,7 @@ The RP2354B side runs on core 0 (`bt::run`); core 1 keeps to the AT32F405 links.
 | 0x74 | BT → RP | `Device`: a device slot's flags (bonded, connected, encrypted, ready), RSSI, battery, appearance, address, its map's length and CRC-32, its name |
 | 0x75 | BT → RP | `DeviceMap`: a piece of a device's report map (offset, total, ≤ 59 bytes) |
 | 0x76 | BT → RP | `Found`: a device that may be paired, found while looking: address, RSSI, appearance, name (at most once a second each) |
+| 0x77 | BT → RP | `Log`: a line of the module's log (≤ 63 bytes; a longer line in several), which the RP2354B keeps in RAM (2 KB, the latest whole lines, with the time it came; `GetModuleLog`) |
 
 **Reports.** One HID service with a fixed report map (`kvm_proto::link::bt::report::MAP`, 229 bytes): keyboard (boot
 layout, ID 1, with the LED output report), mouse (16 buttons, 16-bit X/Y, wheel, AC pan, ID 2), consumer (one 16-bit
@@ -839,7 +841,7 @@ small C3 boards) runs the same module firmware, and the RP2354B reaches it on a 
   a second ran over (measured on the first dongle, 2026-11-15; next to none while nothing moved), each one was resent,
   and the late reply broke the next exchange too, so the pointer stuttered.
 
-**Bluetooth devices** (0.1.33, `devices.rs`, `kvm-core::bt::Devices`). At the same time as it is a keyboard and mouse
+**Bluetooth devices** (0.1.47, `devices.rs`, `kvm-core::bt::Devices`). At the same time as it is a keyboard and mouse
 to its hosts, the module is the central of up to four Bluetooth LE HID devices (HID over GATT: keyboards, mice, other
 input devices; the ESP32-C3 has no Bluetooth Classic, so devices that only have that can't pair), in device slots 1–4.
 To the engine each is a device as a front port's is (§4.3): a mode (Auto, which is Normalized for it, Normalized or
@@ -861,11 +863,18 @@ front ports' and sent wherever its routing says, keymap and hotkeys included.
 - **Reconnecting:** while a bonded device isn't connected, a passive scan watches a quarter of the time (40 ms every 160
   ms: about 20 mA at 3.3 V while a bonded device stays off) for its advertising, by its address or one its IRK resolves,
   and connects at once with the stored handles: a device that wakes up reports without being read anew. Its connection's
-  parameters are what it asks for. The link must be encrypted with the bond's key within 8 s (the module checks the
-  stack's state, as its event doesn't come when that fails, and asks again after 2 s), and set up (GATT client, reports
-  on, battery) within 8 s more; otherwise the module lets the connection go, and the device's next advertising gets a
-  fresh one. Until 0.1.33 it waited 40 s: a keyboard waking from idle could show as connecting until it dropped the link
-  itself (2026-11-20).
+  parameters are what it asks for. A reconnection never becomes a pairing. A device that hasn't asked for security
+  itself after 100 ms is asked (again every 250 ms while the stack's one pairing state machine is busy with another
+  link); the link counts as encrypted by the stack's state, as its `Encrypted` event doesn't always come, and its
+  `PairingComplete`, which it also gives when the bond's key worked, isn't taken for anything. When the bond's key
+  doesn't work (`BondLost`) or the stack wants a passkey, the module lets the connection go without telling the device
+  that a pairing failed; a link not encrypted within 8 s, or not set up within 8 s more, goes too. A reconnection that
+  failed holds off the next for 0.5 s, doubling to 4 s while they keep failing. From 0.1.34 to 0.1.37 the module took
+  that `PairingComplete` for a pairing begun anew and let every reconnection go the moment it was encrypted; before, it
+  asked at once (and in 0.1.33 again after 2 s, which after a failed key made the stack pair anew) (2026-11-20, found
+  with the module's log, `odkvmctl device log`). (0.1.35 to 0.1.39 also worked around a supposed address-type mismatch
+  in the stack's bond lookup for hosts; that wasn't what failed, one host in two slots was (**Flash**), and 0.1.40
+  dropped it.)
 - **Reports:** each input report's notification goes to the RP2354B (`DeviceInput`), which puts the report ID back in
   front when the map has IDs and parses it as a USB device's report. A report longer than a link message (62 bytes) is
   dropped. The engine asks for a device's map (`RequestMap`) once when it holds none with the CRC the device's state
@@ -881,11 +890,22 @@ front ports' and sent wherever its routing says, keymap and hotkeys included.
   every 5 ms, and again at once after a frame that carried a message (the module only answers). A keyboard's LEDs are
   its target's (`DeviceOutput`).
 - **Flash:** the device slots live in the two sectors before the hosts' (A/B records with a CRC, `bonds::DeviceBonds`):
-  a device's save never touches the hosts' bonds. Saves come only from pairing, forgetting and a lost bond.
+  a device's save never touches the hosts' bonds. Saves come only from pairing, forgetting and a lost bond. Both flash
+  handles are made before either reads: a handle learns the flash's size from the chip's ID, which comes back wrong
+  after a read; until 0.1.41 the devices' handle took the flash for 0 bytes long, so no device's bond was ever saved and
+  a module restart lost them all (2026-11-20). One peer is never in two slots: a host or device that pairs anew clears
+  any other slot that holds it (the same address, or an IRK of one resolving the other's, or the same IRK), with the
+  same save, and a start that finds one peer in two slots keeps the first. A host in two slots put two entries for it in
+  the controller's resolving list, and the controller asserted about 0.3 s after that host paired anew; firmware back to
+  0.1.29 did the same until the slots were cleared (2026-11-20). *Erase all pairings* (`BtEraseAll`) clears whatever
+  state is left: both records of both kinds, the stack's keys, and with the restart the controller's list.
 - **Radio:** the controller takes 10 activities at most (connections, advertising, scanning): five host connections,
   four devices, advertising and a scan would be 11, which only happens with every slot of both kinds in use while a
   host pairs and a device is sought; the one that doesn't get its activity tries again later. The stack holds 17 keys
-  (the eight slots' and one pairing's per connection; `tidy_keys` keeps the devices' too).
+  (the eight slots' and one pairing's per connection; `tidy_keys` keeps the devices' too). A panic restarts the
+  module; its place and message are kept in RTC RAM across the reset and sent with the next start's log lines, with
+  the reset's reason. (The controller's own log lines can't be kept: esp-radio's `print-logs-from-driver` makes the
+  controller log so much that the module stops advertising (0.1.39) or hangs until its watchdog resets it (0.1.43).)
 - **The window and `odkvmctl`** show a device slot only while it holds a bond: a free slot is nothing to set. A
   device pinned to a Bluetooth host makes the module keep that host connected (`Select`'s mask) whatever its policy.
 
@@ -1267,6 +1287,8 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x1B `BtScan` / 0x1C `GetBtFound` | look for devices to pair for 60 s, or stop (host pairing closes); entry n of the devices found (address, RSSI, appearance, name), none past the last |
 | 0x1D `BtPairDevice` / 0x1E `BtForgetDevice` | pair the device found at an address into a free slot (`Busy` while one pairs); forget a slot (0xFF = all) |
 | 0x1F `GetBtDeviceMap` | slot, offset: up to 48 bytes of the report map the KVM holds for a device slot, and its length (0: none) |
+| 0x21 `BtEraseAll` | every pairing the module holds, hosts and devices, erased, and the module restarted (`EraseAll`); a configuration change |
+| 0x20 `GetModuleLog` | position: up to 48 bytes of the module's log the KVM keeps, from there, and the positions of the first byte kept and past the last (counted since the RP2354B started) |
 
 | Event | Body |
 |---|---|
@@ -1368,7 +1390,8 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
   - `odkvmctl status` (the default), `odkvmctl list` (control interfaces this computer sees), `odkvmctl watch` (events);
   - `odkvmctl switch pc1|pc2|toggle|next|host1…host4`;
   - `odkvmctl wireless` (the four host slots), `wireless pair [stop]`, `wireless passkey <digits>`,
-    `wireless forget <slot|all>`, `wireless name <slot> [<name>]`, `wireless policy <slot> stay|on-select` (a KVM with
+    `wireless forget <slot|all>`, `wireless name <slot> [<name>]`, `wireless policy <slot> stay|on-select`,
+    `wireless erase` (every pairing the module holds, hosts and devices, and a restart of the module) (a KVM with
     the Bluetooth module, §4.13). The user-facing name is neutral until the product is listed with the Bluetooth SIG
     (design.md §16);
   - `odkvmctl device` (the four device slots, and while looking the devices found, numbered), `device scan [stop]`
@@ -1376,7 +1399,8 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     (follows the pairing to its end, with the passkey to type on a keyboard that asks), `device forget <slot|all>`,
     `device mode <slot> auto|normalized|off`, `device route <slot> follow|pc1|pc2|host1…host4`, `device map <slot>`
     (the report map the KVM holds, as hex, and what the parser makes of it, run on the PC: to send along when a device
-    shows as not supported) (§4.13);
+    shows as not supported), `device log` (the module's recent log as the KVM keeps it: connections, pairing, why a
+    device was let go) (§4.13);
   - `odkvmctl port <keyboard|mouse|other> [mode <…>|route <…>|redetect]`;
   - `odkvmctl profile` (list: each device's mode, and its pin where it has one), `odkvmctl profile
     next|<number>|<name>` (make it active), `odkvmctl profile <number|name> name <text>`, `odkvmctl profile
@@ -1422,12 +1446,13 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
   - *Overview*: the two PCs (active one highlighted, which one this computer is, link and VBUS, switch button), the
     front ports in one line each, power, recent events;
   - *Ports*: a tab per profile in use (the active one bold in the accent colour), and in the tab: its name, its
-    screen-hop arrangement, *Make active*, and a row per device: the three front ports and each Bluetooth device that
-    holds a bond (a free slot is nothing to set). A row has the device (its state, its product or name; hovering over a
-    port gives its IDs, speed, what runs and why, its classes, rate and faults), its mode, where its input goes
-    (following the active host, or pinned to PC1, PC2 or a paired wireless host: in passthrough the PCs only, and the
-    routing is off for a device that is off) and re-detect. Below, how many profiles are in use and whether the KVM
-    powers up in the last one;
+    screen-hop arrangement, *Make active*, and a block per device: the three front ports and each Bluetooth device
+    that holds a bond (a free slot is nothing to set). Its row has the device (its state, its product or name), its
+    mode, where its input goes (following the active host, or pinned to PC1, PC2 or a paired wireless host: in
+    passthrough the PCs only, and the routing is off for a device that is off) and re-detect; under the row, across
+    the card, what the port cards up to 0.1.29 said: a front port's IDs and speed, the mode it runs in and why, its
+    classes, report rate and power, and over-current faults; a wireless device's battery and signal. Below, how many
+    profiles are in use and whether the KVM powers up in the last one;
   - *Displays*: monitors that follow the KVM, per profile (below);
   - *Screen hop* (the feature's name is a translation term, §4.14): whether it
     runs and, if not, what it needs, with a button for the absolute pointer or the Mouse port's mode; the profiles it
@@ -1480,7 +1505,8 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     §4.13): pairing a host (with a countdown, and a passkey field while a host waits for one); pairing a device (*Look
     for devices* with a countdown, the devices found with their kind, signal and *Pair*, how far the pairing got, and
     the six digits to type on a keyboard that asks for them); the four device slots (name, kind, state, battery,
-    forget; their modes and routings are on *Ports*); and the four host slots: name, state, policy, forget. While the
+    forget; their modes and routings are on *Ports*); the four host slots: name, state, policy, forget; and, last,
+    *Erase all pairings* (two presses: every host and device the module holds, its keys, and a restart). While the
     module is starting, being programmed or failed, the page says so instead (with *Try again* after 5 failed
     attempts).
 

@@ -590,6 +590,32 @@ impl Client {
             .collect()
     }
 
+    /// The wireless module's recent log as the KVM keeps it (empty without one), piece by piece: lines that came while
+    /// it was read are left for the next time.
+    pub fn module_log(&mut self) -> Result<String> {
+        let mut out = Vec::new();
+        let mut at = 0u32;
+        let mut until = None;
+        loop {
+            let (first, end, from, data) = self.expect(Request::GetModuleLog(at), |r| {
+                if let Response::ModuleLog { first, end, at, data } = r { Some((first, end, at, data)) } else { None }
+            })?;
+            if from != at && !out.is_empty() {
+                // Lines made room while it was read: start over from the first kept.
+                out.clear();
+                at = first;
+                continue;
+            }
+            let until = *until.get_or_insert(end);
+            out.extend_from_slice(&data);
+            at = from + data.len() as u32;
+            if data.is_empty() || at >= until {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
     /// The report map the KVM holds for device slot `n` (empty while it holds none), piece by piece.
     pub fn bt_device_map(&mut self, n: u8) -> Result<Vec<u8>> {
         let mut map = Vec::new();
@@ -677,6 +703,11 @@ impl Client {
     /// Forgets the bond in slot 1–4, or every bond (0xFF).
     pub fn bt_forget(&mut self, slot: u8) -> Result<()> {
         self.ok(Request::BtForget(slot))
+    }
+
+    /// Erases every pairing the wireless module holds, hosts and devices, and restarts it.
+    pub fn bt_erase_all(&mut self) -> Result<()> {
+        self.ok(Request::BtEraseAll)
     }
 
     /// The passkey a pairing host shows, typed here instead of on the KVM's keyboard.

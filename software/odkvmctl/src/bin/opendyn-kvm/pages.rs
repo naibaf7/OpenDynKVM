@@ -11,7 +11,7 @@ use kvm_proto::ctrl::{
     MAX_PROFILES, Pc, Polling, Port, PortMode, PortState, ProfileName, Rgb, Routing, Target, VialMode, caps, class,
     diag, selftest, status_flags,
 };
-use odkvmctl::client::Snapshot;
+use odkvmctl::client::{DeviceSlot, Snapshot};
 use odkvmctl::{autostart, fl, i18n, local, names};
 
 use crate::look::{self, BAD, GOOD, WARN, card, chip, ink, note};
@@ -71,10 +71,23 @@ fn diag_column(ui: &mut Ui, id: &str, groups: &[(Option<diag::Group>, Vec<&diag:
     });
 }
 
-/// The hotkey rows on the Keyboard page; the last only for a KVM with the Bluetooth module.
 /// The Ports page's device column: the widest of the front ports' and wireless devices' names in the languages, with
 /// the mode and routing dropdowns beside it in a 900 px window.
 const DEVICE_COLUMN: f32 = 180.0;
+/// The Ports page's mode and routing columns (their dropdowns' widths).
+const MODE_COLUMN: f32 = 155.0;
+const ROUTE_COLUMN: f32 = 170.0;
+
+/// How a line under a device's row on the Ports page looks.
+#[derive(Clone, Copy)]
+enum Tone {
+    /// Grey, as a note.
+    Note,
+    /// The text colour.
+    Plain,
+    /// A status colour (made readable on the card).
+    Ink(Color32),
+}
 
 /// The button that removes an entry of the hotkey list.
 pub(crate) const REMOVE: &str = "×";
@@ -393,34 +406,56 @@ impl App {
         }
     }
 
-    /// A front port's device in detail, for the hover text of its row: IDs, speed, what runs and why, its interfaces.
-    fn port_details(s: &Snapshot, port: Port) -> Option<String> {
-        let p = &s.ports[port.index()];
-        if matches!(p.state, PortState::Empty) {
-            return None;
+    /// What the old port cards said of a device, under its row (software.md §9): a front port's IDs and speed, the
+    /// mode it runs in and why, its kinds, report rate and power, and over-current faults; a wireless device's battery
+    /// and signal. Each line with how it looks.
+    fn device_details(s: &Snapshot, d: Device) -> Vec<(String, Tone)> {
+        let mut lines = Vec::new();
+        match (d.port(), d.wireless()) {
+            (Some(port), _) => {
+                let p = &s.ports[port.index()];
+                if p.state == PortState::Empty {
+                    return lines;
+                }
+                lines.push((format!("{:04x}:{:04x} · {}", p.vid, p.pid, names::speed(p.speed)), Tone::Note));
+                if p.state == PortState::Module {
+                    // Not a device for the PCs: say so, and how to get the port back (software.md §4.13).
+                    lines.push((fl!("port-module-note"), Tone::Ink(crate::bluetooth::violet())));
+                    return lines;
+                }
+                let mut running = fl!("running-mode", mode = names::mode(p.effective));
+                if p.mode == PortMode::Auto || p.mode != p.effective {
+                    running += &format!(" ({})", names::reason(p.reason));
+                }
+                lines.push((running, Tone::Plain));
+                let mut kinds = names::classes(p.classes);
+                if p.report_rate_hz > 0 {
+                    kinds += &format!(" · {} Hz", p.report_rate_hz);
+                }
+                if p.max_power_ma > 0 {
+                    kinds += &format!(" · {}", fl!("up-to-ma", milliamps = p.max_power_ma));
+                }
+                lines.push((kinds, Tone::Note));
+                if p.faults > 0 {
+                    lines.push((fl!("over-current-faults", count = p.faults), Tone::Ink(BAD)));
+                }
+            }
+            (None, Some(n)) => {
+                let Some(i) = s.device(n) else { return lines };
+                let mut parts = Vec::new();
+                if i.battery <= 100 {
+                    parts.push(fl!("battery", percent = i.battery));
+                }
+                if i.connected() && i.rssi != 0 {
+                    parts.push(fl!("link-signal", dbm = i.rssi));
+                }
+                if !parts.is_empty() {
+                    lines.push((parts.join(" · "), Tone::Note));
+                }
+            }
+            (None, None) => {}
         }
-        if p.state == PortState::Module {
-            // Not a device for the PCs: say so, and how to get the port back (software.md §4.13).
-            return Some(fl!("port-module-note"));
-        }
-        let mut lines = vec![format!("{:04x}:{:04x} · {}", p.vid, p.pid, names::speed(p.speed))];
-        let mut running = fl!("running-mode", mode = names::mode(p.effective));
-        if p.mode == PortMode::Auto || p.mode != p.effective {
-            running += &format!(" ({})", names::reason(p.reason));
-        }
-        lines.push(running);
-        let mut details = names::classes(p.classes);
-        if p.report_rate_hz > 0 {
-            details += &format!(" · {} Hz", p.report_rate_hz);
-        }
-        if p.max_power_ma > 0 {
-            details += &format!(" · {}", fl!("up-to-ma", milliamps = p.max_power_ma));
-        }
-        lines.push(details);
-        if p.faults > 0 {
-            lines.push(fl!("over-current-faults", count = p.faults));
-        }
-        Some(lines.join("\n"))
+        lines
     }
 
     /// The routings a device in `mode` can have: following, or pinned to a PC, or (but in passthrough, which is a PC's
@@ -503,65 +538,94 @@ impl App {
                 });
                 ui.add_space(6.0);
                 let (mut modes, mut routes) = (p.modes, p.routes);
-                egui::Grid::new(("devices", tab)).num_columns(4).spacing([12.0, 8.0]).striped(true).show(ui, |ui| {
-                    note(ui, fl!("device"));
-                    note(ui, fl!("mode"));
-                    note(ui, fl!("routing"));
-                    ui.label("");
-                    ui.end_row();
-                    for d in s.routed_devices() {
-                        let (state, color, what) = Self::device_line(s, d);
-                        // The device, how it is doing, and what it is on a line of its own (wrapped, never cut).
-                        let r = ui
-                            .vertical(|ui| {
-                                ui.set_width(DEVICE_COLUMN);
-                                let title = RichText::new(names::device_title(d)).strong();
-                                ui.add(egui::Label::new(title).truncate());
-                                ui.label(RichText::new(state).color(ink(ui, color)));
-                                ui.add(egui::Label::new(what).wrap());
-                            })
-                            .response;
-                        if let Some(details) = d.port().and_then(|port| Self::port_details(s, port)) {
-                            r.on_hover_text(details);
-                        }
-                        let m = &mut modes[d.index()];
-                        egui::ComboBox::from_id_salt(("mode", tab, d.index()))
-                            .selected_text(names::mode(*m))
-                            .width(155.0)
-                            .show_ui(ui, |ui| {
-                                for mode in d.modes() {
-                                    ui.selectable_value(m, *mode, names::mode(*mode));
-                                }
+                // A block per device: its row (name, state and product; mode; routing; re-detect), and under it
+                // across the card what the old port cards said of it. Fixed columns keep the dropdowns in line.
+                const GAP: f32 = 12.0;
+                let margin = egui::Margin::symmetric(6, 5);
+                let column = |ui: &mut Ui, width: f32, height: f32, add: &mut dyn FnMut(&mut Ui)| {
+                    let size = egui::vec2(width, height);
+                    ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.set_min_size(size);
+                        add(ui);
+                    });
+                };
+                egui::Frame::new().inner_margin(margin).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = GAP;
+                        let h = ui.spacing().interact_size.y;
+                        column(ui, DEVICE_COLUMN, h, &mut |ui| note(ui, fl!("device")));
+                        column(ui, MODE_COLUMN, h, &mut |ui| note(ui, fl!("mode")));
+                        column(ui, ROUTE_COLUMN, h, &mut |ui| note(ui, fl!("routing")));
+                    });
+                });
+                let stripe = ui.visuals().faint_bg_color;
+                for (row, d) in s.routed_devices().into_iter().enumerate() {
+                    let (state, color, what) = Self::device_line(s, d);
+                    let fill = if row % 2 == 0 { stripe } else { Color32::TRANSPARENT };
+                    egui::Frame::new().fill(fill).corner_radius(4.0).inner_margin(margin).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = GAP;
+                            // The device, how it is doing, and what it is on a line of its own (wrapped, never cut).
+                            let block = ui
+                                .vertical(|ui| {
+                                    ui.set_width(DEVICE_COLUMN);
+                                    let title = RichText::new(names::device_title(d)).strong();
+                                    ui.add(egui::Label::new(title).truncate());
+                                    ui.label(RichText::new(&state).color(ink(ui, color)));
+                                    ui.add(egui::Label::new(&what).wrap());
+                                })
+                                .response;
+                            let h = block.rect.height();
+                            let m = &mut modes[d.index()];
+                            column(ui, MODE_COLUMN, h, &mut |ui| {
+                                egui::ComboBox::from_id_salt(("mode", tab, d.index()))
+                                    .selected_text(names::mode(*m))
+                                    .width(MODE_COLUMN)
+                                    .show_ui(ui, |ui| {
+                                        for mode in d.modes() {
+                                            ui.selectable_value(m, *mode, names::mode(*mode));
+                                        }
+                                    });
                             });
-                        let route = &mut routes[d.index()];
-                        // A device in passthrough goes to a PC: a wireless host pin makes it follow.
-                        if *m == PortMode::Passthrough && route.pinned().is_some_and(|h| h.bt_slot().is_some()) {
-                            *route = Routing::Follow;
-                        }
-                        ui.add_enabled_ui(*m != PortMode::Off, |ui| {
-                            let host = |h| crate::screens::host_label(s, h);
-                            egui::ComboBox::from_id_salt(("route", tab, d.index()))
-                                .selected_text(names::route(*route, host))
-                                .width(170.0)
-                                .show_ui(ui, |ui| {
-                                    for r in Self::offered_routes(s, *m, *route) {
-                                        ui.selectable_value(route, r, names::route(r, host));
+                            let route = &mut routes[d.index()];
+                            // A device in passthrough goes to a PC: a wireless host pin makes it follow.
+                            if *m == PortMode::Passthrough && route.pinned().is_some_and(|h| h.bt_slot().is_some()) {
+                                *route = Routing::Follow;
+                            }
+                            let mode = *m;
+                            column(ui, ROUTE_COLUMN, h, &mut |ui| {
+                                ui.add_enabled_ui(mode != PortMode::Off, |ui| {
+                                    let host = |h| crate::screens::host_label(s, h);
+                                    egui::ComboBox::from_id_salt(("route", tab, d.index()))
+                                        .selected_text(names::route(*route, host))
+                                        .width(ROUTE_COLUMN)
+                                        .show_ui(ui, |ui| {
+                                            for r in Self::offered_routes(s, mode, *route) {
+                                                ui.selectable_value(route, r, names::route(r, host));
+                                            }
+                                        });
+                                });
+                            });
+                            if let Some(port) = d.port().filter(|p| s.ports[p.index()].state != PortState::Empty) {
+                                column(ui, 0.0, h, &mut |ui| {
+                                    if ui.small_button("↻").on_hover_text(fl!("redetect")).clicked() {
+                                        self.send(UiCmd::Redetect(port));
                                     }
                                 });
+                            }
                         });
-                        match d.port() {
-                            Some(port) if s.ports[port.index()].state != PortState::Empty => {
-                                if ui.small_button("↻").on_hover_text(fl!("redetect")).clicked() {
-                                    self.send(UiCmd::Redetect(port));
-                                }
-                            }
-                            _ => {
-                                ui.label("");
-                            }
+                        for (text, tone) in Self::device_details(s, d) {
+                            let text = RichText::new(text);
+                            let text = match tone {
+                                Tone::Note => text.color(look::palette(ui).weak),
+                                Tone::Plain => text,
+                                Tone::Ink(c) => text.color(ink(ui, c)),
+                            };
+                            ui.add(egui::Label::new(text).wrap());
                         }
-                        ui.end_row();
-                    }
-                });
+                    });
+                }
                 if routes != p.routes {
                     self.set(ConfigValue::ProfileRoutes(n, routes));
                 }
