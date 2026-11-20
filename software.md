@@ -841,7 +841,7 @@ small C3 boards) runs the same module firmware, and the RP2354B reaches it on a 
   a second ran over (measured on the first dongle, 2026-11-15; next to none while nothing moved), each one was resent,
   and the late reply broke the next exchange too, so the pointer stuttered.
 
-**Bluetooth devices** (0.1.47, `devices.rs`, `kvm-core::bt::Devices`). At the same time as it is a keyboard and mouse
+**Bluetooth devices** (0.1.50, `devices.rs`, `kvm-core::bt::Devices`). At the same time as it is a keyboard and mouse
 to its hosts, the module is the central of up to four Bluetooth LE HID devices (HID over GATT: keyboards, mice, other
 input devices; the ESP32-C3 has no Bluetooth Classic, so devices that only have that can't pair), in device slots 1–4.
 To the engine each is a device as a front port's is (§4.3): a mode (Auto, which is Normalized for it, Normalized or
@@ -863,18 +863,21 @@ front ports' and sent wherever its routing says, keymap and hotkeys included.
 - **Reconnecting:** while a bonded device isn't connected, a passive scan watches a quarter of the time (40 ms every 160
   ms: about 20 mA at 3.3 V while a bonded device stays off) for its advertising, by its address or one its IRK resolves,
   and connects at once with the stored handles: a device that wakes up reports without being read anew. Its connection's
-  parameters are what it asks for. A reconnection never becomes a pairing. A device that hasn't asked for security
-  itself after 100 ms is asked (again every 250 ms while the stack's one pairing state machine is busy with another
-  link); the link counts as encrypted by the stack's state, as its `Encrypted` event doesn't always come, and its
-  `PairingComplete`, which it also gives when the bond's key worked, isn't taken for anything. When the bond's key
-  doesn't work (`BondLost`) or the stack wants a passkey, the module lets the connection go without telling the device
-  that a pairing failed; a link not encrypted within 8 s, or not set up within 8 s more, goes too. A reconnection that
-  failed holds off the next for 0.5 s, doubling to 4 s while they keep failing. From 0.1.34 to 0.1.37 the module took
-  that `PairingComplete` for a pairing begun anew and let every reconnection go the moment it was encrypted; before, it
-  asked at once (and in 0.1.33 again after 2 s, which after a failed key made the stack pair anew) (2026-11-20, found
-  with the module's log, `odkvmctl device log`). (0.1.35 to 0.1.39 also worked around a supposed address-type mismatch
-  in the stack's bond lookup for hosts; that wasn't what failed, one host in two slots was (**Flash**), and 0.1.40
-  dropped it.)
+  parameters are what it asks for. A reconnection never becomes a pairing. The link is encrypted with the bond's key by
+  `GattClient::new`, the stack's own way for a bonded peer, which stops when the key fails; the module doesn't ask for
+  security itself (`request_security` is the user's way: when the key failed once, the stack sent the device a pairing
+  request, a keyboard took it and changed its key, and every reconnection after ended in a MIC failure, until 0.1.49).
+  The link counts as encrypted by the stack's state, as its `Encrypted` event doesn't always come, and its
+  `PairingComplete`, which it also gives when the bond's key worked, isn't taken for anything. When the key doesn't work
+  (`BondLost`) or the stack wants a passkey, the module lets the connection go without telling the device that a pairing
+  failed; a link not encrypted 4 s after it connected, or not set up within 8 s more, goes too. Making the GATT client
+  is tried up to 10 times, 100 ms apart, while the device stays connected (a keyboard waking while a mouse moved lost it
+  again and again, 2026-11-20); its error and the stack's free packets go to the log. A reconnection that failed holds
+  off the next for 0.5 s, doubling to 4 s while they keep failing. From 0.1.34 to 0.1.37 the module took that
+  `PairingComplete` for a pairing begun anew and let every reconnection go the moment it was encrypted; before, it asked
+  at once (and in 0.1.33 again after 2 s, which after a failed key made the stack pair anew) (2026-11-20, found with the
+  module's log, `odkvmctl device log`). (0.1.35 to 0.1.39 also worked around a supposed address-type mismatch in the
+  stack's bond lookup for hosts; that wasn't what failed, one host in two slots was (**Flash**), and 0.1.40 dropped it.)
 - **Reports:** each input report's notification goes to the RP2354B (`DeviceInput`), which puts the report ID back in
   front when the map has IDs and parses it as a USB device's report. A report longer than a link message (62 bytes) is
   dropped. The engine asks for a device's map (`RequestMap`) once when it holds none with the CRC the device's state
@@ -906,6 +909,8 @@ front ports' and sent wherever its routing says, keymap and hotkeys included.
   module; its place and message are kept in RTC RAM across the reset and sent with the next start's log lines, with
   the reset's reason. (The controller's own log lines can't be kept: esp-radio's `print-logs-from-driver` makes the
   controller log so much that the module stops advertising (0.1.39) or hangs until its watchdog resets it (0.1.43).)
+  The Bluetooth stack's own warnings and errors go to the log (`log::Stack`, at most 10 a second; the rest of its
+  lines are compiled out): why an encryption with a bond failed, for one.
 - **The window and `odkvmctl`** show a device slot only while it holds a bond: a free slot is nothing to set. A
   device pinned to a Bluetooth host makes the module keep that host connected (`Select`'s mask) whatever its policy.
 

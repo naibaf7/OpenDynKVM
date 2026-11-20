@@ -140,6 +140,7 @@ async fn main(spawner: Spawner) {
     if let Some(text) = last_panic() {
         log::line(format_args!("the last run ended in a panic: {text}"));
     }
+    log::stack_lines();
 
     // The link: UART0 on the KVM's board, or the chip's USB serial port on a front port (software.md §4.13).
     // It runs one interrupt level above the Bluetooth side: pairing's P-256 maths and a bond being written can

@@ -20,7 +20,9 @@ critical-section = "1.2"
 # Legacy pairing: many Bluetooth keyboards and mice have nothing else (hosts still pair with LE Secure Connections
 # only, `ble::run`). A GATT client's notification queue holds 8 (trouble-host: 1, and a full one drops the oldest: a
 # key's press or release lost). 32 packets for nine connections.
+# log: the stack's warnings and errors (why an encryption failed, among them) into the module's log (`log::Stack`).
 trouble-host = { version = "0.8", features = [
+    "log",
     "derive",
     "security",
     "legacy-pairing",
@@ -37,6 +39,8 @@ embassy-futures = "0.1.2"
 heapless = "0.9"
 embedded-io-async = "0.7"
 static_cell = "2.1"
+# Warnings and errors only: everything below is compiled out.
+log = { version = "0.4", features = ["release_max_level_warn"] }
 
 [profile.release]
 debug = 2

@@ -61,3 +61,6 @@ Thumbs.db
 # Misc
 *.log
 *.tmp
+
+# Planning notes, not published yet
+hid_mapping.md

@@ -59,6 +59,50 @@ impl Write for Writer<'_> {
     }
 }
 
+/// The Bluetooth stack's warnings and errors (through the `log` crate) into the log, at most [`STACK_PER_S`] a second:
+/// why an encryption with a bond failed, for one (a device's key refused, 2026-11-20). Nothing else logs through it.
+pub struct Stack;
+const STACK_PER_S: u32 = 10;
+/// The second lines are counted in, and how many came in it (no atomics on the ESP32-C3: a critical section).
+static STACK_COUNT: Mutex<core::cell::Cell<(u32, u32)>> = Mutex::new(core::cell::Cell::new((0, 0)));
+
+impl ::log::Log for Stack {
+    fn enabled(&self, m: &::log::Metadata) -> bool {
+        m.level() <= ::log::Level::Warn && m.target().starts_with("trouble_host")
+    }
+
+    fn log(&self, r: &::log::Record) {
+        if !self.enabled(r.metadata()) {
+            return;
+        }
+        let second = (embassy_time::Instant::now().as_millis() / 1000) as u32;
+        let take = critical_section::with(|cs| {
+            let c = STACK_COUNT.borrow(cs);
+            let (window, count) = c.get();
+            let count = if window == second { count + 1 } else { 1 };
+            c.set((second, count));
+            count <= STACK_PER_S
+        });
+        if take {
+            line(format_args!("stack {}: {}", r.level(), r.args()));
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static STACK: Stack = Stack;
+
+/// The stack's warnings and errors into the log from here on ([`Stack`]).
+pub fn stack_lines() {
+    // SAFETY: once, at start, before the stack runs (the racy forms: the ESP32-C3 has no atomics).
+    unsafe {
+        if ::log::set_logger_racy(&STACK).is_ok() {
+            ::log::set_max_level_racy(::log::LevelFilter::Warn);
+        }
+    }
+}
+
 /// One line of the log (what doesn't fit 160 bytes is cut).
 pub fn line(args: core::fmt::Arguments) {
     let mut text: heapless::String<160> = heapless::String::new();

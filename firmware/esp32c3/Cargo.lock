@@ -1476,13 +1476,14 @@ dependencies = [
  "esp-storage",
  "heapless 0.9.3",
  "kvm-proto",
+ "log",
  "static_cell",
  "trouble-host",
 ]
 
 [[package]]
 name = "kvm-proto"
-version = "0.1.47"
+version = "0.1.50"
 dependencies = [
  "heapless 0.9.3",
 ]
@@ -2190,6 +2191,7 @@ dependencies = [
  "embedded-io 0.7.1",
  "futures",
  "heapless 0.9.3",
+ "log",
  "p256",
  "rand",
  "rand_chacha",

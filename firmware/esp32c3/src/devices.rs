@@ -50,16 +50,9 @@ const REPORT_REFERENCE: u16 = 0x2908;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long pairing may stall (a passkey not typed): SMP's own limit is 30 s.
 const SECURE_TIMEOUT: Duration = Duration::from_secs(40);
-/// A reconnected device that hasn't started security itself by now is asked for it. A device that sends a Security
-/// Request does so in its first connection events: asking at the same time would collide with it (the stack,
-/// trouble-host 0.8, waiting for encryption with the bond, takes the device's request as an error and answers
-/// "pairing failed"). Short, as a device that never asks (the first board's keyboard and mouse) waits this long.
-const ASK_SECURITY_AFTER: Duration = Duration::from_millis(100);
-/// Asking again this often while the stack refuses (its one pairing state machine busy with another link).
-const ASK_AGAIN: Duration = Duration::from_millis(250);
-/// A bonded device's link not encrypted with its key after this long: the connection goes, so that the device's next
-/// advertising gets a fresh one.
-const ENCRYPT_GIVE_UP: Duration = Duration::from_secs(8);
+/// A bonded device's link not encrypted with its key this long after it connected: the connection goes, so that the
+/// device's next advertising gets a fresh one.
+const ENCRYPT_GIVE_UP: Duration = Duration::from_secs(4);
 /// A reconnection that failed holds off the next one this long, doubling up to 4 s while they keep failing: a device
 /// isn't hammered, and still caught while it advertises.
 const RETRY_FIRST: Duration = Duration::from_millis(500);
@@ -577,10 +570,7 @@ fn pairing_devices(stack: &St, on: bool) {
 
 /// Waits until the link is encrypted: with the bond's key (`new` false), or after pairing a new device, whose bond it
 /// returns. None: it failed, or the device left.
-async fn secure(slot: usize, new: bool, conn: &Conn, stack: &'static St) -> Option<Option<BondInformation>> {
-    if !new {
-        return encrypt_bonded(slot, conn, stack).await.then_some(None);
-    }
+async fn secure(slot: usize, conn: &Conn, stack: &'static St) -> Option<BondInformation> {
     loop {
         let ev = with_timeout(SECURE_TIMEOUT, conn.next()).await.ok()?;
         match ev {
@@ -597,7 +587,7 @@ async fn secure(slot: usize, new: bool, conn: &Conn, stack: &'static St) -> Opti
             ConnectionEvent::PassKeyConfirm(_) | ConnectionEvent::PassKeyInput => {
                 let _ = conn.pass_key_cancel();
             }
-            ConnectionEvent::PairingComplete { bond, .. } => return bond.map(Some),
+            ConnectionEvent::PairingComplete { bond, .. } => return bond,
             ConnectionEvent::PairingFailed(_) => {
                 log::line(format_args!("device {}: pairing failed", slot + 1));
                 return None;
@@ -610,36 +600,25 @@ async fn secure(slot: usize, new: bool, conn: &Conn, stack: &'static St) -> Opti
     }
 }
 
-/// A bonded device reconnected: waits until the link is encrypted with its key, as the stack's state says (its
-/// `Encrypted` event doesn't always come). One that hasn't asked for security itself after `ASK_SECURITY_AFTER` is
-/// asked (again every `ASK_AGAIN` while the stack refuses). A reconnection never becomes a pairing: when the key
-/// doesn't work (`BondLost`, after which the stack would pair anew had the module asked) or the stack wants a passkey,
-/// the module lets the connection go, without telling the device that a pairing failed (which can leave it needing to
-/// be switched off and on). False: not encrypted, or the device left.
-async fn encrypt_bonded(slot: usize, conn: &Conn, stack: &'static St) -> bool {
+/// A bonded device reconnected, and its GATT client was made: `GattClient::new` encrypts a bonded peer's link with its
+/// key the stack's own way, which never falls back to pairing anew. Waits until the link is encrypted, as the stack's
+/// state says (its `Encrypted` event doesn't always come), until `ENCRYPT_GIVE_UP` after the device connected (`from`).
+/// When the key doesn't work (`BondLost`) or the stack wants a passkey, the module lets the connection go without
+/// telling the device that a pairing failed. Until 0.1.49 the module asked for security itself (`request_security`),
+/// and when the key failed once, for whatever reason, the stack then sent the device a pairing request: a keyboard
+/// took it, changed its key, and from then on every reconnection ended in a MIC failure (2026-11-20). False: not
+/// encrypted, or the device left.
+async fn encrypted_with_key(slot: usize, conn: &Conn, stack: &'static St, from: Instant) -> bool {
     let dev = slot + 1;
-    let start = Instant::now();
-    let mut asked = false;
-    let mut next_ask = ASK_SECURITY_AFTER;
     loop {
         if conn.security_level().is_ok_and(|l| l.encrypted()) {
-            let ms = start.elapsed().as_millis();
-            log::line(format_args!("device {dev}: encrypted after {ms} ms{}", if asked { " (asked)" } else { "" }));
+            let ms = from.elapsed().as_millis();
+            log::line(format_args!("device {dev}: encrypted after {ms} ms"));
             return true;
         }
-        let waited = start.elapsed();
-        if waited >= ENCRYPT_GIVE_UP {
+        if from.elapsed() >= ENCRYPT_GIVE_UP {
             log::line(format_args!("device {dev}: not encrypted with its key, letting it go"));
             return false;
-        }
-        if !asked && waited >= next_ask {
-            match conn.request_security() {
-                Ok(()) => asked = true,
-                Err(e) => {
-                    log::line(format_args!("device {dev}: asking for security refused ({e:?}), asking again"));
-                    next_ask = waited + ASK_AGAIN;
-                }
-            }
         }
         if let Either::First(ev) = select(conn.next(), Timer::after_millis(50)).await {
             match ev {
@@ -660,8 +639,7 @@ async fn encrypt_bonded(slot: usize, conn: &Conn, stack: &'static St) -> bool {
                 }
                 // Also what the stack says when the link is encrypted with the bond's key (its pairing state machine
                 // ends in success either way): the encryption state, checked above, decides. From 0.1.34 to 0.1.37
-                // it let every reconnection go the moment it was encrypted (2026-11-20, the log: a bond for it,
-                // with the slot's key, and "began pairing anew" 70 ms after asking).
+                // the module let every reconnection go the moment it was encrypted (2026-11-20).
                 ConnectionEvent::PairingComplete { .. } => {}
                 ConnectionEvent::PairingFailed(e) => {
                     log::line(format_args!("device {dev}: security failed ({e:?})"));
@@ -677,6 +655,55 @@ async fn encrypt_bonded(slot: usize, conn: &Conn, stack: &'static St) -> bool {
 }
 
 type Client = GattClient<'static, Controller, DefaultPacketPool, 16>;
+
+/// Tries at making a connection's GATT client, `CLIENT_RETRY` apart, before the connection goes.
+const CLIENT_TRIES: u32 = 10;
+const CLIENT_RETRY: Duration = Duration::from_millis(100);
+
+/// The connection's GATT client (for a bonded device, making it also encrypts the link with the bond's key). A try
+/// that fails while the device is still connected is tried again: a keyboard waking while a mouse moved lost its
+/// client about 110 ms after it connected, again and again for 20 s, until the mouse was switched off (2026-11-20).
+/// The first failure and the last go to the log, with the stack's packet pool as it is then.
+async fn gatt_client(slot: usize, conn: &Conn, stack: &'static St) -> Option<Client> {
+    let dev = slot + 1;
+    for attempt in 1..=CLIENT_TRIES {
+        let e = match with_timeout(SETUP_TIMEOUT, Client::new(stack, conn)).await {
+            Ok(Ok(client)) => {
+                if attempt > 1 {
+                    log::line(format_args!("device {dev}: GATT client at try {attempt}"));
+                }
+                return Some(client);
+            }
+            Ok(Err(e)) => e,
+            Err(_) => {
+                log::line(format_args!("device {dev}: no GATT client in time, letting it go"));
+                return None;
+            }
+        };
+        let last = attempt == CLIENT_TRIES || !conn.is_connected();
+        if attempt == 1 || last {
+            let (free, all) = free_packets();
+            log::line(format_args!("device {dev}: no GATT client ({e:?}; {free} of {all} packets free)"));
+        }
+        if last {
+            log::line(format_args!("device {dev}: letting it go"));
+            return None;
+        }
+        Timer::after(CLIENT_RETRY).await;
+    }
+    None
+}
+
+/// Free packets in the stack's pool, and how many it has: taken until none is left, and given back at once.
+fn free_packets() -> (usize, usize) {
+    let mut held: heapless::Vec<<DefaultPacketPool as PacketPool>::Packet, 64> = heapless::Vec::new();
+    while let Some(p) = DefaultPacketPool::allocate() {
+        if held.push(p).is_err() {
+            break;
+        }
+    }
+    (held.len(), DefaultPacketPool::capacity())
+}
 
 /// Reads a new device's HID service: its report map, its reports and their IDs, and its battery and name.
 async fn discover(client: &Client, bond: &BondInformation, addr: &[u8; 7]) -> Option<Device> {
@@ -769,26 +796,33 @@ async fn connection(slot: usize, new: bool, mine: u32, conn: Conn, stack: &'stat
         pairing_devices(stack, true);
     }
     let _ = conn.set_bondable(new);
-    if new {
+    let from = Instant::now();
+    // Pairing: asked for at once. A bonded device's link is encrypted by `Client::new` (`encrypted_with_key`).
+    let bond = if new {
         let _ = conn.request_security();
-    }
-    let secured = select(secure(slot, new, &conn, stack), DROP[slot].wait()).await;
-    if new {
+        let secured = select(secure(slot, &conn, stack), DROP[slot].wait()).await;
         pairing_devices(stack, false);
-    }
-    let bond = match secured {
-        Either::First(Some(b)) => b,
-        _ => {
-            end(slot, new, mine, &conn, stack, current());
-            return;
+        match secured {
+            Either::First(Some(b)) => Some(b),
+            _ => {
+                end(slot, new, mine, &conn, stack, current());
+                return;
+            }
         }
+    } else {
+        None
     };
-    set_flags(slot, |d| d.flags |= device_flags::ENCRYPTED);
-    let Ok(Ok(client)) = with_timeout(SETUP_TIMEOUT, Client::new(stack, &conn)).await else {
-        log::line(format_args!("device {dev}: no GATT client, letting it go"));
+    let Some(client) = gatt_client(slot, &conn, stack).await else {
         end(slot, new, mine, &conn, stack, current());
         return;
     };
+    if !new
+        && !matches!(select(encrypted_with_key(slot, &conn, stack, from), DROP[slot].wait()).await, Either::First(true))
+    {
+        end(slot, new, mine, &conn, stack, current());
+        return;
+    }
+    set_flags(slot, |d| d.flags |= device_flags::ENCRYPTED);
     let work = async {
         if let Some(b) = &bond {
             stage(DevicePairing::Reading, Some(slot));
