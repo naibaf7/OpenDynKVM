@@ -90,7 +90,7 @@ fixed-size frame. Variable-length frames (§6.1) would win back about 15 µs if 
 | 0 | `host::hub_task` | Root port (Hub-0 only), hub events, hands each front port's device to its port task |
 | 0 | `host::port_task` ×3 | Read the descriptors, let the engine pick the mode (§4.3), run the interrupt pipes, execute the engine's device requests |
 | 0 | `link::dispatch` ×2, `link::uploader` ×2 | Link messages → engine; descriptor sets → AT32F405s |
-| 0 | `ui::run` | The MX key (debounced: press / long press), the six LEDs through PIO (WS2812 timing), 100 Hz |
+| 0 | `ui::run` | The MX key (debounced: press / long press), the six or seven LEDs through PIO (WS2812 timing), 100 Hz |
 | 0 | `power::monitor`, `power::port_power` ×3 | ADC: PWR VBUS, CC1/CC2, `PWR_ST`; front-port faults, enables and power cycles |
 | 0 | `storage::run`, `system::ticker`, `system::reboots` | Changed config and keymap items to flash (§4.8); engine timers and link error counts; reboots |
 | 0 | `update::run` | The A/B update writer and the `explicit_buy` of a new image (§4.9) |
@@ -152,7 +152,17 @@ in host mode (RP2350 datasheet §12.7).
 
 ### 4.3 Port manager
 
-One task per front port. Hub-0 ports 1/2/3 are Keyboard/Mouse/Other (schematic block 7).
+One task per front port. Hub-0 ports 1/2/3 are Keyboard/Mouse/Aux 2 (schematic block 7; Aux 2 was named Other up to
+board 0.18.0). Board 0.19.0 adds **Aux 1** on Hub-0's port 4 (strapped off before), between Mouse and Aux 2 on the
+front, without a router: it runs every mode but Passthrough (`Port::has_router`).
+
+**Which board** (0.1.67): one image serves every board. At boot, before any port is powered, `board::has_aux1` reads
+Aux 1's FAULT line (GPIO10) against the pad's pull-down: its 10 kΩ pull-up on 0.19.0 reads high, the unconnected pin
+of a board before reads low. With Aux 1 found, `Info` says hardware 0.19.0 and `caps::AUX1`, the port's task and
+power task run, and the LED chain has seven LEDs; without it, hardware 0.12.0, three ports and six LEDs as before.
+The engine (`Engine::has_port`) and the host software (`Snapshot::has_port`) leave Aux 1 out of the diagnostics, the
+lists of ports and devices, and `odkvmctl port aux1` on a board without it. A FAULT line stuck low on a 0.19.0 board
+would make it look like an older one (three ports, its Aux 1 unused).
 
 ```
 Empty ─attach─► Probing ─descriptors read─► decide mode ─┬─► Hosted (Normalized | Mirrored | Mirrored+identity | Off)
@@ -160,11 +170,14 @@ Empty ─attach─► Probing ─descriptors read─► decide mode ─┬─►
   └──────────── detach / over-current / re-detect ◄───────────────────────────────────┘
 ```
 
-**Devices, modes and routings** (`ctrl::Device`, `ctrl::Routing`). The KVM routes seven devices: the three front
-ports' and the four Bluetooth device slots' (§4.13). Each has, in every profile, a **mode** and a **routing**:
+**Devices, modes and routings** (`ctrl::Device`, `ctrl::Routing`). The KVM routes eight devices: the four front
+ports' (Aux 1 only on a board with it) and the four Bluetooth device slots' (§4.13). Each has, in every profile, a
+**mode** and a **routing**:
 - **Mode:** Auto, Normalized, Mirrored, Mirrored + identity, Passthrough, or Off (its input goes nowhere; a front
-  port's device stays powered and hosted). A Bluetooth device takes Auto (which is Normalized for it), Normalized and
-  Off: it only ever reaches the KVM as reports.
+  port's device stays powered and hosted). Aux 1 takes every mode but Passthrough: where another port would fall back
+  to it (a non-HID device, no mirror endpoints left), Aux 1 runs Normalized if the device has keys, buttons or axes the
+  KVM reads, else Off (`AutoReason::NeedsPassthrough`). The default *gaming* profile leaves it in Auto. A Bluetooth
+  device takes Auto (which is Normalized for it), Normalized and Off: it only ever reaches the KVM as reports.
 - **Routing:** *follow* the active target (a PC or a Bluetooth host), or be *pinned* to one host whichever is active.
   A device in passthrough is pinned to a PC, or follows the active PC (the home PC while a Bluetooth host is active):
   a pin to a Bluetooth host makes it follow, as its USB can only reach a PC.
@@ -183,7 +196,7 @@ keyboard's LEDs are its target's.
   - Hub-0 runs at full speed, so a high-speed device is probed at full speed; only a high-speed device answers
     GET_DESCRIPTOR(DEVICE_QUALIFIER) there. A port in passthrough reports the speed on the PC's hub instead: high for
     such a device, unless that hub's own link to the PC (the AT32F405's) is full speed. Until 0.1.11 it showed
-    Hub-0's full speed (first board, 2026-11-12, a USB 2.0 flash drive on Other).
+    Hub-0's full speed (first board, 2026-11-12, a USB 2.0 flash drive on Aux 2, then named Other).
 - **Auto policy** is design.md §4 verbatim, as a pure function with unit tests.
 - **XInput pads** (`kvm_hid::xinput`, no report descriptor): a wired pad (interface 0xFF/0x5D/0x01) is mirrored by
   Auto, and normalized when set so. A wireless receiver (one interface 0xFF/0x5D/0x81 per pad, each with a headset
@@ -208,7 +221,7 @@ keyboard's LEDs are its target's.
   - On a PC switch, a port that follows the active PC is routed straight to the new PC (it re-enumerates there anyway).
     A port pinned to a PC stays; a change of its pin flips the router once (`PortSlot::routed`).
   - The KVM can no longer see the device, so it doesn't notice an unplug. Swapping devices on a passthrough port
-    therefore needs a re-probe: `odkvmctl port other redetect`, or a mode change. When no device comes on Hub-0
+    therefore needs a re-probe: `odkvmctl port aux2 redetect`, or a mode change. When no device comes on Hub-0
     within 2 s of it (`REPROBE_MS`), the port is empty; until 0.1.11 it stayed probing (blinking yellow) for good.
   - A re-probe unplugs the device on its data lines (the router off for 250 ms) and plugs it into Hub-0, whose port
     reset restarts it; VBUS stays on. Until 0.1.6 it cycled VBUS for 300 ms, which is no power-off: the port's 220 µF
@@ -249,7 +262,7 @@ hotkeys also work on a mirrored keyboard.
     it is, as `SetActive` does;
   - next / previous profile (`next-profile`, `prev-profile`), among those in use; select profile 0–7
     (`select-profile0`–`7`), ignored while it isn't in use;
-  - cycle the Other port's mode and routing (`other-port`), as the KVM's key can.
+  - cycle the Aux 2 port's mode and routing (`aux2-port`), as the KVM's key can.
 
   Like the key, a hotkey works whatever the software locks say (`Origin::Device`).
 - **Learning** (`hotkey::Learner`, request `LearnHotkey`): the KVM learns a hotkey from the keys pressed. It reads the
@@ -280,7 +293,7 @@ hotkeys also work on a mirrored keyboard.
 - **Key** (`KEY`, GPIO11, MX switch to GND with 100 nF; internal pull-up, so active low): debounced for 10 ms. A press
   shorter than 600 ms (tap) and one held for `long-press-ms` (long press: 1 s by default, 0.8–3 s; it fires while the
   key is still down) do what the settings `key-tap` and `key-long` say (§8.3):
-  toggle the PC (the tap's default), select the next profile in use (the long press's default), cycle the Other port's
+  toggle the PC (the tap's default), select the next profile in use (the long press's default), cycle the Aux 2 port's
   mode and routing in the active profile (Auto → passthrough following the active PC → pinned to PC1 → pinned to PC2
   → Auto, in one step: the router flips once), or nothing. For 1.5 s after the active profile changes, the five front
   LEDs count its number from the left: in white for profiles 0–4 (one LED for profile 0), in cyan for 5–7 (one for
@@ -293,12 +306,14 @@ hotkeys also work on a mirrored keyboard.
   locked, but only arms the key: the answer is `NeedsKeyPress`, and a tap within 30 s (`engine::UNLOCK_WAIT_MS`) turns
   it on, as a change made at the device. Turning it off again meanwhile withdraws the request. The key held at
   power-up turns both on (`Engine::allow_software`, called from `main` along with the AT32F405 retry).
-- **LEDs** (`LED_DATA`, GPIO15, through the 74AHCT1G125): chain order PC1, Keyboard, Mouse, Other, PC2 (the
-  side-emitting front LEDs, left to right), then the key LED (SK6812MINI-E) last, so a missing or damaged hand-fitted
-  key LED leaves the others working (analysis.md finding 8; `kvm-core::leds::chain`). PIO program with WS2812/SK6812
-  timing, 100 Hz refresh for breathing effects. The meaning of each colour is in design.md §7.
-- **Brightness** defaults to 32/255: at full brightness the six LEDs draw up to 0.22 A of a PC port's budget
-  (analysis.md finding 6). `odkvmctl config set led-brightness` changes it.
+- **LEDs** (`LED_DATA`, GPIO15, through the 74AHCT1G125): chain order PC1, Keyboard, Mouse, Aux 1 (0.19.0 on), Aux 2,
+  PC2 (the side-emitting front LEDs, left to right), then the key LED (SK6812MINI-E) last, so a missing or damaged
+  hand-fitted key LED leaves the others working (analysis.md finding 8; `kvm-core::leds::chain`). `leds::render` always
+  gives seven colours: on a board without Aux 1 it closes the gap, so the key is the sixth and the seventh colour goes
+  nowhere. A new profile is counted on the front LEDs as before, five white then cyan, on either board. PIO program
+  with WS2812/SK6812 timing, 100 Hz refresh for breathing effects. The meaning of each colour is in design.md §7.
+- **Brightness** defaults to 32/255: at full brightness the six LEDs draw up to 0.22 A of a PC port's budget, the
+  seven of 0.19.0 up to 0.26 A (analysis.md finding 6). `odkvmctl config set led-brightness` changes it.
 
 ### 4.7 Power and faults
 
@@ -307,8 +322,11 @@ hotkeys also work on a mirrored keyboard.
   The PC ports' CC and VBUS are measured by the AT32F405s and arrive in their status messages.
 - `PWR_ST` (GPIO1): high = the PWR port is powering the board (TPS2121 IN1), low = PC bus (IN2).
 - **Front ports** (TPS2553 + TS3USB3031 each): Keyboard GPIO20–23 and Mouse GPIO24–27, in the order SEL0, SEL1, EN,
-  FAULT; Other SEL0 GPIO34, SEL1 GPIO37, EN GPIO32, FAULT GPIO33 (the RP2354B's south-east corner, facing that port).
-  FAULT is active low with a 10 kΩ pull-up. A fault switches the port off for 1 s, then retries.
+  FAULT; Aux 2 SEL0 GPIO34, SEL1 GPIO37, EN GPIO32, FAULT GPIO33 (the RP2354B's south-east corner, facing that port);
+  Aux 1 (0.19.0, TPS2553 only) EN GPIO8, FAULT GPIO10. FAULT is active low with a 10 kΩ pull-up. A fault switches the
+  port off for 1 s, then retries.
+- **Replugging** a device (re-detect, a failed probe, taking it back from passthrough) takes the router off Hub-0 for
+  250 ms with VBUS on. Aux 1 has no router: it is replugged by its power, off for 1 s.
 - **CC voltage across Rd (5.1 kΩ) → advertised current:** < 0.2 V nothing, 0.2–0.66 V default USB, 0.66–1.23 V 1.5 A,
   > 1.23 V 3.0 A.
 - **Supply, measured** (`kvm-core::supply`, firmware 0.1.28): the board measures no current, and a PC
@@ -366,9 +384,10 @@ items in a **log-structured key-value store**
   `endurance_with_the_firmware_items` with everything the firmware stores at its largest (the 4 keymaps' 32 layers and
   axis rules, 16 known devices' calibrations and field overrides, a full macro buffer, Vial's tap dances, combos, key
   overrides and alternate repeat keys, the records and the four arrangements with every screen slot used: 29.3 KB
-  carried around the ring) and the config at its largest (800 bytes, `config::ITEM_MAX`: 752 with everything set, 720
-  with the defaults, as all eight profiles' names, modes, routings, keymaps and fallback keymaps and the six hosts'
-  keyboard layouts are written; the arrangements have items of their own): each sector is erased once per 266 config
+  carried around the ring) and the config at its largest (808 bytes, `config::ITEM_MAX`, the most that still packs
+  five into a sector: 784 with everything set, 752 with the defaults, as all eight profiles' names, the eight
+  devices' modes and routings, keymaps and fallback keymaps and the six hosts' keyboard layouts are written; the
+  arrangements have items of their own; 0.1.67 added the Aux 1 device): each sector is erased once per 266 config
   saves, the 61 within one cycle of each other, so 26.7 million saves before the first sector reaches its rated cycles
   (17 sectors before 0.1.51, with one keymap: 74 saves, 7.5 million). Paced, that is about 50 years of a script
   saving once a minute day and night; set up by hand, it doesn't wear out.
@@ -515,7 +534,7 @@ The self-test (`selftest.rs`, design.md §10 step 1.5) runs at every boot and re
 - **LED code:** while it runs, one white LED walks along the chain. For 5 s after it ends, each LED shows its part of
   the result, green for passed and blinking red for failed:
   - PC1 / PC2: that PC's link, hub and AT32F405 firmware;
-  - Keyboard / Mouse / Other: the port's power switch;
+  - Keyboard / Mouse / Aux 2: the port's power switch;
   - key: Hub-0, the PWR-port readings and the Bluetooth module's firmware.
 - **The red key:** after the self-test, while any fault in `selftest::ON_KEY` remains, the key LED blinks red,
   alternating with the active PC's colour, and in standby too (red and dark): Hub-0 missing, the PWR-port readings,
@@ -577,7 +596,7 @@ only serve the interfaces. Since 0.1.51; before, the keymap was the keyboard's o
   around the centre, in 256ths; a trigger has no centre. Applied to the device's reports before they are merged.
 - **The KVM's actions** (0x7E0C–0x7E1F, `KVM_ACTION`, milestone 4): the hotkey list's actions as keycodes, in its
   order (the other PC, next and previous host, PC1, PC2, Bluetooth hosts 1–4, next and previous profile, profiles 0–7,
-  the Other port's mode), so a mouse or gamepad button switches the PC as a hotkey does. They fill QMK's keyboard
+  the Aux 2 port's mode), so a mouse or gamepad button switches the PC as a hotkey does. They fill QMK's keyboard
   range after mouse buttons 9–16 and the d-pad (0x7E00–0x7E0B), which the Vial definition names as Vial's custom
   keycodes (`build.rs`: BTN9…, DPAD_U…, PC_TOG, PC1, HOST1, PROF0, …), so Vial offers them too. The engine does an
   action once the steps before it reached the host (`Step::Kvm`).
@@ -695,7 +714,7 @@ saved: after a power loss the KVM finds the running PC again from the PCs' state
   - *Wake standby* (`standby-wake`, default on) while the active PC sleeps and allows remote wakeup: the front ports
     with a keyboard or mouse, and the empty ones, stay powered (chosen when standby starts), the others switch off;
     Hub-0 runs; the LEDs are off.
-  - *Deep standby* otherwise: all three front ports off, Hub-0 held in reset (`power::HUB0_HELD` keeps the hub task's
+  - *Deep standby* otherwise: all front ports off, Hub-0 held in reset (`power::HUB0_HELD` keeps the hub task's
     recovery from releasing it), LEDs off.
   - `standby-glow` (default off): instead of all LEDs going dark, the key LED breathes slowly in the active PC's
     colour, between a quarter and the full set brightness.
@@ -1098,13 +1117,13 @@ only a Bluetooth host can be configured without a cable (§8.1 "Over Bluetooth" 
 the version from its `Hello`, the UART exchanges that failed (`bt::LINK_ERRORS`) and the hosts connected; while there
 are any, the hosts whose notification settings the module holds in RAM (`BT_SETTINGS_HELD`, orange).
 
-**On hardware** (2026-11-14, the first 0.12.0 board with an ESP32-C3 board on its Other port): the dongle is found,
+**On hardware** (2026-11-14, the first 0.12.0 board with an ESP32-C3 board on its Other port, now Aux 2): the dongle is found,
 programmed from blank and updated over USB (interrupt slots, DTR/RTS into the ROM, the watchdog restart out of it),
 pairs with the passkey typed on the KVM's keyboard, takes input when switched to, and takes part in screen hop. Mouse
 to host 5–10 ms at the host's 15 ms connection interval, against 1 ms over USB. **Unverified** (no module on a board
 yet): the UART link at 3 Mbaud, the UART break as a way into the ROM of a blank module, the ROM's FLASH_END reboot;
 and several hosts at once. Host side and engine are tested on the PC
-(`kvm-core` engine tests, the simulator with `OPENDYN_SIM_BT=1`, or `OPENDYN_SIM_BT=dongle` for a board on the Other
+(`kvm-core` engine tests, the simulator with `OPENDYN_SIM_BT=1`, or `OPENDYN_SIM_BT=dongle` for a board on the Aux 2
 port).
 
 **The ESP32 module** (`firmware/esp32`, `kvm-classic`, 0.1.53). An original ESP32 is dual mode, so it is a Bluetooth
@@ -1531,7 +1550,7 @@ yet); events use request id 0.
 
 | Request | Response |
 |---|---|
-| 0x01 `GetInfo` | protocol version (15), firmware versions (RP2354B, AT32F405 ×2), hardware version (u32, packed like the firmware's), serial, capability bits (`BLUETOOTH` when the module answers); then the Bluetooth module's firmware version |
+| 0x01 `GetInfo` | protocol version (16), firmware versions (RP2354B, AT32F405 ×2), hardware version (u32, packed like the firmware's: 0.19.0 on a board with the Aux 1 port, else 0.12.0, §4.3), serial, capability bits (`BLUETOOTH` when the module answers, `AUX1` on a board with the Aux 1 port); then the Bluetooth module's firmware version |
 | 0x02 `GetStatus` | active PC, **which PC is asking**, link state of each PC, power source, advertised current, budget, lock bits, uptime, link errors, self-test bits 0–15 (§4.10); then the Bluetooth host that gets input, the hosts ready and bonded (bit masks), seconds of pairing left, the host waiting for a passkey, the module's state, and self-test bits 16–31; then screen hop's state (off, on, or what it needs) and the pointer's place in the arrangement (two i16); then the supply judged from its measured 5 V (unknown, good, sags, low), its voltage now and lowest in the last minute, and what the front devices declare (§4.7); then the Bluetooth devices bonded and ready (bit masks), seconds of looking for devices left, how many found, how far pairing a device got, and the passkey to type on it |
 | 0x03 `GetPort` | state, mode setting and effective mode, where its input goes now (a host, or none), Auto reason, VID:PID, speed, interface classes, report rate, faults |
 | 0x04 `GetPortString` | manufacturer or product string of a port's device (UTF-8, ≤ 58 bytes) |
@@ -1584,14 +1603,14 @@ yet); events use request id 0.
 | Key | Value |
 |---|---|
 | 0x0004 | double-tap window (ms) |
-| 0x0005 / 0x0006 | what a tap / a long press on the KVM's key does: nothing, toggle PC (tap's default), next profile (long press's default), cycle the Other port's mode and routing (§4.6) |
+| 0x0005 / 0x0006 | what a tap / a long press on the KVM's key does: nothing, toggle PC (tap's default), next profile (long press's default), cycle the Aux 2 port's mode and routing (§4.6) |
 | 0x0007 | how long the key is held for a long press: 800–3000 ms (default 1000) |
 | 0x0010 | LED brightness |
 | 0x0011 / 0x0012 | PC1 / PC2 colour |
 | 0x0020 | PC-side polling: 125 µs or 1 ms |
 | 0x0021 | VBUS power cycle when a passthrough port switches |
-| 0x0030–0x0036 | mode of each device in the active profile (`Device` order: the Keyboard, Mouse and Other ports, Bluetooth devices 1–4): auto, normalized, mirrored, mirrored + identity, passthrough, off (a Bluetooth device: auto, normalized, off) |
-| 0x0038–0x003E | routing of each device in the active profile: 0 follow, 1 + a host's index pinned to it (PC1, PC2, Bluetooth hosts 1–4) |
+| 0x0030–0x0037 | mode of each device in the active profile (`Device` order: the Keyboard, Mouse, Aux 1 and Aux 2 ports, Bluetooth devices 1–4; Aux 1 is kept on a board without it too): auto, normalized, mirrored, mirrored + identity, passthrough, off (Aux 1: all but passthrough; a Bluetooth device: auto, normalized, off) |
+| 0x0038–0x003F | routing of each device in the active profile: 0 follow, 1 + a host's index pinned to it (PC1, PC2, Bluetooth hosts 1–4) |
 | 0x0040 | software switching allowed; from software only **off**: turning it on answers `NeedsKeyPress` and waits 30 s for a tap on the key (§4.6) |
 | 0x0041 | software configuration allowed (likewise; asking for it back works while it is off) |
 | 0x0050 | Vial interface: off / on / auto (§4.11) |
@@ -1634,7 +1653,9 @@ are there.
 `GetDiag` returns the KVM's measurements, each graded by the firmware: good (green), warning (orange), bad (red), or
 no grade (a count, a setting, or a part that is off). The firmware grades because only it knows the limits and the
 context, and a host that doesn't know an item still shows its grade and number. Ids, names and units are in
-`kvm_proto::ctrl::diag`, the limits and their sources in `kvm_core::diag`.
+`kvm_proto::ctrl::diag`, the limits and their sources in `kvm_core::diag`. An id's high nibble is its group; the USB
+and Power groups were full, so Aux 1's two items (0.19.0 on, left out on a board without it) are 0x70 and 0x80, and
+0x6x continues the Bluetooth group.
 
 | Group | Items | Where from |
 |---|---|---|
@@ -1686,7 +1707,7 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     KVM holds, as hex, and what the parser makes of it, run on the PC: to send along when a device shows as not
     supported), `device log` (the module's recent log as the KVM keeps it: connections, pairing, why a
     device was let go) (§4.13);
-  - `odkvmctl port <keyboard|mouse|other> [mode <…>|route <…>|redetect]`;
+  - `odkvmctl port <keyboard|mouse|aux1|aux2> [mode <…>|route <…>|redetect]` (`aux1` only on a board with it);
   - `odkvmctl profile` (list: each device's mode, and its pin where it has one), `odkvmctl profile
     next|<number>|<name>` (make it active), `odkvmctl profile <number|name> name <text>`, `odkvmctl profile
     <number|name> <device> <mode|-> [<routing>]` (a device: `keyboard`, `mouse`, `other`, `wireless1`–`4`; `-` keeps
@@ -1748,17 +1769,18 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     `pc1 2560x1440 150% at 1920,0 desk 0,0` (`pc1`, `pc2` or `host1`–`host4`; scaling and positions may be left out;
     `no-hop` for a screen off for hop, `fixed` for a place on its computer that dragging doesn't change) or `off`.
     `odkvmctl status` has a screen-hop line.
-  - `--sim` runs any command against a built-in simulated device (`OPENDYN_SIM_HOP=1`: with screen hop set up, two
+  - `--sim` runs any command against a built-in simulated device, a 0.19.0 board with a media dial on Aux 1
+    (`OPENDYN_SIM_BOARD=0.12`: a board before it, three ports; `OPENDYN_SIM_HOP=1`: with screen hop set up, two
     arrangements and, with `OPENDYN_SIM_BT=1`, the tablet of host 1 in both; `OPENDYN_SIM_PAD=1`, `receiver` or
     `symmetric`: a generic gamepad, a wireless receiver with a pad linked, or a symmetric-stick pad with a touch pad on
-    the Other port instead of the webcam, Normalized, with the virtual gamepad on).
+    the Aux 2 port instead of the webcam, Normalized, with the virtual gamepad on).
 - **GUI** (`opendyn-kvm`), laid out after Creative's Sound Blaster app: a sidebar with the logo, coloured page icons
   and, at its foot, the quick controls (profile, PC1 / PC2 in the KVM's LED colours, LED brightness, dark / light), and
   the pages as rounded cards. The accent colour is the active PC's. Pages:
   - *Overview*: the two PCs (active one highlighted, which one this computer is, link and VBUS, switch button), the
     front ports in one line each, power, recent events;
   - *Ports*: a tab per profile in use (the active one bold in the accent colour), and in the tab: its name, its
-    screen-hop arrangement, *Make active*, and a block per device: the three front ports and each Bluetooth device
+    screen-hop arrangement, *Make active*, and a block per device: the board's front ports and each Bluetooth device
     that holds a bond (a free slot is nothing to set). Its row has the device (its state, its product or name), its
     mode, where its input goes (following the active host, or pinned to PC1, PC2 or a paired wireless host: in
     passthrough the PCs only, and the routing is off for a device that is off) and re-detect; under the row, across

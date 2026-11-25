@@ -185,7 +185,7 @@ const CUSTOM: [(&str, &str); 32] = [
     ("PROF5", "KVM: profile 5"),
     ("PROF6", "KVM: profile 6"),
     ("PROF7", "KVM: profile 7"),
-    ("OTHER", "KVM: the Other port's mode"),
+    ("AUX2", "KVM: the Aux 2 port's mode"),
 ];
 
 fn main() {

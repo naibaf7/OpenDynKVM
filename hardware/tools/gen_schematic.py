@@ -54,6 +54,7 @@ RES = {
     '12k': ('C25752', '0402WGF1202TCE'), '22k': ('C25768', '0402WGF2202TCE'),
     '33k': ('C25779', '0402WGF3302TCE'),
     '47k': ('C25792', '0402WGF4702TCE'), '100k': ('C25741', '0402WGF1003TCE'),
+    '100R': ('C25076', '0402WGF1000TCE'), '200k': ('C25764', '0402WGF2003TCE'),   # 0.19.0, block 18 (checked 2026-11-25)
 }
 CAP = {
     '15pF': ('C1548', '0402CG150J500NT', C0402),
@@ -252,7 +253,7 @@ GPIO = {
     # crossing them (EN and FAULT nearest the corner: the power switch lies west of the router)
     20: 'KB_SEL0', 21: 'KB_SEL1', 22: 'KB_EN', 23: 'KB_FLT',
     24: 'MS_SEL0', 25: 'MS_SEL1', 26: 'MS_EN', 27: 'MS_FLT',
-    32: 'OT_EN', 33: 'OT_FLT', 34: 'OT_SEL0', 37: 'OT_SEL1',
+    32: 'A2_EN', 33: 'A2_FLT', 34: 'A2_SEL0', 37: 'A2_SEL1',
     # Hub-0 reset and VBUS_DET on GPIO2/3 (pins 79/80, the corner facing Hub-0); same pad type and reset state
     # (Digital IO (FT), pull-down) as any other bank 0 GPIO
     2: 'HUB0_RST', 3: 'HUB0_VBUS',
@@ -277,6 +278,10 @@ GPIO = {
     # crystal's B.Cu run, and re-laying the south row's lines with it (UART, OT_EN, RUN, SWD, six orders and worker
     # counts) always left one of them unrouted (2026-11-14).
     9: 'ESP_RST',
+    # 0.19.0: the last five free pins that route (GPIO4/5/7/8/10, together at the top of the west side; GPIO30/31 by the
+    # UART never route, see above).  GPIO4/5 are I2C0's SDA/SCL (also UART1 TX/RX, PWM2 A/B, any PIO) for the rear
+    # extension connector (block 18), GPIO7 switches its 3.3 V; GPIO8/10 are the Aux 1 port's power switch (block 17).
+    4: 'EXT_SDA_RP', 5: 'EXT_SCL_RP', 7: 'EXT_EN', 8: 'A1_EN', 10: 'A1_FLT',
 }
 rp = {'81': 'GND'}
 rp_pins = {  # QFN-80 pin -> GPIO number
@@ -389,17 +394,17 @@ def hub(h, up, ds, vbus_det, rst, non_rem_port1):
 
 
 block(7)
+# Port 4 is the Aux 1 front port since 0.19.0 (block 17): straight to its USB-A through the port's ESD, no switch - the
+# PC hubs have no fifth port for a passthrough.  Up to 0.18.0 it was unused, D+/D- strapped high (R707/R708).
 hub(0, ('H0_UP_DP', 'H0_UP_DM'),
-    [('H0_KB_DP', 'H0_KB_DM'), ('H0_MS_DP', 'H0_MS_DM'), ('H0_OT_DP', 'H0_OT_DM'), ('H0_D4_DP', 'H0_D4_DM')],
+    [('H0_KB_DP', 'H0_KB_DM'), ('H0_MS_DP', 'H0_MS_DM'), ('H0_A2_DP', 'H0_A2_DM'), ('A1_DP', 'A1_DM')],
     'HUB0_VBUS', 'HUB0_RST', False)
-R('10k', 'H0_D4_DP', '+3V3')                          # port 4 unused: disabled by strap
-R('10k', 'H0_D4_DM', '+3V3')
 # Hub ports follow where the lanes leave each hub on the board (all hubs sit identically under their USB-C,
 # ports facing south).  AT32 #1 sits right of Hub-1 -> port 4 (east end); AT32 #2 sits left of Hub-2 -> port 1
 # (west end, non-removable).  The strap can only mark port 1; the flag only affects the hub descriptor.
 for n, at_port in ((1, 4), (2, 1)):
     block(7 + n)
-    fronts = [(f'H{n}_{p}_DP', f'H{n}_{p}_DM') for p in ('KB', 'MS', 'OT')]
+    fronts = [(f'H{n}_{p}_DP', f'H{n}_{p}_DM') for p in ('KB', 'MS', 'A2')]
     at = (f'H{n}_AT_DP', f'H{n}_AT_DM')
     hub(n, (f'PC{n}_DP', f'PC{n}_DM'), fronts + [at] if at_port == 4 else [at] + fronts,
         f'VDET_PC{n}', f'HUB{n}_RST', at_port == 1)
@@ -430,7 +435,8 @@ for n in (1, 2):
     R('10k', f'CC2_PC{n}', f'AT{n}_CC2')
 
 # ══ 12-14. Front ports: USB-A, ESD, 1:3 router, current-limited VBUS ═══════════
-for k, (p, label) in enumerate([('KB', 'Keyboard'), ('MS', 'Mouse'), ('OT', 'Other')]):
+# Aux 2 (block 14, nets A2_*) was the Other port (OT_*) up to 0.18.0; the new port without a router is Aux 1 (block 17).
+for k, (p, label) in enumerate([('KB', 'Keyboard'), ('MS', 'Mouse'), ('A2', 'Aux 2')]):
     block(12 + k)
     part('J', 'Connector:USB_A', f'USB-A {label}', 'Connector_USB:USB_A_Molex_67643_Horizontal',
          {'1': f'VBUS_{p}', '2': f'{p}_DM', '3': f'{p}_DP', '4': 'GND', 'SH': 'GND'}, lcsc='C2798029', mpn='676430910')
@@ -470,59 +476,104 @@ part('U', '74xGxx:74AHCT1G125', '74AHCT1G125', SOT235,
      {'5': '+5V', '3': 'GND', '1': 'GND', '2': 'LED_DATA', '4': 'LED_BUF'}, lcsc='C7484', mpn='SN74AHCT1G125DBVR')
 R('33R', 'LED_BUF', 'LED_D0')                         # damps ringing on the long run into the chain
 C('100nF', '+5V')
-# chain: front edge left to right (PC1, KB, MS, OT, PC2, side-emitting), then the key LED under the MX switch.
-# The key LED comes last, so the status LEDs work with it missing or damaged.
+# chain: front edge left to right (PC1, KB, MS, A1, A2, PC2, side-emitting; the four port LEDs on the bottom, under
+# their USB-A, since 0.19.0), then the key LED under the MX switch.  The key LED comes last, so the status LEDs work
+# with it missing or damaged.
+LED_NAMES = ['PC1', 'KB', 'MS', 'A1', 'A2', 'PC2']
 part('D', 'LED:SK6812MINI-E', 'SK6812MINI-E', 'LED_SMD:LED_SK6812MINI-E_3.2x2.8mm_P1.5mm_ReverseMount',
-     {'3': '+5V', '1': 'GND', '2': 'LED_D5', '4': None}, lcsc='C5149201', mpn='SK6812MINI-E')
+     {'3': '+5V', '1': 'GND', '2': f'LED_D{len(LED_NAMES)}', '4': None}, lcsc='C5149201', mpn='SK6812MINI-E')
 C('100nF', '+5V')
-for k, name in enumerate(['PC1', 'KB', 'MS', 'OT', 'PC2']):
+for k, name in enumerate(LED_NAMES):
     part('D', 'KVM:SK6812SIDE-A', f'LED {name}', 'CustomFootprints:LED_SK6812SIDE-A_4.0x1.6mm',
          {'2': '+5V', '4': 'GND', '1': f'LED_D{k}', '3': f'LED_D{k + 1}'}, lcsc='C5378721', mpn='SK6812SIDE-A')
     C('100nF', '+5V')
 for k in range(4):
     part('H', 'Mechanical:MountingHole', 'M3', 'MountingHole:MountingHole_3.2mm_M3', {}, in_bom=False)
 
-# ══ 16. Bluetooth LE coprocessor: ESP32-C3-MINI-1 (0.16.0, fitted on the BT variant only) ══════════════════
+# ══ 16. Bluetooth coprocessor: ESP32-MINI-1 (0.19.0, fitted on the BT variant only) ══════════════════════════════════
 block(16)
 fit('BT')
-# Bluetooth LE keyboard and mouse towards extra PCs, tablets and phones (design.md 13).  The RP2354B talks to it over
-# UART0 (ESP_RXD = the RP's TX into the module's RXD0, ESP_TXD the other way, both on the module's UART0 pins, which
-# are also its ROM bootloader's) and reprograms it from its own image, as it does the AT32F405s.
-# Strapping (datasheet section 4): IO2 and IO8 high (pull-ups here, both float otherwise); IO9 low at reset = UART
-# download, high = boot from flash.  IO9 is on ESP_RXD: the line idles high (the UART's idle level, and R1604 before
-# the RP2354B drives it), so the module boots its firmware; the RP2354B holds the line low (a UART break) across a
-# reset to get the ROM bootloader - a blank module resets over and over by itself, a programmed one restarts into its
-# ROM on a link command (software.md 4.13).  After reset IO9 is only an input the firmware never drives.
-# EN: Espressif's 10 k / 1 uF delay (datasheet section 9) for power-on, and from 0.18.0 the RP2354B's GPIO9 (ESP_RST)
-# through 1 k: driven low, EN sits at 0.3 V (reset below 0.25 x VDD = 0.83 V), and the pin's current stays at 3.3 mA
-# while it empties the 1 uF (1 ms).
+# Bluetooth Classic and LE keyboards, mice and pads, and Bluetooth LE hosts (design.md 16).  0.16.0-0.18.0 had an
+# ESP32-C3-MINI-1 here (LE only); the original ESP32 is the one chip that also does Classic (the 5-series pad), and the
+# same firmware runs it as on the HUZZAH32 stand-in (firmware/esp32).  The RP2354B talks to it over UART0 (ESP_RXD = the
+# RP's TX into the module's RXD0 = IO3, ESP_TXD = its TXD0 = IO1 back, the ROM bootloader's pins too) and reprograms it
+# with the image the host software streams (software.md 4.13).
+# Strapping (datasheet section 4): IO0 low at reset = UART download, high (its own pull-up) = boot from flash; IO2 must be
+# low or floating for the download (internal pull-down: left open); MTDI (IO12) low = 3.3 V flash (internal pull-down:
+# left open); MTDO (IO15) and IO5 keep their pull-ups (the ROM logs on TXD0, which the RP2354B reads past).
+# IO0 is on ESP_RXD, as the ESP32-C3's IO9 was (software.md 4.13): the line idles high (the UART's idle level, and R1602
+# before the RP2354B drives it), so the module boots its firmware; the RP2354B holds it low (a UART break) across a reset
+# on EN to get the ROM bootloader.  After reset IO0 is only an input the firmware never drives.
+# EN: Espressif's RC (datasheet figure 10, R1 / C3: 10 k / 1 uF) for power-on, and the RP2354B's GPIO9 (ESP_RST) through
+# 1 k: driven low, EN sits at 0.3 V, and the pin's current stays at 3.3 mA while it empties the 1 uF (1 ms).
 # The RP2354B's pads come out of reset with a pull-down, 36-113 k at 3.3 V (RP2350 datasheet, pad table), which the
-# firmware turns off at the start of main.  Until then (its boot ROM, BOOTSEL, a debugger holding it in reset):
-# - EN sits at 2.60-2.98 V against the 10 k + 1 k, above the module's reset release (0.75 x VDD = 2.48 V).
-# - IO9 sits at 2.93-3.17 V against R1604 (5.1 k with the chip's own 45 k), above its high level (also 0.75 x VDD).
-#   IO9 is sampled at every power-up, usually while the RP2354B is still booting.  R1604 was 10 k until 0.18.0, which
-#   left 2.69 V at the pull-down's low end; 5.1 k is the board's CC resistor, no new part.
-# Power: 3.3 V from the TLV62569; Bluetooth LE TX at the +9 dBm the firmware allows peaks at 190 mA (table 6-5), so the
-# module gets its 10 uF + 100 nF right at its 3V3 pad (budget: design.md 6.1).
-esp = {'3': '+3V3', '8': 'ESP_EN', '30': 'ESP_RXD', '31': 'ESP_TXD', '5': 'ESP_IO2', '22': 'ESP_IO8', '23': 'ESP_RXD',
-       '6': 'ESP_LOG'}
-for n in (1, 2, 11, 14, *range(36, 54)):
+# firmware turns off at the start of main.  Until then (its boot ROM, BOOTSEL, a debugger holding it in reset) EN sits at
+# 2.60-2.98 V against the 10 k + 1 k, and IO0 at 2.93-3.17 V against R1602 (5.1 k with the chip's own ~45 k pull-up),
+# both above the ESP32's high level (0.75 x VDD = 2.48 V).  Without R1602, IO0 would sit near 1.5 V while the RP2354B
+# boots, and the module could start in its ROM.
+# Power: 3.3 V from the TLV62569, with Espressif's 22 uF + 100 nF at the 3V3 pad (datasheet figure 10).  The firmware
+# runs Bluetooth only; the module's worst case is Wi-Fi's 379 mA (table 16).  Budget: design.md 6.1.
+esp = {'3': '+3V3', '8': 'ESP_EN', '35': 'ESP_RXD', '36': 'ESP_TXD', '21': 'ESP_RXD', '22': 'ESP_LOG'}
+for n in (1, 2, 27, *range(38, 56)):
     esp[str(n)] = 'GND'
-for n in (12, 13, 16, 18, 19, 20, 21, 26, 27, 4, 7, 9, 10, 15, 17, 24, 25, 28, 29, 32, 33, 34, 35):
+for n in (4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 23, 24, 25, 26, 28, 29, 30, 31, 32, 33, 34, 37):
     esp[str(n)] = None
-part('U', 'KVM:ESP32-C3-MINI-1', 'ESP32-C3-MINI-1', 'CustomFootprints:ESP32-C3-MINI-1', esp,
-     lcsc='C41349510', mpn='ESP32-C3-MINI-1-H4X')
-C('10uF', '+3V3')
+part('U', 'KVM:ESP32-MINI-1', 'ESP32-MINI-1', 'CustomFootprints:ESP32-MINI-1', esp,
+     lcsc='C2980305', mpn='ESP32-MINI-1-N4')
+C('22uF', '+3V3')
 C('100nF', '+3V3')
 R('10k', '+3V3', 'ESP_EN')
 C('1uF', 'ESP_EN')
-R('10k', '+3V3', 'ESP_IO2')
-R('10k', '+3V3', 'ESP_IO8')
-R('5.1k', '+3V3', 'ESP_RXD')                          # IO9 high (boot from flash) whatever the RP2354B's pad does
-R('1k', 'ESP_RST', 'ESP_EN')                          # 0.18.0: the RP2354B's reset line, at the EN pad's RC
+R('5.1k', '+3V3', 'ESP_RXD')                          # IO0 high (boot from flash) whatever the RP2354B's pad does
+R('1k', 'ESP_RST', 'ESP_EN')                          # the RP2354B's reset line, at the EN pad's RC
 fit(None)
-# the module's own log (its UART1 TX on IO3) on a test pad beside it, for bring-up without the RP2354B's help
+# a spare pin (IO4) on a test pad beside the module: a log of its own for bring-up without the RP2354B's help (the
+# firmware can put a UART's TX there; the ESP32-C3 had its log on IO3)
 part('TP', 'Connector:TestPoint', 'ESP LOG', 'TestPoint:TestPoint_Pad_D1.0mm', {'1': 'ESP_LOG'}, in_bom=False)
+
+# ══ 17. Front port: Aux 1 (0.19.0) - USB-A, ESD, current-limited VBUS, on Hub-0's port 4 ═══════════════════════════════
+block(17)
+# Normalized and mirrored only (design.md 4): its lines go straight to Hub-0's fourth port through the ESD, with no
+# 1:3 router - each PC hub has one port to its AT32F405 and three to the other routers, none left for a passthrough.
+# The same power switch, limit and bulk as the other three ports.
+part('J', 'Connector:USB_A', 'USB-A Aux 1', 'Connector_USB:USB_A_Molex_67643_Horizontal',
+     {'1': 'VBUS_A1', '2': 'A1_DM', '3': 'A1_DP', '4': 'GND', 'SH': 'GND'}, lcsc='C2798029', mpn='676430910')
+usblc6('A1_DM', 'A1_DP', 'VBUS_A1')
+part('U', 'KVM:TPS2553DBV', 'TPS2553', SOT236,
+     {'1': '+5V', '3': 'A1_EN', '6': 'VBUS_A1', '4': 'A1_FLT', '5': 'A1_ILIM', '2': 'GND'},
+     lcsc='C55266', mpn='TPS2553DBVR')
+C('1uF', '+5V')
+R('22k', 'A1_ILIM', 'GND')                            # ~1.18 A, the same as the other three ports
+R('10k', '+3V3', 'A1_FLT')
+R('100k', 'A1_EN', 'GND')                             # port unpowered until firmware enables it
+CP('VBUS_A1')                                         # >= 120 uF per port (USB 2.0 7.2.4.1), 10 V polymer
+
+# ══ 18. Rear extension connector (0.19.0): JST SH 4-pin, Qwiic / STEMMA QT pinout ═════════════════════════════════
+block(18)
+# GND, 3.3 V, SDA, SCL in SparkFun's Qwiic order.  The two lines are the RP2354B's GPIO4/5: I2C0 in hardware, and also
+# UART1, PWM or PIO, so the one connector takes I2C boards (buttons, joysticks, keypads, small displays; an RS-232 level
+# shifter for a video matrix on a PIO UART) or two plain inputs (assistive switches through a two-jack adapter).
+# Its 3.3 V comes through a current-limited switch, off until the firmware turns it on (GPIO7): a short on the connector
+# cannot pull down the 3.3 V rail every MCU runs from, and the firmware can power-cycle a hung I2C device.  R_ILIM 200 k:
+# 23950 / 200^0.977 = 136 mA nominal (TPS2553 datasheet, current-limit equations; 210 k is specified at 110-150 mA).
+# The pull-ups sit on that switched 3.3 V, so an accessory that is off is not fed through its I/O lines; ESD on both
+# lines and on the supply at the connector, 100 R in series towards the RP2354B's pins.
+part('J', 'Connector_Generic_MountingPin:Conn_01x04_MountingPin', 'EXT',
+     'Connector_JST:JST_SH_SM04B-SRSS-TB_1x04-1MP_P1.00mm_Horizontal',
+     {'1': 'GND', '2': 'EXT_3V3', '3': 'EXT_SDA', '4': 'EXT_SCL', 'MP': 'GND'},
+     lcsc='C160404', mpn='SM04B-SRSS-TB(LF)(SN)')
+part('U', 'KVM:TPS2553DBV', 'TPS2553', SOT236,
+     {'1': '+3V3', '3': 'EXT_EN', '6': 'EXT_3V3', '4': None, '5': 'EXT_ILIM', '2': 'GND'},
+     lcsc='C55266', mpn='TPS2553DBVR')
+C('1uF', '+3V3')
+R('200k', 'EXT_ILIM', 'GND')
+R('100k', 'EXT_EN', 'GND')                            # off until the firmware turns it on
+C('1uF', 'EXT_3V3')
+usblc6('EXT_SCL', 'EXT_SDA', 'EXT_3V3')               # SCL on channel 1 (west), SDA on channel 2, as the pins come
+R('4.7k', 'EXT_3V3', 'EXT_SDA')
+R('4.7k', 'EXT_3V3', 'EXT_SCL')
+R('100R', 'EXT_SDA_RP', 'EXT_SDA')
+R('100R', 'EXT_SCL_RP', 'EXT_SCL')
 
 # power flags: rails fed through passives (inductor, resistor) or from connectors
 FLAGS = ['GND', '+3V3', 'RP_VREG', 'VBUS_PC1', 'VBUS_PC2', 'VBUS_PWR']
@@ -534,16 +585,19 @@ BLOCK_TITLES = {
     6: '6. Service switch: RP2354B USB -> SERVICE port (S=0, default) / Hub-0 (S=1)',
     7: '7. Hub-0 (KVM host side, FS)', 8: '8. Hub-1 (PC1)', 9: '9. Hub-2 (PC2)',
     10: '10. AT32F405 #1 (HS device to PC1)', 11: '11. AT32F405 #2 (HS device to PC2)',
-    12: '12. Front port: Keyboard', 13: '13. Front port: Mouse', 14: '14. Front port: Other',
+    12: '12. Front port: Keyboard', 13: '13. Front port: Mouse', 14: '14. Front port: Aux 2',
     15: '15. MX key + under-key LED (hand-assembled), status LEDs, mounting holes',
-    16: '16. Bluetooth LE coprocessor ESP32-C3-MINI-1 (fitted on the BT variant only, Fit = BT)',
+    16: '16. Bluetooth coprocessor ESP32-MINI-1 (fitted on the BT variant only, Fit = BT)',
+    17: '17. Front port: Aux 1 (Hub-0 port 4, normalized / mirrored only)',
+    18: '18. Rear extension connector (JST SH, Qwiic pinout)',
 }
 # block -> (column x, top y) on the A0 sheet; blocks flow downward within a column
 LAYOUT = {1: (20, 30), 2: (20, 120), 3: (20, 210), 4: (20, 300),
           5: (250, 30), 6: (250, 300),
           7: (480, 30), 8: (480, 190), 9: (480, 350),
           10: (710, 30), 11: (710, 230),
-          12: (940, 30), 13: (940, 190), 14: (940, 350), 15: (710, 440), 16: (250, 440)}
+          12: (940, 30), 13: (940, 190), 14: (940, 350), 15: (710, 440), 16: (250, 440),
+          17: (940, 510), 18: (480, 510)}
 COLUMN_W = 230
 NOTES = [
     'Generated by tools/gen_schematic.py from the netlist in that file - edit the generator, not this sheet.',

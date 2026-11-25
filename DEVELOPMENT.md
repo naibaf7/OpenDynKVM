@@ -84,11 +84,12 @@ cargo build -p odkvmctl --release                      # odkvmctl and opendyn-kv
 cargo build -p odkvmctl --release --target x86_64-pc-windows-gnu
 cargo xtask package --macos                            # on a Mac: the macOS app in a disk image → dist/
 OPENDYN_SHOTS=/tmp/shots cargo test -p odkvmctl --bin opendyn-kvm -- --ignored screenshots   # every GUI page as an image
-OPENDYN_SIM_BT=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim   # the same with the Bluetooth module (0.16.0)
-OPENDYN_SIM_BT=dongle cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the module as an ESP32-C3 board on Other
+OPENDYN_SIM_BOARD=0.12 cargo run -p odkvmctl --bin opendyn-kvm -- --sim   # a board before 0.19.0: three front ports
+OPENDYN_SIM_BT=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim   # the same with the Bluetooth module
+OPENDYN_SIM_BT=dongle cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the module as an ESP32-C3 board on Aux 2
 OPENDYN_SIM_BT=needs-update cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # a module waiting for its firmware
 OPENDYN_SIM_HOP=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the same with screen hop set up
-OPENDYN_SIM_PAD=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # a gamepad on Other (the Keymaps page, calibration)
+OPENDYN_SIM_PAD=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # a gamepad on Aux 2 (the Keymaps page, calibration)
 OPENDYN_SIM_PAD=receiver cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # a pad receiver (symmetric: touch-pad pad)
 OPENDYN_LANG=de cargo run -p odkvmctl --bin odkvmctl -- --sim       # in German (en, fr, de, nb, zh; or Settings → Language)
 # The GUI with the simulator in a browser (software.md §9 "On the web"; needs the wasm32-unknown-unknown target and
@@ -135,14 +136,15 @@ Hardware, firmware and host software each carry a `major.minor.patch` version.
 
 | What | Now | Where it is set |
 |---|---|---|
-| Hardware | **0.18.0** in design, not ordered yet (0.13.0 to 0.17.0 were designed and never ordered). **0.12.0** is the board ordered as revision 12 | `HW_VERSION` in `hardware/tools/gen_pcb.py` (printed on the board: the design's version) and `kvm_proto::HARDWARE_VERSION` (what the firmware reports: the newest board that was ordered, still 0.12.0) |
-| Firmware, RP2354B and both AT32F405s alike | **0.1.66** | `kvm_proto::FIRMWARE_VERSION` |
-| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.66** | `version` in the root `Cargo.toml` |
+| Hardware | **0.19.0** in design, not ordered yet (0.13.0 to 0.18.0 were designed and never ordered). **0.12.0** is the board ordered as revision 12 | `HW_VERSION` in `hardware/tools/gen_pcb.py` (printed on the board: the design's version) and `kvm_proto::HARDWARE_VERSION` (what the firmware reports: the newest board that was ordered, still 0.12.0), or `kvm_proto::HARDWARE_VERSION_AUX1` (0.19.0) on a board where the firmware finds the Aux 1 port |
+| Firmware, RP2354B and both AT32F405s alike | **0.1.67** | `kvm_proto::FIRMWARE_VERSION` |
+| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.67** | `version` in the root `Cargo.toml` |
 
 - **Hardware:** a new major version is a different board: 1.0.0 will be the mass-production board, 2.0.0 a new design.
   Minor versions are revisions of the same board. When a board is ordered:
   1. Tag the commit that was sent to the fab, `hw-vX.Y.Z` (that tag is the record of what was built).
-  2. Set `kvm_proto::HARDWARE_VERSION` to that version.
+  2. Set `kvm_proto::HARDWARE_VERSION` to that version (and `HARDWARE_VERSION_AUX1`, if it is the first ordered board
+     with the Aux 1 port).
   3. Bump `HW_VERSION` for the next design, which is then changed in place.
 
   A revision of an ordered board is routed from that board, so it differs only where it has to: see "Revising an
@@ -226,6 +228,10 @@ The first board, a 0.12.0, runs firmware 0.1.17. Faults of the board itself, wit
     (over USB-C/DisplayPort and over the HDMI port, which on some models takes chip address 0xB7) and on an Intel Mac
     (the `IOI2CRequest` layout, and AMD's reply wait).
 - **The Bluetooth module** (boards from 0.16.0), the fixes for errata E2 and E3 (from 0.17.0), and the module's EN line (0.18.0).
+- **Board 0.19.0** (firmware 0.1.67): no board yet. To check on the first one: that the firmware finds Aux 1 (the boot
+  log says "Aux 1 port found", the app shows hardware 0.19.0 and four ports), that Aux 1 hosts and powers a device and
+  replugs it by its power, the seven LEDs in order with the side LEDs on the bottom, and the ESP32-MINI-1 module. On
+  the 0.12.0 board, 0.1.67 must still show three ports and six LEDs (checked in the engine and the simulator only).
 - **The module as an ESP32-C3 board on a front port** works on the first 0.12.0 board (2026-11-14): found, programmed
   over USB from blank and updated, paired, switched to, and used in screen hop; mouse to host 5–10 ms at the host's
   15 ms connection interval (1 ms over USB). Still to see: a host that takes 7.5 ms, and several hosts at once.

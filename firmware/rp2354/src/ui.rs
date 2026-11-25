@@ -1,4 +1,4 @@
-//! The MX key and the six LEDs (software.md §4.6).
+//! The MX key and the status LEDs: six, or seven on a board with the Aux 1 port (software.md §4.6).
 
 use embassy_rp::gpio::Input;
 use embassy_rp::peripherals::PIO0;

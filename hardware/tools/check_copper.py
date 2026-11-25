@@ -45,17 +45,16 @@ PCB = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'kvm.kicad_pcb') 
 MM = pcbnew.ToMM
 CELL = 1.5                       # spatial hash cell, mm
 LAYERS = ('F.Cu', 'B.Cu', 'In1.Cu', 'In2.Cu')
-PAIR_NAMES = ('H0_', 'H1_', 'H2_', 'PC1_', 'PC2_', 'KB_', 'MS_', 'OT_')
+PAIR_NAMES = ('H0_', 'H1_', 'H2_', 'PC1_', 'PC2_', 'KB_', 'MS_', 'A1_', 'A2_')
 PAIR_W, PAIR_S = 0.15, 0.15      # the design's HS pair width and gap (design.md §11: ~88 ohm differential over L2)
 PAIR_SKEW_MAX = 1.2              # mm of length mismatch that is still inside a high-speed pair's budget: 8 ps at
 #                              6.7 ps/mm.  Was 0.75 mm (5 ps), the number usually quoted for USB 2.0 HS; rev 9 sets
 #                              1.2 mm, which is 0.4 % of a 480 Mb/s bit and still ~6x tighter than the ~50 ps that HS
 #                              app notes allow (see check_usb_si.py SKEW_MAX for why).  check_usb_si.py uses the same.
 # a pair whose own two lines may sit closer than the pair gap, with the reason it is accepted (printed as such, and
-# never counted as a violation): H0_D4 is Hub-0's fourth port and is disabled in this design - its D4 lines are strapped
-# and carry nothing - so where the port-4 via row pinches the pair to 0.1346 mm (DRC, at (163.60, 125.75), 5.3 mil and
-# comfortably fabricable) it is accepted instead of squeezed further.  Rev 9, 2026-10-26, by decision.
-WAIVED_PAIRS = {frozenset(('H0_D4_DP', 'H0_D4_DM')): 'H0_D4 is a disabled port (D4 strapped)'}
+# never counted as a violation).  Empty since 0.19.0: up to 0.18.0 Hub-0's disabled port 4 (H0_D4, strapped, carrying
+# nothing) was accepted at 0.1346 mm where its via row pinched it; that port is the Aux 1 port's live pair now.
+WAIVED_PAIRS = {}
 PLANE_GAP_MAX = 4.0              # mm: longer than this without plane copper underneath is a return-path break
 PLANE_STEP = 0.05                # mm: sampling step along a pair's F.Cu copper for the plane test
 VIA_PLANE_CLR = 0.25             # mm: the planes' clearance round a via (zone 0.2 + margin)

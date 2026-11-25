@@ -2,6 +2,45 @@
 
 Implements [specs.md](specs.md). The KiCad project is generated from scripts in [hardware/](hardware/) (§14).
 
+**0.19.0 changes** (2026-11-25):
+- **Four front ports:** Keyboard, Mouse, **Aux 1** and **Aux 2**, at a 26 mm pitch, centred (each outer port 12.4 mm
+  from its side edge).
+  - **Aux 2** is the Other port up to 0.18.0, renamed in the hardware, firmware and host software.
+  - **Aux 1** is new. It sits on Hub-0's fourth port, unused until now, with no 1:3 router, so it runs Normalized,
+    Mirrored or Off but never Passthrough. Each PC hub has one port to its AT32F405 and three to the routers, none
+    left over.
+  - Its power switch and current limit (about 1.18 A) are the same as the other ports'. It uses GPIO8/10 for EN /
+    FAULT.
+  - The firmware (0.1.67 on) finds Aux 1 at boot by the 10 kΩ pull-up on its FAULT line, which the boards before leave
+    unconnected, and serves both: four ports and seven LEDs here, three ports and six LEDs on 0.12.0 to 0.18.0
+    (software.md §4.3).
+- **Output macro rework:** each port's ESD now sits right behind its D−/D+ pins, with the router north of it, and the
+  VBUS switch and its resistors west of the ESD.
+  - The 220 µF bulk sits in the gap west of each connector. Keyboard's is the exception and goes north-west of its
+    connector, behind mounting hole H1503.
+  - Aux 2's column is 3 mm west of its pins, clear of the longer Bluetooth module.
+- **All six status LEDs are on the bottom side**, the port LEDs centred under their USB-A, PC1 / PC2 just inboard of
+  the front mounting holes; the lens still faces the front edge.
+  - The case's windows for them are below the board and run up into the USB-A notches.
+  - The front corner posts lost their inboard arm towards the front wall (hardware/case/gen_case.py).
+- **ESP32-MINI-1** (the original ESP32: Bluetooth Classic as well as LE) instead of the ESP32-C3-MINI-1 (§16).
+  - IO0 replaces the C3's IO9 on the RP2354B's TX line.
+  - The bypass is Espressif's 22 µF + 100 nF.
+  - IO0's pull-up and a log pad (IO4) are on the bottom, under the module.
+- **Rear extension connector:** a JST SH 4-pin, Qwiic / STEMMA QT pinout (GND, 3.3 V, SDA, SCL), next to PC1.
+  - SDA/SCL are GPIO4/5: I²C0, UART1, PWM or PIO.
+  - Its 3.3 V goes through a TPS2553 at about 136 mA, switched by GPIO7.
+  - The lines have ESD protection, 100 Ω in series and 4.7 kΩ pull-ups on the switched 3.3 V.
+- **+5V feed** (TPS2121 → the four port switches) is a planned full-width lane, `route.py` `RAIL_LANES`.
+  - Its way: 1.1 mm on F.Cu/B.Cu and 1.39 mm on In2.Cu, down the gap between the RP2354B and AT32 #2. It uses two vias
+    per layer change, except one where a second would land in the logo's via-free box.
+  - Why: the new Aux 2 lanes and the logo closed the rail's old corridor. The first full run then fed all four ports
+    through the LEDs' 0.3 mm branch: 280–320 mV of drop, about 190 K of rise on In2.Cu.
+  - The router now refuses to join a heavy load to a light branch.
+- **BOOTSEL** moved 2.4 mm west beside the connector. It cannot move towards the service USB-C: the lid's pinhole must
+  keep clear of the lid's logo. The OSHW logo went east of BOOTSEL, and the OpenDynKVM silkscreen logo moved above
+  Aux 1.
+
 **Rev 5 changes** (layout):
 - **Switch input: back to the MX key with an RGB LED**, replacing the touch key (AT42QT1010 and electrode removed).
   - It sits in the **centre of the board** (160, 140) for stability, with no other part within 2.25 mm of its 18 mm
@@ -165,7 +204,7 @@ What each PC sees, permanently, from the moment its USB port is powered:
 PC ── 4-port USB 2.0 hub (on the KVM)
         ├─ port 1: "KVM HID" composite device (High-Speed)   ← always present (persistent emulation)
         │     ├─ keyboard / mouse interfaces (normalized or mirrored, see §4)
-        │     ├─ "other" HID mirror (only if a HID device is on the Other port)
+        │     ├─ Aux HID mirrors (only if a HID device is on an Aux port)
         │     └─ control interface (vendor HID) used by the host software (§8)
         └─ ports 2–4: empty, unless a front port is in passthrough mode
 ```
@@ -182,13 +221,15 @@ PC ── 4-port USB 2.0 hub (on the KVM)
  USB-C PWR/SERVICE ═ D+/D− ══ TS3USB30E ════════════════════║══║═══ native USB
    (VBUS → power path)          ║ (normal position)          ║  ║
                                 ╚═► Hub-0 USB2514B (runs at FS)
-                                       DS1   DS2   DS3
-                                        ║     ║     ║
-                              ┌─────────╨─────╨─────╨──────────────────────────────────┐
-                              │ one TS3USB3031 1:3 switch per front port:              │
-                              │   A → Hub-0 (persistent emulation)     B → Hub-1 (PC1)   C → Hub-2 (PC2)  │
-                              └────────┬──────────────────┬──────────────────┬─────────┘
-                                 USB-A Keyboard     USB-A Mouse       USB-A Other
+                                       DS1   DS2   DS3                   DS4
+                                        ║     ║     ║                     ║ (no router: Hub-0 only)
+                              ┌─────────╨─────╨─────╨──────────────┐      ║
+                              │ one TS3USB3031 1:3 switch per port │      ║
+                              │   A → Hub-0 (persistent emulation) │      ║
+                              │   B → Hub-1 (PC1)   C → Hub-2 (PC2)│      ║
+                              └────┬───────────┬──────────────┬────┘      ║
+                         USB-A Keyboard  USB-A Mouse    USB-A Aux 2   USB-A Aux 1
+                         (front, left to right: Keyboard, Mouse, Aux 1, Aux 2)
 ```
 
 ## 3. Key decisions and why
@@ -267,7 +308,8 @@ All three ports are decided together: a port already mirrored keeps its endpoint
 endpoints freed by a mode change or an unplug go to a port that was left out.
 
 ### 3.4 Host side: native USB host plus a hub, not PIO-USB
-The RP2354B's native USB host feeds Hub-0 (FS upstream), and Hub-0 feeds the three front ports. TinyUSB's RP2040/RP2350
+The RP2354B's native USB host feeds Hub-0 (FS upstream), and Hub-0 feeds the four front ports (since 0.19.0: three
+through their 1:3 routers, Aux 1 directly on its fourth port). TinyUSB's RP2040/RP2350
 host driver supports hubs and low-speed devices behind a hub (PRE preamble), and has 15 hardware-polled interrupt
 endpoints. Bit-banged PIO-USB would save the hub but has weaker device compatibility, and it would consume a whole CPU
 core.
@@ -282,7 +324,7 @@ where the KVM emulates the device, or straight to Hub-1/Hub-2, where the real de
 
 ## 4. Port modes
 
-Each front port (Keyboard, Mouse, Other) can be set independently, from the host software (§8) or by the Auto policy,
+Each front port (Keyboard, Mouse, Aux 1, Aux 2; Aux 1 has no router, so no Passthrough) can be set independently, from the host software (§8) or by the Auto policy,
 and so can each Bluetooth device paired with the module (§16: Normalized or Off only, as it reaches the KVM as
 reports). Each also has a routing: it follows the active PC or Bluetooth host, or is **pinned** to one host whichever
 is active. The modes and routings of every device are a profile, and the key on the KVM switches between profiles
@@ -336,9 +378,11 @@ is active. The modes and routings of every device are a profile, and the key on 
   - otherwise (vendor-page inputs, more than 16 buttons, absolute axes, unknown usage pages) → **Mirrored**.
   - A vendor *command* channel by itself (e.g. HID++) does not trigger Mirrored. The host software flags it as
     "vendor features available: use Mirrored + identity or Passthrough".
-- **Other port, HID device** → **Mirrored**, as long as the endpoint budget allows; otherwise Passthrough.
+- **Aux 2 port, HID device** → **Mirrored**, as long as the endpoint budget allows; otherwise Passthrough.
+- **Aux 1 port** (0.19.0, no router): HID devices as on Aux 2, but where Aux 2 would fall back to Passthrough it can
+  only run Normalized or stay Off; a non-HID device (a flash drive, a webcam) is not served there.
 
-### The Other port in practice: webcam or gamepad
+### The Aux 2 port in practice: webcam or gamepad
 - **Webcam** (UVC video + audio classes): **Passthrough** at full 480 Mbit/s, straight to the PC's hub.
   - The default is to follow the active PC. Each switch re-enumerates it on the new PC, which takes about 1 s; video
     apps typically need re-selecting the camera.
@@ -432,26 +476,29 @@ is active. The modes and routings of every device are a profile, and the key on 
 | U22 | Service USB switch | **TI TS3USB30EDGSR** 1:2 | VSSOP-10 | 1 | C131998 | Ext / 2159 | 0.76 | stock | pull resistor makes PWR/SERVICE the default |
 | U10 | Input priority mux | **TI TPS2121RUXR** (2.4 A limit, XCOMP priority mode) | VQFN-HR-12 2×2.5 | 1 | C485916 | Ext / 27314 | 0.92 | custom | IN1 = PWR port, IN2 = PC bus |
 | U11 | PC1/PC2 ideal-diode OR | **TI LM66200DRLR** dual ideal diode | SOT-583 | 1 | C3235556 | Ext / 15638 | 0.42 | custom | or 2× LM66100DCKR (C2869734, stock symbol) |
-| U12–U14 | Front VBUS switches | **TI TPS2553DBVR** adjustable limit, EN + FAULT | SOT-23-6 | 3 | C55266 | Ext / 51844 | 0.54 | custom | about 1.0 A each. OpenRower's SY6280AAC (C55136, $0.09) has no FAULT output, which the host software needs |
+| U12–U14, U1702, U1801 | Front VBUS switches (four ports), the extension connector's 3.3 V | **TI TPS2553DBVR** adjustable limit, EN + FAULT | SOT-23-6 | 5 | C55266 | Ext / 51844 | 0.54 | custom | about 1.0 A each. OpenRower's SY6280AAC (C55136, $0.09) has no FAULT output, which the host software needs |
 | U15 | 3.3 V rail | **TI TLV62569DBVR** 2 A buck | SOT-23-5 | 1 | C141836 | Ext / 442749 | 0.07 | stock | |
-| U16–U21 | ESD (D+/D−, VBUS) | **ST USBLC6-2SC6** | SOT-23-6 | 6 | C7519 | Ext / 43630 | 0.18 | stock | same part and JLC correction as OpenRower |
+| U16–U21, U1701, U1802 | ESD (D+/D−, VBUS; the extension's SDA/SCL) | **ST USBLC6-2SC6** | SOT-23-6 | 8 | C7519 | Ext / 43630 | 0.18 | stock | same part and JLC correction as OpenRower |
 | L401 | 3.3 V buck inductor | **Sunlord SWPA3015S2R2MT** 2.2 µH shielded | 3.0×3.0×1.5 | 1 | C43389 | Ext / — | — | stock | output filter of the TLV62569 buck (§6) |
 | D4–D6 | ESD on CC lines | **Nexperia PESD5V0S2BT,215** | SOT-23 | 3 | C49338 | Ext / 25103 | 0.09 | stock | |
 | J1–J3 | Rear USB-C (PC1, PC2, PWR/SERVICE) | **HRO TYPE-C-31-M-12** | SMD 16-pin | 3 | C165948 | Ext / 345875 | 0.19 | OpenRower footprint | replaces GCT USB4105-GF-A (C3020560, 0 in stock); 5.1 kΩ Rd per CC pin |
-| J4–J6 | Front USB-A | **Molex 67643-0910** | THT R/A | 3 | C2798029 | Ext / 4411 | 0.85 | stock (`USB_A_Molex_67643_Horizontal`) | alt: Amphenol 87520-0010BLF C599115 (18408, $0.68, needs a custom footprint) |
+| J4–J6, J1701 | Front USB-A (Keyboard, Mouse, Aux 2, Aux 1) | **Molex 67643-0910** | THT R/A | 4 | C2798029 | Ext / 4411 | 0.85 | stock (`USB_A_Molex_67643_Horizontal`) | alt: Amphenol 87520-0010BLF C599115 (18408, $0.68, needs a custom footprint) |
 | SW1501 | Switch key | **MX-compatible switch** in a **HanElectricity CPG151101S11-2** hot-swap socket (Kailh CPG151101S11 equivalent) | MX 1u | 1 | C49352235 (socket) | **JLC, bottom side** (the switch is plugged in afterwards) | — | custom footprint | centred on the board; socket on the bottom. What to order: §11 |
 | SW2 | Recovery (pinhole) | **XKB TS-1187A-B-A-B** | SMD 5.1×5.1 | 1 | C318884 | **Basic** / 274052 | 0.02 | OpenRower footprint | on RP2354B `QSPI_SS` |
 | D1501 | Key LED | **SK6812MINI-E** reverse-mount RGB | 3.2×2.8 | 1 | C5149201 | **JLC, bottom side** | — | stock (`…_ReverseMount`) | bottom side, shines up through a cut-out into the switch's LED window; **last** in the LED chain, so a missing or damaged key LED cannot darken the five status LEDs |
-| D1502–D1506 | Status LEDs | **SK6812SIDE-A** side-emitting RGB | 4.0×1.6 | 5 | C5378721 | Ext / 183498 | 0.11 | custom footprint from JLC's land pattern | front edge, left to right: PC1, Keyboard, Mouse, Other, PC2. Light leaves the long face opposite the pads, so they sit at 0° with the lens towards the edge (up to 0.16.0 they sat at 180° and shone into the board: hardware/errata.md E3) |
+| D1502–D1507 | Status LEDs | **SK6812SIDE-A** side-emitting RGB | 4.0×1.6 | 6 | C5378721 | Ext / 183498 | 0.11 | custom footprint from JLC's land pattern | front edge, on the bottom side since 0.19.0, left to right: PC1, Keyboard, Mouse, Aux 1, Aux 2, PC2. Light leaves the long face opposite the pads, so they sit at 0° with the lens towards the edge (up to 0.16.0 they sat at 180° and shone into the board: hardware/errata.md E3) |
 | U1501 | LED data buffer | **TI SN74AHCT1G125DBVR** | SOT-23-5 | 1 | C7484 | Ext / 49531 | 0.10 | stock | 3.3 V GPIO → 5 V LED data |
 | U24 | RP2354B core supply (DVDD 1.1 V) | **TI TLV73311PDBVR** 1.1 V 300 mA LDO, ±1.4 % max | SOT-23-5 | 1 | C2865431 | Ext / 3592 | 0.14 | custom | replaces the switcher's inductor, which had only 4 in stock (§6). Stable with or without ceramic capacitors. The RP2350 needs DVDD 1.05–1.16 V; this gives 1.085–1.115 V |
 | Y1–Y3 | 12 MHz crystals | **Abracon ABM8-272-T3** (Raspberry Pi's part) | 3225 | 3 | C20625731 | Ext / — | — | stock | RP2354B + both AT32F405s (the OTGHS PHY requires exactly 12 MHz); 10 pF load, so 15 pF C0G caps |
 | Y4–Y6 | 24 MHz crystals | **YXC X322524MOB4SI** | 3225 | 3 | C70590 | Ext / 45855 | 0.09 | stock | hubs |
-| R, C | passives | UNI-ROYAL 0402/0603, Samsung MLCC | | ~120 | as OpenRower | Basic | | stock | |
+| U1601 | Bluetooth module (BT variant) | **Espressif ESP32-MINI-1-N4** | LGA-55 13.2×19.0 | 1 | C2980305 | Ext / 3178 | 2.97 | custom footprint from JLC's land pattern | 0.19.0; 0.16.0–0.18.0 had the ESP32-C3-MINI-1-H4X (C41349510) |
+| J1801 | Rear extension connector | **JST SM04B-SRSS-TB(LF)(SN)** (Qwiic / STEMMA QT) | SH 1.0 mm, side entry | 1 | C160404 | Ext / 39823 | 0.14 | stock | 0.19.0 |
+| R, C | passives | UNI-ROYAL 0402/0603, Samsung MLCC | | ~130 | as OpenRower | Basic | | stock | |
 | J7–J9 | Debug (optional) | Tag-Connect TC2030-NL pads (SWD ×3) | — | — | — | not assembled | | footprint | firmware development only |
 
 Rough cost is **about $26 of parts per board**, plus about $60 per order in JLC extended-part fees, before the PCB,
-assembly and enclosure. The rev 1 STM32 BOM was about $41 per board at distributor prices, or about $70 at JLC's.
+assembly and enclosure (rev 2's estimate; 0.19.0 at JLC's prices of 2026-11-25: about $21.40 a board at 500 boards,
+the fourth port and the extension connector included). The rev 1 STM32 BOM was about $41 per board at distributor prices, or about $70 at JLC's.
 
 ## 6. Power
 
@@ -492,22 +539,27 @@ USB-C PC2  VBUS ─► LM66200 ch.B ─┴───────────► T
   more than they advertise. Measured on the first board (2026-11-17): under 1 W from the PWR port in every state,
   front devices included, far below the estimate above.
 
-### 6.1 Budget with the Bluetooth module (0.16.0)
+### 6.1 Budget with the Bluetooth module (0.16.0; ESP32-MINI-1 since 0.19.0)
 
-The module (§16) runs from the same 3.3 V buck. ESP32-C3-MINI-1 datasheet v2.2: Bluetooth LE transmit at 0 / +9 / +20 dBm
-draws 170 / 190 / 340 mA peak (table 6-5), receive 86 mA; the CPU at 160 MHz with the radio idle 16–28 mA (table 6-6).
-The firmware caps transmit power at +9 dBm, so the peak is 190 mA, in bursts of a few hundred microseconds per
-connection event.
+The module (§16) runs from the same 3.3 V buck.
+- **ESP32-MINI-1 (0.19.0):** its datasheet (v1.8, table 16) lists only Wi-Fi peaks, the worst being 379 mA (802.11b
+  at +19.5 dBm). The firmware never starts Wi-Fi and its Bluetooth transmit draws less, so 379 mA is the budget's upper
+  bound for the peak.
+  - The average with Bluetooth Classic and LE running is an estimate, about 100 mA (the dual-core Xtensa at 240 MHz
+    and a 4.2 controller, against the C3's 40 mA). Measure it on the first 0.19.0 board.
+- **ESP32-C3-MINI-1 (0.16.0–0.18.0):** datasheet v2.2, Bluetooth LE transmit at 0 / +9 / +20 dBm draws 170 / 190 /
+  340 mA peak (table 6-5), receive 86 mA; the CPU at 160 MHz with the radio idle 16–28 mA (table 6-6). The firmware
+  caps transmit power at +9 dBm, so the peak is 190 mA, in bursts of a few hundred microseconds per connection event.
 
 | Rail | Before | With the module | Limit |
 |---|---|---|---|
-| 3.3 V, average | 0.35–0.45 A | + about 40 mA (four hosts connected, the selected one at 7.5–15 ms) | TLV62569: 2 A |
-| 3.3 V, peak | — | + 190 mA | 2 A; 10 µF + 100 nF at the module's 3V3 pad |
-| 5 V, average (90 % buck) | about 0.5 A + LEDs | + about 30 mA | the source's advertised current |
+| 3.3 V, average | 0.35–0.45 A | + about 100 mA with the ESP32 (estimate; C3: about 40 mA) | TLV62569: 2 A |
+| 3.3 V, peak | — | + 379 mA at most (C3: 190 mA) | 2 A; 22 µF + 100 nF at the module's 3V3 pad (C3: 10 µF) |
+| 5 V, average (90 % buck) | about 0.5 A + LEDs | + about 75 mA (C3: about 30 mA) | the source's advertised current |
 
 - The buck has more than 1 A of headroom at the peak, so the module needs no separate regulator or load switch.
 - The front-port budget the firmware reports (`Status.budget_ma`) takes 30 mA more off the source when the module
-  answers (`kvm_core::engine::BT_CURRENT_MA`). The source table above shifts by that much: a USB 3 PC port leaves
+  answers (`kvm_core::engine::BT_CURRENT_MA`, sized for the C3; the ESP32 wants about 75 mA there once measured). The source table above shifts by that much: a USB 3 PC port leaves
   about 0.37 A.
 - The board built without the module (the `_nobt` BOM, §16) draws exactly what 0.15.0 did.
 
@@ -549,7 +601,7 @@ Alternatives searched:
 - **Key:** a press toggles PC1/PC2. A long press (1 s by default, adjustable from 0.8 to 3 s) makes the next profile
   active (§4); for 1.5 s the front LEDs
   count its number from the left (one for profile 0, two for profile 1, …), then the port LEDs show its modes. Both are
-  configurable: switch PCs, next profile, cycle the Other port's mode, or nothing. The LED under the keycap glows in
+  configurable: switch PCs, next profile, cycle the Aux 2 port's mode, or nothing. The LED under the keycap glows in
   the active PC's colour.
   - **Blinking red** (alternating with the active PC's colour, and in standby too): a part of the KVM doesn't work.
     This covers Hub-0, the PWR-port readings, for either PC its link, its hub, its chip's firmware or its chip's
@@ -559,7 +611,7 @@ Alternatives searched:
     failed attempts in a row, so it doesn't reprogram a chip at every power-up (software.md §4.9). Switching and
     configuration from software are allowed again too (§8). That press is neither a tap nor a long press.
   - **Pulsing white:** a firmware update, or software asking to be allowed again, waits for a tap (§8).
-- **Status LEDs** on the front edge:
+- **Status LEDs** along the front edge (on the board's underside since 0.19.0, shining out below the ports):
   - **PC1 and PC2:** connection state (off = unpowered, dim = connected, breathing = suspended). The active PC is
     bright.
   - **One per USB-A port:** that port's mode (Normalized, Mirrored, Mirrored + identity, Passthrough, Pinned), shown as
@@ -593,7 +645,7 @@ Alternatives searched:
 **Front ends.** Both use the same protocol:
 - **`odkvmctl`**: a cross-platform tray app plus CLI (proposed: Rust + hidapi, one static binary per OS).
   - The tray icon shows the active PC, with notifications on switch and on faults.
-  - The CLI allows scripting, e.g. `odkvmctl switch pc2`, `odkvmctl port mouse mode mirrored-identity`.
+  - The CLI allows scripting, e.g. `odkvmctl switch pc2`, `odkvmctl port mouse mode identity`.
 - **Browser** (Chromium-based browsers): the same window, built for the web, with zero install: over WebHID from a PC,
   or over Web Bluetooth from a Bluetooth host; the simulator otherwise (software.md §9 "On the web").
 
@@ -701,8 +753,9 @@ During firmware *development*, a debug probe still helps for stepping through co
 - **Board:** 120 × 80 mm. JLC assembles both sides (2026-10-27): the per-pin decoupling caps under the chips, the
   key's hot-swap socket and the key LED are on the bottom; only the switch itself is plugged in by hand.
   - **Rear edge:** USB-C PC1, PWR/SERVICE and PC2 at a 45 mm pitch, centred.
-  - **Front edge:** the Keyboard, Mouse and Other USB-A ports at a 35 mm pitch, centred, each with its status LED
-    to its left. The PC1 LED sits at the far left and the PC2 LED at the far right.
+  - **Front edge:** the Keyboard, Mouse, Aux 1 and Aux 2 USB-A ports at a 26 mm pitch, centred (0.19.0; up to 0.18.0
+    three ports at 35 mm), each with its status LED under it on the bottom side; the PC1 and PC2 LEDs sit on the
+    bottom too, just inboard of the front mounting holes.
   - **Centre:** the MX key at (160, 153.5), right behind the Mouse port. Its 18.1 mm keycap outline (the footprint's
     User.Drawings) clears the Mouse USB-A body by 1.93 mm (Molex 67643, 7.16 mm tall; the keycap only moves straight
     down, so no height can collide) and the switch body by 3.9 mm. Within 2.25 mm of the keycap sit C517 (0402, 0.5 mm
@@ -755,9 +808,11 @@ During firmware *development*, a debug probe still helps for stepping through co
     its router.
   - **Nesting:** the outermost lane always turns last, so no two lanes cross.
   - **Length:** the longest link, Hub-1 → Other router, is about 130 mm, within the usual USB 2.0 budget for a 90 Ω
-    microstrip.
+    microstrip. 0.19.0 (four ports, tools/route.py LANES): Hub-2 → Keyboard router is the longest, 136 mm (it runs
+    under the Bluetooth module and behind all four ports on B.Cu, 4 vias), then Hub-1 → Aux 2 router at 103 mm.
 - **In the case:** the side LEDs shine through front-panel holes. Four M3 holes: two in the rear corners, and two at
-  y = 170 near the front corners, which leaves the front corners for the PC LEDs. The bottom side carries only the
+  y = 170 near the front corners, which leaves the front corners for the PC LEDs. (0.19.0: all six LEDs on the
+  underside, the PC LEDs just inboard of the front holes; the case's windows sit below the board.) The bottom side carries only the
   key's socket and LED and the 0402 decoupling caps under the RP2354B, the two AT32s and the three hubs (32, at most
   0.5 mm tall), so the case can have a support post right next to the key.
 - **Key parts** (2026-10-27: JLC assembles the socket and the LED with the rest of the bottom side; the switch and
@@ -989,10 +1044,18 @@ devices as a front port's is, normalized or off, following the active host or pi
 may also control the KVM through the module, once the KVM's key allowed that host (§8, 0.1.52). Firmware and control
 protocol: software.md §4.13.
 
-- **Module:** ESP32-C3-MINI-1-H4X (LCSC C41349510), pre-certified, with its PCB antenna. Chosen over a bare nRF54L or
-  ESP32-C3 for the certification it carries (the board's radio tests reuse the module's) and over an nRF54L15 module
-  for price and LCSC stock. Bluetooth LE only: Classic-only devices (some keyboards, mice and game controllers) stay on the USB
-  ports.
+- **Module:** ESP32-MINI-1-N4 (LCSC C2980305) since 0.19.0, pre-certified, with its PCB antenna: the original ESP32,
+  the one Espressif chip with Bluetooth Classic as well as LE, so Classic-only devices (the 5-series pad, some
+  keyboards and mice) pair too. The same firmware runs it as on the HUZZAH32 stand-in (firmware/esp32). Its RAM is the
+  limit (128 KB of main DRAM with the radio on; software.md 4.13), and its LE controller is the older 4.2 one.
+  0.16.0-0.18.0 had the ESP32-C3-MINI-1-H4X (LCSC C41349510), chosen over a bare nRF54L or ESP32-C3 for the
+  certification it carries and over an nRF54L15 module for price and LCSC stock, LE only.
+- **0.19.0 placement and wiring:** the same corner, its antenna end still at x 219.5 (centre 207.3 / 156.0, 2.4 mm
+  longer than the C3). UART0 (RXD0 = IO3, TXD0 = IO1) is on the south side where the C3's was; IO0, its download
+  strap, is on ESP_RXD with a 5.1 k pull-up, as the C3's IO9 was; EN on GPIO9 through 1 k as before; IO2 and MTDI
+  (IO12) are left open for their internal pull-downs (download needs IO2 low, MTDI low selects 3.3 V flash). The bypass
+  is Espressif's 22 uF + 100 nF. IO0's pull-up and the IO4 log pad sit on the bottom, under the module, so that
+  Hub-2's lanes can pass its north-west corner.
 - **Placement:** on the top side near the south-east corner (centre 208.5 / 156.0), its antenna end at x 219.5,
   0.5 mm inside the east edge (nothing overhangs the board), south-east of Hub-2's lanes; its UART pads face south.
   0.16.0 put it on the bottom; on 2026-11-12 it moved to the top with its passives (same centre, the layout mirrored),

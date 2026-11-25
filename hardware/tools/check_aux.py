@@ -39,10 +39,12 @@ POWER = {'GND', '+3V3', '+5V', '+1V1'}
 # the chips whose pins an auxiliary part should sit beside
 CHIPS = ('U501', 'U601', 'U701', 'U801', 'U901', 'U1001', 'U1101', 'U1202', 'U1302', 'U1402')
 ACCEPTED = {'R304', 'R204', 'C1501', 'R501', 'C516',     # see the docstring
-            'R1201', 'R1202', 'R1301', 'R1302', 'R1401', 'R1402'}
-# front-port EN pull-downs: measured against the RP2354B pin they belong to, but they are placed at the port's
-# switch (their other connection), which is what the net needs; the pad they connect by is the switch-side one
-FACING_OK = {'R1205', 'R1305', 'R1405', 'R1102', 'R403'}
+            'R1201', 'R1202', 'R1301', 'R1302', 'R1401', 'R1402',
+            'R1702', 'R1703'}       # the Aux 1 port's FAULT / EN straps, at its switch (see FACING_OK), 40 mm from the RP
+# front-port EN pull-downs and FAULT pull-ups: measured against the RP2354B pin they belong to, but they are placed at
+# the port's switch (their other connection), which is what the net needs; the pad they connect by is the switch-side
+# one (0.19.0: the FAULT pull-ups too - the macros are hand-placed, 40-45 mm from the RP2354B)
+FACING_OK = {'R1205', 'R1305', 'R1405', 'R1703', 'R1204', 'R1304', 'R1404', 'R1702', 'R1102', 'R403'}
 
 
 def main():

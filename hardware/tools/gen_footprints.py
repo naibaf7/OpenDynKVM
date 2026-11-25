@@ -32,6 +32,14 @@ FROM_EASYEDA = {
     # The pads are the package's back row, overhanging its body at -Y; the lens is the long face at +Y, away from the
     # pads (datasheet §4, §6).  Every board up to 0.16.0 read it the other way round (errata E3).
     'LED_SK6812SIDE-A_4.0x1.6mm': ('C5378721', 'SK6812SIDE-A side-emitting RGB LED 4.0x2.0x1.6 mm; light exits towards +Y (away from the pads)', None),
+    # The Bluetooth coprocessor since 0.19.0 (0.16.0-0.18.0: the ESP32-C3-MINI-1, its pads taken from KiCad's
+    # ESP32-C6-MINI-1).  JLC's land pattern is the datasheet's (v1.8 figure 14, measured: 0.4 x 0.8 mm pads at 0.8 mm,
+    # outer edges 12.6 x 12.9 mm apart, the 3 x 3 grid of 1.0 mm ground pads at 1.5 mm); the body comes from it too,
+    # 13.2 x 19.0 mm with the antenna end at y = -12.2 and the pad end at +6.8.  The board places its own antenna
+    # keep-out (tools/gen_pcb.py ANT_KEEPOUT), so the footprint carries none.
+    'ESP32-MINI-1': ('C2980305', 'Espressif ESP32-MINI-1 (-N4), 13.2 x 19.0 mm LGA-55, PCB antenna towards -Y; JLC land '
+                     'pattern (datasheet v1.8 figure 14). The antenna keep-out on the board is placed with the footprint '
+                     '(tools/gen_pcb.py)', None),
 }
 
 
@@ -307,43 +315,11 @@ def logo():
     return name, fp, ink.bounds
 
 
-MINI1_SRC = ('/usr/share/kicad/footprints/RF_Module.pretty', 'ESP32-C6-MINI-1')
-
-
-def esp32_c3_mini():
-    """ESP32-C3-MINI-1 (0.16.0's Bluetooth LE coprocessor).  Its land pattern (datasheet v2.2 figure 11-1: 48 pads
-    0.8 x 0.4 at 0.8 mm, a 3 x 3 grid of 1.45 mm ground pads, four 0.7 mm corner pads, 13.2 x 16.6 mm body) is the
-    one KiCad ships for the ESP32-C6-MINI-1, the same module outline; the pads are taken from there.  Left out: that
-    footprint's keep-out zone (43.2 x 20.4 mm, Espressif's 15 mm round a module whose antenna sits on the board) and
-    its courtyard, which follows that zone.  The board places its own antenna keep-out (tools/gen_pcb.py ANT_KEEPOUT),
-    cut to what is on the board, and the courtyard here is the module body: the antenna end at y = -11, the pad end
-    at +5.6 (the C3 and C6 modules have the same outline, datasheet figure 10-1)."""
-    src = pcbnew.FootprintLoad(*MINI1_SRC)
-    fp = pcbnew.FOOTPRINT(None)
-    fp.SetAttributes(pcbnew.FP_SMD)
-    for p in src.Pads():
-        q = p.Duplicate()
-        q.SetParent(fp)
-        fp.Add(q)
-    add_rect(fp, pcbnew.F_Fab, -6.6, -11.0, 6.6, 5.6, 0.1)
-    add_line(fp, pcbnew.F_Fab, (-6.6, -5.6), (6.6, -5.6), 0.1)          # where the antenna area begins
-    add_rect(fp, pcbnew.F_SilkS, -6.75, -11.15, 6.75, 5.75, 0.12)
-    add_line(fp, pcbnew.F_SilkS, (-7.2, -4.0), (-7.2, -3.2), 0.12)      # pin 1 mark
-    name = 'ESP32-C3-MINI-1'
-    finish(fp, name, 'Espressif ESP32-C3-MINI-1 (-H4X), 13.2 x 16.6 mm LGA-53, PCB antenna towards -Y; land pattern '
-           'of datasheet v2.2 figure 11-1 (KiCad ESP32-C6-MINI-1 pads, same outline). The antenna keep-out on '
-           'the board is placed with the footprint (tools/gen_pcb.py)', (-6.6, -11.0, 6.6, 5.6))
-    return name, fp
-
-
 def main():
     os.makedirs(LIB, exist_ok=True)
     name, fp = mx_hotswap()
     pcbnew.FootprintSave(LIB, fp)
     print(f'{name}: MX holes + hot-swap socket pads')
-    name, fp = esp32_c3_mini()
-    pcbnew.FootprintSave(LIB, fp)
-    print(f'{name}: {len(fp.Pads())} pads (from KiCad {MINI1_SRC[1]})')
     try:
         name, fp, (x0, y0, x1, y1) = logo()
         pcbnew.FootprintSave(LIB, fp)

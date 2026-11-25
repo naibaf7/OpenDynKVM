@@ -6,13 +6,13 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use defmt::info;
 use embassy_futures::select::{Either, Either4, select, select4};
 use embassy_rp::adc::{Adc, Async, Channel};
-use embassy_rp::gpio::{Input, Level};
+use embassy_rp::gpio::{Flex, Input, Level};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker, Timer};
 use kvm_core::engine::PowerInfo;
 use kvm_core::standby::PowerPlan;
-use kvm_proto::ctrl::{Advertised, Port, PowerSource};
+use kvm_proto::ctrl::{Advertised, PORTS, Port, PowerSource};
 
 use crate::kvm;
 use crate::uartlog::uart_log;
@@ -22,11 +22,13 @@ const PERIOD: Duration = Duration::from_millis(200);
 const FAULT_BACKOFF: Duration = Duration::from_millis(1000);
 /// VBUS off time for a deliberate power cycle (passthrough switch, re-detect).
 const CYCLE_OFF: Duration = Duration::from_millis(1000);
-/// A data-line replug: long enough for Hub-0 to see the device leave (a connect takes its 100 ms debounce).
+/// A data-line replug: long enough for Hub-0 to see the device leave (a connect takes its 100 ms debounce). A port
+/// without a router (Aux 1) has no way to take its data lines away: it is replugged with VBUS off for [`CYCLE_OFF`].
 const REPLUG_OFF: Duration = Duration::from_millis(250);
 
 /// Self-test findings, filled in during the first second after boot.
-/// Bit k: port k's power switch faulted when first switched on, or its FAULT line was low while it was off.
+/// Bit k: port k's power switch faulted when first switched on, or its FAULT line was low while it was off (`Port`
+/// index).
 pub static PORT_SELFTEST: AtomicU8 = AtomicU8::new(0);
 /// PWR-port readings: 0 not yet judged, 1 plausible, 2 implausible.
 pub static POWER_SELFTEST: AtomicU8 = AtomicU8::new(0);
@@ -34,8 +36,8 @@ pub static POWER_SELFTEST: AtomicU8 = AtomicU8::new(0);
 const FIRST_ON_WATCH: Duration = Duration::from_millis(100);
 
 /// Whether each front port may have VBUS under the standby plan; [`port_power`] follows it.
-static PORT_ALLOWED: [AtomicBool; 3] = [const { AtomicBool::new(true) }; 3];
-static PLAN_CHANGED: [Signal<CriticalSectionRawMutex, ()>; 3] = [const { Signal::new() }; 3];
+static PORT_ALLOWED: [AtomicBool; PORTS] = [const { AtomicBool::new(true) }; PORTS];
+static PLAN_CHANGED: [Signal<CriticalSectionRawMutex, ()>; PORTS] = [const { Signal::new() }; PORTS];
 /// Hub-0 is held in reset for deep standby: the hub task's recovery must not let it go.
 pub static HUB0_HELD: AtomicBool = AtomicBool::new(false);
 
@@ -105,10 +107,10 @@ pub async fn monitor(mut i: Inputs) -> ! {
     }
 }
 
-/// Watches one port's TPS2553 FAULT (active low) and runs power cycles the engine asks for.
-#[embassy_executor::task(pool_size = 3)]
-pub async fn port_power(index: usize, mut fault: Input<'static>) -> ! {
-    let port = Port::from_index(index).unwrap_or(Port::Other);
+/// Watches one port's TPS2553 FAULT (active low; an input) and runs power cycles the engine asks for.
+#[embassy_executor::task(pool_size = 4)] // one per front port (`PORTS`)
+pub async fn port_power(port: Port, mut fault: Flex<'static>) -> ! {
+    let index = port.index();
     // Self-test: FAULT is released while the switch is off, and stays released through the first switch-on.
     Timer::after_millis(1).await;
     let mut bad = fault.is_low();
@@ -151,7 +153,7 @@ pub async fn port_power(index: usize, mut fault: Input<'static>) -> ! {
                     Timer::after(CYCLE_OFF).await;
                 }
                 Either4::Third(()) => continue,
-                Either4::Fourth(()) => {
+                Either4::Fourth(()) if port.has_router() => {
                     // VBUS stays on; the router goes off and back to Hub-0, unless the engine routed the port
                     // elsewhere meanwhile.
                     let generation = kvm::ROUTE_GEN[index].load(Ordering::Relaxed);
@@ -161,6 +163,12 @@ pub async fn port_power(index: usize, mut fault: Input<'static>) -> ! {
                         kvm::with_board(|b| b.ports[index].route(kvm_core::Route::Kvm));
                     }
                     continue;
+                }
+                Either4::Fourth(()) => {
+                    // Aux 1: unplugged by its power instead, long enough for the port's capacitor to drain through the
+                    // device (a short dip is no power-off, `kvm::Output::Reprobe`).
+                    kvm::with_board(|b| b.ports[index].power(false));
+                    Timer::after(CYCLE_OFF).await;
                 }
             }
             if !allowed() {

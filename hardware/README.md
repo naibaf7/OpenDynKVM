@@ -5,8 +5,8 @@ edit the generator scripts in `tools/`, not the schematic or board in eeschema /
 
 | File | Made by |
 |---|---|
-| `KVM.kicad_sym` | `tools/gen_symbols.py` (custom symbols: AT32F405CCT7, TS3USB3031, TPS2121, LM66200, TPS2553, SK6812SIDE-A) |
-| `CustomFootprints.pretty/` | `tools/gen_footprints.py` (TPS2121 RUX and SK6812SIDE-A from JLC's EasyEDA land patterns, MX switch in a Kailh hot-swap socket, the OpenDynKVM logo as silkscreen from `../branding/`); the HRO USB-C footprint is copied from OpenRower |
+| `KVM.kicad_sym` | `tools/gen_symbols.py` (custom symbols: AT32F405CCT7, TS3USB3031, TPS2121, LM66200, TPS2553, SK6812SIDE-A, ESP32-MINI-1) |
+| `CustomFootprints.pretty/` | `tools/gen_footprints.py` (TPS2121 RUX, SK6812SIDE-A and the ESP32-MINI-1 from JLC's EasyEDA land patterns, MX switch in a Kailh hot-swap socket, the OpenDynKVM logo as silkscreen from `../branding/`); the HRO USB-C footprint is copied from OpenRower |
 | `kvm.kicad_sch` | `tools/gen_schematic.py`: the whole netlist, block by block |
 | `kvm.kicad_pcb` | `tools/gen_pcb.py` (placement), then `tools/route.py` (routing, planes) |
 | `bom/`, `fab/`, `kvm_gerbers.zip` | `tools/make_fab.py` |
@@ -37,10 +37,9 @@ chip's pins, vias and layers, foreign copper in its courtyard and foreign tracks
 Budgets and accepted exceptions (rev 9, 2026-10-26): the intra-pair skew budget is **1.2 mm = 8 ps** at 6.7 ps/mm
 (`check_usb_si.py` `SKEW_MAX`, shared by `check_copper.py` `PAIR_SKEW_MAX`).  That is 0.4 % of a 480 Mb/s bit and about
 six times tighter than the ~50 ps USB 2.0 high-speed app notes allow; it was 0.75 mm (5 ps) before, which the two
-board-spanning pairs cannot meet (SVC 0.88 mm, H2_AT 0.99 mm).  **H0_D4** is a *documented exception*: it is Hub-0's
-disabled port (D4 is strapped), and where the port-4 via row pinches its pair to 0.1346 mm the pair is accepted, not
-squeezed - `check_copper.py` prints it under "accepted exceptions" and never counts it, so the eleven live pairs keep the
-strict 0.15 mm gap.
+board-spanning pairs cannot meet (SVC 0.88 mm, H2_AT 0.99 mm).  Up to 0.18.0 Hub-0's disabled port 4 (H0_D4,
+strapped) was a documented exception at a 0.1346 mm gap; since 0.19.0 that port is the Aux 1 port's live pair (A1) and
+every pair keeps the strict 0.15 mm gap (`check_copper.py` `WAIVED_PAIRS` is empty).
 
 ## Regenerating
 
@@ -74,7 +73,7 @@ uv run tools/route.py --live                 # USB pairs, planes, power, signals
                                              #   (or all) prints its centre runs and both offset lines as they
                                              #   are laid.  Neither changes a full run.
 kicad-cli pcb drc --schematic-parity kvm.kicad_pcb
-uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5
+uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1702=0.5 U1403=0.5 U403=0.5
                                              # the +5 V feed (jlcpcb.md §5): a full run can pass every check above
                                              # with a bad one (0.15.0's three runs: 495, 121 and 96 mV)
 uv run tools/make_fab.py                     # JLC BOM + CPL (corrections applied), gerbers, drill; two assembly

@@ -394,8 +394,10 @@ enum PortArg {
     Keyboard,
     #[value(alias = "ms")]
     Mouse,
-    #[value(alias = "ot")]
-    Other,
+    #[value(alias = "a1")]
+    Aux1,
+    #[value(alias = "a2")]
+    Aux2,
 }
 
 #[derive(Subcommand)]
@@ -440,7 +442,8 @@ impl From<PortArg> for Port {
         match p {
             PortArg::Keyboard => Port::Keyboard,
             PortArg::Mouse => Port::Mouse,
-            PortArg::Other => Port::Other,
+            PortArg::Aux1 => Port::Aux1,
+            PortArg::Aux2 => Port::Aux2,
         }
     }
 }
@@ -571,8 +574,8 @@ fn print_status(c: &Client, s: &Snapshot) {
         println!("  {}", fl!("cli-module-update-hint", command = "odkvmctl update --module"));
     }
     println!("{}", fl!("cli-ports"));
-    for p in Port::ALL {
-        print_port(s, *p);
+    for p in s.front_ports() {
+        print_port(s, p);
     }
     for d in s.devices.iter().filter(|d| d.bonded()) {
         print_device(s, d);
@@ -2169,6 +2172,9 @@ fn main() -> Result<()> {
         }
         Cmd::Port { port, action } => {
             let port: Port = port.into();
+            if !c.snapshot()?.has_port(port) {
+                bail!(fl!("cli-no-aux1"));
+            }
             match action {
                 None => {}
                 Some(PortAction::Mode { mode }) => {

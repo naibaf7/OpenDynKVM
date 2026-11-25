@@ -6,7 +6,7 @@
 //! other PC becomes active when the active one is switched off. Nothing here is saved: after a power loss the KVM
 //! finds the running PC again from the PCs' states.
 
-use kvm_proto::ctrl::{LinkState, Pc};
+use kvm_proto::ctrl::{LinkState, PORTS, Pc};
 use kvm_proto::link::msg::{Status as AtStatus, UsbState};
 
 /// No PC up for this long: standby.
@@ -94,13 +94,13 @@ pub enum PowerMode {
 pub struct PowerPlan {
     pub mode: PowerMode,
     /// Front ports that may have VBUS.
-    pub ports: [bool; 3],
+    pub ports: [bool; PORTS],
     /// Hub-0 out of reset.
     pub hub0: bool,
 }
 
 impl PowerPlan {
-    pub const ACTIVE: PowerPlan = PowerPlan { mode: PowerMode::Active, ports: [true; 3], hub0: true };
+    pub const ACTIVE: PowerPlan = PowerPlan { mode: PowerMode::Active, ports: [true; PORTS], hub0: true };
 }
 
 /// Follows both PCs over time and decides the power plan.
@@ -113,7 +113,7 @@ pub struct Tracker {
     /// Since when no PC has been up (and nothing kept the KVM awake).
     idle_since: Option<u32>,
     /// The front ports to power in wake standby, decided when standby started.
-    wake_ports: [bool; 3],
+    wake_ports: [bool; PORTS],
     wake_sent: [Option<u32>; 2],
     plan: PowerPlan,
 }
@@ -131,7 +131,7 @@ impl Tracker {
             since: [0; 2],
             seen_vbus: [false; 2],
             idle_since: None,
-            wake_ports: [true; 3],
+            wake_ports: [true; PORTS],
             wake_sent: [None; 2],
             plan: PowerPlan::ACTIVE,
         }
@@ -180,7 +180,7 @@ impl Tracker {
     /// The plan for now.
     /// - `wake`: config `standby-wake`; `busy`: something shows on the LEDs (identify, an update, the self-test);
     /// - `wake_ports`: the front ports worth keeping for a wakeup, used when standby starts.
-    pub fn update(&mut self, now: u32, active: Pc, wake: bool, busy: bool, wake_ports: [bool; 3]) -> PowerPlan {
+    pub fn update(&mut self, now: u32, active: Pc, wake: bool, busy: bool, wake_ports: [bool; PORTS]) -> PowerPlan {
         let up = self.last.contains(&Presence::Up);
         let idle_ms = if up || busy {
             self.idle_since = None;
@@ -198,7 +198,7 @@ impl Tracker {
         self.plan = if wake && self.last[active.index()] == (Presence::Asleep { wake: true }) {
             PowerPlan { mode: PowerMode::WakeStandby, ports: self.wake_ports, hub0: true }
         } else {
-            PowerPlan { mode: PowerMode::DeepStandby, ports: [false; 3], hub0: false }
+            PowerPlan { mode: PowerMode::DeepStandby, ports: [false; PORTS], hub0: false }
         };
         self.plan
     }
@@ -293,14 +293,14 @@ mod tests {
 
     #[test]
     fn standby_starts_after_the_idle_time_and_ends_with_a_pc() {
-        let ports = [true, false, true];
+        let ports = [true, false, true, true];
         let mut t = tracker([UP, OFF]);
         assert_eq!(t.update(0, Pc::Pc1, true, false, ports), PowerPlan::ACTIVE);
         t.observe(1_000, [OFF, OFF]);
         assert_eq!(t.update(1_000, Pc::Pc1, true, false, ports).mode, PowerMode::Active);
         assert_eq!(t.update(1_000 + STANDBY_AFTER_MS - 1, Pc::Pc1, true, false, ports).mode, PowerMode::Active);
         let deep = t.update(1_000 + STANDBY_AFTER_MS, Pc::Pc1, true, false, ports);
-        assert_eq!(deep, PowerPlan { mode: PowerMode::DeepStandby, ports: [false; 3], hub0: false });
+        assert_eq!(deep, PowerPlan { mode: PowerMode::DeepStandby, ports: [false; PORTS], hub0: false });
         // The KVM's key wakes it for another idle time.
         t.keep_awake(20_000);
         assert_eq!(t.update(20_000, Pc::Pc1, true, false, ports), PowerPlan::ACTIVE);
@@ -315,17 +315,17 @@ mod tests {
     #[test]
     fn a_wakeable_pc_keeps_the_ports_that_can_wake_it() {
         let mut t = tracker([UP, OFF]);
-        t.update(0, Pc::Pc1, true, false, [true; 3]);
+        t.update(0, Pc::Pc1, true, false, [true; PORTS]);
         t.observe(1_000, [WAKEABLE, OFF]);
-        t.update(1_000, Pc::Pc1, true, false, [true; 3]);
-        let plan = t.update(1_000 + STANDBY_AFTER_MS, Pc::Pc1, true, false, [true, true, false]);
-        assert_eq!(plan, PowerPlan { mode: PowerMode::WakeStandby, ports: [true, true, false], hub0: true });
+        t.update(1_000, Pc::Pc1, true, false, [true; PORTS]);
+        let plan = t.update(1_000 + STANDBY_AFTER_MS, Pc::Pc1, true, false, [true, true, true, false]);
+        assert_eq!(plan, PowerPlan { mode: PowerMode::WakeStandby, ports: [true, true, true, false], hub0: true });
         // The ports were chosen when standby started; devices dropping off later change nothing.
-        let plan = t.update(20_000, Pc::Pc1, true, false, [true; 3]);
-        assert_eq!(plan.ports, [true, true, false]);
+        let plan = t.update(20_000, Pc::Pc1, true, false, [true; PORTS]);
+        assert_eq!(plan.ports, [true, true, true, false]);
         // Without standby-wake, or with the sleeping PC not active, it is deep standby.
-        assert_eq!(t.update(21_000, Pc::Pc1, false, false, [true; 3]).mode, PowerMode::DeepStandby);
-        assert_eq!(t.update(22_000, Pc::Pc2, true, false, [true; 3]).mode, PowerMode::DeepStandby);
+        assert_eq!(t.update(21_000, Pc::Pc1, false, false, [true; PORTS]).mode, PowerMode::DeepStandby);
+        assert_eq!(t.update(22_000, Pc::Pc2, true, false, [true; PORTS]).mode, PowerMode::DeepStandby);
     }
 
     #[test]

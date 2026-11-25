@@ -530,7 +530,7 @@ mod tests {
         let mirrors = [
             MirrorSource { port: Port::Mouse, iface: &mouse.interfaces[0], report_desc: RD },
             MirrorSource { port: Port::Mouse, iface: &mouse.interfaces[1], report_desc: RD },
-            MirrorSource { port: Port::Other, iface: &pad.interfaces[0], report_desc: &[] },
+            MirrorSource { port: Port::Aux2, iface: &pad.interfaces[0], report_desc: &[] },
         ];
         let identity = IdentitySource {
             port: Port::Mouse,
@@ -575,7 +575,7 @@ mod tests {
     #[test]
     fn vial_interface_takes_the_last_in_endpoint() {
         let mouse = parse_config(GAMING_MOUSE_CONFIG).unwrap();
-        let m = |i| MirrorSource { port: Port::Other, iface: &mouse.interfaces[i], report_desc: RD };
+        let m = |i| MirrorSource { port: Port::Aux2, iface: &mouse.interfaces[i], report_desc: RD };
         let two = [m(0), m(1)];
         let three = [m(0), m(1), m(0)];
         let params = |mirrors| Params {
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn too_many_mirrors_is_an_error() {
         let mouse = parse_config(GAMING_MOUSE_CONFIG).unwrap();
-        let m = |i| MirrorSource { port: Port::Other, iface: &mouse.interfaces[i], report_desc: RD };
+        let m = |i| MirrorSource { port: Port::Aux2, iface: &mouse.interfaces[i], report_desc: RD };
         let mirrors = [m(0), m(1), m(0), m(1)];
         let mut out = [0u8; 4096];
         let r = build(

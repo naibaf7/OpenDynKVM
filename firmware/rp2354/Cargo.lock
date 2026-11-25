@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-core"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "defmt",
  "heapless 0.9.3",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-hid"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "defmt",
  "heapless 0.9.3",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-map"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "defmt",
  "heapless 0.9.3",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "kvm-proto"
-version = "0.1.66"
+version = "0.1.67"
 dependencies = [
  "defmt",
  "heapless 0.9.3",

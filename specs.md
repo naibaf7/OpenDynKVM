@@ -21,7 +21,7 @@ and [software.md](software.md) (firmware and host software).
 | **PC ports** | 2 × USB-C, USB 2.0 High-Speed. Each PC sees a 4-port hub with the KVM's own composite device on it, always present ([design.md §1](design.md)) |
 | **Power** | USB-C PWR/SERVICE (optional, takes priority), otherwise **either** PC's port, through ideal diodes. This deviates from the requirement on purpose: with power from PC1 only, PC2 would lose its keyboard and mouse whenever PC1 is off ([design.md §6](design.md)) |
 | **Power draw** | about 0.5 A from 5 V for the electronics, plus the peripherals. A PC's USB 2.0 port (500 mA) is not enough; a USB 3 port leaves about 0.4 A for the peripherals, a 3 A USB-C source about 2.5 A |
-| **Front ports** | 3 × USB-A (Keyboard, Mouse, Other), each with its own current-limited 5 V switch (about 1 A) and a 1:3 analog USB switch: to the KVM's host, or straight to PC1's or PC2's hub |
+| **Front ports** | 4 × USB-A (Keyboard, Mouse, Aux 1, Aux 2; up to board 0.18.0: 3 × Keyboard, Mouse, Other, Other being Aux 2 now), each with its own current-limited 5 V switch (about 1 A); all but Aux 1 have a 1:3 analog USB switch: to the KVM's host, or straight to PC1's or PC2's hub |
 | **Port modes** | Normalized (the KVM's own keyboard and mouse), Mirrored (the device's HID interfaces, copied), Mirrored + identity (also its VID/PID and name), Passthrough (the real device, on one PC) and Auto, which picks one per device ([design.md §4](design.md)) |
 | **Switching time** | under 1 ms in the emulated modes; about 1 s in passthrough, where the device re-enumerates |
 | **Added latency** | about 0.1 ms on average (≈ 36 µs in the KVM + 0–125 µs until the PC's next High-Speed poll) ([software.md §3](software.md)) |

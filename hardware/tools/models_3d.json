@@ -57,6 +57,35 @@
    }
   ]
  },
+ "C2980305": {
+  "footprint": "CustomFootprints:ESP32-MINI-1",
+  "easyeda": "WIFI-SMD_ESP32-MINI-1",
+  "uuid": "32aa5547b29a47f0bed0d64870895ae0",
+  "bottom": false,
+  "box": [
+   -6.6,
+   6.6,
+   -6.78,
+   12.22,
+   0.0,
+   2.41
+  ],
+  "models": [
+   {
+    "file": "${KIPRJMOD}/3dmodels/C2980305.step",
+    "offset": [
+     0.0,
+     2.715,
+     0.01
+    ],
+    "rotate": [
+     0.0,
+     0.0,
+     0.0
+    ]
+   }
+  ]
+ },
  "C318884": {
   "footprint": "Button_Switch_SMD:SW_Push_1P1T_XKB_TS-1187A",
   "easyeda": "SW-SMD_4P-L5.1-W5.1-P3.70-LS6.5-TL_H1.5",
@@ -106,35 +135,6 @@
      0.0,
      0.0,
      0.03
-    ],
-    "rotate": [
-     0.0,
-     0.0,
-     0.0
-    ]
-   }
-  ]
- },
- "C41349510": {
-  "footprint": "CustomFootprints:ESP32-C3-MINI-1",
-  "easyeda": "WIFIM-SMD_ESP32-C3-MINI-1",
-  "uuid": "789e2235438340f8bef14c336f136f9e",
-  "bottom": false,
-  "box": [
-   -6.6,
-   6.6,
-   -5.58,
-   11.02,
-   0.0,
-   2.5
-  ],
-  "models": [
-   {
-    "file": "${KIPRJMOD}/3dmodels/C41349510.step",
-    "offset": [
-     0.0,
-     2.715,
-     0.0
     ],
     "rotate": [
      0.0,

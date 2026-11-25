@@ -2,8 +2,11 @@
 
 A 3D-printable case in three printed parts: a **tray** the board sits in, a flat **lid** with the OpenDynKVM logo
 raised over the key, and four **spacers**. Four M3 screws through the lid, the spacers and the board's four mounting
-holes hold everything together. It fits every board from 0.12.0 to 0.17.0: their holes, ports, key and LEDs are in
-the same places.
+holes hold everything together. It is built for board 0.19.0: four USB-A ports at a 26 mm pitch, the six side LEDs
+on the board's underside (their windows are below the board, and the two front corner posts leave them room), and a
+window in the rear for the extension connector. Boards 0.12.0 to 0.18.0 (three ports at 35 mm, LEDs on top) need the
+case from their own commit (`git show hw-vX.Y.Z:hardware/case/...`, or `board_facts.py` and `gen_case.py` run on
+that board).
 
 ![The case, assembled](case.svg)
 

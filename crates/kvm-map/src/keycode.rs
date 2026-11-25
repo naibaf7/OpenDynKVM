@@ -21,7 +21,7 @@ pub const KVM_BTN9: u16 = 0x7E00;
 pub const KVM_DPAD: u16 = 0x7E08;
 /// KVM actions 0–19 (`Action::Kvm`): the hotkey list's actions in their order (`kvm_proto::ctrl::HotkeyAction::ALL`):
 /// toggle PC, next and previous host, PC1, PC2, Bluetooth hosts 1–4, next and previous profile, profiles 0–7, the
-/// Other port's mode. They fill the keyboard range: 0x7E0C–0x7E1F.
+/// Aux 2 port's mode. They fill the keyboard range: 0x7E0C–0x7E1F.
 pub const KVM_ACTION: u16 = 0x7E0C;
 pub const KVM_ACTIONS: u16 = 20;
 

@@ -2,7 +2,7 @@
 
 use heapless::Vec;
 use kvm_hid::translate::{Verdict, caps};
-use kvm_proto::ctrl::{AutoReason, Port, PortMode, Speed, class as cls};
+use kvm_proto::ctrl::{AutoReason, PORTS, Port, PortMode, Speed, class as cls};
 
 use crate::usbdesc::{ConfigInfo, DeviceDesc, MAX_INTERFACES, class};
 
@@ -111,6 +111,16 @@ impl DeviceSummary {
         self.has_hid() && self.hid().all(Verdict::fits)
     }
 
+    /// The KVM can read it into its own keyboard, mouse and gamepad: keys, buttons, axes or media keys on a HID
+    /// interface, gamepads too, since the mapping engine reads them (hid_mapping.md): to the virtual gamepad, or as the
+    /// keymap says. XInput pads, wired or behind a wireless receiver, are decoded without a descriptor
+    /// (`kvm_hid::xinput`).
+    pub fn normalizable(&self) -> bool {
+        self.hid().any(|v| v.caps & (caps::KEYBOARD | caps::MOUSE | caps::CONSUMER | caps::SYSTEM | caps::GAMEPAD) != 0)
+            || self.has_xinput()
+            || self.has_xinput_wireless()
+    }
+
     /// IN and OUT endpoints a mirror of every HID and XInput interface needs.
     pub fn mirror_cost(&self) -> (u8, u8) {
         self.interfaces
@@ -177,7 +187,7 @@ impl Budget {
 /// later is normalized without re-enumerating the PCs. `modes`: each port's effective mode while the KVM hosts its
 /// device; `wireless`: a Bluetooth device is normalized (it needs the KVM's interfaces as a port would); `vial`: the
 /// Vial interface is on.
-pub fn wide(modes: [Option<PortMode>; 3], mirror_in: u8, wireless: bool, vial: bool) -> bool {
+pub fn wide(modes: [Option<PortMode>; PORTS], mirror_in: u8, wireless: bool, vial: bool) -> bool {
     let mirrored = |p: Port| matches!(modes[p.index()], Some(PortMode::Mirrored | PortMode::MirroredIdentity));
     mirrored(Port::Keyboard)
         && mirrored(Port::Mouse)
@@ -197,9 +207,9 @@ pub struct Candidate<'a> {
 /// The effective mode of every port with a device, indexed by port. Candidates are served in order, so the ports
 /// already mirrored go first and keep their endpoints against a newcomer. `wireless`: a Bluetooth device is
 /// normalized; `vial`: the Vial interface is on.
-pub fn decide_all(candidates: &[Candidate], wireless: bool, vial: bool) -> [Option<(PortMode, AutoReason)>; 3] {
+pub fn decide_all(candidates: &[Candidate], wireless: bool, vial: bool) -> [Option<(PortMode, AutoReason)>; PORTS] {
     let serve = |mut b: Budget| {
-        let mut out = [None; 3];
+        let mut out = [None; PORTS];
         let mut mirror_in = 0;
         for c in candidates {
             let (mode, why) = decide(c.setting, c.port, c.dev, &b);
@@ -225,14 +235,20 @@ pub fn decide_all(candidates: &[Candidate], wireless: bool, vial: bool) -> [Opti
 
 /// The effective mode of a port and why.
 pub fn decide(setting: PortMode, port: Port, d: &DeviceSummary, b: &Budget) -> (PortMode, AutoReason) {
+    match decide_routed(setting, port, d, b) {
+        // Aux 1 has no router (design.md §4): what would go to a PC's own USB runs Normalized where it can, else off.
+        (PortMode::Passthrough, _) if !port.has_router() => {
+            (if d.normalizable() { PortMode::Normalized } else { PortMode::Off }, AutoReason::NeedsPassthrough)
+        }
+        decided => decided,
+    }
+}
+
+/// [`decide`] for a port with a router: Passthrough is always there to fall back to.
+fn decide_routed(setting: PortMode, port: Port, d: &DeviceSummary, b: &Budget) -> (PortMode, AutoReason) {
     let (need_in, need_out) = d.mirror_cost();
     let mirror_fits = need_in > 0 && need_in <= b.free_in && need_out <= b.free_out;
-    // Gamepads too, since the mapping engine reads them (hid_mapping.md): to the virtual gamepad, or as the keymap says.
-    // XInput pads, wired or behind a wireless receiver, are decoded without a descriptor (`kvm_hid::xinput`).
-    let normalizable =
-        d.hid().any(|v| v.caps & (caps::KEYBOARD | caps::MOUSE | caps::CONSUMER | caps::SYSTEM | caps::GAMEPAD) != 0)
-            || d.has_xinput()
-            || d.has_xinput_wireless();
+    let normalizable = d.normalizable();
     match setting {
         PortMode::Auto => {
             if d.has_non_hid() || (!d.has_hid() && !d.has_xinput()) {
@@ -243,12 +259,12 @@ pub fn decide(setting: PortMode, port: Port, d: &DeviceSummary, b: &Budget) -> (
                 } else {
                     (PortMode::Passthrough, AutoReason::EndpointBudget)
                 }
-            } else if port != Port::Other && d.all_hid_fit() {
+            } else if !port.is_aux() && d.all_hid_fit() {
                 (PortMode::Normalized, AutoReason::FitsNormalized)
             } else if mirror_fits {
-                let why = if port == Port::Other { AutoReason::OtherPortHid } else { AutoReason::ExtraInputs };
+                let why = if port.is_aux() { AutoReason::AuxPortHid } else { AutoReason::ExtraInputs };
                 (PortMode::Mirrored, why)
-            } else if port != Port::Other && normalizable {
+            } else if !port.is_aux() && normalizable {
                 // Standard keys and buttons still work; the extras are lost until endpoints free up.
                 (PortMode::Normalized, AutoReason::EndpointBudget)
             } else {
@@ -298,8 +314,9 @@ mod tests {
         let d = summary(GAMING_MOUSE_CONFIG, |_| Some(FITS_MOUSE));
         assert_eq!(decide(PortMode::Auto, Port::Mouse, &d, &ROOM), (PortMode::Normalized, AutoReason::FitsNormalized));
         assert_eq!(d.mirror_cost(), (2, 1));
-        // On the Other port the same device is mirrored.
-        assert_eq!(decide(PortMode::Auto, Port::Other, &d, &ROOM), (PortMode::Mirrored, AutoReason::OtherPortHid));
+        // On the Aux ports the same device is mirrored.
+        assert_eq!(decide(PortMode::Auto, Port::Aux2, &d, &ROOM), (PortMode::Mirrored, AutoReason::AuxPortHid));
+        assert_eq!(decide(PortMode::Auto, Port::Aux1, &d, &ROOM), (PortMode::Mirrored, AutoReason::AuxPortHid));
     }
 
     #[test]
@@ -318,20 +335,20 @@ mod tests {
     #[test]
     fn webcam_passes_through_and_xinput_is_mirrored() {
         let cam = summary(WEBCAM_CONFIG, |_| None);
-        assert_eq!(decide(PortMode::Auto, Port::Other, &cam, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
-        assert_eq!(decide(PortMode::Mirrored, Port::Other, &cam, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
+        assert_eq!(decide(PortMode::Auto, Port::Aux2, &cam, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
+        assert_eq!(decide(PortMode::Mirrored, Port::Aux2, &cam, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
         assert_eq!(
-            decide(PortMode::Passthrough, Port::Other, &cam, &ROOM),
+            decide(PortMode::Passthrough, Port::Aux2, &cam, &ROOM),
             (PortMode::Passthrough, AutoReason::NotAuto)
         );
-        assert_eq!(decide(PortMode::Off, Port::Other, &cam, &ROOM), (PortMode::Off, AutoReason::NotAuto));
+        assert_eq!(decide(PortMode::Off, Port::Aux2, &cam, &ROOM), (PortMode::Off, AutoReason::NotAuto));
         assert!(cam.classes() & cls::VIDEO != 0);
 
         let pad = summary(XINPUT_CONFIG, |_| None);
-        assert_eq!(decide(PortMode::Auto, Port::Other, &pad, &ROOM), (PortMode::Mirrored, AutoReason::XInput));
+        assert_eq!(decide(PortMode::Auto, Port::Aux2, &pad, &ROOM), (PortMode::Mirrored, AutoReason::XInput));
         let none = Budget { free_in: 0, free_out: 0, identity_free: true };
         assert_eq!(
-            decide(PortMode::Auto, Port::Other, &pad, &none),
+            decide(PortMode::Auto, Port::Aux2, &pad, &none),
             (PortMode::Passthrough, AutoReason::EndpointBudget)
         );
     }
@@ -341,12 +358,38 @@ mod tests {
         let rx = summary(RECEIVER_CONFIG, |_| None);
         assert!(rx.has_xinput_wireless() && rx.classes() & cls::GAMEPAD != 0);
         // Auto and mirrored: the PC gets it all (four pads, the headsets); Normalized: the KVM reads one pad.
-        assert_eq!(decide(PortMode::Auto, Port::Other, &rx, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
-        assert_eq!(decide(PortMode::Mirrored, Port::Other, &rx, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
-        assert_eq!(decide(PortMode::Normalized, Port::Other, &rx, &ROOM), (PortMode::Normalized, AutoReason::NotAuto));
+        assert_eq!(decide(PortMode::Auto, Port::Aux2, &rx, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
+        assert_eq!(decide(PortMode::Mirrored, Port::Aux2, &rx, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
+        assert_eq!(decide(PortMode::Normalized, Port::Aux2, &rx, &ROOM), (PortMode::Normalized, AutoReason::NotAuto));
         // A wired pad: mirrored by Auto as before, and now normalizable too.
         let pad = summary(XINPUT_CONFIG, |_| None);
-        assert_eq!(decide(PortMode::Normalized, Port::Other, &pad, &ROOM), (PortMode::Normalized, AutoReason::NotAuto));
+        assert_eq!(decide(PortMode::Normalized, Port::Aux2, &pad, &ROOM), (PortMode::Normalized, AutoReason::NotAuto));
+    }
+
+    #[test]
+    fn aux1_never_passes_through() {
+        let needs = AutoReason::NeedsPassthrough;
+        // A webcam has nothing the KVM can read: it stays off, whatever the port is set to.
+        let cam = summary(WEBCAM_CONFIG, |_| None);
+        for setting in [PortMode::Auto, PortMode::Mirrored, PortMode::Normalized, PortMode::Passthrough] {
+            assert_eq!(decide(setting, Port::Aux1, &cam, &ROOM), (PortMode::Off, needs), "{setting:?}");
+        }
+        assert_eq!(decide(PortMode::Off, Port::Aux1, &cam, &ROOM), (PortMode::Off, AutoReason::NotAuto));
+        // A wireless receiver that Auto passes through elsewhere: the KVM reads its pad.
+        let rx = summary(RECEIVER_CONFIG, |_| None);
+        assert_eq!(decide(PortMode::Auto, Port::Aux1, &rx, &ROOM), (PortMode::Normalized, needs));
+        // An XInput pad is mirrored while endpoints are left, then normalized instead of passed through.
+        let pad = summary(XINPUT_CONFIG, |_| None);
+        assert_eq!(decide(PortMode::Auto, Port::Aux1, &pad, &ROOM), (PortMode::Mirrored, AutoReason::XInput));
+        let none = Budget { free_in: 0, free_out: 0, identity_free: true };
+        assert_eq!(decide(PortMode::Auto, Port::Aux1, &pad, &none), (PortMode::Normalized, needs));
+        // A device with extra inputs that no longer fits a mirror, likewise.
+        let mouse = summary(GAMING_MOUSE_CONFIG, |n| Some(if n == 0 { FITS_MOUSE } else { KB_VENDOR }));
+        assert_eq!(decide(PortMode::Auto, Port::Aux1, &mouse, &none), (PortMode::Normalized, needs));
+        assert_eq!(
+            decide(PortMode::Auto, Port::Aux2, &mouse, &none),
+            (PortMode::Passthrough, AutoReason::EndpointBudget)
+        );
     }
 
     #[test]
@@ -358,26 +401,26 @@ mod tests {
         let squeezed = Some((PortMode::Normalized, AutoReason::EndpointBudget));
         // 2 + 2 IN endpoints: more than EP5–EP7 have, and nothing runs Normalized.
         let both = [c(Port::Keyboard, PortMode::Mirrored), c(Port::Mouse, PortMode::Mirrored)];
-        assert_eq!(decide_all(&both, false, false), [mirrored, mirrored, None]);
-        assert!(wide([Some(PortMode::Mirrored), Some(PortMode::Mirrored), None], 4, false, false));
+        assert_eq!(decide_all(&both, false, false), [mirrored, mirrored, None, None]);
+        assert!(wide([Some(PortMode::Mirrored), Some(PortMode::Mirrored), None, None], 4, false, false));
         // A normalized Bluetooth keyboard needs the KVM's interfaces as a port's would.
-        assert_eq!(decide_all(&both, true, false), [mirrored, squeezed, None]);
-        // With Vial on, 5 are left: an XInput pad on Other still fits.
-        let with_pad = [both[0], both[1], Candidate { port: Port::Other, setting: PortMode::Auto, dev: &pad }];
+        assert_eq!(decide_all(&both, true, false), [mirrored, squeezed, None, None]);
+        // With Vial on, 5 are left: an XInput pad on Aux 2 still fits.
+        let with_pad = [both[0], both[1], Candidate { port: Port::Aux2, setting: PortMode::Auto, dev: &pad }];
         let all = decide_all(&with_pad, false, true);
-        assert_eq!(all, [mirrored, mirrored, Some((PortMode::Mirrored, AutoReason::XInput))]);
+        assert_eq!(all, [mirrored, mirrored, None, Some((PortMode::Mirrored, AutoReason::XInput))]);
         // A port running Normalized needs the KVM's interfaces: the port served last loses its mirror.
-        let other = c(Port::Other, PortMode::Normalized);
+        let other = c(Port::Aux2, PortMode::Normalized);
         let normalized = Some((PortMode::Normalized, AutoReason::NotAuto));
-        assert_eq!(decide_all(&[both[0], both[1], other], false, false), [mirrored, squeezed, normalized]);
-        assert_eq!(decide_all(&[both[1], both[0], other], false, false), [squeezed, mirrored, normalized]);
+        assert_eq!(decide_all(&[both[0], both[1], other], false, false), [mirrored, squeezed, None, normalized]);
+        assert_eq!(decide_all(&[both[1], both[0], other], false, false), [squeezed, mirrored, None, normalized]);
         // So does a mouse in Auto that fits the normalized format.
         let auto = [both[0], c(Port::Mouse, PortMode::Auto)];
         assert_eq!(
             decide_all(&auto, false, false),
-            [mirrored, Some((PortMode::Normalized, AutoReason::FitsNormalized)), None]
+            [mirrored, Some((PortMode::Normalized, AutoReason::FitsNormalized)), None, None]
         );
         // A setup that fits EP5–EP7 keeps the KVM's interfaces.
-        assert!(!wide([Some(PortMode::Mirrored), Some(PortMode::Mirrored), None], 3, false, false));
+        assert!(!wide([Some(PortMode::Mirrored), Some(PortMode::Mirrored), None, None], 3, false, false));
     }
 }

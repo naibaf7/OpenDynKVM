@@ -37,7 +37,7 @@ SYSFP = '/usr/share/kicad/footprints'
 MODELS_3D = os.path.join(HERE, 'tools', 'models_3d.json')
 
 # Board: 120 x 80 mm, origin (100, 100).  Rear edge (top, y = 100): USB-C PC1 / PWR-SERVICE / PC2.
-# Front edge (bottom, y = 180): USB-A Keyboard / Mouse / Other with the status LEDs; MX key in the centre.
+# Front edge (bottom, y = 180): USB-A Keyboard / Mouse / Aux 1 / Aux 2 with the status LEDs; MX key in the centre.
 X0, Y0, W, H = 100.0, 100.0, 120.0, 80.0
 X1, Y1 = X0 + W, Y0 + H
 EDGE_MIN = 1.0          # auto-placed courtyards stay this far inside the board edge
@@ -46,11 +46,19 @@ GAP = 0.35              # minimum courtyard gap for auto-placed parts: room for 
 USB_C_Y = Y0 + 3.65                 # receptacle face flush with the rear edge (OpenRower geometry)
 USB_A_Y = Y1 - 13.2                 # pad row; receptacle face flush with the front edge
 REAR_X = {'J101': 115.0, 'J301': 160.0, 'J201': 205.0}     # USB-C centres, 45 mm pitch
-PORT_C = {'KB': 125.0, 'MS': 160.0, 'OT': 195.0}           # USB-A centres, 35 mm pitch
+# USB-A centres (0.19.0): four ports at a 26 mm pitch, symmetric about the board's centre line, so each outer port's
+# courtyard is 12.37 mm from its side edge.  Aux 1 (block 17, no router) sits between Mouse and Aux 2 (block 14, the
+# Other port up to 0.18.0).  Up to
+# 0.18.0: three ports at a 35 mm pitch (125 / 160 / 195), each macro's parts west of its connector and its LED at the
+# front edge beside it; four did not fit that way.
+PORT_C = {'KB': 121.0, 'MS': 147.0, 'A1': 173.0, 'A2': 199.0}
+PORT_BLOCK = {'KB': 12, 'MS': 13, 'A2': 14, 'A1': 17}
 PORT_X = {p: c - 3.5 for p, c in PORT_C.items()}           # USB-A pin 1 (VBUS); D-/D+ at +2.5/+4.5
 # Side LEDs at 0 degrees: the lens (the footprint's +Y side, away from its pads) faces the front edge, 0.5 mm from it.
 # Up to 0.16.0 they sat at 180 degrees, pads 0.5 mm from the edge, and shone into the board (errata E3).  The
 # courtyard keeps the same span (body 1.36 mm and courtyard 1.6 mm south of the origin, 0.85 mm north of it).
+# 0.19.0: the four port LEDs are on the bottom, centred under their USB-A (0 degrees, flipped left-right, so the lens
+# still faces the front edge); PC1 / PC2 stay on top at the two front corners.
 LED_Y = Y1 - 0.5 - 1.36
 
 KEY = (160.0, 153.5)                # MX key, centred left-right, right behind the middle USB-A port
@@ -62,9 +70,11 @@ KEY_CLEAR = 11.25                   # no parts within the 18 mm keycap + 2.25 mm
 #  2. AT32F405 #1 | RP2354B | AT32F405 #2, mirrored about the centre line: each AT32's SPI side faces the RP
 #     (AT32 #2 is AT32 #1 turned 180 degrees, so its OTGHS faces south); the RP's crystal sits beside it
 #  3. the MX key, centred, right behind the middle USB-A port
-#  4. three identical output macros (OUT_MACRO): USB-A with its ESD, 1:3 router and VBUS switch to its left
-#  The auto-placed passives of the first macro of each kind are copied into the others (MACRO_TWINS).  Then the
-#  rest: power path and service switch between the input macros, LED buffer by the key.
+#  4. four output macros (OUT_MACRO, all hand-placed): USB-A at the front edge; behind it a column with the ESD right
+#     behind the D-/D+ pins and the 1:3 router north of it, the VBUS switch and its resistors west of the ESD; the
+#     220 uF bulk in the gap west of the connector; the port LED on the bottom under the connector
+#  The auto-placed passives of the first input macro are copied into the others (MACRO_TWINS).  Then the rest: power
+#  path and service switch between the input macros, LED buffer by the key.
 IN_MACRO = {   # {p} = USB-C block, {h} = hub block: (dx from the USB-C centre, y, rotation)
     'J{p}01': (0.0, USB_C_Y, 180), 'U{p}01': (0.0, 113.0, 270),      # ESD: D-/D+ run straight through it.  rev 9 puts
     #                            all three at 113.0 (1.0 mm north of the old spot): the service ESD had to go there
@@ -83,14 +93,48 @@ IN_MACRO = {   # {p} = USB-C block, {h} = hub block: (dx from the USB-C centre, 
     # crystal load caps right at the crystal: XI beside pad 1 (bottom left), XO above pad 3 (top right)
     'C{h}10': (-12.85, 122.45, 180), 'C{h}11': (-8.4, 118.6, 90),
 }
-OUT_MACRO = {  # {b} = port block: (dx from the USB-A centre, y, rotation)
-    'J{b}01': (-3.5, USB_A_Y, 0),                                    # USB-A (origin = pin 1 = VBUS, west end)
-    'U{b}01': (-13.5, USB_A_Y - 7.6, 90),                            # ESD, D- west / D+ east like the connector
-    'U{b}02': (-13.5, USB_A_Y - 13.05, 180),                         # 1:3 router: D-/D+ face the ESD
-    'U{b}03': (-19.0, USB_A_Y - 7.35, 0),                            # VBUS switch
-    'C{b}03': (-13.0, USB_A_Y + 2.7, 90),                            # 220 uF port bulk (polymer can), in front
+# Output macro (0.19.0).  {b} = port block.  Two frames: the connector, its bulk and its LED are placed from the
+# USB-A centre c (CONN_PARTS), everything else from the port's column xc = c + COLUMN_DX[port] (COLUMN_PARTS); y is
+# absolute.  The column holds the data path in a straight line behind the connector's D-/D+ pins (c - 1 / c + 1):
+# the ESD (rot 90, flow-through, D- west like the connector) and north of it the 1:3 router (rot 180: its common
+# pins 10/11 face the ESD, MHL west, USB1/USB2 north), with the router's SEL straps east of it and its 100 nF
+# south-west; the VBUS switch west of the ESD with its input cap above it, its ILIM / FAULT resistors below it and
+# its EN pull-down west.  Mouse keeps its 0.18.0 column (x 146.5): the key's 2.25 mm clearance starts at 148.75.
+# Aux 2's column is 3 mm west of its pins, clear of the Bluetooth module's west end (x 200.25).
+COLUMN_DX = {'KB': -0.5, 'MS': -0.5, 'A2': -3.0}
+CONN_PARTS = {   # (dx from c, y, rotation[, 'B'])
+    'J{b}01': (-3.5, USB_A_Y, 0),                    # USB-A (origin = pin 1 = VBUS, west end)
+    'C{b}03': (-13.0, USB_A_Y + 2.7, 90),            # 220 uF port bulk (polymer can), in the gap west of the port
 }
-MACRO_TWINS = {1: [(3, 45.0), (2, 90.0)], 8: [(7, 45.0), (9, 90.0)], 12: [(13, 35.0), (14, 70.0)]}
+COLUMN_PARTS = {  # (dx from xc, y, rotation)
+    'U{b}02': (0.0, 153.75, 180),                    # 1:3 router
+    # (2026-11-25, user: the first layout packed these too tightly for routing) the SEL straps 1.75 mm out from the
+    # router's SEL pads, so the pins' fan-out vias fit between; the switch 1.16 mm off the ESD, its resistors apart
+    'R{b}01': (3.3, 153.2, 90),                      # SEL0 pull-down, beside SEL0 (pin 1, east)
+    'R{b}02': (3.3, 155.6, 90),                      # SEL1 pull-up, beside SEL1 (pin 2)
+    'C{b}01': (-2.9, 156.4, 0),                      # the router's 100 nF, clear of its west (MHL) escape
+    'U{b}01': (0.0, 160.3, 90),                      # ESD, D- west / D+ east like the connector
+    'U{b}03': (-5.0, 159.45, 0),                     # VBUS switch (TPS2553)
+    'C{b}02': (-6.15, 156.8, 0),                     # its 1 uF input cap, over IN (pin 1)
+    'R{b}03': (-3.85, 162.3, 0),                     # ILIM
+    'R{b}04': (-6.3, 162.3, 0),                      # FAULT pull-up
+    'R{b}05': (-8.05, 160.4, 90),                    # EN pull-down, west of EN (pin 3)
+}
+# The Aux 1 port (block 17) has no router: its ESD sits 0.5 mm east of its pins (the key's clearance ends at x 171.25)
+# and its switch, turned 180 degrees so that OUT faces the ESD, east of it.  Its 220 uF is in the gap west of it like
+# the others' (centred under the key's south edge, outside the lid's key cut-out).
+A1_PARTS = {
+    'J1701': (PORT_C['A1'] - 3.5, USB_A_Y, 0),
+    'C1702': (PORT_C['A1'] - 13.0, USB_A_Y + 2.7, 90),
+    'U1701': (PORT_C['A1'] + 0.5, 160.3, 90),        # ESD
+    'U1702': (178.8, 159.45, 180),                   # VBUS switch: OUT / ILIM / FAULT west, IN / GND / EN east,
+    #                                                  1.46 mm off the ESD
+    'R1702': (177.65, 156.8, 0),                     # FAULT pull-up, over FAULT (pin 4, north-west)
+    'R1703': (179.95, 156.8, 0),                     # EN pull-down, over EN (pin 3, north-east)
+    'R1701': (177.65, 162.3, 0),                     # ILIM, below the switch's west end
+    'C1701': (179.95, 162.3, 0),                     # 1 uF input cap, below IN (pin 1, south-east)
+}
+MACRO_TWINS = {1: [(3, 45.0), (2, 90.0)], 8: [(7, 45.0), (9, 90.0)]}
 AT_X = 34.0                         # AT32 #2's offset from the centre line (it sits at 160 + AT_X)
 AT1_X, AT1_Y = 114.0, 139.0         # AT32F405 #1: another 10 mm left, so the PC1 USB-C block (connector, ESD, hub
                                     # and their passives) and the PWR/SERVICE block above it get vertical room. It
@@ -128,9 +172,6 @@ PLACEMENT = {
     'R503': (144.8, 124.4, 90), 'R504': (146.0, 124.4, 90),     # rev 8: between the RP2354B's USB pins (south) and the
     # service switch's south-facing common port (north), so both RP-side pairs are short and straight.  Side by side in x
     # with pad 1 south - the RP side, which check_aux wants nearer the RP2354B's pin - and pad 2 north, facing the port.
-    # Hub-0's unused port 4: its D+ / D- resistors just east of the hub's south-east corner (below pins 9 / 8 sits
-    # Hub-0's Other via pair, so both lines run east along the pin row: pin 9 to the nearer one, pin 8 below it)
-    'R707': (166.4, 124.3, 90), 'R708': (167.65, 124.3, 90),
     # SWD pads (SWCLK/SWDIO/RUN leave the south side eastwards) just beyond the crystal, so those lines end before
     # the Other-port lines (south-east corner pins) turn south past them
     'J501': (RP_X + 22.0, RP_Y + 5.5, 0), 'U404': (RP_X - 12.5, RP_Y - 6.0, 0),
@@ -139,7 +180,10 @@ PLACEMENT = {
     'C519': (RP_X + 22.6, RP_Y + 8.3, 0), 'R505': (RP_X + 24.3, RP_Y + 8.75, 90),
     # top row between the input macros: BOOTSEL; service switch and power path right of PWR/SERVICE, 2 mm further
     # down so the rear USB-C pad rows and their VBUS / CC lines keep the strip along the rear edge
-    'SW501': (138.0, 105.5, 0), 'U601': (140.0, 114.0, 90),    # the service switch (TS3USB3031, rev 8)
+    # 0.19.0: the extension connector (block 18) takes the OSHW logo's strip next to PC1, BOOTSEL moves 2.4 mm west to
+    # sit beside it and the logo goes east of BOOTSEL.  BOOTSEL cannot move towards the service USB-C instead: its
+    # pinhole in the lid must keep 2.5 mm from the lid's 36 mm logo, which starts at x 142 (case/gen_case.py)
+    'SW501': (135.6, 105.5, 0), 'U601': (140.0, 114.0, 90),    # the service switch (TS3USB3031, rev 8)
     # The service switch sits in the open strip west of Hub-0 and north of the RP2354B (moved there 2026-10-25:
     # 15 mm left, 5 mm up, and rotated).  At 90 its two channel pairs (USB1 3/4 = Hub-0's upstream, USB2
     # 5/6 = the service connector) face **east**, straight at the service ESD (160,115) and Hub-0's upstream pins
@@ -168,6 +212,18 @@ PLACEMENT = {
     # output pair sit within 3 mm), so the bulk pair goes on the free strip west of the power block - 3.0 x 1.6 mm
     # courtyards, the nearest free spots (measured, rev 9)
     'C407': (170.0, 105.0, 90), 'C408': (170.0, 111.0, 90),
+    # the rear extension connector (block 18, 0.19.0): a JST SH side-entry receptacle, opening north, its face 0.7 mm
+    # inside the rear edge (its mounting pads keep the board's 0.5 mm edge clearance).  x 127.25: its case window
+    # (7.5 mm) keeps a 1.25 mm rib to PC1's USB-C window (14.5 mm round x 115).  Pins (180 degrees): GND 128.75, 3V3
+    # 127.75, SDA 126.75, SCL 125.75.  Behind it the ESD (SCL west, SDA east, its 3V3 pad between them facing the 3V3
+    # pin), the series resistors towards the RP2354B, the pull-ups east; the 3.3 V switch south of BOOTSEL.
+    'J1801': (127.25, 103.32, 180),
+    # (spread out 2026-11-25, user: 1.5 mm between the connector's pads and the ESD's for the lines and their vias)
+    'U1802': (126.25, 110.2, 90),
+    'R1806': (125.3, 113.85, 90), 'R1805': (127.2, 113.85, 90),
+    'R1803': (130.75, 109.0, 90), 'R1804': (129.4, 109.0, 90),
+    'U1801': (133.4, 113.0, 180),                                    # OUT / ILIM / FAULT west, IN / GND / EN east
+    'R1801': (129.9, 113.2, 90), 'C1802': (132.3, 115.65, 0), 'C1801': (134.6, 115.65, 0), 'R1802': (136.4, 111.9, 90),
     'C413': (133.8, 127.35, 180),                                    # TLV73311 input 1 uF: beside its +3V3 pins (the auto
     #                                                                  pass anchored it to the buck instead, 45 mm away)
     # the RP2354B's bulk caps keep their rev-8 spots: with the per-pin 100 nF caps gone to B.Cu, the auto pass moved the
@@ -178,17 +234,28 @@ PLACEMENT = {
     'SW1501': (KEY[0], KEY[1], 0), 'D1501': (KEY[0], KEY[1] + 5.08, 0, 'B'),
     'U1501': (134.0, 141.4, 0),                                      # LED data buffer west of the key's corner, west of
     'C1502': (131.1, 140.4, 90), 'C1503': (131.1, 142.45, 90),       # the RP2354B's fan-out; its and the key LED's caps
-    # status LEDs on the front edge, left to right: PC1, KB, MS, OT (each left of its port), PC2
-    'D1502': (106.5, LED_Y, 0), 'D1506': (213.5, LED_Y, 0),
+    # status LEDs on the front edge, all six on the bottom since 0.19.0, left to right: PC1, KB, MS, A1, A2 (each under
+    # its port), PC2.  PC1 / PC2 sit just inboard of the front mounting holes: the case's corner posts keep only their
+    # outboard arm towards the front wall there (case/gen_case.py), so the LEDs and their windows are clear of them
+    'D1502': (107.0, LED_Y, 0, 'B'), 'D1507': (213.0, LED_Y, 0, 'B'),
+    'C1504': (107.45, LED_Y - 1.8, 0, 'B'), 'C1509': (213.45, LED_Y - 1.8, 0, 'B'),
     'H1501': (104.0, 104.0, 0), 'H1502': (216.0, 104.0, 0), 'H1503': (104.0, 170.0, 0), 'H1504': (216.0, 170.0, 0),
 }
 for j, pb, hb in (('J101', 1, 8), ('J301', 3, 7), ('J201', 2, 9)):
     for key, (dx, y, rot) in IN_MACRO.items():
         PLACEMENT[key.format(p=pb, h=hb)] = (REAR_X[j] + dx, y, rot)
-for k, p in enumerate(['KB', 'MS', 'OT']):
-    for key, (dx, y, rot) in OUT_MACRO.items():
-        PLACEMENT[key.format(b=12 + k)] = (PORT_C[p] + dx, y, rot)
-    PLACEMENT[f'D{1503 + k}'] = (PORT_C[p] - 12.0, LED_Y, 0)      # port status LED, left of the port
+for p in ('KB', 'MS', 'A2'):
+    for key, (dx, y, rot) in CONN_PARTS.items():
+        PLACEMENT[key.format(b=PORT_BLOCK[p])] = (PORT_C[p] + dx, y, rot)
+    for key, (dx, y, rot) in COLUMN_PARTS.items():
+        PLACEMENT[key.format(b=PORT_BLOCK[p])] = (PORT_C[p] + COLUMN_DX[p] + dx, y, rot)
+PLACEMENT.update(A1_PARTS)
+# The Keyboard port's bulk cannot sit in the gap west of it: mounting hole H1503 is there (100.5-107.5 x 166.5-173.5).
+# It goes north-west of the connector instead, behind the hole, west of the switch's EN pull-down.
+PLACEMENT['C1203'] = (107.9, 160.5, 90)
+for k, p in enumerate(('KB', 'MS', 'A1', 'A2')):
+    PLACEMENT[f'D{1503 + k}'] = (PORT_C[p], LED_Y, 0, 'B')          # port status LED, under its port (bottom side)
+    PLACEMENT[f'C{1505 + k}'] = (PORT_C[p] + 0.45, LED_Y - 1.8, 0, 'B')   # its 100 nF, at its +5V pad (mirrored)
 # rev 8: the service switch (U601, PLACEMENT above) sits exactly where the hub macro puts its NR0 strap resistor, so
 # Hub-0's copy of R{h}05 is overridden here, after the macro has written it (an entry in the literal above would be
 # overwritten by the loop).  Only Hub-0 is affected - it is the one hub with a switch beside it.  The new spot is south
@@ -235,18 +302,7 @@ for _ref, _x in (('R703', 164.3), ('R702', 165.5), ('R704', 166.7)):
 # the wider strip does not remove it: PAD_ESCAPE_INWARD in route.py still gives VBUS_PWR its way out of the slot.
 # U301 itself now takes the macro spot (0.0, 113.0, 270) like the other two input ESDs - no override needed.
 PLACEMENT['C711'] = (151.6, 117.0, 90)
-# rev 8: Hub-0's port-4 pull-ups (R707/R708) move from the hub macro's north-east corner to *south* of the hub's
-# port-4 pins 9/8.  Those two pins are a pair like any other (the stub to the pull-ups is what tells the hub the port is
-# not removable), and in the macro spot their pair had to round the hub's south fan-out corner - the only way round being
-# Hub-0's Other pair's hand lane (H0_LANES['OT']), which the group's every order lost to.  South of the pins the same
-# pair is a straight 2.5 mm run down the fan-out lane at x 163.75 (tools/route.py, FANOUT_IC['U701']).  Pad 1 (the D4
-# line) faces north, toward the pins it serves (check_aux), and pad 2 is the +3V3 pull-up.
-# R707 (the DP line) sits *east* of R708 and not the other way round: the hub's own DP pin (9) is east of its DM pin
-# (8), so this keeps the P line on the same side at both ends of the link and the pair needs no P/N swap.  The other
-# way round the router has to twist the pair, and measured on the first rev-8 attempt it could not: the swap zone
-# landed on Hub-0's south pad row (PAIR FAIL H0_D4_DP/H0_D4_DM no pair path from (0,515,1275) to (0,538,1278)).
-PLACEMENT['R707'] = (164.55, 130.0, 270)
-PLACEMENT['R708'] = (163.3, 130.0, 270)
+# Hub-0's port 4 is the Aux 1 port since 0.19.0: no port-4 pull-ups any more (R707/R708 up to 0.18.0).
 # The SVC_SEL pull-down follows the switch: it is on the net the RP2354B drives into U601.2, and with the switch at
 # (140,114) the auto-placed spot left its served pad *further* from that pin than its GND pad (check_aux: "pad on that
 # net 8.32 mm, other pad 7.32 mm").  It must not sit in the common port's escape ray either - pin 2 is on the switch's
@@ -261,41 +317,40 @@ PLACEMENT['R510'] = (135.5, 120.5, 270)
 PLACEMENT['C510'] = (142.5, 123.6, 180)
 PLACEMENT['C710'] = (147.15, 120.5, 180)
 
-# ── Bluetooth LE module (0.16.0, block 16; fitted on the BT variant only) ─────────────────────────────────────────────
-# ESP32-C3-MINI-1 on the top side near the south-east corner, its antenna end on the east edge (x 220.0, flush;
-# Espressif's placement guide: antenna at the board edge, no copper under it on any layer).  The only board edge with
-# room: the north edge has the three USB-C ports, the west edge and the band north of here carry the hub lanes, the
-# south edge the USB-A ports and the LEDs.  Hub-2's lanes come down x 205-209 on F.Cu to y 140 and turn south-west to
-# x 199 by y 146-151, north-west of the module.  On 2026-11-08/09 it moved up (from y 158.5 to 152.5), then, for no
-# overhang past the board edge, a bit down and west (to 208.5 / 156.0).  0.16.0 put it on the bottom; on 2026-11-12 it
-# moved to the top, its layout mirrored (same centre, antenna still east), so that the bottom carries only
-# small parts: routed by seeding 0.17.0's board and moving these nine parts (tools/route.py --move, README.md).
-# Its 22 ground pads join the F.Cu GND pour instead of taking a via each (route.py POUR_PADS).
-# Rotated 270: antenna east, pads 1-11 along the north side (3V3 at x 210.9, EN 206.9, IO2 209.3, IO3 208.5), pads 12-24
-# along the west side (IO8 at y ESP_AT + 3.2, IO9 + 4.0 ... from the north), pads 25-35 along the south side (RXD0 at
-# x 208.5, TXD0 209.3), the ground row 36-48 along the antenna end.  Its passives sit north and west of it, mirrored
-# from the bottom-side layout; the two pull-ups west stand on end in the 1.3 mm between the module and the logo.
-# The antenna end is at x 219.5, 0.5 mm inside the board edge.
-ESP_AT = (208.5, 156.0)
+# ── Bluetooth module (block 16; fitted on the BT variant only) ─────────────────────────────────────────────────────────
+# ESP32-MINI-1 (0.19.0; 0.16.0-0.18.0 had the ESP32-C3-MINI-1 at (208.5, 156.0)) on the top side near the south-east
+# corner, its antenna end on the east edge (Espressif's placement guide: antenna at the board edge, no copper under it
+# on any layer).  The only board edge with room: the north edge has the three USB-C ports, the west edge and the band
+# north of here carry the hub lanes, the south edge the USB-A ports.  The module is 2.4 mm longer than the C3, so its
+# centre moved 1.2 mm west and its pad end sits at x 200.5 (courtyard 200.25): the Aux 2 port's column is 3 mm west of
+# its pins for it (COLUMN_DX).  Its ground pads join the F.Cu GND pour instead of taking a via each (route.py
+# POUR_PADS).
+# Rotated 270: antenna east; pads 1-13 along the north side (3V3 at x 210.5, EN 206.5), pads 14-27 along the west side
+# (IO0 at y 156.4, IO4 157.2), pads 28-40 along the south side (RXD0 at x 208.1, TXD0 208.9), the ground row 41-54
+# along the antenna end.  Its passives sit north of it, where the C3's were (the 3V3 and EN pads are in the same
+# places to 0.4 mm), east of x 203.4; IO0's pull-up and the log pad underneath it.  The antenna end is at x 219.5,
+# 0.5 mm inside the board edge.
+ESP_AT = (207.3, 156.0)
 _ex, _ey = ESP_AT
 PLACEMENT.update({
     'U1601': (_ex, _ey, 270),
-    'C1602': (_ex + 2.55, _ey - 7.6, 180),        # 100 nF at the 3V3 pad
-    'R1602': (_ex + 0.5, _ey - 7.6, 180),         # IO2 pull-up, at its pad
-    'R1601': (_ex - 1.7, _ey - 7.6, 180),         # EN pull-up and EN delay cap, at the EN pad
-    'C1601': (_ex + 1.9, _ey - 9.25, 180),        # 10 uF on the 3V3 pad's line
-    'C1603': (_ex - 1.7, _ey - 9.1, 180),
-    'TP1601': (_ex - 6.4, _ey - 8.6, 180),        # the module's log (IO3)
-    'R1604': (_ex - 6.7, _ey + 4.9, 90),          # RXD0 / IO9 pull-up (boot from flash), beside IO9 (pad 23)
-    'R1603': (_ex - 6.7, _ey + 2.6, 270),         # IO8 pull-up, west of its pad
-    'R1605': (_ex - 4.0, _ey - 8.35, 90),         # 0.18.0: GPIO9 to EN, between the log pad and the EN RC
+    'C1602': (_ex + 3.65, _ey - 7.75, 180),       # 100 nF at the 3V3 pad
+    'C1601': (_ex + 3.65, _ey - 9.6, 180),        # 22 uF on the 3V3 pad's line
+    'R1601': (_ex - 0.9, _ey - 7.75, 180),        # EN pull-up and EN delay cap, at the EN pad
+    'C1603': (_ex - 0.9, _ey - 9.25, 180),
+    'R1603': (_ex - 3.3, _ey - 8.5, 90),          # GPIO9 (ESP_RST) to EN, beside the EN RC
+    # IO0's pull-up (on ESP_RXD) and the IO4 log pad go on the bottom, under the module's west pads: the module's
+    # north-west corner is where Hub-2's Mouse and Aux 2 lanes come down to the routers (tools/route.py LANES)
+    'R1602': (_ex - 4.8, _ey + 0.4, 90, 'B'),     # ESP_RXD / IO0 pull-up (boot from flash), under IO0 (pad 21)
+    'TP1601': (_ex - 4.7, _ey + 3.5, 0, 'B'),     # the module's spare IO4 (its log, for bring-up), from below
 })
 # Antenna keep-out, a board-level rule area on every copper layer (route.py honours it, and the zone filler
 # leaves every plane out of it - GND on F.Cu, In1.Cu and B.Cu, +3V3 on In2.Cu): no track, via or zone fill from the
-# antenna's start (5.6 mm beyond the pad centre, datasheet figure 10-1) to the board edge, and 15 mm beyond the module's
-# sides along the edge (Espressif's clearance) - northwards, and southwards as far as H1504's courtyard (y 166.5; the
-# hole is bare, a pad there is allowed).  Relative to ESP_AT: (x0, y0, x1, y1).
-ANT_KEEPOUT = (5.6, -6.6 - 15.0, 220.0 - ESP_AT[0], 166.4 - ESP_AT[1])
+# antenna's start (6.6 mm beyond the pad centre: the ground pad row along the antenna end reaches 6.45, datasheet
+# figure 14) to the board edge, and 15 mm beyond the module's sides along the edge (Espressif's clearance) -
+# northwards, and southwards as far as H1504's courtyard (y 166.5; the hole is bare, a pad there is allowed).
+# Relative to ESP_AT: (x0, y0, x1, y1).
+ANT_KEEPOUT = (6.6, -6.6 - 15.0, 220.0 - ESP_AT[0], 166.4 - ESP_AT[1])
 
 # no auto-placed parts here: the key, the planned USB pair corridors (see tools/route.py) and their via sites
 KEEP_FREE = [
@@ -316,21 +371,17 @@ KEEP_FREE = [
     # the Bluetooth module and its south and west sides, and its antenna keep-out (from ESP_AT: a box at a fixed place
     # pushed Hub-2's C907 off its spot, and the hub macro's twins C707 / C807 with it - C807 then sat on CC2_PC1's
     # 0.15.0 via, and CC1/CC2_PC1 went unrouted in three runs)
-    (ESP_AT[0] - 8.5, ESP_AT[1] - 7.0, 220.0, ESP_AT[1] + 10.2),
-    (ESP_AT[0] + 5.4, ESP_AT[1] - 21.8, 220.0, 166.5),
-    (184.15, 149.65, 199.55, 162.45),  # the OpenDynKVM logo (LOGOS)
-    (124.95, 101.4, 132.25, 110.1),    # the OSHW logo and the version
+    (ESP_AT[0] - 7.4, ESP_AT[1] - 7.0, 220.0, ESP_AT[1] + 10.2),
+    (ESP_AT[0] + 6.3, ESP_AT[1] - 21.8, 220.0, 166.5),
     (138.3, 112.3, 141.7, 115.7),  # the service switch U601 (rev 8): Hub-0's decoupling ring must place clear of it
 ]
 for _x in REAR_X.values():                    # per input macro
     KEEP_FREE += [(_x - 12.5, 126.0, _x + 3.3, 129.6),   # hub ports leaving the hub
                   (_x - 4.7, 115.0, _x + 1.5, 122.0),    # ESD -> hub upstream
                   (_x - 1.7, 108.4, _x + 1.7, 112.2)]    # connector -> ESD (D+/D- straight down)
-for _c in PORT_C.values():                    # per output macro: router -> ESD fan-in, connector -> ESD pair
-    KEEP_FREE += [(_c - 15.2, USB_A_Y - 10.0, _c - 10.6, USB_A_Y - 1.0),    # the ESD's escape and the USB-A -> ESD
-                  # pair's approach.  It starts below the port switch's east ring (its SEL0/SEL1 pull-downs belong
-                  # there) and covers only the ESD, whose own escape the pair needs
-                  (_c - 14.6, USB_A_Y - 3.6, _c + 1.5, USB_A_Y - 2.0)]      # connector -> ESD pair
+for _p, _c in PORT_C.items():                 # per output macro: the connector -> ESD pair behind the connector
+    _xc = _c + COLUMN_DX.get(_p, 0.5)
+    KEEP_FREE += [(min(_xc, _c) - 1.8, 162.4, max(_xc, _c) + 1.8, USB_A_Y - 2.0)]
 # escape rings: no auto-placed part within this distance of a fine-pitch IC's courtyard, so every pin can
 # leave (or drop to B.Cu through a via) before it meets the decoupling capacitors.  It must cover the router's
 # staggered via fan-out (tools/route.py FANOUT_IC: 3.2 mm beyond the pin tips for the hubs, 3.5-4.6 mm for the
@@ -388,11 +439,11 @@ PIN_FIRST = {'R507', 'R508',                       # AT32 BOOT0 pull-downs
              'R806', 'C812',                       # Hub-1 reset pull-up and cap (the twins follow their spots)
              'R104', 'R105'}                       # VBUS -> VDET divider legs, beside the hub's VBUS_DET pin
 # Hub-1 lane layer changes (via pairs)
-KEEP_FREE_CIRCLES = [(107.5, 152.2, 1.2), (108.5, 150.8, 1.2), (143.0, 153.75, 1.2), (178.0, 153.75, 1.2)]
+KEEP_FREE_CIRCLES = [(PORT_C[_p] + COLUMN_DX[_p] - 3.5, 153.75, 1.2) for _p in ('KB', 'MS', 'A2')]   # MHL escapes
 
 # auto-placement: anchor overrides (part -> footprint ref whose pins it should sit next to)
 ANCHOR_REF = {}
-ANCHOR_REF.update({f'C{1504 + k}': f'D{1502 + k}' for k in range(5)})   # each side LED's decoupling
+# (the six side LEDs' 100 nF are hand-placed with their LEDs on the bottom, PLACEMENT)
 ANCHOR_REF.update({'C411': 'L401', 'C412': 'L401'})                    # 3.3 V buck output caps (refs shift when block 4's
 #                                                                        schematic gains a part: these were C407/C408)
 ANCHOR_REF.update({'R511': 'J301', 'R512': 'J301'})                    # CC series resistors: at the connector
@@ -430,8 +481,9 @@ STACKUP = [   # (layer, type, thickness mm, dielectric Er)
 ]
 
 SILK_TEXT = [
-    ('PC1', (123.0, 106.0), 0), ('PWR / SERVICE', (171.0, 101.2), 0), ('PC2', (197.0, 106.0), 0),
-    ('KEYBOARD', (PORT_C['KB'], 163.2), 0), ('MOUSE', (PORT_C['MS'], 163.2), 0), ('OTHER', (PORT_C['OT'], 163.2), 0),
+    ('PC1', (115.0, 110.2), 0), ('PWR / SERVICE', (171.0, 101.2), 0), ('PC2', (197.0, 106.0), 0), ('EXT', (122.6, 103.0), 0),
+    ('KEYBOARD', (PORT_C['KB'] + 4.5, 163.45), 0), ('MOUSE', (PORT_C['MS'] + 4.5, 163.45), 0),
+    ('AUX 1', (PORT_C['A1'] + 4.5, 163.45), 0), ('AUX 2', (PORT_C['A2'] + 4.5, 163.45), 0),
 ]
 
 # The board's version, printed on it (DEVELOPMENT.md "Versions"): a new major version is a different board, a minor version a
@@ -441,8 +493,10 @@ SILK_TEXT = [
 # 0.14.0 replaced 0.13.0 (errata.md E1), and 0.15.0 is 0.14.0's netlist routed from scratch.  0.16.0 adds the Bluetooth
 # module (block 16, design.md 16), fitted or not.  0.17.0 fixes what the first 0.12.0 board showed: SVC_SEL's pull-up
 # (errata.md E2) and the side LEDs' direction (E3).  0.18.0 gives the RP2354B a reset line to the module's EN (GPIO9
-# through R1605), routed by a seeded run from 0.17.0.
-HW_VERSION = '0.18.0'
+# through R1605), routed by a seeded run from 0.17.0.  0.19.0 has four front ports (Aux 1, the new one, on Hub-0's port 4
+# without a router), the ESP32-MINI-1 instead of the ESP32-C3-MINI-1 (Bluetooth Classic), the rear extension
+# connector (JST SH, Qwiic pinout) and all six status LEDs on the bottom; routed from scratch.
+HW_VERSION = '0.19.0'
 
 # The logos (2026-11-08: reworked for 0.16.0, whose Bluetooth module took the badge's corner).  Before, one badge
 # bottom right (2026-11-03): the OpenDynKVM logo over the open source hardware logo and the version.  The board has no
@@ -452,9 +506,13 @@ HW_VERSION = '0.18.0'
 # West of the key was the first try: it took the vias of the lines around the keyboard and mouse switches.
 # Each keeps vias out of its print with a rule area on every copper layer (route.py honours it).  Absolute positions;
 # a keep-out is (x0, y0, x1, y1).
-LOGOS = [('LOGO1', 'CustomFootprints:OpenDynKVM_Logo_14mm_SilkScreen', (191.85, 156.05), (184.15, 149.65, 199.55, 162.45)),
-         ('LOGO2', 'Symbol:OSHW-Logo2_7.3x6mm_SilkScreen', (128.6, 104.5), (124.95, 101.4, 132.25, 110.1))]
-VERSION_AT = (128.6, 109.3)
+# 0.19.0: the OpenDynKVM logo moved from behind the OTHER port (now Aux 2's column) to the patch east of the key,
+# above the AUX 1 port (placed by the user in pcbnew, 2026-11-25); the OSHW logo moved east of BOOTSEL (the extension connector
+# took its place).
+LOGOS = [('LOGO1', 'CustomFootprints:OpenDynKVM_Logo_14mm_SilkScreen', (182.0, 149.0), (174.3, 142.6, 189.7, 155.4)),
+         ('LOGO2', 'Symbol:OSHW-Logo2_7.3x6mm_SilkScreen', (143.4, 104.5), (139.75, 101.4, 147.05, 110.1))]
+VERSION_AT = (143.4, 109.3)
+KEEP_FREE += [box for _, _, _, box in LOGOS]      # no auto-placed part on a logo's print
 
 
 def export_netlist():

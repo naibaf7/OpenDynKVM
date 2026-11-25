@@ -1262,10 +1262,10 @@ mod tests {
             app.screens.select(Some(1));
             shot(&mut app, format!("{theme_name}-screens-full.ppm"), 1300);
             app.screens.select(None);
-            // The Ports page down to the Other port (OPENDYN_SIM_BT=dongle: the wireless module on it).
+            // The Ports page down to the Aux 2 port (OPENDYN_SIM_BT=dongle: the wireless module on it).
             app.page = Page::Ports;
             shot(&mut app, format!("{theme_name}-ports-full.ppm"), 1300);
-            // The mapping editor, each picture whole, a control selected (OPENDYN_SIM_PAD=1: a gamepad on Other).
+            // The mapping editor, each picture whole, a control selected (OPENDYN_SIM_PAD=1: a gamepad on Aux 2).
             app.page = Page::Keymaps;
             for (kind, name, sel) in [
                 (keymaps::Kind::Keyboard, "keyboard", Some(0x39)),

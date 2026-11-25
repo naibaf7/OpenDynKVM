@@ -24,7 +24,8 @@ MIN_PAD_GAP = 0.25          # mm, copper of different footprints
 MIN_RAIL_EDGE = 2.5         # mm, body to an edge that carries JLC rails
 RAIL_EDGES = ()             # none: the board is larger than 70x70 mm
 MIN_EDGE = 0.5              # mm, body to left/right edge (edge-mounted parts exempt)
-EDGE_PARTS = {'J101', 'J201', 'J301', 'J1201', 'J1301', 'J1401', 'D1502', 'D1503', 'D1504', 'D1505', 'D1506',
+EDGE_PARTS = {'J101', 'J201', 'J301', 'J1201', 'J1301', 'J1401', 'J1701', 'J1801',
+              'D1502', 'D1503', 'D1504', 'D1505', 'D1506', 'D1507',
               'U1601'}     # the module's PCB antenna at the board edge (Espressif), 0.47 mm inside it: no overhang
 MM = pcbnew.ToMM
 

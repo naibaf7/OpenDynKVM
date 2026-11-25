@@ -288,7 +288,7 @@ fn code_legend(kc: u16, layout: Layout, style: Style) -> String {
                 HotkeyAction::NextProfile => "P→".into(),
                 HotkeyAction::PrevProfile => "←P".into(),
                 HotkeyAction::SelectProfile(n) => format!("P{n}"),
-                HotkeyAction::OtherPortMode => "Oth".into(),
+                HotkeyAction::Aux2PortMode => "A2".into(),
                 HotkeyAction::None => "—".into(),
             }
         }

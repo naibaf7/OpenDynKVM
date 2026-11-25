@@ -11,8 +11,9 @@ board.json is in KiCad's frame: millimetres, x to the right, y down (the rear ed
 
 What is written:
 - the board outline (bounding box) and thickness, and HW_VERSION from tools/gen_pcb.py;
-- the mounting holes (H*), the USB-C (J101, J201, J301) and USB-A (J1201, J1301, J1401) connectors, the side LEDs
-  (D1502 to D1506), the key (SW1501) and the bootloader button (SW501): position and courtyard;
+- the mounting holes (H*), the USB-C (J101, J201, J301) and USB-A (J1201, J1301, J1701, J1401) connectors, the rear
+  extension connector (J1801), the side LEDs (D1502 to D1507, with their side), the key (SW1501) and the bootloader
+  button (SW501): position and courtyard;
 - every footprint's courtyard, side and footprint name, for gen_case.py's clearance checks.
 """
 import json
@@ -69,8 +70,9 @@ def main():
         'thickness': mm(board.GetDesignSettings().GetBoardThickness()),
         'holes': [p for p in parts if p['ref'].startswith('H') and 'drill' in p],
         'usb_c': pick(['J101', 'J301', 'J201']),
-        'usb_a': pick(['J1201', 'J1301', 'J1401']),
-        'leds': pick(['D1502', 'D1503', 'D1504', 'D1505', 'D1506']),
+        'usb_a': pick(['J1201', 'J1301', 'J1701', 'J1401']),
+        'ext': pick(['J1801']),
+        'leds': pick(['D1502', 'D1503', 'D1504', 'D1505', 'D1506', 'D1507']),
         'key': pick(['SW1501'])[0],
         'button': pick(['SW501'])[0],
         'parts': parts,

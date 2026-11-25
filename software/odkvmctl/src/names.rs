@@ -59,7 +59,8 @@ pub fn port_title(p: Port) -> String {
     match p {
         Port::Keyboard => fl!("port-keyboard"),
         Port::Mouse => fl!("port-mouse"),
-        Port::Other => fl!("port-other"),
+        Port::Aux1 => fl!("port-aux1"),
+        Port::Aux2 => fl!("port-aux2"),
     }
 }
 
@@ -173,7 +174,7 @@ pub fn key_action(a: KeyAction) -> String {
         KeyAction::None => fl!("key-action-none"),
         KeyAction::TogglePc => fl!("key-action-toggle-pc"),
         KeyAction::NextProfile => fl!("key-action-next-profile"),
-        KeyAction::OtherPortMode => fl!("key-action-other-port"),
+        KeyAction::Aux2PortMode => fl!("key-action-aux2-port"),
         KeyAction::NextTarget => fl!("key-action-next-target"),
     }
 }
@@ -183,11 +184,12 @@ pub fn reason(r: AutoReason) -> String {
         AutoReason::NotAuto => fl!("reason-not-auto"),
         AutoReason::FitsNormalized => fl!("reason-fits-normalized"),
         AutoReason::ExtraInputs => fl!("reason-extra-inputs"),
-        AutoReason::OtherPortHid => fl!("reason-other-port-hid"),
+        AutoReason::AuxPortHid => fl!("reason-aux-port-hid"),
         AutoReason::NonHid => fl!("reason-non-hid"),
         AutoReason::XInput => fl!("reason-xinput"),
         AutoReason::EndpointBudget => fl!("reason-endpoint-budget"),
         AutoReason::IdentityTaken => fl!("reason-identity-taken"),
+        AutoReason::NeedsPassthrough => fl!("reason-needs-passthrough"),
     }
 }
 
@@ -296,7 +298,8 @@ pub fn selftest(bits: u32) -> String {
         (HUB2, fl!("selftest-hub2")),
         (PORT_KB, fl!("selftest-port-kb")),
         (PORT_MS, fl!("selftest-port-ms")),
-        (PORT_OT, fl!("selftest-port-ot")),
+        (PORT_A1, fl!("selftest-port-a1")),
+        (PORT_A2, fl!("selftest-port-a2")),
         (POWER, fl!("selftest-power")),
         (AT32_FW1, fl!("selftest-at32-fw1")),
         (AT32_FW2, fl!("selftest-at32-fw2")),
@@ -498,7 +501,8 @@ pub fn diag_name(id: u8) -> String {
         PHY_SWAP => fl!("diag-phy-swap"),
         KB_SPEED => fl!("diag-kb-speed"),
         MS_SPEED => fl!("diag-ms-speed"),
-        OT_SPEED => fl!("diag-ot-speed"),
+        A1_SPEED => fl!("diag-a1-speed"),
+        A2_SPEED => fl!("diag-a2-speed"),
         PC1_SPEED => fl!("diag-pc-speed", pc = "PC1"),
         PC2_SPEED => fl!("diag-pc-speed", pc = "PC2"),
         PC1_LINK => fl!("diag-pc-link", pc = "PC1"),
@@ -524,7 +528,8 @@ pub fn diag_name(id: u8) -> String {
         PC2_DROPOUTS => fl!("diag-dropouts", pc = "PC2"),
         KB_FAULTS => fl!("diag-kb-faults"),
         MS_FAULTS => fl!("diag-ms-faults"),
-        OT_FAULTS => fl!("diag-ot-faults"),
+        A1_FAULTS => fl!("diag-a1-faults"),
+        A2_FAULTS => fl!("diag-a2-faults"),
         AT1_TEMP => fl!("diag-at-temp", n = 1),
         AT2_TEMP => fl!("diag-at-temp", n = 2),
         AT1_FW => fl!("diag-at-fw", n = 1),
@@ -622,7 +627,7 @@ pub fn diag_help(id: u8) -> String {
         SUPPLY => fl!("diag-help-supply"),
         SUPPLY_DIPS => fl!("diag-help-supply-dips"),
         PC1_DROPOUTS | PC2_DROPOUTS => fl!("diag-help-dropouts"),
-        KB_FAULTS | MS_FAULTS | OT_FAULTS => fl!("diag-help-faults"),
+        KB_FAULTS | MS_FAULTS | A2_FAULTS => fl!("diag-help-faults"),
         AT1_TEMP | AT2_TEMP => fl!("diag-help-at-temp"),
         AT1_FW | AT2_FW => fl!("diag-help-at-fw"),
         BT_MODULE => fl!("diag-help-bt-module"),
@@ -704,18 +709,20 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("power-cycle", key::POWER_CYCLE_ON_SWITCH),
     ("mode-keyboard", key::MODE_BASE),
     ("mode-mouse", key::MODE_BASE + 1),
-    ("mode-other", key::MODE_BASE + 2),
-    ("mode-wireless1", key::MODE_BASE + 3),
-    ("mode-wireless2", key::MODE_BASE + 4),
-    ("mode-wireless3", key::MODE_BASE + 5),
-    ("mode-wireless4", key::MODE_BASE + 6),
+    ("mode-aux1", key::MODE_BASE + 2),
+    ("mode-aux2", key::MODE_BASE + 3),
+    ("mode-wireless1", key::MODE_BASE + 4),
+    ("mode-wireless2", key::MODE_BASE + 5),
+    ("mode-wireless3", key::MODE_BASE + 6),
+    ("mode-wireless4", key::MODE_BASE + 7),
     ("route-keyboard", key::ROUTE_BASE),
     ("route-mouse", key::ROUTE_BASE + 1),
-    ("route-other", key::ROUTE_BASE + 2),
-    ("route-wireless1", key::ROUTE_BASE + 3),
-    ("route-wireless2", key::ROUTE_BASE + 4),
-    ("route-wireless3", key::ROUTE_BASE + 5),
-    ("route-wireless4", key::ROUTE_BASE + 6),
+    ("route-aux1", key::ROUTE_BASE + 2),
+    ("route-aux2", key::ROUTE_BASE + 3),
+    ("route-wireless1", key::ROUTE_BASE + 4),
+    ("route-wireless2", key::ROUTE_BASE + 5),
+    ("route-wireless3", key::ROUTE_BASE + 6),
+    ("route-wireless4", key::ROUTE_BASE + 7),
     ("software-switching", key::SW_SWITCH_ALLOWED),
     ("software-config", key::SW_CONFIG_ALLOWED),
     ("vial", key::VIAL),
@@ -1110,7 +1117,8 @@ pub fn parse_mode(d: Device, s: &str) -> Result<PortMode, String> {
         .ok_or_else(|| fl!("parse-mode", value = s.trim(), modes = names()))
 }
 
-/// Every device's mode, in the order Keyboard, Mouse, Other, wireless 1–4: `auto,auto,passthrough,auto,auto,off,auto`.
+/// Every device's mode, in the order Keyboard, Mouse, Aux 1, Aux 2, wireless 1–4:
+/// `auto,auto,mirrored,passthrough,auto,auto,off,auto`.
 pub fn parse_profile_modes(s: &str) -> Result<[PortMode; DEVICES], String> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != DEVICES {
@@ -1123,7 +1131,7 @@ pub fn parse_profile_modes(s: &str) -> Result<[PortMode; DEVICES], String> {
     Ok(out)
 }
 
-/// Every device's routing, in the same order: `follow,follow,pc2,host1,follow,follow,follow`.
+/// Every device's routing, in the same order: `follow,follow,follow,pc2,host1,follow,follow,follow`.
 pub fn parse_profile_routes(s: &str) -> Result<[Routing; DEVICES], String> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != DEVICES {
@@ -1198,19 +1206,29 @@ mod tests {
         }
         assert!(parse_value(key::COLOR_PC1, "#12345").is_err());
         assert_eq!(config_key("mode-mouse"), Some(key::MODE_BASE + 1));
-        assert_eq!(config_key("route-wireless3"), Some(key::ROUTE_BASE + 5));
+        assert_eq!(config_key("route-wireless3"), Some(key::ROUTE_BASE + 6));
+        assert_eq!(config_key("mode-aux1"), Some(key::MODE_BASE + 2));
         assert_eq!(config_key("profile7-routes"), Some(key::PROFILE_ROUTES_BASE + 7));
         assert_eq!(
-            parse_value(key::MODE_BASE + 3, "passthrough").map(|_| ()),
+            parse_value(key::MODE_BASE + 4, "passthrough").map(|_| ()),
             Err(fl!("parse-mode", value = "passthrough", modes = "auto, normalized, off"))
+        );
+        assert_eq!(
+            parse_value(key::MODE_BASE + 2, "passthrough").map(|_| ()),
+            Err(fl!("parse-mode", value = "passthrough", modes = "auto, normalized, mirrored, identity, off"))
         );
         assert_eq!(
             parse_value(key::ROUTE_BASE, "host2"),
             Ok(ConfigValue::Route(Device::Keyboard, Routing::Pin(Host::Bt2)))
         );
-        let routes = parse_profile_routes("follow,pc1,pc2,host1,follow,follow,host4").unwrap();
-        assert_eq!(format_value(&ConfigValue::ProfileRoutes(0, routes)), "follow,pc1,pc2,host1,follow,follow,host4");
-        assert!(parse_profile_modes("auto,auto,passthrough").is_err(), "all seven");
+        let routes = parse_profile_routes("follow,pc1,follow,pc2,host1,follow,follow,host4").unwrap();
+        assert_eq!(
+            format_value(&ConfigValue::ProfileRoutes(0, routes)),
+            "follow,pc1,follow,pc2,host1,follow,follow,host4"
+        );
+        assert!(parse_profile_modes("auto,auto,passthrough").is_err(), "all eight");
+        assert!(parse_profile_modes("auto,auto,passthrough,auto,auto,auto,auto,auto").is_err(), "not on Aux 1");
+        assert!(parse_profile_modes("auto,auto,mirrored,passthrough,auto,auto,off,auto").is_ok());
         // An entry of the hotkey list: an action and a hotkey, or none.
         let k = config_key("hotkey3").unwrap();
         let v = parse_value(k, "select-host3 ctrl+alt+3").unwrap();

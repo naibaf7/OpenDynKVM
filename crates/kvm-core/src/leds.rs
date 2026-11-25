@@ -1,21 +1,37 @@
-//! The six status LEDs (design.md §7). One data line, chain order as on the rev 5 board: the five side-emitting LEDs
-//! left to right along the front (PC1, Keyboard, Mouse, Other, PC2), then the hand-fitted LED under the key, last so
-//! that a missing or damaged key LED leaves the status LEDs working.
+//! The status LEDs (design.md §7). One data line, in chain order: the side-emitting LEDs left to right along the front
+//! (PC1, Keyboard, Mouse, Aux 1, Aux 2, PC2), then the hand-fitted LED under the key, last so that a missing or damaged
+//! key LED leaves the status LEDs working. A board before 0.19.0 has no Aux 1 port and no LED for it: six LEDs, the
+//! same order without that one.
 
-use kvm_proto::ctrl::{LinkState, Pc, PortMode, PortState, Rgb, selftest};
+use kvm_proto::ctrl::{LinkState, PORTS, Pc, PortMode, PortState, Rgb, selftest};
 
-pub const COUNT: usize = 6;
+/// LEDs on the longest chain (boards from 0.19.0). [`render`] always gives this many; on a shorter chain the last
+/// colour goes nowhere.
+pub const COUNT: usize = 7;
 
-/// Position of each LED in the chain.
+/// Position of each LED in the chain of a board with the Aux 1 port; [`render`] closes the gap on one without.
 pub mod chain {
     pub const PC1: usize = 0;
     pub const KEYBOARD: usize = 1;
     pub const MOUSE: usize = 2;
-    pub const OTHER: usize = 3;
-    pub const PC2: usize = 4;
-    pub const KEY: usize = 5;
+    pub const AUX1: usize = 3;
+    pub const AUX2: usize = 4;
+    pub const PC2: usize = 5;
+    pub const KEY: usize = 6;
     pub const PCS: [usize; 2] = [PC1, PC2];
-    pub const PORTS: [usize; 3] = [KEYBOARD, MOUSE, OTHER];
+    /// By `Port` index.
+    pub const PORTS: [usize; super::PORTS] = [KEYBOARD, MOUSE, AUX1, AUX2];
+}
+
+/// The LEDs a board has, as [`chain`] positions in chain order: all of them, or all but Aux 1's.
+fn layout(aux1: bool) -> &'static [usize] {
+    use chain::*;
+    if aux1 { &[PC1, KEYBOARD, MOUSE, AUX1, AUX2, PC2, KEY] } else { &[PC1, KEYBOARD, MOUSE, AUX2, PC2, KEY] }
+}
+
+/// Colours by [`chain`] position, in the order of the LEDs the board has.
+fn to_chain(c: [Rgb; COUNT], layout: &[usize]) -> [Rgb; COUNT] {
+    core::array::from_fn(|k| layout.get(k).map_or(OFF, |&pos| c[pos]))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,8 +39,10 @@ pub mod chain {
 pub struct LedInputs {
     pub active: Pc,
     pub links: [LinkState; 2],
+    /// The board has the Aux 1 port, and the LED for it (`caps::AUX1`, boards from 0.19.0).
+    pub aux1: bool,
     /// Each port's state, effective mode, and the PC it is pinned to.
-    pub ports: [(PortState, PortMode, Option<Pc>); 3],
+    pub ports: [(PortState, PortMode, Option<Pc>); PORTS],
     pub color_pc1: Rgb,
     pub color_pc2: Rgb,
     pub brightness: u8,
@@ -79,11 +97,11 @@ fn blink(now_ms: u32, period_ms: u32) -> bool {
 /// The self-test code (design.md §10, step 1.5). While it runs, one white LED walks along the chain. Then each LED
 /// shows its part of the result: green passed, blinking red failed.
 /// - PC1 / PC2: that PC's link, hub and AT32F405 firmware;
-/// - Keyboard / Mouse / Other: the port's power switch;
+/// - Keyboard / Mouse / Aux 1 / Aux 2: the port's power switch;
 /// - key: Hub-0, the PWR-port readings and the Bluetooth module's firmware.
-fn selftest_code(bits: u32, now_ms: u32) -> [Rgb; COUNT] {
+fn selftest_code(bits: u32, now_ms: u32, layout: &[usize]) -> [Rgb; COUNT] {
     if bits & selftest::RUNNING != 0 {
-        let lit = (now_ms / 150) as usize % COUNT;
+        let lit = layout[(now_ms / 150) as usize % layout.len()];
         return core::array::from_fn(|k| if k == lit { WHITE } else { OFF });
     }
     let red = if blink(now_ms, 400) { RED } else { OFF };
@@ -92,7 +110,7 @@ fn selftest_code(bits: u32, now_ms: u32) -> [Rgb; COUNT] {
     for k in 0..2 {
         out[chain::PCS[k]] = show(selftest::PCS[k]);
     }
-    for k in 0..3 {
+    for k in 0..PORTS {
         out[chain::PORTS[k]] = show(selftest::PORTS[k]);
     }
     // Not the Bluetooth module's firmware: after an update it waits for the host software to send it, as intended.
@@ -100,10 +118,12 @@ fn selftest_code(bits: u32, now_ms: u32) -> [Rgb; COUNT] {
     out
 }
 
-/// Colours in chain order ([`chain`]), brightness applied.
+/// Colours in the order of the board's chain ([`chain`] on a board with Aux 1, without its LED on one without),
+/// brightness applied.
 pub fn render(i: &LedInputs, now_ms: u32) -> [Rgb; COUNT] {
+    let layout = layout(i.aux1);
     if let Some(bits) = i.selftest {
-        return selftest_code(bits, now_ms).map(|c| scale(c, i.brightness as u16));
+        return to_chain(selftest_code(bits, now_ms, layout), layout).map(|c| scale(c, i.brightness as u16));
     }
     let pc_color = |pc: Pc| if pc == Pc::Pc1 { i.color_pc1 } else { i.color_pc2 };
     let mut out = [OFF; COUNT];
@@ -115,7 +135,7 @@ pub fn render(i: &LedInputs, now_ms: u32) -> [Rgb; COUNT] {
             // Breathes between a quarter and the full set brightness, in the active PC's colour.
             out[chain::KEY] = scale(pc_color(i.active), 64 + wave(now_ms, 6000) * 3 / 4);
         }
-        return out.map(|c| scale(c, i.brightness as u16));
+        return to_chain(out, layout).map(|c| scale(c, i.brightness as u16));
     }
 
     // The key glows in the active PC's colour, pulses white while a firmware update waits for a press, and blinks red
@@ -182,17 +202,19 @@ pub fn render(i: &LedInputs, now_ms: u32) -> [Rgb; COUNT] {
     }
 
     // A profile just made active: the front LEDs count it from the left, one for profile 0, two for profile 1, …, in
-    // white for the first five and in cyan for profiles 5–7 (one for profile 5).
+    // white for the first five and in cyan for profiles 5–7 (one for profile 5), on either board.
+    let mut out = to_chain(out, layout);
+    let front = layout.len() - 1;
     if let Some(k) = i.profile {
-        let (count, colour) = if (k as usize) < chain::KEY { (k as usize + 1, WHITE) } else { (k as usize - 4, CYAN) };
-        for (n, c) in out[..chain::KEY].iter_mut().enumerate() {
+        let (count, colour) = if k < 5 { (k as usize + 1, WHITE) } else { (k as usize - 4, CYAN) };
+        for (n, c) in out[..front].iter_mut().enumerate() {
             *c = if n < count { colour } else { OFF };
         }
     }
 
     if i.identify {
         let on = blink(now_ms, 250);
-        for c in out.iter_mut() {
+        for c in out[..layout.len()].iter_mut() {
             *c = if on { WHITE } else { OFF };
         }
     }
@@ -208,9 +230,11 @@ mod tests {
         LedInputs {
             active: Pc::Pc2,
             links: [LinkState::Connected, LinkState::Connected],
+            aux1: true,
             ports: [
                 (PortState::Hosted, PortMode::Normalized, None),
                 (PortState::Hosted, PortMode::MirroredIdentity, None),
+                (PortState::Hosted, PortMode::Mirrored, None),
                 (PortState::Empty, PortMode::Auto, None),
             ],
             color_pc1: Rgb::new(0, 0, 255),
@@ -236,7 +260,7 @@ mod tests {
         assert_eq!(c[chain::KEY], Rgb::new(255, 0, 0));
         assert_eq!(c[chain::PC1], Rgb::new(0, 0, 40));
         assert_eq!(c[chain::PC2], Rgb::new(255, 0, 0));
-        assert_eq!((c[chain::KEYBOARD], c[chain::MOUSE], c[chain::OTHER]), (GREEN, MAGENTA, OFF));
+        assert_eq!((c[chain::KEYBOARD], c[chain::MOUSE], c[chain::AUX1], c[chain::AUX2]), (GREEN, MAGENTA, CYAN, OFF));
         let mut dim = inputs();
         dim.brightness = 128;
         assert_eq!(render(&dim, 0)[chain::PC2], Rgb::new(128, 0, 0));
@@ -245,9 +269,28 @@ mod tests {
     #[test]
     fn chain_order_puts_the_key_last() {
         assert_eq!(
-            [chain::PC1, chain::KEYBOARD, chain::MOUSE, chain::OTHER, chain::PC2, chain::KEY],
-            [0, 1, 2, 3, 4, 5]
+            [chain::PC1, chain::KEYBOARD, chain::MOUSE, chain::AUX1, chain::AUX2, chain::PC2, chain::KEY],
+            [0, 1, 2, 3, 4, 5, 6]
         );
+    }
+
+    #[test]
+    fn a_board_without_aux1_has_six_leds_in_the_same_order() {
+        let mut i = inputs();
+        i.aux1 = false;
+        i.ports[3] = (PortState::Hosted, PortMode::Normalized, None);
+        let c = render(&i, 0);
+        // PC1, Keyboard, Mouse, Aux 2, PC2, key; nothing after the key.
+        assert_eq!(c, [Rgb::new(0, 0, 40), GREEN, MAGENTA, GREEN, Rgb::new(255, 0, 0), Rgb::new(255, 0, 0), OFF]);
+        i.profile = Some(4);
+        assert_eq!(render(&i, 0)[..5], [WHITE; 5]);
+        i.selftest = Some(selftest::PORT_A2);
+        assert_eq!(render(&i, 0)[3], RED);
+        i.selftest = Some(selftest::RUNNING);
+        assert_eq!(render(&i, 5 * 150)[5], WHITE, "the walking light reaches the key, the sixth LED");
+        i.selftest = None;
+        i.identify = true;
+        assert_eq!(render(&i, 0)[6], OFF);
     }
 
     #[test]
@@ -257,10 +300,11 @@ mod tests {
         let c = render(&i, 150);
         assert_eq!(c.iter().filter(|c| **c == WHITE).count(), 1);
         assert_eq!(c[1], WHITE);
-        i.selftest = Some(selftest::LINK2 | selftest::PORT_MS);
+        i.selftest = Some(selftest::LINK2 | selftest::PORT_MS | selftest::PORT_A1);
         let c = render(&i, 0);
         assert_eq!((c[chain::PC1], c[chain::PC2]), (GREEN, RED));
-        assert_eq!((c[chain::KEYBOARD], c[chain::MOUSE], c[chain::OTHER], c[chain::KEY]), (GREEN, RED, GREEN, GREEN));
+        assert_eq!((c[chain::KEYBOARD], c[chain::MOUSE], c[chain::AUX2], c[chain::KEY]), (GREEN, RED, GREEN, GREEN));
+        assert_eq!(c[chain::AUX1], RED);
         assert_eq!(render(&i, 200)[chain::PC2], OFF);
         // A Bluetooth module waiting for its firmware is no failure.
         i.selftest = Some(selftest::BT_FW);
@@ -303,23 +347,23 @@ mod tests {
         let mut i = inputs();
         i.profile = Some(1);
         let c = render(&i, 0);
-        assert_eq!(c[..chain::KEY], [WHITE, WHITE, OFF, OFF, OFF]);
+        assert_eq!(c[..chain::KEY], [WHITE, WHITE, OFF, OFF, OFF, OFF]);
         assert_eq!(c[chain::KEY], Rgb::new(255, 0, 0), "the key keeps the active PC's colour");
         i.profile = Some(4);
-        assert_eq!(render(&i, 0)[..chain::KEY], [WHITE; 5]);
+        assert_eq!(render(&i, 0)[..chain::KEY], [WHITE, WHITE, WHITE, WHITE, WHITE, OFF]);
         i.profile = Some(5);
-        assert_eq!(render(&i, 0)[..chain::KEY], [CYAN, OFF, OFF, OFF, OFF]);
+        assert_eq!(render(&i, 0)[..chain::KEY], [CYAN, OFF, OFF, OFF, OFF, OFF]);
         i.profile = Some(7);
-        assert_eq!(render(&i, 0)[..chain::KEY], [CYAN, CYAN, CYAN, OFF, OFF]);
+        assert_eq!(render(&i, 0)[..chain::KEY], [CYAN, CYAN, CYAN, OFF, OFF, OFF]);
     }
 
     #[test]
     fn passthrough_shows_where_it_is_pinned() {
         let mut i = inputs();
-        i.ports[2] = (PortState::Passthrough, PortMode::Passthrough, Some(Pc::Pc1));
-        assert_eq!(render(&i, 0)[chain::OTHER], Rgb::new(0, 0, 255));
-        i.ports[2].2 = None;
-        assert_eq!(render(&i, 0)[chain::OTHER], WHITE);
+        i.ports[3] = (PortState::Passthrough, PortMode::Passthrough, Some(Pc::Pc1));
+        assert_eq!(render(&i, 0)[chain::AUX2], Rgb::new(0, 0, 255));
+        i.ports[3].2 = None;
+        assert_eq!(render(&i, 0)[chain::AUX2], WHITE);
         i.ports[0] = (PortState::Hosted, PortMode::Off, None);
         assert_eq!(render(&i, 0)[chain::KEYBOARD], OFF);
     }

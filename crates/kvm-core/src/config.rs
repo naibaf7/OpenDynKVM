@@ -11,8 +11,8 @@ use core::ops::RangeInclusive;
 use kvm_proto::ctrl::{
     Accel, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, DEVICES, Device, ErrorCode, GamepadOut, HOP_CORNER_MAX,
     HOP_RESISTANCE_MAX, HOP_SPEED, HOSTS, Host, Hotkey, HotkeyAction, HotkeyBinding, KEYMAPS, KeyAction,
-    MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, MAX_SCREENS, Mapping, PROFILE_NAME_MAX, Polling, PortMode,
-    ProfileName, Rgb, Routing, Screen, Units, VialMode, key,
+    MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, MAX_SCREENS, Mapping, PORTS, PROFILE_NAME_MAX, Polling, Port,
+    PortMode, ProfileName, Rgb, Routing, Screen, Units, VialMode, key,
 };
 use kvm_proto::wire::{Reader, Writer};
 
@@ -20,8 +20,9 @@ pub use crate::hop::Layout;
 
 /// Store key of the config.
 pub const ITEM: u16 = 0x0001;
-/// Room for every key with margin (`item_roundtrip` keeps the item at its longest 32 bytes short of it).
-pub const ITEM_MAX: usize = 800;
+/// Room for every key with margin (`item_roundtrip` keeps the item at its longest 24 bytes short of it), and the most
+/// that still packs five config items into a 4 KB store sector ([`crate::store`]: (4096 − 16) / 5 − 8).
+pub const ITEM_MAX: usize = 808;
 /// Store key of arrangement 0's item; arrangement n's is this + n.
 pub const ARRANGEMENT_ITEM: u16 = 0x0010;
 /// An arrangement's item at its longest: its name (key, length, then the name with its own length) and every screen
@@ -125,12 +126,19 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// Every front port in `ports`, the Bluetooth devices in Auto, everything following the active target.
+    /// Every front port in `ports` (Aux 1 in Auto where `ports` is Passthrough, which it can't take), the Bluetooth
+    /// devices in Auto, everything following the active target.
     const fn new(name: &str, ports: PortMode) -> Profile {
         let mut modes = [PortMode::Auto; DEVICES];
         let mut i = 0;
-        while i < 3 {
-            modes[i] = ports;
+        while i < PORTS {
+            let routed = match Port::from_index(i) {
+                Some(p) => p.has_router(),
+                None => false,
+            };
+            if routed || !ports.is_passthrough() {
+                modes[i] = ports;
+            }
             i += 1;
         }
         Profile {
@@ -595,14 +603,14 @@ mod tests {
     #[test]
     fn item_roundtrip() {
         let mut c = Config::default();
-        c.set(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
-        c.set(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
+        c.set(ConfigValue::Mode(Device::Aux2, PortMode::Passthrough), Origin::Software).unwrap();
+        c.set(ConfigValue::Route(Device::Aux2, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
         c.set(ConfigValue::ColorPc2(Rgb::new(9, 8, 7)), Origin::Software).unwrap();
         c.set(ConfigValue::SwSwitchAllowed(false), Origin::Software).unwrap();
         c.set(ConfigValue::Vial(VialMode::Auto), Origin::Software).unwrap();
         c.set(ConfigValue::AutoSelect(false), Origin::Software).unwrap();
         c.set(ConfigValue::StandbyGlow(true), Origin::Software).unwrap();
-        c.set(ConfigValue::KeyLong(KeyAction::OtherPortMode), Origin::Software).unwrap();
+        c.set(ConfigValue::KeyLong(KeyAction::Aux2PortMode), Origin::Software).unwrap();
         // The last profile active (remembered), every name as long as it can be: the item still fits.
         c.set(ConfigValue::RememberProfile(true), Origin::Software).unwrap();
         c.set(ConfigValue::ProfileCount(MAX_PROFILES as u8), Origin::Software).unwrap();
@@ -660,7 +668,7 @@ mod tests {
         let mut buf = [0xFFu8; ITEM_MAX];
         let n = c.encode(&mut buf);
         // Everything at its longest, with room left for what comes next.
-        assert!(n + 32 <= ITEM_MAX, "item {n} bytes of {ITEM_MAX}");
+        assert!(n + 24 <= ITEM_MAX, "item {n} bytes of {ITEM_MAX}");
         let mut d = Config::decode(&buf[..n]);
         // The config item holds no arrangement: each comes from its own item.
         assert_eq!(d.arrangements, [Arrangement::EMPTY; MAX_ARRANGEMENTS]);
@@ -674,7 +682,7 @@ mod tests {
         assert!(d.arrangements[2].screens[3].off && d.arrangements[2].screens[4].fixed);
         assert_eq!(d.modes()[..3], [PortMode::Auto, PortMode::Mirrored, PortMode::Auto]);
         assert_eq!(d.route(Device::Wireless2), Routing::Pin(Host::Bt4));
-        assert_eq!(d.profiles[0].modes[Device::Other.index()], PortMode::Passthrough);
+        assert_eq!(d.profiles[0].modes[Device::Aux2.index()], PortMode::Passthrough);
         assert_eq!(d.profiles[3].routes, c.profiles[3].routes);
         assert_eq!(Config::decode(&[]), Config::default());
     }
@@ -706,27 +714,27 @@ mod tests {
     fn the_config_item_leaves_arrangements_and_the_modes_in_force_to_their_own_places() {
         let mut c = Config::default();
         c.set(ConfigValue::Screen(0, 6, Screen::new(Host::Pc2, 3840, 2160, [-2560, 0])), Origin::Software).unwrap();
-        c.set(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
-        c.set(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc2)), Origin::Software).unwrap();
+        c.set(ConfigValue::Mode(Device::Aux2, PortMode::Passthrough), Origin::Software).unwrap();
+        c.set(ConfigValue::Route(Device::Aux2, Routing::Pin(Host::Pc2)), Origin::Software).unwrap();
         let mut buf = [0u8; ITEM_MAX];
         let n = c.encode(&mut buf);
         let mut r = Reader::new(&buf[..n]);
         while let (Ok(k), Ok(_)) = (r.u16(), r.lv()) {
-            assert!(key::arrangement_of(k).is_none() && !(0x0030..0x003F).contains(&k), "{k:#06x}");
+            assert!(key::arrangement_of(k).is_none() && !(0x0030..0x0040).contains(&k), "{k:#06x}");
         }
         let d = Config::decode(&buf[..n]);
-        assert_eq!((d.modes(), d.route(Device::Other)), (c.modes(), Routing::Pin(Host::Pc2)), "from the profile's own");
+        assert_eq!((d.modes(), d.route(Device::Aux2)), (c.modes(), Routing::Pin(Host::Pc2)), "from the profile's own");
         assert_eq!(d.arrangements[0], Arrangement::EMPTY);
         // Written into a config item anyway, they change nothing.
         let mut item = [0u8; 16];
         let mut w = Writer::new(&mut item);
-        w.u16(key::MODE_BASE + 2).unwrap();
+        w.u16(key::MODE_BASE + Device::Aux2.index() as u16).unwrap();
         w.lv(&[PortMode::Passthrough as u8]).unwrap();
-        w.u16(key::ROUTE_BASE + 2).unwrap();
+        w.u16(key::ROUTE_BASE + Device::Aux2.index() as u16).unwrap();
         w.lv(&[Routing::Pin(Host::Pc1).to_u8()]).unwrap();
         let n = w.len();
         let d = Config::decode(&item[..n]);
-        assert_eq!((d.modes(), d.route(Device::Other)), ([PortMode::Auto; DEVICES], Routing::Follow));
+        assert_eq!((d.modes(), d.route(Device::Aux2)), ([PortMode::Auto; DEVICES], Routing::Follow));
     }
 
     #[test]
@@ -739,8 +747,22 @@ mod tests {
         let mut modes = [PortMode::Auto; DEVICES];
         modes[Device::Wireless3.index()] = PortMode::Passthrough;
         assert_eq!(c.set(ConfigValue::ProfileModes(1, modes), Origin::Software), Err(ErrorCode::InvalidValue));
-        // The gaming profile passes the front ports through and leaves the Bluetooth devices normalized.
-        assert_eq!(c.profiles[1].modes[2..4], [PortMode::Passthrough, PortMode::Auto]);
+        // The gaming profile passes the front ports through, but for Aux 1, which can't, and leaves the Bluetooth
+        // devices normalized.
+        assert_eq!(
+            c.profiles[1].modes[1..5],
+            [PortMode::Passthrough, PortMode::Auto, PortMode::Passthrough, PortMode::Auto]
+        );
+        assert!(
+            Config::DEFAULT
+                .profiles
+                .iter()
+                .all(|p| (0..DEVICES).all(|i| Device::from_index(i).unwrap().takes(p.modes[i])))
+        );
+        assert_eq!(
+            c.set(ConfigValue::Mode(Device::Aux1, PortMode::Passthrough), Origin::Software),
+            Err(ErrorCode::InvalidValue)
+        );
     }
 
     #[test]

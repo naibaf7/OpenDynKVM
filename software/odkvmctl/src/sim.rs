@@ -1,16 +1,17 @@
-//! A simulated KVM: the firmware's own `kvm_core::Engine`, with three fake front-port devices and both PCs
-//! connected. This computer plays PC1.
+//! A simulated KVM: the firmware's own `kvm_core::Engine`, on a 0.19.0 board with a fake device on each of its four
+//! front ports, and both PCs connected. This computer plays PC1. With `OPENDYN_SIM_BOARD=0.12` it is a board before
+//! 0.19.0: three front ports, no Aux 1.
 //!
 //! The mouse streams 1 kHz reports through the engine (so report rates and normalization are real); re-detection,
 //! firmware updates and descriptor-set changes are acted out with plausible delays. Someone presses the KVM's key when
 //! it waits for it. Its keyboard types what is sent to [`SimTransport::simulated_keyboard`]: the GUI sends the keys
 //! pressed in its window while a hotkey is learned.
 //!
-//! With `OPENDYN_SIM_BT=1` it is a 0.16.0 board with the Bluetooth module: a tablet in slot 1, connected, and a phone
+//! With `OPENDYN_SIM_BT=1` the board has the Bluetooth module: a tablet in slot 1, connected, and a phone
 //! in slot 2, bonded and away (connect-when-selected). Pairing finds a "Laptop" that asks for a passkey (any six digits
 //! do), selecting the phone connects it after a moment. With `OPENDYN_SIM_BT=needs-update` the module is fitted, but
 //! runs another firmware; streaming it the module's (`update --module`, the GUI's *Update the wireless module*) acts
-//! out programming it, and then it is up as above. With `OPENDYN_SIM_BT=dongle` the board has no module, and an ESP32-C3 board on the Other port is
+//! out programming it, and then it is up as above. With `OPENDYN_SIM_BT=dongle` the board has no module, and an ESP32-C3 board on the Aux 2 port is
 //! it (software.md §4.13), with the same hosts. Without any of these there is no module, as on most boards.
 //!
 //! With `OPENDYN_SIM_HOP=1` screen hop is set up and on in the first profile: the absolute pointer, PC1 with a
@@ -45,10 +46,11 @@ pub const FW_VERSION: u32 = {
     let (major, minor, patch) = kvm_proto::FIRMWARE_VERSION;
     version_u32(major, minor, patch)
 };
-const HW_VERSION: u32 = {
-    let (major, minor, patch) = kvm_proto::HARDWARE_VERSION;
-    version_u32(major, minor, patch)
-};
+
+/// The simulated board has the Aux 1 port (0.19.0, the default), or is one before it (`OPENDYN_SIM_BOARD=0.12`).
+fn sim_aux1() -> bool {
+    crate::env_var("OPENDYN_SIM_BOARD").as_deref() != Some("0.12")
+}
 
 #[rustfmt::skip]
 const BOOT_KEYBOARD: &[u8] = &[
@@ -194,7 +196,24 @@ fn device_for(port: Port) -> Probed {
             ),
             &[(0, GAMING_MOUSE), (1, HIDPP)],
         ),
-        Port::Other if sim_pad() == Some(SimPad::Receiver) => probed(
+        // A media dial: consumer keys only, mirrored there as on Aux 2.
+        Port::Aux1 => probed(
+            0x1209,
+            0x0002,
+            "Simulated",
+            "Media dial (simulated)",
+            config_descriptor(
+                &[Iface {
+                    class: (3, 0, 0),
+                    report_len: Some(MEDIA_KEYS.len()),
+                    eps: &[(0x81, 8, 2)],
+                    alt_with_iso: false,
+                }],
+                50,
+            ),
+            &[(0, MEDIA_KEYS)],
+        ),
+        Port::Aux2 if sim_pad() == Some(SimPad::Receiver) => probed(
             0x045E,
             0x0719,
             "Simulated",
@@ -255,7 +274,7 @@ fn device_for(port: Port) -> Probed {
             ),
             &[],
         ),
-        Port::Other if sim_pad() == Some(SimPad::Symmetric) => probed(
+        Port::Aux2 if sim_pad() == Some(SimPad::Symmetric) => probed(
             0x054C,
             0x0CE6,
             "Simulated",
@@ -271,7 +290,7 @@ fn device_for(port: Port) -> Probed {
             ),
             &[(0, SYMMETRIC_PAD)],
         ),
-        Port::Other if sim_pad().is_some() => probed(
+        Port::Aux2 if sim_pad().is_some() => probed(
             0x0F0D,
             0x00C1,
             "Simulated",
@@ -288,7 +307,7 @@ fn device_for(port: Port) -> Probed {
             &[(0, GAMEPAD)],
         ),
         // A high-speed device: it answers the device qualifier on Hub-0.
-        Port::Other => Probed {
+        Port::Aux2 => Probed {
             high_speed: true,
             ..probed(
                 0x046D,
@@ -339,7 +358,7 @@ pub struct SimTransport {
     keys: (Sender<[u8; 8]>, Receiver<[u8; 8]>),
     /// The simulated Bluetooth module's host slots, when it is fitted (`OPENDYN_SIM_BT`).
     bt: Option<[HostState; 4]>,
-    /// The module is an ESP32-C3 board on the Other port (`OPENDYN_SIM_BT=dongle`).
+    /// The module is an ESP32-C3 board on the Aux 2 port (`OPENDYN_SIM_BT=dongle`).
     dongle: bool,
     /// The protocol `GetInfo` says, if not this program's ([`SimTransport::speaking`]).
     proto: Option<u8>,
@@ -386,7 +405,7 @@ fn esp_board() -> Probed {
 const BT_READY: u8 = host_flags::BONDED | host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED;
 const DEVICE_READY: u8 = device_flags::BONDED | device_flags::CONNECTED | device_flags::ENCRYPTED | device_flags::READY;
 
-/// A generic gamepad (`OPENDYN_SIM_PAD=1`, on the Other port): 14 buttons, a hat with a null state, X, Y, Z, Rz.
+/// A generic gamepad (`OPENDYN_SIM_PAD=1`, on the Aux 2 port): 14 buttons, a hat with a null state, X, Y, Z, Rz.
 #[rustfmt::skip]
 const GAMEPAD: &[u8] = &[
     0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x15, 0x00, 0x25, 0x01, 0x35, 0x00, 0x45, 0x01, 0x75, 0x01, 0x95, 0x0E, 0x05,
@@ -411,7 +430,7 @@ const SYMMETRIC_PAD: &[u8] = &[
     0xC0,
 ];
 
-/// The gamepad the simulated KVM has on the Other port instead of the webcam (`OPENDYN_SIM_PAD`).
+/// The gamepad the simulated KVM has on the Aux 2 port instead of the webcam (`OPENDYN_SIM_PAD`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimPad {
     /// `1`: a generic HID gamepad.
@@ -572,19 +591,19 @@ impl SimTransport {
         Ok(())
     }
 
-    /// The simulated KVM without the module on its board, and an ESP32-C3 board on the Other port as the module.
+    /// The simulated KVM without the module on its board, and an ESP32-C3 board on the Aux 2 port as the module.
     pub fn with_dongle() -> Self {
         let mut sim = Self::with_module(BtModule::Absent);
         sim.dongle = true;
-        sim.engine.port_detached(Port::Other);
-        sim.attach(Port::Other);
+        sim.engine.port_detached(Port::Aux2);
+        sim.attach(Port::Aux2);
         while sim.engine.poll_output().is_some() {}
         sim
     }
 
     /// What the simulated device on `p` does on attaching; the dongle is found to be the module and says hello.
     fn attach(&mut self, p: Port) {
-        if self.dongle && p == Port::Other {
+        if self.dongle && p == Port::Aux2 {
             self.engine.port_attached(p, &esp_board());
             if self.engine.dongle_wanted(p) {
                 self.engine.dongle_claimed(p);
@@ -603,11 +622,20 @@ impl SimTransport {
     /// The simulated KVM with its Bluetooth module `module`: absent, up, or needing an update (anything else counts as
     /// up).
     pub fn with_module(module: BtModule) -> Self {
+        Self::with_board(module, sim_aux1())
+    }
+
+    /// The simulated KVM with its Bluetooth module `module`, on a board with the Aux 1 port (0.19.0) or one before it.
+    pub fn with_board(module: BtModule, aux1: bool) -> Self {
         let info = Info {
             proto: kvm_proto::ctrl::PROTOCOL_VERSION,
             rp_fw: FW_VERSION,
             at_fw: [0; 2],
-            hw: HW_VERSION,
+            hw: {
+                let (major, minor, patch) =
+                    if aux1 { kvm_proto::HARDWARE_VERSION_AUX1 } else { kvm_proto::HARDWARE_VERSION };
+                version_u32(major, minor, patch)
+            },
             serial: *b"SIM00001",
             caps: caps::MIRRORED
                 | caps::IDENTITY
@@ -615,6 +643,7 @@ impl SimTransport {
                 | caps::FW_UPDATE
                 | caps::BT_UPDATE
                 | caps::VIAL
+                | if aux1 { caps::AUX1 } else { 0 }
                 | caps::SIMULATED,
             bt_fw: 0,
         };
@@ -628,16 +657,16 @@ impl SimTransport {
         engine.set_board_diag(BoardDiag::TYPICAL);
         if sim_pad().is_some() {
             use kvm_proto::ctrl::{ConfigValue, Device, GamepadOut, PortMode};
-            let normalized = ConfigValue::Mode(Device::Other, PortMode::Normalized);
+            let normalized = ConfigValue::Mode(Device::Aux2, PortMode::Normalized);
             let _ = engine.set_config(normalized, kvm_core::config::Origin::Device);
             let _ = engine.set_config(ConfigValue::Gamepad(GamepadOut::Hid), kvm_core::config::Origin::Device);
         }
-        for p in Port::ALL {
+        for p in Port::ALL.iter().filter(|p| aux1 || **p != Port::Aux1) {
             engine.port_attached(*p, &device_for(*p));
         }
         // The receiver's pad is linked.
         if sim_pad() == Some(SimPad::Receiver) {
-            engine.device_report(Port::Other, 0, &[0x08, 0x80], 0);
+            engine.device_report(Port::Aux2, 0, &[0x08, 0x80], 0);
         }
         if crate::env_var("OPENDYN_SIM_HOP").as_deref() == Some("1") {
             Self::hop_demo(&mut engine);
@@ -978,7 +1007,7 @@ impl SimTransport {
                     self.inbox.push_back(r);
                 }
                 Output::Reprobe(p) => {
-                    if self.dongle && p == Port::Other {
+                    if self.dongle && p == Port::Aux2 {
                         // Replugged, it leaves Hub-0 first (the real KVM sees it go).
                         self.engine.port_detached(p);
                         self.bt = None;
@@ -1095,6 +1124,27 @@ mod tests {
     };
 
     #[test]
+    fn a_board_before_0_19_has_three_ports_and_a_newer_one_four() {
+        let mut c = Client::new(Box::new(SimTransport::with_board(BtModule::Absent, false)));
+        let s = c.snapshot().unwrap();
+        assert!(!s.has_port(Port::Aux1));
+        assert_eq!(s.front_ports().collect::<Vec<_>>(), [Port::Keyboard, Port::Mouse, Port::Aux2]);
+        assert_eq!(s.routed_devices(), [Device::Keyboard, Device::Mouse, Device::Aux2]);
+        assert_eq!(s.info.hw, version_u32(0, 12, 0));
+        assert_eq!(s.ports[Port::Aux1.index()].state, PortState::Empty);
+
+        let mut c = Client::new(Box::new(SimTransport::with_board(BtModule::Absent, true)));
+        let s = c.snapshot().unwrap();
+        assert_eq!(s.front_ports().count(), 4);
+        assert_eq!(s.info.hw, version_u32(0, 19, 0));
+        // Its media dial is mirrored, as on Aux 2; it can't be passed through.
+        let a1 = &s.ports[Port::Aux1.index()];
+        assert_eq!((a1.state, a1.effective), (PortState::Hosted, PortMode::Mirrored));
+        assert_eq!(s.products[Port::Aux1.index()], "Media dial (simulated)");
+        assert!(c.set_mode(Device::Aux1, PortMode::Passthrough).is_err());
+    }
+
+    #[test]
     fn configuration_comes_back_after_the_key_is_pressed() {
         let mut c = Client::new(Box::new(SimTransport::new()));
         c.set_config(ConfigValue::SwConfigAllowed(false)).unwrap();
@@ -1188,7 +1238,10 @@ mod tests {
         // The keyboard paired from the start, connected; a free slot is no device to set.
         assert_eq!(s.devices.iter().filter(|d| d.bonded()).count(), 1);
         assert!(s.device(1).is_some_and(|d| d.ready() && d.name.as_str() == "Desk keyboard"));
-        assert_eq!(s.routed_devices(), [Device::Keyboard, Device::Mouse, Device::Other, Device::Wireless1]);
+        assert_eq!(
+            s.routed_devices(),
+            [Device::Keyboard, Device::Mouse, Device::Aux1, Device::Aux2, Device::Wireless1]
+        );
         // The keyboard's report map as the KVM holds it (several pieces), and none for a free slot.
         let (iface, interfaces, map) = c.device_map(Device::Wireless1, 0).unwrap();
         assert_eq!((iface, interfaces), (0, 1));
@@ -1224,29 +1277,29 @@ mod tests {
             list[active as usize].routes[Device::Wireless2.index()],
             kvm_proto::ctrl::Routing::Pin(kvm_proto::ctrl::Host::Bt1)
         );
-        assert_eq!(s.routed_devices().len(), 5);
+        assert_eq!(s.routed_devices().len(), 6);
         // Forgotten: no longer listed.
         c.bt_forget_device(2).unwrap();
-        assert_eq!(c.snapshot().unwrap().routed_devices().len(), 4);
+        assert_eq!(c.snapshot().unwrap().routed_devices().len(), 5);
         // Every pairing erased: no host and no device left.
         c.bt_erase_all().unwrap();
         let s = c.snapshot().unwrap();
         assert!(s.devices.iter().all(|d| !d.bonded()) && s.bt.iter().all(|h| !h.bonded()));
-        assert_eq!(s.routed_devices().len(), 3);
+        assert_eq!(s.routed_devices().len(), 4, "the four front ports");
     }
 
     #[test]
     fn an_esp32_board_on_the_other_port_is_the_module() {
         let mut c = Client::new(Box::new(SimTransport::with_dongle()));
         let s = c.snapshot().unwrap();
-        assert_eq!(s.ports[Port::Other.index()].state, PortState::Module);
-        assert_eq!(s.module_port(), Some(Port::Other));
+        assert_eq!(s.ports[Port::Aux2.index()].state, PortState::Module);
+        assert_eq!(s.module_port(), Some(Port::Aux2));
         assert!(s.has_bluetooth());
         assert_eq!(s.bt_bonded().count(), 2);
         // Re-detected, it leaves and comes back as the module.
-        c.redetect(Port::Other).unwrap();
+        c.redetect(Port::Aux2).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while c.port(Port::Other).unwrap().state != PortState::Module {
+        while c.port(Port::Aux2).unwrap().state != PortState::Module {
             assert!(Instant::now() < deadline, "the board didn't come back as the module");
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1352,7 +1405,7 @@ mod tests {
         assert_eq!(s.status.asking_pc(), Some(Pc::Pc1));
         assert_eq!(s.ports[Port::Keyboard.index()].effective, PortMode::Normalized);
         assert_eq!(s.ports[Port::Mouse.index()].effective, PortMode::Normalized, "HID++ alone doesn't force mirroring");
-        assert_eq!(s.ports[Port::Other.index()].state, PortState::Passthrough);
+        assert_eq!(s.ports[Port::Aux2.index()].state, PortState::Passthrough);
         assert_eq!(s.products[Port::Mouse.index()], "Gaming mouse (simulated)");
 
         c.switch(Target::Pc2).unwrap();

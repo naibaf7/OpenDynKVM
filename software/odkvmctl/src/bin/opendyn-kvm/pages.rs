@@ -111,7 +111,7 @@ pub(crate) fn action_label(s: &Snapshot, a: HotkeyAction) -> String {
             });
             fl!("hotkey-profile", profile = name.unwrap_or_else(|| fl!("profile-n", n = n)))
         }
-        HotkeyAction::OtherPortMode => fl!("hotkey-other-port"),
+        HotkeyAction::Aux2PortMode => fl!("hotkey-aux2-port"),
     }
 }
 
@@ -314,9 +314,9 @@ impl App {
         ui.add_space(8.0);
         card(ui, &fl!("front-ports"), |ui| {
             egui::Grid::new("ports-summary").num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
-                for port in Port::ALL {
+                for port in s.front_ports() {
                     let p = &s.ports[port.index()];
-                    ui.label(RichText::new(names::port_title(*port)).strong());
+                    ui.label(RichText::new(names::port_title(port)).strong());
                     let product = &s.products[port.index()];
                     ui.label(if p.state == PortState::Empty {
                         "—".to_string()

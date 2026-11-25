@@ -94,24 +94,28 @@ sym('SK6812SIDE-A', 'D', 'CustomFootprints:LED_SK6812SIDE-A_4.0x1.6mm',
     width=10.16, lcsc='C5378721')
 
 
-# ESP32-C3-MINI-1, Bluetooth LE coprocessor (0.16.0), 53-pad LGA (esp32-c3-mini-1 datasheet v2.2, table 3-1).  Every
-# ground pad (1, 2, 11, 14, 36-48 under the antenna end, the exposed pad 49, the corner pads 50-53) is one stacked GND
-# pin; the NC pads are pins too, so the netlist covers every pad of the footprint.
-sym('ESP32-C3-MINI-1', 'U', 'CustomFootprints:ESP32-C3-MINI-1',
-    'https://documentation.espressif.com/esp32-c3-mini-1_datasheet_en.pdf',
-    'ESP32-C3 module: RISC-V 160 MHz, Bluetooth LE 5 + Wi-Fi 4, 4 MB flash, PCB antenna, 13.2 x 16.6 mm. '
-    'Strapping: IO2 and IO8 high, IO9 low at reset = UART download; EN high = on',
+# ESP32-MINI-1, the Bluetooth coprocessor since 0.19.0 (the original ESP32: Bluetooth Classic and LE), 55-pad LGA
+# (esp32-mini-1 datasheet v1.8, table 3 and figure 3).  Every ground pad (1, 2, 27, 38-54 - 41-54 the row along the
+# antenna end - and the exposed pad 55, nine pads of one number) is one stacked GND pin; the NC pads are pins too, so
+# the netlist covers every pad of the footprint.  0.16.0-0.18.0 had the ESP32-C3-MINI-1 here.
+sym('ESP32-MINI-1', 'U', 'CustomFootprints:ESP32-MINI-1',
+    'https://www.espressif.com/sites/default/files/documentation/esp32-mini-1_datasheet_en.pdf',
+    'ESP32 module (ESP32-U4WDH): dual-core Xtensa 240 MHz, Bluetooth Classic + LE 4.2 + Wi-Fi 4, 4 MB flash, PCB '
+    'antenna, 13.2 x 19.0 mm. Strapping: IO0 low at reset = UART download (IO2 low or floating); EN high = on',
     left=[('3', '3V3', 'power_in'), None, ('8', 'EN', 'input'), None,
-          ('30', 'RXD0/IO20', 'bidirectional'), ('31', 'TXD0/IO21', 'bidirectional'), None,
-          ('5', 'IO2', 'bidirectional'), ('22', 'IO8', 'bidirectional'), ('23', 'IO9', 'bidirectional'), None,
-          ('26', 'IO18/USB_D-', 'bidirectional'), ('27', 'IO19/USB_D+', 'bidirectional')],
-    right=[('12', 'IO0', 'bidirectional'), ('13', 'IO1', 'bidirectional'), ('6', 'IO3', 'bidirectional'),
-           ('18', 'IO4/MTMS', 'bidirectional'), ('19', 'IO5/MTDI', 'bidirectional'),
-           ('20', 'IO6/MTCK', 'bidirectional'), ('21', 'IO7/MTDO', 'bidirectional'),
-           ('16', 'IO10', 'bidirectional'), None]
-          + [(str(n), 'NC', 'no_connect') for n in (4, 7, 9, 10, 15, 17, 24, 25, 28, 29, 32, 33, 34, 35)],
-    bottom=[([str(n) for n in (1, 2, 11, 14, *range(36, 54))], 'GND', 'power_in')],
-    width=20.32, lcsc='C41349510')
+          ('35', 'RXD0/IO3', 'bidirectional'), ('36', 'TXD0/IO1', 'bidirectional'), None,
+          ('21', 'IO0', 'bidirectional'), ('20', 'IO2', 'bidirectional'), ('29', 'IO5', 'bidirectional'),
+          ('17', 'IO12/MTDI', 'bidirectional'), ('19', 'IO15/MTDO', 'bidirectional'), None,
+          ('16', 'IO14/MTMS', 'bidirectional'), ('18', 'IO13/MTCK', 'bidirectional')],
+    right=[('4', 'I36', 'input'), ('5', 'I37', 'input'), ('6', 'I38', 'input'), ('7', 'I39', 'input'),
+           ('9', 'I34', 'input'), ('10', 'I35', 'input'), ('11', 'IO32', 'bidirectional'),
+           ('12', 'IO33', 'bidirectional'), ('13', 'IO25', 'bidirectional'), ('14', 'IO26', 'bidirectional'),
+           ('15', 'IO27', 'bidirectional'), ('22', 'IO4', 'bidirectional'), ('25', 'IO9', 'bidirectional'),
+           ('26', 'IO10', 'bidirectional'), ('30', 'IO18', 'bidirectional'), ('31', 'IO23', 'bidirectional'),
+           ('32', 'IO19', 'bidirectional'), ('33', 'IO22', 'bidirectional'), ('34', 'IO21', 'bidirectional'), None]
+          + [(str(n), 'NC', 'no_connect') for n in (23, 24, 28, 37)],
+    bottom=[([str(n) for n in (1, 2, 27, *range(38, 56))], 'GND', 'power_in')],
+    width=20.32, lcsc='C2980305')
 
 
 def pin(num, name, etype, x, y, ang, hide=False):

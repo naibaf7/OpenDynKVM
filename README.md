@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="hardware/render/kvm-front-readme.png" alt="The OpenDynKVM board, hardware 0.17.0: the front with its USB-A ports, the mechanical key and the status LEDs" width="720">
+  <img src="hardware/render/kvm-front-readme.png" alt="The OpenDynKVM board, hardware 0.19.0: the front with its four USB-A ports, the mechanical key and the Bluetooth module" width="720">
 </p>
 
 <h2 align="center">Product page: <a href="https://smartapes.no/opendynkvm/">https://smartapes.no/opendynkvm/</a></h2>
@@ -14,19 +14,20 @@
 # OpenDynKVM
 
 An open-source USB KVM switch for two PCs that switches in under a millisecond. Each PC is permanently connected to a
-keyboard, mouse and "other" device emulated by the KVM ("persistent emulation"), so a switch only changes where the
+keyboard, mouse and aux devices emulated by the KVM ("persistent emulation"), so a switch only changes where the
 reports go: no PC sees a disconnect, nothing re-enumerates, and High-Speed USB on the PC side adds about 0.1 ms of
 latency. Devices that cannot be emulated (webcams, flash drives) go straight to a PC in passthrough mode. Keyboards
 without their own remapping can be remapped on the KVM with the Vial app.
 
 - **Back:** USB-C to PC1, USB-C to PC2, USB-C power/service port (optional power, firmware recovery).
-- **Front:** USB-A for keyboard, mouse and one other device; a mechanical key (tap = switch PC) with an RGB LED; status
-  LEDs per PC and per port.
+- **Front:** four USB-A ports, Keyboard, Mouse, Aux 1 and Aux 2 (boards before 0.19.0 have three, without Aux 1); a
+  mechanical key (tap = switch PC) with an RGB LED; status LEDs per PC and per port.
 - **Inside:** an RP2354B (USB host for the front ports, all switching logic), two AT32F405 (one High-Speed USB device per
-  PC), three USB 2.0 hubs and a 1:3 analog USB switch per front port.
+  PC), three USB 2.0 hubs and a 1:3 analog USB switch per front port but Aux 1, which has no passthrough.
 
-**Status (2026-11-14):** the first boards, hardware 0.12.0, run firmware 0.1.19. Hardware 0.18.0, with the fixes from
-their bring-up, is designed but not ordered yet. What has been verified on a board and what has not:
+**Status (2026-11-14):** the first boards, hardware 0.12.0, run firmware 0.1.19. Hardware 0.19.0, with the fixes from
+their bring-up, a fourth front port and the ESP32-MINI-1 module (2026-11-25), is designed but not ordered yet; one
+firmware serves both. What has been verified on a board and what has not:
 [DEVELOPMENT.md](DEVELOPMENT.md#bring-up-status).
 
 ## Documentation
@@ -123,7 +124,7 @@ Windows needs no drivers.
   action, the hotkey, **Apply**; × removes one) or with `odkvmctl hotkey`. Out of the box there is one: double-tap
   Scroll Lock toggles the PC. Actions: toggle PC, next / previous host (PC1, PC2, then the Bluetooth hosts that are
   connected), select a host (PC1, PC2, Bluetooth host 1–4), next / previous profile, select a profile (0–7), cycle the
-  Other port's mode. On the command line: `odkvmctl hotkey add select-pc1 ctrl+alt+1`, `odkvmctl hotkey` lists them,
+  Aux 2 port's mode. On the command line: `odkvmctl hotkey add select-pc1 ctrl+alt+1`, `odkvmctl hotkey` lists them,
   `odkvmctl hotkey set 2 none`, `odkvmctl hotkey remove 2`. Or press a hotkey instead of typing it: `learn` in place of
   it, or **Learn** on the Keyboard page, then the hotkey on the KVM's keyboard within 10 s. The KVM itself reads the
   keys, so it learns exactly what it will recognise, and they reach neither PC meanwhile (Alt+F4 closes nothing). It
@@ -139,10 +140,11 @@ Windows needs no drivers.
   goes, and `odkvmctl config set profiles 1-8` sets how many are in use. The GUI has them on the Ports page (a tab per
   profile, a row per device with its mode and where its input goes) and in the sidebar. In passthrough the KVM can't see the keyboard, so the hotkey
   doesn't switch there: use the key or the software.
-- **The key's actions:** `odkvmctl config set key-tap|key-long toggle-pc|next-profile|other-port|none` and
+- **The key's actions:** `odkvmctl config set key-tap|key-long toggle-pc|next-profile|aux2-port|none` and
   `odkvmctl config set long-press-ms 800-3000` (GUI: Keyboard page). By default a tap switches PCs and a 1 s long
   press selects the next profile.
-- **Port modes** (`odkvmctl port keyboard|mouse|other mode <mode>`, which changes the active profile):
+- **Port modes** (`odkvmctl port keyboard|mouse|aux1|aux2 mode <mode>`, which changes the active profile; Aux 1 takes
+  every mode but `passthrough`):
 
   | Mode | What the PCs see | Use it for |
   |---|---|---|
@@ -155,7 +157,8 @@ Windows needs no drivers.
 
   Mirrored devices share 3 USB endpoints, one per HID interface (2 with Vial on). While the keyboard and the mouse
   are both mirrored, the KVM gives up its own keyboard and mouse interfaces for them, and they share 6 (5). A device
-  that doesn't fit runs normalized where it can, otherwise passthrough; `odkvmctl status` and the GUI say why.
+  that doesn't fit runs normalized where it can, otherwise passthrough (on Aux 1: off); `odkvmctl status` and the GUI
+  say why.
 
   After swapping the device on a passthrough port, run `odkvmctl port <port> redetect`.
 - **Where a device's input goes** (`odkvmctl port <port> route follow|pc1|pc2|host1-host4`, also per profile): by

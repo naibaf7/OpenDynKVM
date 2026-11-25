@@ -19,7 +19,7 @@ Run from hardware/:   uv run tools/dc_drop.py NET SOURCE SINK[=AMPS] ... [--oute
   SOURCE  comma list of REF.PIN, tied together (e.g. U402.1,U402.8: the TPS2121's OUT pins)
   SINK    REF (all its pads on NET, tied) or a comma list of REF.PIN; AMPS defaults to 1
 Example (jlcpcb.md, copper weight; three front ports at 0.5 A and the 3.3 V buck at 0.5 A):
-  uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5
+  uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1702=0.5 U1403=0.5 U403=0.5
 """
 
 import collections

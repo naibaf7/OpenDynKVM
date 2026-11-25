@@ -8,7 +8,7 @@ use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::{
     Accel, AxisCal, BT_DEVICES, BT_HOSTS, BtDeviceInfo, BtFound, BtHostInfo, BtPointer, BtPolicy, ConfigValue,
     Controls, DEVICES, Device, DeviceMsg, ErrorCode, Event, FW_CHUNK, FieldOverride, FwState, FwTarget, HOSTS, Host,
-    Hotkey, Info, KEYCODES_PER, LearnEnd, MACRO_PIECE, MAX_ARRANGEMENTS, MAX_PROFILES, MAX_SCREENS, Mapping,
+    Hotkey, Info, KEYCODES_PER, LearnEnd, MACRO_PIECE, MAX_ARRANGEMENTS, MAX_PROFILES, MAX_SCREENS, Mapping, PORTS,
     PROTOCOL_VERSION, Pc, Port, PortInfo, PortMode, PortState, RebootTarget, Request, Response, Routing, Screen,
     Status, StringKind, Target, Units, caps, diag, key, status_flags,
 };
@@ -105,8 +105,9 @@ fn only_reads(req: &Request) -> bool {
 pub struct Snapshot {
     pub info: Info,
     pub status: Status,
-    pub ports: [PortInfo; 3],
-    pub products: [String; 3],
+    /// By `Port` index; a board before 0.19.0 has no Aux 1 ([`Snapshot::has_port`]).
+    pub ports: [PortInfo; PORTS],
+    pub products: [String; PORTS],
     pub config: Vec<ConfigValue>,
     /// The Bluetooth host slots 1–4, read only from a KVM with the Bluetooth module (`caps::BLUETOOTH`); empty
     /// otherwise, which is how the UIs know to show the two PCs alone.
@@ -264,6 +265,16 @@ impl Snapshot {
         self.info.caps & caps::BLUETOOTH != 0
     }
 
+    /// The board has front port `p`: all but Aux 1, which boards from 0.19.0 have (`caps::AUX1`).
+    pub fn has_port(&self, p: Port) -> bool {
+        p != Port::Aux1 || self.info.caps & caps::AUX1 != 0
+    }
+
+    /// The board's front ports, left to right.
+    pub fn front_ports(&self) -> impl Iterator<Item = Port> + '_ {
+        Port::ALL.iter().copied().filter(|p| self.has_port(*p))
+    }
+
     /// The front port whose ESP32-C3 board is the Bluetooth module, on a KVM without it on the board.
     pub fn module_port(&self) -> Option<Port> {
         self.ports.iter().find(|p| p.state == PortState::Module).map(|p| p.port)
@@ -279,12 +290,13 @@ impl Snapshot {
         self.devices.iter().find(|d| d.slot == n)
     }
 
-    /// The devices the UIs list for modes and routings: the three front ports, and each Bluetooth device slot that
+    /// The devices the UIs list for modes and routings: the board's front ports, and each Bluetooth device slot that
     /// holds a bond (a free slot is nothing to set).
     pub fn routed_devices(&self) -> Vec<Device> {
         Device::ALL
             .iter()
             .copied()
+            .filter(|d| d.port().is_none_or(|p| self.has_port(p)))
             .filter(|d| d.wireless().is_none_or(|n| self.device(n).is_some_and(|i| i.bonded())))
             .collect()
     }
@@ -759,8 +771,8 @@ impl Client {
     pub async fn snapshot_keeping(&mut self, config: Option<Vec<ConfigValue>>) -> Result<Snapshot> {
         let info = self.info_checked().await?;
         let status = self.status().await?;
-        let mut ports = [PortInfo::empty(Port::Keyboard, PortMode::Auto); 3];
-        let mut products: [String; 3] = Default::default();
+        let mut ports = [PortInfo::empty(Port::Keyboard, PortMode::Auto); PORTS];
+        let mut products: [String; PORTS] = Default::default();
         let reqs: Vec<Request> = Port::ALL.iter().map(|p| Request::GetPort(*p)).collect();
         for r in self.request_all(&reqs).await? {
             match r {

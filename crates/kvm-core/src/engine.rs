@@ -13,8 +13,8 @@ use kvm_proto::ctrl::diag::{self as cdiag, BtModule, ClockSource, Grade, Item, i
 use kvm_proto::ctrl::{
     self, Advertised, AutoReason, BtPointer, ConfigValue, DEVICES, Device, DevicePairing, ErrorCode, Event, FaultKind,
     FwState, FwTarget, GamepadOut, HOSTS, HopState, Host, Hotkey, HotkeyAction, Info, KeyAction, LearnEnd, LinkState,
-    MAX_ARRANGEMENTS, Pc, Port, PortInfo, PortMode, PortState, PowerSource, RebootTarget, Request, Response, Routing,
-    Speed, StringKind, SwitchSource, Target, VialMode, status_flags,
+    MAX_ARRANGEMENTS, PORTS, Pc, Port, PortInfo, PortMode, PortState, PowerSource, RebootTarget, Request, Response,
+    Routing, Speed, StringKind, SwitchSource, Target, VialMode, status_flags,
 };
 use kvm_proto::link::bt::{
     DeviceState, EventKind as BtEventKind, HostState as BtHostState, control as btcontrol, host_flags as bthost,
@@ -452,7 +452,7 @@ pub struct Engine {
     /// Gamepad axis calibration and field overrides per device identity.
     cal: crate::known::KnownDevices,
     pcs: [PcSlot; 2],
-    ports: [PortSlot; 3],
+    ports: [PortSlot; PORTS],
     presentation: Presentation,
     desc: Vec<u8, { kvm_proto::descset::MAX_LEN }>,
     out: Deque<Output, OUTPUT_QUEUE>,
@@ -601,7 +601,7 @@ impl Engine {
             keymap_now: None,
             cal: crate::known::KnownDevices::new(),
             pcs: [PcSlot::NEW, PcSlot::NEW],
-            ports: [PortSlot::new(), PortSlot::new(), PortSlot::new()],
+            ports: [const { PortSlot::new() }; PORTS],
             presentation: Presentation::EMPTY,
             desc: Vec::new(),
             out: Deque::new(),
@@ -890,7 +890,8 @@ impl Engine {
         LedInputs {
             active: self.active,
             links: [self.pcs[0].link, self.pcs[1].link],
-            ports: [port(0), port(1), port(2)],
+            aux1: self.has_port(Port::Aux1),
+            ports: core::array::from_fn(port),
             color_pc1: self.config.color_pc1,
             color_pc2: self.config.color_pc2,
             brightness: self.config.led_brightness,
@@ -909,6 +910,11 @@ impl Engine {
             bt_pairing: self.bt.pairing_until.is_some() || self.wireless.scan_until.is_some(),
             bt_passkey: self.bt.passkey.is_some(),
         }
+    }
+
+    /// The board has front port `p`: every port but Aux 1, which only boards from 0.19.0 have (`caps::AUX1`).
+    pub fn has_port(&self, p: Port) -> bool {
+        p != Port::Aux1 || self.info.caps & ctrl::caps::AUX1 != 0
     }
 
     fn selftest_showing(&self) -> bool {
@@ -1264,7 +1270,7 @@ impl Engine {
     }
 
     fn build_presentation(&self, buf: &mut [u8]) -> Option<(usize, Presentation)> {
-        let configs: [Option<_>; 3] = core::array::from_fn(|i| {
+        let configs: [Option<_>; PORTS] = core::array::from_fn(|i| {
             let p = &self.ports[i];
             p.dev.as_ref().filter(|_| p.is_mirrored()).and_then(|d| parse_config(&d.probed.config).map(|c| (d, c)))
         });
@@ -1275,7 +1281,7 @@ impl Engine {
         let mut identity = None;
         for (i, entry) in configs.iter().enumerate() {
             let Some((d, cfg)) = entry else { continue };
-            let port = Port::from_index(i).unwrap_or(Port::Other);
+            let port = Port::from_index(i).unwrap_or(Port::Aux2);
             for iface in cfg.interfaces.iter().filter(|f| f.in_ep().is_some()) {
                 let rd = d.probed.report_descs.iter().find(|(n, _)| *n == iface.number).map(|(_, r)| r.as_slice());
                 let usable = iface.is_xinput() || (iface.is_hid() && rd.is_some());
@@ -1745,7 +1751,7 @@ impl Engine {
             return;
         }
         s.state = PortState::Hosted;
-        let mut touched = [false; 3];
+        let mut touched = [false; PORTS];
         touched[port.index()] = true;
         self.redecide(touched);
     }
@@ -1823,18 +1829,18 @@ impl Engine {
     /// Decides every port's mode again (attach, unplug, a mode or Vial change). The ports compete for the mirror
     /// endpoints and identity, so a change on one can move another; those already mirrored keep their endpoints, and
     /// the one with identity keeps it. Ports `touched` are reported as changed even if their mode stays.
-    fn redecide(&mut self, touched: [bool; 3]) {
+    fn redecide(&mut self, touched: [bool; PORTS]) {
         let rank = |p: &PortSlot| match (p.is_mirrored(), p.effective) {
             (true, PortMode::MirroredIdentity) => 0,
             (true, _) => 1,
             _ => 2,
         };
-        let mut order: Vec<Port, 3> = Port::ALL.iter().copied().collect();
+        let mut order: Vec<Port, PORTS> = Port::ALL.iter().copied().collect();
         order.sort_unstable_by_key(|p| (rank(&self.ports[p.index()]), p.index()));
         let settings = self.config.modes();
         let wireless = self.wireless_normalized();
         let decided = {
-            let candidates: Vec<Candidate, 3> = order
+            let candidates: Vec<Candidate, PORTS> = order
                 .iter()
                 .filter_map(|&port| {
                     let s = &self.ports[port.index()];
@@ -1844,7 +1850,7 @@ impl Engine {
                 .collect();
             policy::decide_all(&candidates, wireless, self.config.vial == VialMode::On)
         };
-        let mut changed = [false; 3];
+        let mut changed = [false; PORTS];
         for &port in Port::ALL {
             let i = port.index();
             let Some((eff, reason)) = decided[i] else { continue };
@@ -1952,7 +1958,7 @@ impl Engine {
         self.release_port(port);
         self.ports[i] = PortSlot { faults: self.ports[i].faults, ..PortSlot::new() };
         // Endpoints freed up, or Normalized lost a user: the other ports may now get the mode they asked for.
-        self.redecide([false; 3]);
+        self.redecide([false; PORTS]);
         if was_mirrored {
             self.rebuild_presentation();
         }
@@ -2858,13 +2864,14 @@ impl Engine {
     }
 
     /// Front ports worth powering while a sleeping PC waits for a key press: those with a keyboard or mouse, and
-    /// empty ones (a keyboard plugged in then can wake it too).
-    fn wake_ports(&self) -> [bool; 3] {
+    /// empty ones (a keyboard plugged in then can wake it too), of those the board has.
+    fn wake_ports(&self) -> [bool; PORTS] {
         core::array::from_fn(|i| {
-            self.ports[i]
-                .dev
-                .as_ref()
-                .is_none_or(|d| d.summary.classes() & (ctrl::class::KEYBOARD | ctrl::class::MOUSE) != 0)
+            Port::from_index(i).is_some_and(|p| self.has_port(p))
+                && self.ports[i]
+                    .dev
+                    .as_ref()
+                    .is_none_or(|d| d.summary.classes() & (ctrl::class::KEYBOARD | ctrl::class::MOUSE) != 0)
         })
     }
 
@@ -3093,7 +3100,7 @@ impl Engine {
             KeyAction::TogglePc => self.switch(Target::Toggle, SwitchSource::Key),
             KeyAction::NextTarget => self.switch(Target::Next, SwitchSource::Key),
             KeyAction::NextProfile => self.select_profile(self.config.next_profile()),
-            KeyAction::OtherPortMode => self.cycle_other_port(),
+            KeyAction::Aux2PortMode => self.cycle_aux2_port(),
         }
     }
 
@@ -3114,7 +3121,7 @@ impl Engine {
             HotkeyAction::PrevProfile => self.select_profile((self.config.profile + count - 1) % count),
             // A profile past those in use is refused, as from the software.
             HotkeyAction::SelectProfile(n) => self.select_profile(n),
-            HotkeyAction::OtherPortMode => self.cycle_other_port(),
+            HotkeyAction::Aux2PortMode => self.cycle_aux2_port(),
         }
     }
 
@@ -3122,10 +3129,10 @@ impl Engine {
         let _ = self.set_config(ConfigValue::Profile(n), Origin::Device);
     }
 
-    /// The Other port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2 → Auto, in one
+    /// The Aux 2 port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2 → Auto, in one
     /// step (the router flips once).
-    fn cycle_other_port(&mut self) {
-        let d = Device::Other;
+    fn cycle_aux2_port(&mut self) {
+        let d = Device::Aux2;
         let (mode, route) = match (self.config.mode(d), self.config.route(d)) {
             (PortMode::Auto, _) => (PortMode::Passthrough, Routing::Follow),
             (PortMode::Passthrough, Routing::Follow) => (PortMode::Passthrough, Routing::Pin(Host::Pc1)),
@@ -3258,7 +3265,7 @@ impl Engine {
             add(id::HUB0_ERRORS, Grade::Info, b.hub0_errors.min(i32::MAX as u32) as i32);
             add(id::ENUM_FAILS, Grade::Info, b.enum_fails.min(i32::MAX as u32) as i32);
         }
-        for p in Port::ALL {
+        for p in Port::ALL.iter().filter(|p| self.has_port(**p)) {
             add(id::PORT_SPEED[p.index()], Grade::Info, self.port_info(*p).speed as i32);
         }
         for k in 0..2 {
@@ -3305,7 +3312,7 @@ impl Engine {
         for k in 0..2 {
             add(id::PC_DROPOUTS[k], Grade::Info, self.supply.dropouts(k) as i32);
         }
-        for p in Port::ALL {
+        for p in Port::ALL.iter().filter(|p| self.has_port(**p)) {
             let faults = self.port_info(*p).faults;
             let grade = if self.selftest & ctrl::selftest::PORTS[p.index()] != 0 {
                 Grade::Bad
@@ -3474,7 +3481,7 @@ impl Engine {
             if s.state == PortState::Probing && s.probe_until.is_some_and(|t| now.wrapping_sub(t) as i32 >= 0) {
                 // Nothing came on Hub-0: the device was unplugged in passthrough, where the KVM couldn't see it. Until
                 // 0.1.11 the port stayed probing (blinking yellow) until a device was plugged in (first board,
-                // 2026-11-12, a flash drive on Other).
+                // 2026-11-12, a flash drive on Aux 2).
                 self.port_detached(port);
             }
         }
@@ -3605,7 +3612,7 @@ impl Engine {
         // A mode or routing, the active profile or its settings changed: the ports are decided again together, so a
         // profile switch moves every port at once (a port still probing is decided when that finishes), and every
         // device's input goes where it goes now.
-        let ports = |c: &Config, i: usize| (c.modes()[i], c.route(Device::from_index(i).unwrap_or(Device::Other)));
+        let ports = |c: &Config, i: usize| (c.modes()[i], c.route(Device::from_index(i).unwrap_or(Device::Aux2)));
         let devices = |c: &Config| core::array::from_fn::<_, DEVICES, _>(|i| ports(c, i));
         if devices(before) != devices(&self.config) {
             self.redecide(core::array::from_fn(|i| ports(before, i) != ports(&self.config, i)));
@@ -3637,7 +3644,7 @@ impl Engine {
             ConfigValue::PcPolling(_) | ConfigValue::AbsPointer(_) => self.rebuild_presentation(),
             ConfigValue::Vial(_) => {
                 // The endpoint budget changed: every port is decided again, then the interfaces are rebuilt.
-                self.redecide([false; 3]);
+                self.redecide([false; PORTS]);
                 self.rebuild_presentation();
             }
             // The virtual gamepad comes or goes: both PCs enumerate the interfaces again.
@@ -3785,7 +3792,7 @@ impl Engine {
                 self.keymap_buttons = 0;
                 self.keymap_changes = self.vial.keymap.changes();
                 let port =
-                    |c: &Config, i: usize| (c.modes()[i], c.route(Device::from_index(i).unwrap_or(Device::Other)));
+                    |c: &Config, i: usize| (c.modes()[i], c.route(Device::from_index(i).unwrap_or(Device::Aux2)));
                 self.redecide(core::array::from_fn(|i| port(&before, i) != port(&self.config, i)));
                 self.rebuild_presentation();
                 self.hop.forget_all();
@@ -4277,7 +4284,7 @@ impl Engine {
         }
         if c.usable {
             // One of the KVM's devices now, or no longer: the endpoint budget, where input goes, the pinned hosts.
-            self.redecide([false; 3]);
+            self.redecide([false; PORTS]);
         } else if c.started {
             let target = self.target_of(d);
             self.apply_leds_of(Some(target));
@@ -4297,7 +4304,7 @@ impl Engine {
     pub fn bt_device_map(&mut self, dev: u8, offset: u16, total: u16, data: &[u8]) {
         match self.wireless.map_piece(dev, offset, total, data) {
             Some(crate::bt::MapState::Held) => {
-                self.redecide([false; 3]);
+                self.redecide([false; PORTS]);
                 self.event(Event::BtDeviceChanged(dev));
             }
             Some(_) => self.event(Event::BtDeviceChanged(dev)),
@@ -4360,7 +4367,7 @@ impl Engine {
             self.release_dev(d);
         }
         self.wireless = Devices::EMPTY;
-        self.redecide([false; 3]);
+        self.redecide([false; PORTS]);
         self.event(Event::BtChanged(0));
         self.event(Event::BtDeviceChanged(0));
     }
@@ -4719,7 +4726,7 @@ mod tests {
         e.pc_status(Pc::Pc1, usb(UsbState::Unpowered, false));
         e.tick(T0 + 2_000);
         e.tick(T0 + 2_000 + crate::standby::STANDBY_AFTER_MS);
-        let deep = PowerPlan { mode: PowerMode::DeepStandby, ports: [false; 3], hub0: false };
+        let deep = PowerPlan { mode: PowerMode::DeepStandby, ports: [false; PORTS], hub0: false };
         assert_eq!(powers(&drain(&mut e)), [deep]);
         assert!(e.led_inputs().standby);
         assert!(crate::leds::render(&e.led_inputs(), 0).iter().all(|c| *c == ctrl::Rgb::default()));
@@ -4742,7 +4749,7 @@ mod tests {
         e.tick(T0 + 100 + crate::standby::STANDBY_AFTER_MS);
         let plan = e.power_plan();
         assert_eq!(plan.mode, PowerMode::WakeStandby);
-        assert_eq!(plan.ports, [true, true, true], "a keyboard, and two empty ports");
+        assert_eq!(plan.ports, [true, true, false, true], "a keyboard, and two empty ports (no Aux 1 on this board)");
         drain(&mut e);
 
         let t = T0 + 20_000;
@@ -4898,28 +4905,64 @@ mod tests {
         drain(&mut e);
         let cam =
             Probed { config: Vec::from_slice(crate::usbdesc::fixtures::WEBCAM_CONFIG).unwrap(), ..Default::default() };
-        e.port_attached(Port::Other, &cam);
+        e.port_attached(Port::Aux2, &cam);
         assert_eq!(
             drain(&mut e)[0],
-            Output::Route { port: Port::Other, route: Route::Pc(Pc::Pc1), power_cycle: false }
+            Output::Route { port: Port::Aux2, route: Route::Pc(Pc::Pc1), power_cycle: false }
         );
-        e.port_detached(Port::Other); // Hub-0 sees it leave: ignored
-        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        e.port_detached(Port::Aux2); // Hub-0 sees it leave: ignored
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Passthrough);
         e.switch(Target::Toggle, SwitchSource::Key);
         assert!(drain(&mut e).contains(&Output::Route {
-            port: Port::Other,
+            port: Port::Aux2,
             route: Route::Pc(Pc::Pc2),
             power_cycle: false
         }));
         // Pinning it to PC1 moves it back once and then it stays.
-        e.set_config(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Route(Device::Aux2, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
         assert!(drain(&mut e).contains(&Output::Route {
-            port: Port::Other,
+            port: Port::Aux2,
             route: Route::Pc(Pc::Pc1),
             power_cycle: false
         }));
         e.switch(Target::Toggle, SwitchSource::Key);
         assert!(!drain(&mut e).iter().any(|o| matches!(o, Output::Route { .. })));
+    }
+
+    #[test]
+    fn aux1_is_served_on_a_board_with_it_and_never_routed() {
+        // A board before 0.19.0: three ports, six LEDs, no Aux 1 diagnostics.
+        let mut e = engine();
+        assert!(!e.has_port(Port::Aux1) && !e.led_inputs().aux1);
+        let ids: std::vec::Vec<u8> = diag(&mut e).0.iter().map(|i| i.id).collect();
+        assert!(ids.contains(&id::A2_SPEED) && !ids.contains(&id::A1_SPEED) && !ids.contains(&id::A1_FAULTS));
+
+        // 0.19.0: the firmware found Aux 1.
+        let info = Info { caps: ctrl::caps::AUX1, ..e.info };
+        let mut e = Engine::new(Config::default(), info, "TEST0001");
+        e.pc_hello(Pc::Pc1, 1);
+        e.pc_hello(Pc::Pc2, 1);
+        drain(&mut e);
+        assert!(e.has_port(Port::Aux1) && e.led_inputs().aux1);
+        let ids: std::vec::Vec<u8> = diag(&mut e).0.iter().map(|i| i.id).collect();
+        assert!(ids.contains(&id::A1_SPEED) && ids.contains(&id::A1_FAULTS));
+        // A webcam there has no router to go to: it stays off, and nothing is routed.
+        let cam =
+            Probed { config: Vec::from_slice(crate::usbdesc::fixtures::WEBCAM_CONFIG).unwrap(), ..Default::default() };
+        e.port_attached(Port::Aux1, &cam);
+        assert!(!drain(&mut e).iter().any(|o| matches!(o, Output::Route { .. })));
+        let i = e.port_info(Port::Aux1);
+        assert_eq!((i.state, i.effective, i.reason), (PortState::Hosted, PortMode::Off, AutoReason::NeedsPassthrough));
+        // The gaming profile passes the other ports through and leaves Aux 1 in Auto.
+        e.set_config(ConfigValue::Profile(1), Origin::Software).unwrap();
+        drain(&mut e);
+        assert_eq!(e.port_info(Port::Aux1).effective, PortMode::Off);
+        assert!(!drain(&mut e).iter().any(|o| matches!(o, Output::Route { port: Port::Aux1, .. })));
+        // A keyboard there is mirrored, as on Aux 2.
+        e.port_detached(Port::Aux1);
+        e.port_attached(Port::Aux1, &keyboard_and_mouse());
+        let i = e.port_info(Port::Aux1);
+        assert_eq!((i.state, i.effective), (PortState::Hosted, PortMode::Mirrored));
     }
 
     #[test]
@@ -4934,17 +4977,17 @@ mod tests {
             config: Vec::from_slice(crate::usbdesc::fixtures::WEBCAM_CONFIG).unwrap(),
             ..Default::default()
         };
-        e.port_attached(Port::Other, &webcam(true));
-        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
-        assert_eq!(e.port_info(Port::Other).speed, Speed::High);
+        e.port_attached(Port::Aux2, &webcam(true));
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Passthrough);
+        assert_eq!(e.port_info(Port::Aux2).speed, Speed::High);
         // PC2's hub runs at full speed, and so does everything on it.
         e.switch(Target::Toggle, SwitchSource::Key);
-        assert_eq!(e.port_info(Port::Other).speed, Speed::Full);
-        e.set_config(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
-        assert_eq!(e.port_info(Port::Other).speed, Speed::High, "pinned to PC1");
+        assert_eq!(e.port_info(Port::Aux2).speed, Speed::Full);
+        e.set_config(ConfigValue::Route(Device::Aux2, Routing::Pin(Host::Pc1)), Origin::Software).unwrap();
+        assert_eq!(e.port_info(Port::Aux2).speed, Speed::High, "pinned to PC1");
         // A full-speed device stays at full speed.
-        e.port_attached(Port::Other, &webcam(false));
-        assert_eq!(e.port_info(Port::Other).speed, Speed::Full);
+        e.port_attached(Port::Aux2, &webcam(false));
+        assert_eq!(e.port_info(Port::Aux2).speed, Speed::Full);
         // Hosted, a high-speed device runs at Hub-0's full speed.
         e.port_attached(Port::Mouse, &Probed { high_speed: true, ..keyboard_and_mouse() });
         assert_eq!(e.port_info(Port::Mouse).state, PortState::Hosted);
@@ -4959,24 +5002,24 @@ mod tests {
         e.tick(T0);
         let drive =
             Probed { config: Vec::from_slice(crate::usbdesc::fixtures::WEBCAM_CONFIG).unwrap(), ..Default::default() };
-        e.port_attached(Port::Other, &drive);
-        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        e.port_attached(Port::Aux2, &drive);
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Passthrough);
         // Unplugged at the PC's hub, which the KVM can't see; then re-detect.
-        assert_eq!(ask(&mut e, Request::Redetect(Port::Other)), Response::Ok);
-        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Other)));
+        assert_eq!(ask(&mut e, Request::Redetect(Port::Aux2)), Response::Ok);
+        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Aux2)));
         e.tick(T0 + REPROBE_MS - 1);
-        assert_eq!(e.port_info(Port::Other).state, PortState::Probing);
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Probing);
         e.tick(T0 + REPROBE_MS);
-        assert_eq!(e.port_info(Port::Other), PortInfo::empty(Port::Other, PortMode::Auto));
-        assert!(events_to(&drain(&mut e), Pc::Pc1).contains(&Event::PortChanged(Port::Other)));
+        assert_eq!(e.port_info(Port::Aux2), PortInfo::empty(Port::Aux2, PortMode::Auto));
+        assert!(events_to(&drain(&mut e), Pc::Pc1).contains(&Event::PortChanged(Port::Aux2)));
         // A device that is there comes on Hub-0 in time and is probed as usual, however long that takes.
-        assert_eq!(ask(&mut e, Request::Redetect(Port::Other)), Response::Ok);
+        assert_eq!(ask(&mut e, Request::Redetect(Port::Aux2)), Response::Ok);
         e.tick(T0 + REPROBE_MS + 300);
-        e.port_probing(Port::Other);
+        e.port_probing(Port::Aux2);
         e.tick(T0 + 3 * REPROBE_MS);
-        assert_eq!(e.port_info(Port::Other).state, PortState::Probing);
-        e.port_attached(Port::Other, &drive);
-        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Probing);
+        e.port_attached(Port::Aux2, &drive);
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Passthrough);
         // Back from passthrough with the device gone: empty as well.
         e.set_config(ConfigValue::Mode(Device::Mouse, PortMode::Passthrough), Origin::Software).unwrap();
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
@@ -5020,15 +5063,15 @@ mod tests {
         assert!(e.presentation().vial.is_some());
         // ...until an XInput pad needs it; unplugging the pad gives it back.
         let pad = Probed { config: Vec::from_slice(XINPUT_CONFIG).unwrap(), ..Default::default() };
-        e.port_attached(Port::Other, &pad);
-        assert_eq!(e.port_info(Port::Other).effective, PortMode::Mirrored);
+        e.port_attached(Port::Aux2, &pad);
+        assert_eq!(e.port_info(Port::Aux2).effective, PortMode::Mirrored);
         assert!(e.presentation().vial.is_none());
-        e.port_detached(Port::Other);
+        e.port_detached(Port::Aux2);
         assert!(e.presentation().vial.is_some());
         // On: Vial keeps its endpoint and the pad goes to passthrough instead.
         e.set_config(ConfigValue::Vial(VialMode::On), Origin::Software).unwrap();
-        e.port_attached(Port::Other, &pad);
-        let other = e.port_info(Port::Other);
+        e.port_attached(Port::Aux2, &pad);
+        let other = e.port_info(Port::Aux2);
         assert_eq!((other.effective, other.reason), (PortMode::Passthrough, AutoReason::EndpointBudget));
         assert!(e.presentation().vial.is_some());
         e.set_config(ConfigValue::Vial(VialMode::Off), Origin::Software).unwrap();
@@ -5154,10 +5197,10 @@ mod tests {
 
     #[test]
     fn a_mirror_squeezed_out_comes_back_when_the_endpoints_free_up() {
-        // A normalized device on Other keeps the KVM's own interfaces: two 2-endpoint mirrors don't both fit.
+        // A normalized device on Aux 2 keeps the KVM's own interfaces: two 2-endpoint mirrors don't both fit.
         let mut e = engine();
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
-        e.port_attached(Port::Other, &keyboard_and_mouse());
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Aux2, &keyboard_and_mouse());
         e.port_attached(Port::Keyboard, &keyboard_and_mouse());
         e.port_attached(Port::Mouse, &keyboard_and_mouse());
         e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
@@ -5171,8 +5214,8 @@ mod tests {
         drain(&mut e);
         e.set_config(ConfigValue::Mode(Device::Keyboard, PortMode::Mirrored), Origin::Software).unwrap();
         assert_eq!(e.port_info(Port::Keyboard).reason, AutoReason::EndpointBudget);
-        // Unplugging the normalized device on Other makes room for both.
-        e.port_detached(Port::Other);
+        // Unplugging the normalized device on Aux 2 makes room for both.
+        e.port_detached(Port::Aux2);
         assert_eq!(e.port_info(Port::Keyboard).effective, PortMode::Mirrored);
         assert_eq!(e.presentation().mirrors.len(), 4);
     }
@@ -5338,12 +5381,12 @@ mod tests {
         e.pc_status(Pc::Pc1, usb(UsbState::Configured, false));
         e.pc_status(Pc::Pc2, usb(UsbState::Configured, false));
         e.set_config(ConfigValue::KeyTap(KeyAction::NextProfile), Origin::Software).unwrap();
-        e.set_config(ConfigValue::KeyLong(KeyAction::OtherPortMode), Origin::Software).unwrap();
+        e.set_config(ConfigValue::KeyLong(KeyAction::Aux2PortMode), Origin::Software).unwrap();
         e.key(KeyEvent::Tap);
         assert_eq!((e.config().profile, e.active()), (1, Pc::Pc1));
-        // The long press changes the Other port's mode in the active profile only.
+        // The long press changes the Aux 2 port's mode in the active profile only.
         e.key(KeyEvent::Long);
-        let other = Device::Other.index();
+        let other = Device::Aux2.index();
         let p = e.config().profiles;
         assert_eq!((p[1].modes[other], p[1].routes[other]), (PortMode::Passthrough, Routing::Pin(Host::Pc1)));
         assert_eq!((p[0].modes[other], p[0].routes[other]), (PortMode::Auto, Routing::Follow));
@@ -5631,7 +5674,7 @@ mod tests {
             (HotkeyAction::PrevProfile, 0x13),
             (HotkeyAction::SelectProfile(2), 0x1F),
             (HotkeyAction::SelectProfile(3), 0x20),
-            (HotkeyAction::OtherPortMode, 0x12),
+            (HotkeyAction::Aux2PortMode, 0x12),
         ]
         .into_iter()
         .enumerate()
@@ -5651,7 +5694,7 @@ mod tests {
         assert_eq!(press(&mut e, 0x1F), 2);
         assert_eq!(press(&mut e, 0x20), 2, "profile 3 isn't in use");
         press(&mut e, 0x12);
-        assert_eq!(e.config().mode(Device::Other), PortMode::Passthrough);
+        assert_eq!(e.config().mode(Device::Aux2), PortMode::Passthrough);
     }
 
     #[test]
@@ -5759,15 +5802,15 @@ mod tests {
     fn an_esp32_board_on_a_kvm_without_the_module_becomes_the_module() {
         let mut e = engine();
         drain(&mut e);
-        e.port_attached(Port::Other, &esp_board());
+        e.port_attached(Port::Aux2, &esp_board());
         // Probing while the firmware finds out; nothing routed away meanwhile.
-        assert_eq!(e.port_info(Port::Other).state, PortState::Probing);
-        assert!(e.dongle_wanted(Port::Other));
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Probing);
+        assert!(e.dongle_wanted(Port::Aux2));
         assert!(!drain(&mut e).iter().any(|o| matches!(o, Output::Route { .. })));
-        e.dongle_claimed(Port::Other);
-        assert_eq!(e.port_info(Port::Other).state, PortState::Module);
-        assert_eq!(e.dongle_port(), Some(Port::Other));
-        assert_eq!(e.led_inputs().ports[Port::Other.index()].0, PortState::Module);
+        e.dongle_claimed(Port::Aux2);
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Module);
+        assert_eq!(e.dongle_port(), Some(Port::Aux2));
+        assert_eq!(e.led_inputs().ports[Port::Aux2.index()].0, PortState::Module);
         e.set_bt_module(BtModule::Up);
         e.bt_hello(0x000100);
         let Response::Info(i) = ask(&mut e, Request::GetInfo) else { panic!() };
@@ -5783,13 +5826,13 @@ mod tests {
         assert!(!e.dongle_wanted(Port::Mouse));
         assert_eq!(e.port_info(Port::Mouse).state, PortState::Passthrough);
         // Unplugged: the port is empty, Bluetooth is gone, and the next board may be the module.
-        e.port_detached(Port::Other);
-        assert_eq!(e.port_info(Port::Other).state, PortState::Empty);
+        e.port_detached(Port::Aux2);
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Empty);
         assert_eq!(e.status(None).bt_module, BtModule::Absent);
         let Response::Info(i) = ask(&mut e, Request::GetInfo) else { panic!() };
         assert_eq!(i.caps & ctrl::caps::BLUETOOTH, 0);
-        e.port_attached(Port::Other, &esp_board());
-        assert!(e.dongle_wanted(Port::Other));
+        e.port_attached(Port::Aux2, &esp_board());
+        assert!(e.dongle_wanted(Port::Aux2));
     }
 
     #[test]
@@ -5797,60 +5840,60 @@ mod tests {
         // Another firmware: declined, then decided as any device (a non-HID device goes to the active PC).
         let mut e = engine();
         drain(&mut e);
-        e.port_attached(Port::Other, &esp_board());
-        e.dongle_declined(Port::Other);
-        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        e.port_attached(Port::Aux2, &esp_board());
+        e.dongle_declined(Port::Aux2);
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Passthrough);
         assert!(drain(&mut e).contains(&Output::Route {
-            port: Port::Other,
+            port: Port::Aux2,
             route: Route::Pc(Pc::Pc1),
             power_cycle: false
         }));
         // A KVM with the module on board never takes one.
         let mut fitted = engine();
         fitted.set_bt_fitted(true);
-        fitted.port_attached(Port::Other, &esp_board());
-        assert!(!fitted.dongle_wanted(Port::Other));
-        assert_eq!(fitted.port_info(Port::Other).state, PortState::Passthrough);
+        fitted.port_attached(Port::Aux2, &esp_board());
+        assert!(!fitted.dongle_wanted(Port::Aux2));
+        assert_eq!(fitted.port_info(Port::Aux2).state, PortState::Passthrough);
         // Nor a port set to passthrough: one's own ESP32 board stays reachable from a PC.
         let mut pinned = engine();
-        pinned.set_config(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
-        pinned.port_attached(Port::Other, &esp_board());
-        assert!(!pinned.dongle_wanted(Port::Other));
+        pinned.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Passthrough), Origin::Software).unwrap();
+        pinned.port_attached(Port::Aux2, &esp_board());
+        assert!(!pinned.dongle_wanted(Port::Aux2));
         // Setting the module's port to passthrough plugs it in anew, as the ordinary device it then is.
         let mut e = engine();
-        e.port_attached(Port::Other, &esp_board());
-        e.dongle_claimed(Port::Other);
+        e.port_attached(Port::Aux2, &esp_board());
+        e.dongle_claimed(Port::Aux2);
         drain(&mut e);
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
-        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Other)));
-        e.port_detached(Port::Other);
-        e.port_attached(Port::Other, &esp_board());
-        assert!(!e.dongle_wanted(Port::Other));
-        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Passthrough), Origin::Software).unwrap();
+        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Aux2)));
+        e.port_detached(Port::Aux2);
+        e.port_attached(Port::Aux2, &esp_board());
+        assert!(!e.dongle_wanted(Port::Aux2));
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Passthrough);
     }
 
     #[test]
     fn a_declined_esp32_board_is_adopted_when_asked() {
         // Declined (another firmware): an ordinary device, until it is adopted.
         let mut e = engine();
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
-        e.port_attached(Port::Other, &esp_board());
-        assert!(!e.dongle_wanted(Port::Other));
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Passthrough), Origin::Software).unwrap();
+        e.port_attached(Port::Aux2, &esp_board());
+        assert!(!e.dongle_wanted(Port::Aux2));
         drain(&mut e);
-        assert_eq!(ask(&mut e, Request::AdoptModule(Port::Other)), Response::Ok);
-        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Other)));
+        assert_eq!(ask(&mut e, Request::AdoptModule(Port::Aux2)), Response::Ok);
+        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Aux2)));
         // Probed again: taken, the firmware told to program it, and its port no longer passthrough.
-        e.port_detached(Port::Other);
-        e.port_attached(Port::Other, &esp_board());
-        assert!(e.dongle_wanted(Port::Other) && e.dongle_adopt(Port::Other));
-        assert_eq!(e.config().mode(Device::Other), PortMode::Auto);
-        e.dongle_claimed(Port::Other);
-        assert!(!e.dongle_adopt(Port::Other));
+        e.port_detached(Port::Aux2);
+        e.port_attached(Port::Aux2, &esp_board());
+        assert!(e.dongle_wanted(Port::Aux2) && e.dongle_adopt(Port::Aux2));
+        assert_eq!(e.config().mode(Device::Aux2), PortMode::Auto);
+        e.dongle_claimed(Port::Aux2);
+        assert!(!e.dongle_adopt(Port::Aux2));
         // With a module now: no second one.
         assert_eq!(ask(&mut e, Request::AdoptModule(Port::Mouse)), Response::Error(ErrorCode::Busy));
         // An empty port has nothing to adopt; a device that can't be the module ends the adoption.
         let mut e = engine();
-        assert_eq!(ask(&mut e, Request::AdoptModule(Port::Other)), Response::Error(ErrorCode::NoDevice));
+        assert_eq!(ask(&mut e, Request::AdoptModule(Port::Aux2)), Response::Error(ErrorCode::NoDevice));
         e.port_attached(Port::Keyboard, &keyboard_and_mouse());
         assert_eq!(ask(&mut e, Request::AdoptModule(Port::Keyboard)), Response::Ok);
         e.port_detached(Port::Keyboard);
@@ -6716,13 +6759,13 @@ mod tests {
     fn a_gamepad_goes_to_the_virtual_gamepad() {
         let mut e = engine();
         e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
-        e.port_attached(Port::Other, &gamepad());
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Aux2, &gamepad());
         drain(&mut e);
         let nkro = e.presentation().nkro.ep_in;
         assert_eq!(e.presentation().gamepad, GamepadOut::Hid);
         // Without a keymap, 1:1: button 2, the hat right, X full left, Rz three quarters.
-        e.device_report(Port::Other, 0, &[0b10, 0, 2, 0, 128, 128, 224], 10);
+        e.device_report(Port::Aux2, 0, &[0b10, 0, 2, 0, 128, 128, 224], 10);
         let r = last_on(&drain(&mut e), nkro).unwrap();
         let g = read_back(&normalized::NKRO_PAD_DESC, &r).gamepad.unwrap();
         assert_eq!((g.buttons, g.hat, g.axes[0], g.axes[1], g.axes[5]), (0b10, 2, -32767, 128, 24800));
@@ -6730,9 +6773,9 @@ mod tests {
         e.set_config(ConfigValue::ProfileKeymap(0, Some(0)), Origin::Software).unwrap();
         let codes = Vec::from_slice(&[0x05]).unwrap();
         ask(&mut e, Request::SetKeycodes { keymap: 0, layer: 0, first: kvm_map::pos::PAD + 1, codes });
-        e.device_report(Port::Other, 0, &[0, 0, 0x0F, 128, 128, 128, 128], 20);
+        e.device_report(Port::Aux2, 0, &[0, 0, 0x0F, 128, 128, 128, 128], 20);
         drain(&mut e);
-        e.device_report(Port::Other, 0, &[0b10, 0, 0x0F, 128, 128, 128, 128], 30);
+        e.device_report(Port::Aux2, 0, &[0b10, 0, 0x0F, 128, 128, 128, 128], 30);
         let out = drain(&mut e);
         assert!(
             read_back(normalized::NKRO_DESC, &last_on(&out, nkro).unwrap())
@@ -6820,23 +6863,23 @@ mod tests {
     fn a_gamepads_calibration_follows_it_and_is_saved() {
         let mut e = engine();
         e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
-        e.port_attached(Port::Other, &gamepad());
-        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Other)) else { panic!() };
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Aux2, &gamepad());
+        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Aux2)) else { panic!() };
         assert_eq!((c.pad_buttons, c.hat, c.pad_axes, c.mouse_buttons), ((1 << 14) - 1, true, 0b10_0111, 0b111));
         assert_ne!(c.identity, 0);
         // X rests at 140 (raw) and reaches only 20 and 235.
         let cal = AxisCal { min: -27500, centre: 1542, max: 27500, deadzone: 8 };
-        assert_eq!(ask(&mut e, Request::SetCalibration(Device::Other, 0, cal)), Response::Ok);
+        assert_eq!(ask(&mut e, Request::SetCalibration(Device::Aux2, 0, cal)), Response::Ok);
         assert_eq!(
-            ask(&mut e, Request::GetCalibration(Device::Other, 0)),
-            Response::Calibration(Device::Other, 0, cal)
+            ask(&mut e, Request::GetCalibration(Device::Aux2, 0)),
+            Response::Calibration(Device::Aux2, 0, cal)
         );
         drain(&mut e);
-        e.device_report(Port::Other, 0, &[0, 0, 0x0F, 134, 128, 128, 128], 10);
+        e.device_report(Port::Aux2, 0, &[0, 0, 0x0F, 134, 128, 128, 128], 10);
         let r = last_on(&drain(&mut e), e.presentation().nkro.ep_in).unwrap();
         assert_eq!(read_back(&normalized::NKRO_PAD_DESC, &r).gamepad.unwrap().axes[0], 0, "at rest");
-        e.device_report(Port::Other, 0, &[0, 0, 0x0F, 235, 128, 128, 128], 20);
+        e.device_report(Port::Aux2, 0, &[0, 0, 0x0F, 235, 128, 128, 128], 20);
         let r = last_on(&drain(&mut e), e.presentation().nkro.ep_in).unwrap();
         assert_eq!(read_back(&normalized::NKRO_PAD_DESC, &r).gamepad.unwrap().axes[0], 32767);
         e.tick(5100);
@@ -6864,24 +6907,24 @@ mod tests {
     fn a_field_override_makes_undeclared_bits_a_button_and_an_axis() {
         let mut e = engine();
         e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
-        e.port_attached(Port::Other, &gamepad());
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Aux2, &gamepad());
         drain(&mut e);
         let nkro = e.presentation().nkro.ep_in;
         // The padding after the 14 buttons (bit 14) as button 20, the nibble after the hat (bits 20–23) as the slider.
         let button = ctrl::FieldOverride { iface: 0, report_id: 0, bit: 14, bits: 1, flags: 0, target: 19 };
         let slider =
             ctrl::FieldOverride { iface: 0, report_id: 0, bit: 20, bits: 4, flags: 0, target: ctrl::field::AXIS + 6 };
-        assert_eq!(ask(&mut e, Request::SetOverride(Device::Other, 0, Some(button))), Response::Ok);
-        assert_eq!(ask(&mut e, Request::SetOverride(Device::Other, 1, Some(slider))), Response::Ok);
-        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Other)) else { panic!() };
+        assert_eq!(ask(&mut e, Request::SetOverride(Device::Aux2, 0, Some(button))), Response::Ok);
+        assert_eq!(ask(&mut e, Request::SetOverride(Device::Aux2, 1, Some(slider))), Response::Ok);
+        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Aux2)) else { panic!() };
         assert!(c.pad_buttons & (1 << 19) != 0 && c.pad_axes & (1 << 6) != 0, "{c:?}");
-        e.device_report(Port::Other, 0, &[0, 0b0100_0000, 0xFF, 128, 128, 128, 128], 10);
+        e.device_report(Port::Aux2, 0, &[0, 0b0100_0000, 0xFF, 128, 128, 128, 128], 10);
         let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
         assert_eq!((g.buttons, g.axes[6]), (1 << 19, 32767));
         assert_eq!(
-            ask(&mut e, Request::GetOverride(Device::Other, 0)),
-            Response::Override(Device::Other, 0, Some(button))
+            ask(&mut e, Request::GetOverride(Device::Aux2, 0)),
+            Response::Override(Device::Aux2, 0, Some(button))
         );
         assert_eq!(ask(&mut e, Request::SetOverride(Device::Mouse, 0, None)), Response::Error(ErrorCode::NoDevice));
     }
@@ -6914,13 +6957,13 @@ mod tests {
     #[test]
     fn a_bluetooth_host_gets_the_gamepad_or_the_profiles_fallback() {
         let mut e = with_bt();
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
-        e.port_attached(Port::Other, &gamepad());
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Aux2, &gamepad());
         // Host 2 subscribed to every report, the gamepad's too.
         e.bt_host(BtHostState { reports: btreports::KNOWN | btreports::ALL, ..bt_host(2, BT_READY) });
         assert_eq!(ask(&mut e, Request::SetActive(Target::Bt2)), Response::Ok);
         drain(&mut e);
-        e.device_report(Port::Other, 0, &[0b1, 0, 0x0F, 128, 128, 128, 128], 10);
+        e.device_report(Port::Aux2, 0, &[0b1, 0, 0x0F, 128, 128, 128, 128], 10);
         let out = bt_inputs(&drain(&mut e));
         let pad = out.iter().rev().find(|(h, id, _)| *h == 2 && *id == btreport::GAMEPAD).expect("a gamepad report");
         assert_eq!((pad.2[0], pad.2[4]), (1, kvm_hid::gamepad::HAT_CENTRE), "button 1, the hat at rest");
@@ -6943,9 +6986,9 @@ mod tests {
         );
         let some = btreports::KNOWN | btreports::KEYBOARD | btreports::MOUSE | btreports::CONSUMER;
         e.bt_host(BtHostState { reports: some, ..bt_host(2, BT_READY) });
-        e.device_report(Port::Other, 0, &[0, 0, 0x0F, 128, 128, 128, 128], 20);
+        e.device_report(Port::Aux2, 0, &[0, 0, 0x0F, 128, 128, 128, 128], 20);
         drain(&mut e);
-        e.device_report(Port::Other, 0, &[0b1, 0, 0x0F, 128, 128, 128, 128], 30);
+        e.device_report(Port::Aux2, 0, &[0b1, 0, 0x0F, 128, 128, 128, 128], 30);
         let out = bt_inputs(&drain(&mut e));
         assert!(out.iter().all(|(_, id, _)| *id != btreport::GAMEPAD), "{out:?}");
         assert!(out.iter().any(|(h, id, d)| *h == 2 && *id == btreport::KEYBOARD && d[2] == 0x04), "{out:?}");
@@ -7038,35 +7081,35 @@ mod tests {
             ..Default::default()
         };
         // Auto: the PC gets the receiver as it is.
-        e.port_attached(Port::Other, &rx);
-        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        e.port_attached(Port::Aux2, &rx);
+        assert_eq!(e.port_info(Port::Aux2).state, PortState::Passthrough);
         // Normalized: the KVM reads its first pad, and asks the receiver whether one is linked.
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
-        e.port_attached(Port::Other, &rx);
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Aux2, &rx);
         let out = drain(&mut e);
         assert_eq!(
-            (e.port_info(Port::Other).state, e.port_info(Port::Other).effective),
+            (e.port_info(Port::Aux2).state, e.port_info(Port::Aux2).effective),
             (PortState::Hosted, PortMode::Normalized)
         );
-        assert!(device_outs(&out).contains(&(Port::Other, 0, xinput::INQUIRY.to_vec())), "{:?}", device_outs(&out));
+        assert!(device_outs(&out).contains(&(Port::Aux2, 0, xinput::INQUIRY.to_vec())), "{:?}", device_outs(&out));
         // A pad links: its player LED.
-        e.device_report(Port::Other, 0, &[0x08, 0x80], 10);
-        assert_eq!(device_outs(&drain(&mut e)), [(Port::Other, 0, xinput::led(0).to_vec())]);
+        e.device_report(Port::Aux2, 0, &[0x08, 0x80], 10);
+        assert_eq!(device_outs(&drain(&mut e)), [(Port::Aux2, 0, xinput::led(0).to_vec())]);
         // Its input: A and the left stick to the right, on the virtual gamepad.
         let mut r = [0u8; 29];
         r[1] = 0x01;
         r[6] = 0x00;
         r[7] = 0x10;
         r[10..12].copy_from_slice(&20000i16.to_le_bytes());
-        e.device_report(Port::Other, 0, &r, 20);
+        e.device_report(Port::Aux2, 0, &r, 20);
         let nkro = e.presentation().nkro.ep_in;
         let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
         assert_eq!((g.buttons, g.axes[0]), (1, 20000));
         // What it has, in the standard order.
-        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Other)) else { panic!() };
+        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Aux2)) else { panic!() };
         assert_eq!((c.pad_buttons, c.hat), (xinput::BUTTONS_PRESENT, true));
         // The pad leaves: everything let go.
-        e.device_report(Port::Other, 0, &[0x08, 0x00], 30);
+        e.device_report(Port::Aux2, 0, &[0x08, 0x00], 30);
         let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
         assert_eq!((g.buttons, g.axes[0]), (0, 0));
     }
@@ -7089,11 +7132,11 @@ mod tests {
         ][..];
         let mut e = engine();
         e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
-        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Aux2, PortMode::Normalized), Origin::Software).unwrap();
         let mut p = keyboard_and_mouse();
         p.device = DeviceDesc { vid: 0x054C, pid: 0x0CE6, ..Default::default() };
         p.report_descs[0].1 = Vec::from_slice(desc).unwrap();
-        e.port_attached(Port::Other, &p);
+        e.port_attached(Port::Aux2, &p);
         drain(&mut e);
         let nkro = e.presentation().nkro.ep_in;
         // Cross (its button 2) and the right stick pushed left (its Z), a finger on the touch pad.
@@ -7102,11 +7145,11 @@ mod tests {
         r[1..5].copy_from_slice(&[128, 128, 0, 128]);
         r[8] = 0x08 | 0x20;
         r[1 + 32] = 0x01;
-        e.device_report(Port::Other, 0, &r, 10);
+        e.device_report(Port::Aux2, 0, &r, 10);
         let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
         assert_eq!(g.buttons, 1 | 1 << (crate::pads::TOUCH_BUTTON - 1), "the bottom face button, the touch");
         assert_eq!(g.axes[3], -32767, "the right stick on Rx");
-        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Other)) else { panic!() };
+        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Aux2)) else { panic!() };
         assert!(c.pad_buttons & (1 << 16) != 0 && c.pad_buttons & (1 << 19) != 0, "Home and the touch: {c:?}");
     }
 

@@ -40,15 +40,17 @@ use embassy_rp::pio_programs::ws2812::{PioWs2812, PioWs2812Program};
 use embassy_rp::spi::{self, Spi};
 use embassy_rp::uart::{self, BufferedUart, UartTx};
 use embassy_rp::{bind_interrupts, dma, pac};
-use kvm_proto::ctrl::{Info, caps};
+use kvm_proto::ctrl::{Info, Port, caps};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-use crate::board::{At32Lines, Board, FrontPort};
+use crate::board::{At32Lines, Board, FrontPort, Router};
 
 const VERSION: (u8, u8, u8) = kvm_proto::FIRMWARE_VERSION;
 pub const FW_VERSION: u32 = kvm_proto::version_u32(VERSION.0, VERSION.1, VERSION.2);
 const HW: (u8, u8, u8) = kvm_proto::HARDWARE_VERSION;
+/// The first board with the Aux 1 port: what `Info` reports where [`board::has_aux1`] finds it.
+const HW_AUX1: (u8, u8, u8) = kvm_proto::HARDWARE_VERSION_AUX1;
 
 /// Which firmware and board this image is: `odkvmctl update` refuses an image for another board.
 #[used]
@@ -149,8 +151,20 @@ async fn main(spawner: Spawner) {
     let mut uart_cfg = uart::Config::default();
     uart_cfg.baudrate = uartlog::BAUD;
     spawner.spawn(unwrap!(uartlog::run(UartTx::new(p.UART1, p.PIN_36, p.DMA_CH5, Irqs, uart_cfg))));
-    let (v, hw) = (VERSION, HW);
-    uartlog::uart_log!("OpenDynKVM RP2354B firmware {}.{}.{}, hardware {}.{}.{}", v.0, v.1, v.2, hw.0, hw.1, hw.2);
+    // Which board: the Aux 1 port's FAULT line has a pull-up from 0.19.0 on, before its power switch is ever on.
+    let mut aux1_fault = Flex::new(p.PIN_10);
+    let aux1 = board::has_aux1(&mut aux1_fault).await;
+    let (v, hw) = (VERSION, if aux1 { HW_AUX1 } else { HW });
+    uartlog::uart_log!(
+        "OpenDynKVM RP2354B firmware {}.{}.{}, hardware {}.{}.{}{}",
+        v.0,
+        v.1,
+        v.2,
+        hw.0,
+        hw.1,
+        hw.2,
+        if aux1 { " (Aux 1 port found)" } else { " or later before 0.19.0 (no Aux 1 port)" }
+    );
 
     // Hub-0 out of reset and told that its upstream is powered; the RP2354B's USB goes to Hub-0 (SVC_SEL low = Hub-0: the
     // service connector sits on the switch's USB2 channel since rev 8, so SEL0 is inverted - gen_schematic.py block 6).
@@ -162,21 +176,20 @@ async fn main(spawner: Spawner) {
     // Routers on Hub-0 (the KVM path), as the board's straps hold them at power-up: SEL1/SEL0 = 1/0 = MHL
     // (`FrontPort::route`, TS3USB3031 Table 6-1). The engine starts from that and routes a port only when it leaves it.
     // Until 0.1.5 this set 0/1, an older channel assignment: every front port went to PC1's hub and the KVM never saw
-    // its device (first board, 2026-11-12). VBUS off until the port tasks switch it on.
+    // its device (first board, 2026-11-12). VBUS off until the port tasks switch it on. In `Port` order: Keyboard,
+    // Mouse, Aux 1 (no router; GPIO8 unconnected before 0.19.0), Aux 2.
     let ports = [
         FrontPort {
-            sel0: Output::new(p.PIN_20, Level::Low),
-            sel1: Output::new(p.PIN_21, Level::High),
+            router: Some(Router { sel0: Output::new(p.PIN_20, Level::Low), sel1: Output::new(p.PIN_21, Level::High) }),
             en: Output::new(p.PIN_22, Level::Low),
         },
         FrontPort {
-            sel0: Output::new(p.PIN_24, Level::Low),
-            sel1: Output::new(p.PIN_25, Level::High),
+            router: Some(Router { sel0: Output::new(p.PIN_24, Level::Low), sel1: Output::new(p.PIN_25, Level::High) }),
             en: Output::new(p.PIN_26, Level::Low),
         },
+        FrontPort { router: None, en: Output::new(p.PIN_8, Level::Low) },
         FrontPort {
-            sel0: Output::new(p.PIN_34, Level::Low),
-            sel1: Output::new(p.PIN_37, Level::High),
+            router: Some(Router { sel0: Output::new(p.PIN_34, Level::Low), sel1: Output::new(p.PIN_37, Level::High) }),
             en: Output::new(p.PIN_32, Level::Low),
         },
     ];
@@ -190,12 +203,13 @@ async fn main(spawner: Spawner) {
         proto: kvm_proto::ctrl::PROTOCOL_VERSION,
         rp_fw: FW_VERSION,
         at_fw: [0; 2],
-        hw: kvm_proto::version_u32(HW.0, HW.1, HW.2),
+        hw: kvm_proto::version_u32(hw.0, hw.1, hw.2),
         serial: serial(),
         caps: caps::MIRRORED
             | caps::IDENTITY
             | caps::PASSTHROUGH
             | caps::VIAL
+            | if aux1 { caps::AUX1 } else { 0 }
             | if updates { caps::FW_UPDATE } else { 0 }
             | if modstream::available() { caps::BT_UPDATE } else { 0 },
         bt_fw: 0,
@@ -278,8 +292,8 @@ async fn main(spawner: Spawner) {
 
     let (root, handle) = host::start(usbh::RpHost::new(p.USB));
     spawner.spawn(unwrap!(host::hub_task(root, handle.clone())));
-    for i in 0..3 {
-        spawner.spawn(unwrap!(host::port_task(i, handle.clone())));
+    for &port in Port::ALL.iter().filter(|p| aux1 || **p != Port::Aux1) {
+        spawner.spawn(unwrap!(host::port_task(port, handle.clone())));
     }
     for k in 0..2 {
         spawner.spawn(unwrap!(link::dispatch(k)));
@@ -301,12 +315,15 @@ async fn main(spawner: Spawner) {
         pwr_st: Input::new(p.PIN_1, Pull::None),
     };
     spawner.spawn(unwrap!(power::monitor(inputs)));
-    for (i, pin) in
-        [Input::new(p.PIN_23, Pull::None), Input::new(p.PIN_27, Pull::None), Input::new(p.PIN_33, Pull::None)]
-            .into_iter()
-            .enumerate()
-    {
-        spawner.spawn(unwrap!(power::port_power(i, pin)));
+    // Each port's FAULT line (inputs, with their 10 kΩ pull-ups on the board): Aux 1's only where the board has it.
+    let faults =
+        [(Port::Keyboard, Flex::new(p.PIN_23)), (Port::Mouse, Flex::new(p.PIN_27)), (Port::Aux2, Flex::new(p.PIN_33))];
+    for (port, mut pin) in faults {
+        pin.set_as_input();
+        spawner.spawn(unwrap!(power::port_power(port, pin)));
+    }
+    if aux1 {
+        spawner.spawn(unwrap!(power::port_power(Port::Aux1, aux1_fault)));
     }
     spawner.spawn(unwrap!(storage::run(store)));
     spawner.spawn(unwrap!(update::run()));

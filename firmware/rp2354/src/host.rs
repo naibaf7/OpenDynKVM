@@ -1,7 +1,7 @@
 //! USB host side (software.md §4.3): Hub-0 on the root port, one task per front port.
 //!
-//! The hub task enumerates whatever appears on Hub-0 ports 1–3 (Keyboard, Mouse, Other) and hands it to that port's
-//! task, which reads every descriptor the engine needs, then streams the device's interrupt reports into the engine
+//! The hub task enumerates whatever appears on Hub-0 ports 1–3 (Keyboard, Mouse, Aux 2) and, on a board with it, 4
+//! (Aux 1, from 0.19.0; strapped off before) and hands it to that port's task, which reads every descriptor the engine needs, then streams the device's interrupt reports into the engine
 //! and executes the engine's requests for the device (LED reports, forwarded control requests, OUT data). An ESP32-C3
 //! board the engine wants as the Bluetooth module goes to `bt::dongle_task` instead (software.md §4.13).
 
@@ -22,7 +22,7 @@ use heapless::Vec;
 use kvm_core::engine::{CtrlData, MAX_CONFIG_DESC, MAX_REPORT_DESC, Probed};
 use kvm_core::output::Report;
 use kvm_core::usbdesc::{DeviceDesc, decode_string, dt, parse_config};
-use kvm_proto::ctrl::{Pc, PortState, Speed};
+use kvm_proto::ctrl::{PORTS, Pc, Port, PortState, Speed};
 
 use crate::dongle::{Dongle, UsbLine};
 use crate::uartlog::uart_log;
@@ -45,12 +45,17 @@ pub enum PortCmd {
     Control { pc: Pc, tag: u8, setup: [u8; 8], data: CtrlData },
 }
 
-pub static PORT_CMD: [Channel<CriticalSectionRawMutex, PortCmd, 8>; 3] = [const { Channel::new() }; 3];
-static ATTACH: [Signal<CriticalSectionRawMutex, EnumerationInfo>; 3] = [const { Signal::new() }; 3];
-static DETACH: [Signal<CriticalSectionRawMutex, ()>; 3] = [const { Signal::new() }; 3];
+/// By `Port` index, as every per-port array here and in `kvm` / `power`.
+pub static PORT_CMD: [Channel<CriticalSectionRawMutex, PortCmd, 8>; PORTS] = [const { Channel::new() }; PORTS];
+static ATTACH: [Signal<CriticalSectionRawMutex, EnumerationInfo>; PORTS] = [const { Signal::new() }; PORTS];
+static DETACH: [Signal<CriticalSectionRawMutex, ()>; PORTS] = [const { Signal::new() }; PORTS];
 
-fn port_of(i: usize) -> kvm_proto::ctrl::Port {
-    kvm_proto::ctrl::Port::from_index(i).unwrap_or(kvm_proto::ctrl::Port::Other)
+/// The front port on each of Hub-0's downstream ports (1–4): Aux 1 is its fourth, added on 0.19.0 after the others.
+const HUB0_PORTS: [Port; 4] = [Port::Keyboard, Port::Mouse, Port::Aux2, Port::Aux1];
+
+/// The front port on Hub-0's port `n` (0-based, as the hub class counts), if the board has one there.
+fn front_port(n: usize) -> Option<Port> {
+    HUB0_PORTS.get(n).copied().filter(|p| kvm::with(|e| e.has_port(*p)))
 }
 
 pub type Root = BusController<'static, RpHost>;
@@ -93,15 +98,14 @@ pub async fn hub_task(mut root: Root, handle: Handle) -> ! {
         };
         info!("Hub-0 up at address {}", info.device_address);
         HUB0_UP.store(true, Ordering::Relaxed);
-        // The address each front-port device got, so that it is freed however the device goes.
-        let mut addr = [0u8; 3];
+        // The address each front-port device got (by `Port` index), so that it is freed however the device goes.
+        let mut addr = [0u8; PORTS];
         loop {
             match select(hub.wait_for_event(), root.wait_for_device_event()).await {
                 Either::First(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceDetected { port, speed }))) => {
-                    let i = port as usize;
-                    if i >= 3 {
-                        continue; // port 4 is strapped off
-                    }
+                    // Port 4 is strapped off before 0.19.0.
+                    let Some(front) = front_port(port as usize) else { continue };
+                    let i = front.index();
                     // A device that left and came back between two polls of Hub-0 is only reported as detected, never
                     // as removed: end the session still running on the port (its task waits for that, not for the
                     // new attach, and left the port probing for good: first board, 2026-11-12, a receiver during a PC
@@ -111,7 +115,7 @@ pub async fn hub_task(mut root: Root, handle: Handle) -> ! {
                         handle.free_address(addr[i]);
                         addr[i] = 0;
                     }
-                    kvm::with(|e| e.port_probing(port_of(i)));
+                    kvm::with(|e| e.port_probing(front));
                     let mut cfg = [0u8; MAX_CONFIG_DESC];
                     match hub.enumerate_port(&mut cfg, port, speed).await {
                         Ok((info, _)) => {
@@ -120,15 +124,15 @@ pub async fn hub_task(mut root: Root, handle: Handle) -> ! {
                         }
                         Err(e) => {
                             warn!("port {}: enumeration failed: {}", i, defmt::Debug2Format(&e));
-                            kvm::with(|e| e.port_detached(port_of(i)));
+                            kvm::with(|e| e.port_detached(front));
                             failed(i, "enumeration");
                         }
                     }
                 }
                 Either::First(Ok(HandlerEvent::HandlerEvent(HubEvent::DeviceRemoved { address, port }))) => {
-                    let known = Some(port as usize).filter(|i| *i < 3).map(|i| {
-                        DETACH[i].signal(());
-                        core::mem::take(&mut addr[i])
+                    let known = front_port(port as usize).map(|p| {
+                        DETACH[p.index()].signal(());
+                        core::mem::take(&mut addr[p.index()])
                     });
                     if let Some(a) = address.map(|a| a.get()).or(known.filter(|&a| a != 0)) {
                         handle.free_address(a);
@@ -165,7 +169,7 @@ pub async fn hub_task(mut root: Root, handle: Handle) -> ! {
 }
 
 /// Enumerations or probes in a row that failed on each port; a good probe or a new attempt (`Output::Reprobe`) resets it.
-pub static PROBE_FAILS: [AtomicU8; 3] = [const { AtomicU8::new(0) }; 3];
+pub static PROBE_FAILS: [AtomicU8; PORTS] = [const { AtomicU8::new(0) }; PORTS];
 /// A failed port tries again this often before it is left empty: replugged on the data lines first, then once with
 /// VBUS off for a second, for a device that needs a real power-off.
 const PROBE_TRIES: u8 = 3;
@@ -223,17 +227,20 @@ async fn clear_hub_changes(handle: &Handle, hub: &EnumerationInfo) {
             }
         }
         // Connected, not enabled, and no connect change waiting for the hub class: nothing would ever enumerate it.
-        let i = port as usize - 1;
-        if i < 3 && status & 1 != 0 && status & 2 == 0 && change & 1 == 0 {
+        if let Some(front) = front_port(port as usize - 1)
+            && status & 1 != 0
+            && status & 2 == 0
+            && change & 1 == 0
+        {
             uart_log!("Hub-0 port {}: connected but disabled, replugging it", port);
-            kvm::REPLUG[i].signal(());
+            kvm::REPLUG[front.index()].signal(());
         }
     }
 }
 
 /// Probing reads into these per-port buffers (too large for task stacks).
-static PROBED: [embassy_sync::mutex::Mutex<CriticalSectionRawMutex, Probed>; 3] =
-    [const { embassy_sync::mutex::Mutex::new(Probed::EMPTY) }; 3];
+static PROBED: [embassy_sync::mutex::Mutex<CriticalSectionRawMutex, Probed>; PORTS] =
+    [const { embassy_sync::mutex::Mutex::new(Probed::EMPTY) }; PORTS];
 
 fn setup(request_type: u8, request: u8, value: u16, index: u16, length: u16) -> [u8; 8] {
     let [v0, v1] = value.to_le_bytes();
@@ -315,9 +322,9 @@ async fn probe(ctl: &mut ControlPipe, info: &EnumerationInfo, out: &mut Probed) 
     Ok(())
 }
 
-#[embassy_executor::task(pool_size = 3)]
-pub async fn port_task(index: usize, handle: Handle) -> ! {
-    let port = port_of(index);
+#[embassy_executor::task(pool_size = 4)] // one per front port (`PORTS`)
+pub async fn port_task(port: Port, handle: Handle) -> ! {
+    let index = port.index();
     loop {
         let info = ATTACH[index].wait().await;
         DETACH[index].reset();
@@ -330,7 +337,7 @@ pub async fn port_task(index: usize, handle: Handle) -> ! {
 }
 
 async fn run_device(index: usize, handle: &Handle, info: &EnumerationInfo) {
-    let port = port_of(index);
+    let port = Port::from_index(index).unwrap_or(Port::Aux2);
     let ep0 = EndpointInfo {
         addr: EndpointAddress::from_parts(0, Direction::In),
         ep_type: EndpointType::Control,

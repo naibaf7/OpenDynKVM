@@ -591,7 +591,8 @@ async fn catch_in_rom(uart: &mut BufferedUart, en: &mut Flex<'static>) {
 /// A front port's ESP32-C3 board for [`dongle_task`] (`host.rs`, when the engine wants it found out).
 pub static DONGLE: Channel<CriticalSectionRawMutex, Dongle, 1> = Channel::new();
 /// The board on that port left Hub-0 (`host.rs`).
-pub static DONGLE_GONE: [Signal<CriticalSectionRawMutex, ()>; 3] = [const { Signal::new() }; 3];
+pub static DONGLE_GONE: [Signal<CriticalSectionRawMutex, ()>; kvm_proto::ctrl::PORTS] =
+    [const { Signal::new() }; kvm_proto::ctrl::PORTS];
 
 /// Sessions with boards since start, and the last steps they went through (diagnostics: `BOARD_SESSIONS`,
 /// `BOARD_STEPS`).

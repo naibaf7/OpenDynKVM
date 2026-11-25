@@ -49,6 +49,16 @@
   "matched_by": "number",
   "note": ""
  },
+ "C160404": {
+  "footprint": "JST_SH_SM04B-SRSS-TB_1x04-1MP_P1.00mm_Horizontal",
+  "easyeda": "CONN-SMD_4P-P1.00_SM04B-SRSS-TB-LF-SN",
+  "theta": 0,
+  "dx": -0.0003,
+  "dy": -0.0622,
+  "rms_mm": 0.0003,
+  "matched_by": "number",
+  "note": ""
+ },
  "C16251": {
   "footprint": "QFN-36-1EP_6x6mm_P0.5mm_EP3.7x3.7mm",
   "easyeda": "VQFN-36_L6.0-W6.0-P0.50-BL-EP",
@@ -109,6 +119,16 @@
   "matched_by": "number",
   "note": ""
  },
+ "C25076": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
  "C25100": {
   "footprint": "R_0402_1005Metric",
   "easyeda": "R0402",
@@ -159,6 +179,16 @@
   "matched_by": "number",
   "note": ""
  },
+ "C25764": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
  "C25768": {
   "footprint": "R_0402_1005Metric",
   "easyeda": "R0402",
@@ -180,6 +210,16 @@
   "note": ""
  },
  "C25792": {
+  "footprint": "R_0402_1005Metric",
+  "easyeda": "R0402",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0772,
+  "matched_by": "number",
+  "note": ""
+ },
+ "C25900": {
   "footprint": "R_0402_1005Metric",
   "easyeda": "R0402",
   "theta": 0,
@@ -229,6 +269,16 @@
   "matched_by": "number",
   "note": ""
  },
+ "C2980305": {
+  "footprint": "ESP32-MINI-1",
+  "easyeda": "WIFI-SMD_ESP32-MINI-1",
+  "theta": 0,
+  "dx": 0.0,
+  "dy": 0.0,
+  "rms_mm": 0.0,
+  "matched_by": "number",
+  "note": ""
+ },
  "C318884": {
   "footprint": "SW_Push_1P1T_XKB_TS-1187A",
   "easyeda": "SW-SMD_4P-L5.1-W5.1-P3.70-LS6.5-TL_H1.5",
@@ -256,16 +306,6 @@
   "dx": 0.0,
   "dy": 0.0,
   "rms_mm": 0.0422,
-  "matched_by": "number",
-  "note": ""
- },
- "C41349510": {
-  "footprint": "ESP32-C3-MINI-1",
-  "easyeda": "WIFIM-SMD_ESP32-C3-MINI-1",
-  "theta": 0,
-  "dx": 0.0,
-  "dy": 0.0,
-  "rms_mm": 0.0001,
   "matched_by": "number",
   "note": ""
  },

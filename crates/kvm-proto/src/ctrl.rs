@@ -13,7 +13,7 @@ pub const PAYLOAD_LEN: usize = REPORT_LEN - 2;
 /// The protocol's version. A host and the firmware talk only when theirs are the same: otherwise the host offers the
 /// firmware it came with, and nothing else (`GetInfo` and the `Fw*` requests are all it uses then). Raised with every
 /// change of a message, a config key or a value.
-pub const PROTOCOL_VERSION: u8 = 15;
+pub const PROTOCOL_VERSION: u8 = 16;
 
 /// Vendor usage page and usage of the control interface; hosts discover it by these, not by VID/PID.
 pub const USAGE_PAGE: u16 = 0xFF4B;
@@ -56,7 +56,8 @@ impl Pc {
 }
 
 wire_enum! {
-    pub enum Port { Keyboard = 0, Mouse = 1, Other = 2 }
+    /// The front ports, left to right. Aux 1 is on boards from 0.19.0 only ([`caps::AUX1`]).
+    pub enum Port { Keyboard = 0, Mouse = 1, Aux1 = 2, Aux2 = 3 }
 }
 
 impl Port {
@@ -68,7 +69,8 @@ impl Port {
         match i {
             0 => Some(Port::Keyboard),
             1 => Some(Port::Mouse),
-            2 => Some(Port::Other),
+            2 => Some(Port::Aux1),
+            3 => Some(Port::Aux2),
             _ => None,
         }
     }
@@ -77,7 +79,8 @@ impl Port {
         match self {
             Port::Keyboard => "keyboard",
             Port::Mouse => "mouse",
-            Port::Other => "other",
+            Port::Aux1 => "aux1",
+            Port::Aux2 => "aux2",
         }
     }
 
@@ -85,16 +88,31 @@ impl Port {
         match s {
             "keyboard" | "kb" => Some(Port::Keyboard),
             "mouse" | "ms" => Some(Port::Mouse),
-            "other" | "ot" => Some(Port::Other),
+            "aux1" | "a1" => Some(Port::Aux1),
+            "aux2" | "a2" => Some(Port::Aux2),
             _ => None,
         }
     }
+
+    /// The port has a 1:3 router to the PCs' hubs, so its device can be passed through: every port but Aux 1, which
+    /// sits on Hub-0 alone (design.md §4).
+    pub const fn has_router(self) -> bool {
+        !matches!(self, Port::Aux1)
+    }
+
+    /// One of the two Aux ports: their HID devices are mirrored in Auto, not normalized (design.md §4).
+    pub const fn is_aux(self) -> bool {
+        matches!(self, Port::Aux1 | Port::Aux2)
+    }
 }
+
+/// Front ports the protocol knows ([`Port`]); a board before 0.19.0 has the first two and Aux 2.
+pub const PORTS: usize = 4;
 
 /// Bluetooth device slots (keyboards, mice and other HID devices bonded to the module, software.md §4.13).
 pub const BT_DEVICES: usize = 4;
-/// The devices the KVM routes: the three front ports, then the Bluetooth device slots ([`Device`]).
-pub const DEVICES: usize = 3 + BT_DEVICES;
+/// The devices the KVM routes: the front ports, then the Bluetooth device slots ([`Device`]).
+pub const DEVICES: usize = PORTS + BT_DEVICES;
 
 wire_enum! {
     /// A device the KVM takes input from and routes (software.md §4.3): a front port's, or a Bluetooth device slot's.
@@ -102,11 +120,12 @@ wire_enum! {
     pub enum Device {
         Keyboard = 0,
         Mouse = 1,
-        Other = 2,
-        Wireless1 = 3,
-        Wireless2 = 4,
-        Wireless3 = 5,
-        Wireless4 = 6,
+        Aux1 = 2,
+        Aux2 = 3,
+        Wireless1 = 4,
+        Wireless2 = 5,
+        Wireless3 = 6,
+        Wireless4 = 7,
     }
 }
 
@@ -119,11 +138,12 @@ impl Device {
         match i {
             0 => Some(Device::Keyboard),
             1 => Some(Device::Mouse),
-            2 => Some(Device::Other),
-            3 => Some(Device::Wireless1),
-            4 => Some(Device::Wireless2),
-            5 => Some(Device::Wireless3),
-            6 => Some(Device::Wireless4),
+            2 => Some(Device::Aux1),
+            3 => Some(Device::Aux2),
+            4 => Some(Device::Wireless1),
+            5 => Some(Device::Wireless2),
+            6 => Some(Device::Wireless3),
+            7 => Some(Device::Wireless4),
             _ => None,
         }
     }
@@ -136,28 +156,30 @@ impl Device {
         match p {
             Port::Keyboard => Device::Keyboard,
             Port::Mouse => Device::Mouse,
-            Port::Other => Device::Other,
+            Port::Aux1 => Device::Aux1,
+            Port::Aux2 => Device::Aux2,
         }
     }
 
     /// The Bluetooth device slot (1–[`BT_DEVICES`]), if it is one.
     pub const fn wireless(self) -> Option<u8> {
         match self {
-            Device::Keyboard | Device::Mouse | Device::Other => None,
-            _ => Some(self as u8 - 2),
+            Device::Keyboard | Device::Mouse | Device::Aux1 | Device::Aux2 => None,
+            _ => Some(self as u8 - PORTS as u8 + 1),
         }
     }
 
     /// Bluetooth device slot `slot` (1–[`BT_DEVICES`]).
     pub const fn wireless_slot(slot: u8) -> Option<Device> {
-        if slot >= 1 && slot as usize <= BT_DEVICES { Device::from_index(slot as usize + 2) } else { None }
+        if slot >= 1 && slot as usize <= BT_DEVICES { Device::from_index(PORTS + slot as usize - 1) } else { None }
     }
 
     pub const fn name(self) -> &'static str {
         match self {
             Device::Keyboard => "keyboard",
             Device::Mouse => "mouse",
-            Device::Other => "other",
+            Device::Aux1 => "aux1",
+            Device::Aux2 => "aux2",
             Device::Wireless1 => "wireless1",
             Device::Wireless2 => "wireless2",
             Device::Wireless3 => "wireless3",
@@ -169,11 +191,14 @@ impl Device {
         Device::ALL.iter().copied().find(|d| d.name() == s).or_else(|| Port::from_name(s).map(Device::of_port))
     }
 
-    /// The modes it can be set to: all of them on a front port; over Bluetooth only the KVM's own reports
-    /// (`Auto` is `Normalized` there) or none.
+    /// The modes it can be set to: all of them on a front port with a router, all but Passthrough on Aux 1; over
+    /// Bluetooth only the KVM's own reports (`Auto` is `Normalized` there) or none.
     pub fn modes(self) -> &'static [PortMode] {
         match self.port() {
-            Some(_) => PortMode::ALL,
+            Some(p) if p.has_router() => PortMode::ALL,
+            Some(_) => {
+                &[PortMode::Auto, PortMode::Normalized, PortMode::Mirrored, PortMode::MirroredIdentity, PortMode::Off]
+            }
             None => &[PortMode::Auto, PortMode::Normalized, PortMode::Off],
         }
     }
@@ -312,8 +337,8 @@ wire_enum! {
         /// Vendor-page inputs, more than 16 buttons, absolute axes, unknown usage pages, or a descriptor larger than
         /// the KVM's parser holds.
         ExtraInputs = 2,
-        /// HID device on the Other port.
-        OtherPortHid = 3,
+        /// HID device on an Aux port.
+        AuxPortHid = 3,
         /// At least one non-HID interface.
         NonHid = 4,
         XInput = 5,
@@ -321,6 +346,9 @@ wire_enum! {
         EndpointBudget = 6,
         /// Another port already uses identity.
         IdentityTaken = 7,
+        /// The device would need Passthrough (a non-HID device, or no mirror endpoints left), which the Aux 1 port has
+        /// no router for: it runs Normalized where its inputs allow, else it stays off.
+        NeedsPassthrough = 8,
     }
 }
 
@@ -763,8 +791,8 @@ wire_enum! {
         TogglePc = 1,
         /// Make the next profile in use active, after the last one the first.
         NextProfile = 2,
-        /// Cycle the Other port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2.
-        OtherPortMode = 3,
+        /// Cycle the Aux 2 port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2.
+        Aux2PortMode = 3,
         /// The next target: PC1, PC2, then each Bluetooth host that is ready.
         NextTarget = 4,
     }
@@ -776,7 +804,7 @@ impl KeyAction {
             KeyAction::None => "none",
             KeyAction::TogglePc => "toggle-pc",
             KeyAction::NextProfile => "next-profile",
-            KeyAction::OtherPortMode => "other-port",
+            KeyAction::Aux2PortMode => "aux2-port",
             KeyAction::NextTarget => "next-target",
         }
     }
@@ -1107,7 +1135,9 @@ pub mod selftest {
     /// A front-port power switch reported a fault when first switched on, or its FAULT line is stuck low.
     pub const PORT_KB: u32 = 1 << 5;
     pub const PORT_MS: u32 = 1 << 6;
-    pub const PORT_OT: u32 = 1 << 7;
+    pub const PORT_A2: u32 = 1 << 7;
+    /// The Aux 1 port's power switch (boards from 0.19.0), after the bits a board before it has.
+    pub const PORT_A1: u32 = 1 << 17;
     /// PWR-port VBUS or CC readings out of range, or not matching the power-path status.
     pub const POWER: u32 = 1 << 8;
     /// Reprogramming AT32F405 #1 / #2 with the embedded firmware failed (this boot; tried again at the next one).
@@ -1127,7 +1157,8 @@ pub mod selftest {
     /// Bluetooth fields of `Status`.
     pub const BT_FW: u32 = 1 << 16;
     pub const BT: u32 = BT_FW;
-    pub const PORTS: [u32; 3] = [PORT_KB, PORT_MS, PORT_OT];
+    /// By [`super::Port`] index.
+    pub const PORTS: [u32; super::PORTS] = [PORT_KB, PORT_MS, PORT_A1, PORT_A2];
     /// Everything that concerns PC `k`'s side (its link, hub and AT32F405 firmware).
     pub const PCS: [u32; 2] =
         [LINK1 | HUB1 | AT32_FW1 | AT32_GAVE_UP1 | AT32_XTAL1, LINK2 | HUB2 | AT32_FW2 | AT32_GAVE_UP2 | AT32_XTAL2];
@@ -1271,7 +1302,7 @@ pub mod diag {
         pub const PHY_SWAP: u8 = 0x22;
         pub const KB_SPEED: u8 = 0x23;
         pub const MS_SPEED: u8 = 0x24;
-        pub const OT_SPEED: u8 = 0x25;
+        pub const A2_SPEED: u8 = 0x25;
         pub const PC1_SPEED: u8 = 0x26;
         pub const PC2_SPEED: u8 = 0x27;
         pub const PC1_LINK: u8 = 0x28;
@@ -1298,7 +1329,7 @@ pub mod diag {
         pub const BUDGET: u8 = 0x38;
         pub const KB_FAULTS: u8 = 0x39;
         pub const MS_FAULTS: u8 = 0x3A;
-        pub const OT_FAULTS: u8 = 0x3B;
+        pub const A2_FAULTS: u8 = 0x3B;
         /// The lowest 5 V the KVM ran from in the last minute, graded by `Status::supply`.
         pub const SUPPLY: u8 = 0x3C;
         /// Since start: the 100 ms windows whose millisecond minimum fell under 4.4 V (a device's inrush, a heavy
@@ -1307,6 +1338,11 @@ pub mod diag {
         /// Since start: how often each PC's 5 V went away for less than 3 s (a port that cut out, or a reboot).
         pub const PC1_DROPOUTS: u8 = 0x3E;
         pub const PC2_DROPOUTS: u8 = 0x3F;
+
+        /// The Aux 1 port (boards from 0.19.0): its device's speed in the USB group, its faults in the Power group,
+        /// whose ranges are full.
+        pub const A1_SPEED: u8 = 0x70;
+        pub const A1_FAULTS: u8 = 0x80;
 
         pub const AT1_TEMP: u8 = 0x40;
         pub const AT2_TEMP: u8 = 0x41;
@@ -1338,7 +1374,7 @@ pub mod diag {
         pub const BOARD_LAST_ERROR: u8 = 0x60;
 
         pub const AT_CLOCK: [u8; 2] = [AT1_CLOCK, AT2_CLOCK];
-        pub const PORT_SPEED: [u8; 3] = [KB_SPEED, MS_SPEED, OT_SPEED];
+        pub const PORT_SPEED: [u8; crate::ctrl::PORTS] = [KB_SPEED, MS_SPEED, A1_SPEED, A2_SPEED];
         pub const PC_SPEED: [u8; 2] = [PC1_SPEED, PC2_SPEED];
         pub const PC_LINK: [u8; 2] = [PC1_LINK, PC2_LINK];
         pub const PC_RESETS: [u8; 2] = [PC1_RESETS, PC2_RESETS];
@@ -1346,7 +1382,7 @@ pub mod diag {
         pub const PC_VBUS: [u8; 2] = [PC1_VBUS, PC2_VBUS];
         pub const PC_CC: [u8; 2] = [PC1_CC, PC2_CC];
         pub const AT_3V3: [u8; 2] = [AT1_3V3, AT2_3V3];
-        pub const PORT_FAULTS: [u8; 3] = [KB_FAULTS, MS_FAULTS, OT_FAULTS];
+        pub const PORT_FAULTS: [u8; crate::ctrl::PORTS] = [KB_FAULTS, MS_FAULTS, A1_FAULTS, A2_FAULTS];
         pub const PC_DROPOUTS: [u8; 2] = [PC1_DROPOUTS, PC2_DROPOUTS];
         pub const AT_TEMP: [u8; 2] = [AT1_TEMP, AT2_TEMP];
         pub const AT_FW: [u8; 2] = [AT1_FW, AT2_FW];
@@ -1368,14 +1404,15 @@ pub mod diag {
         pub const ALL: [Group; 6] =
             [Group::System, Group::Clocks, Group::Usb, Group::Power, Group::PcChips, Group::Bluetooth];
 
+        /// The high nibble; 0x6x continues the Bluetooth group, 0x7x the USB group and 0x8x the Power group.
         pub const fn of(id: u8) -> Option<Group> {
             match id >> 4 {
                 0 => Some(Group::System),
                 1 => Some(Group::Clocks),
-                2 => Some(Group::Usb),
-                3 => Some(Group::Power),
+                2 | 7 => Some(Group::Usb),
+                3 | 8 => Some(Group::Power),
                 4 => Some(Group::PcChips),
-                5 => Some(Group::Bluetooth),
+                5 | 6 => Some(Group::Bluetooth),
                 _ => None,
             }
         }
@@ -1461,7 +1498,8 @@ pub mod diag {
             id::PHY_SWAP => m("D+/D− swap (errata E1)", Swap),
             id::KB_SPEED => m("Keyboard port device", Speed),
             id::MS_SPEED => m("Mouse port device", Speed),
-            id::OT_SPEED => m("Other port device", Speed),
+            id::A1_SPEED => m("Aux 1 port device", Speed),
+            id::A2_SPEED => m("Aux 2 port device", Speed),
             id::PC1_SPEED => m("PC1 USB speed", Speed),
             id::PC2_SPEED => m("PC2 USB speed", Speed),
             id::PC1_LINK => m("PC1 link", LinkState),
@@ -1483,7 +1521,8 @@ pub mod diag {
             id::BUDGET => m("Front-port budget", MilliAmp),
             id::KB_FAULTS => m("Keyboard port faults", Count),
             id::MS_FAULTS => m("Mouse port faults", Count),
-            id::OT_FAULTS => m("Other port faults", Count),
+            id::A1_FAULTS => m("Aux 1 port faults", Count),
+            id::A2_FAULTS => m("Aux 2 port faults", Count),
             id::SUPPLY => m("Lowest 5 V in the last minute", MilliVolt),
             id::SUPPLY_DIPS => m("5 V dips under 4.4 V", Count),
             id::PC1_DROPOUTS => m("PC1 5 V dropouts", Count),
@@ -1523,6 +1562,9 @@ pub mod caps {
     pub const BLUETOOTH: u16 = 1 << 5;
     /// The firmware was built with the module's (it knows its SHA-256): `FwTarget::Module` is taken.
     pub const BT_UPDATE: u16 = 1 << 6;
+    /// The board has the Aux 1 port (0.19.0 on, found at boot): Hub-0's fourth port, without a router, so no
+    /// Passthrough there. Without it the board has three front ports, each with every mode.
+    pub const AUX1: u16 = 1 << 7;
     pub const SIMULATED: u16 = 1 << 15;
 }
 
@@ -1597,8 +1639,8 @@ pub enum HotkeyAction {
     PrevProfile,
     /// Profile 0–7 (ignored while it isn't one of those in use).
     SelectProfile(u8),
-    /// Cycle the Other port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2.
-    OtherPortMode,
+    /// Cycle the Aux 2 port's mode and routing: Auto → passthrough → passthrough pinned to PC1 → to PC2.
+    Aux2PortMode,
 }
 
 impl HotkeyAction {
@@ -1623,7 +1665,7 @@ impl HotkeyAction {
         HotkeyAction::SelectProfile(5),
         HotkeyAction::SelectProfile(6),
         HotkeyAction::SelectProfile(7),
-        HotkeyAction::OtherPortMode,
+        HotkeyAction::Aux2PortMode,
         HotkeyAction::None,
     ];
 
@@ -1650,7 +1692,7 @@ impl HotkeyAction {
             HotkeyAction::SelectProfile(5) => "select-profile5",
             HotkeyAction::SelectProfile(6) => "select-profile6",
             HotkeyAction::SelectProfile(_) => "select-profile7",
-            HotkeyAction::OtherPortMode => "other-port",
+            HotkeyAction::Aux2PortMode => "aux2-port",
         }
     }
 
@@ -1669,7 +1711,7 @@ impl HotkeyAction {
             HotkeyAction::NextProfile => (5, 0),
             HotkeyAction::PrevProfile => (6, 0),
             HotkeyAction::SelectProfile(n) => (7, n),
-            HotkeyAction::OtherPortMode => (8, 0),
+            HotkeyAction::Aux2PortMode => (8, 0),
         };
         w.u8(kind)?;
         w.u8(arg)
@@ -1686,7 +1728,7 @@ impl HotkeyAction {
             5 => HotkeyAction::NextProfile,
             6 => HotkeyAction::PrevProfile,
             7 if (arg as usize) < MAX_PROFILES => HotkeyAction::SelectProfile(arg),
-            8 => HotkeyAction::OtherPortMode,
+            8 => HotkeyAction::Aux2PortMode,
             _ => return Err(WireError::Invalid),
         })
     }
@@ -2140,7 +2182,7 @@ pub enum ConfigValue {
     LongPressMs(u16),
     Profile(u8),
     ProfileCount(u8),
-    /// Profile index, then the modes of the Keyboard, Mouse and Other port.
+    /// Profile index, then the modes of the Keyboard, Mouse and Aux 2 port.
     ProfileModes(u8, [PortMode; DEVICES]),
     ProfileRoutes(u8, [Routing; DEVICES]),
     ProfileName(u8, ProfileName),
@@ -3847,7 +3889,8 @@ mod tests {
         let reqs = [
             Request::GetInfo,
             Request::GetStatus,
-            Request::GetPort(Port::Other),
+            Request::GetPort(Port::Aux2),
+            Request::GetPort(Port::Aux1),
             Request::GetPortString(Port::Mouse, StringKind::Product),
             Request::SetActive(Target::Toggle),
             Request::GetConfig(key::COLOR_PC2),
@@ -3856,13 +3899,13 @@ mod tests {
                 HotkeyBinding::new(HotkeyAction::SelectHost(Host::Bt2), Hotkey::double_tap(0x47, true)),
             )),
             Request::SetConfig(ConfigValue::Hotkey(15, HotkeyBinding::NONE)),
-            Request::SetConfig(ConfigValue::Mode(Device::Other, PortMode::Passthrough)),
+            Request::SetConfig(ConfigValue::Mode(Device::Aux2, PortMode::Passthrough)),
             Request::SetConfig(ConfigValue::Mode(Device::Wireless4, PortMode::Off)),
-            Request::SetConfig(ConfigValue::Route(Device::Other, Routing::Pin(Host::Pc2))),
+            Request::SetConfig(ConfigValue::Route(Device::Aux2, Routing::Pin(Host::Pc2))),
             Request::SetConfig(ConfigValue::Route(Device::Wireless1, Routing::Pin(Host::Bt3))),
             Request::SetConfig(ConfigValue::Route(Device::Keyboard, Routing::Follow)),
             Request::SetConfig(ConfigValue::ColorPc1(Rgb::new(1, 2, 3))),
-            Request::SetConfig(ConfigValue::KeyLong(KeyAction::OtherPortMode)),
+            Request::SetConfig(ConfigValue::KeyLong(KeyAction::Aux2PortMode)),
             Request::SetConfig(ConfigValue::Profile(1)),
             Request::SetConfig(ConfigValue::LongPressMs(1500)),
             Request::SetConfig(ConfigValue::RememberProfile(false)),
@@ -3871,6 +3914,7 @@ mod tests {
                 [
                     PortMode::Auto,
                     PortMode::Mirrored,
+                    PortMode::MirroredIdentity,
                     PortMode::Passthrough,
                     PortMode::Normalized,
                     PortMode::Off,
@@ -3884,6 +3928,7 @@ mod tests {
                     Routing::Follow,
                     Routing::Pin(Host::Pc1),
                     Routing::Pin(Host::Pc2),
+                    Routing::Follow,
                     Routing::Pin(Host::Bt1),
                     Routing::Follow,
                     Routing::Pin(Host::Bt4),
@@ -3942,17 +3987,17 @@ mod tests {
             Request::BtScan(false),
             Request::GetBtFound(9),
             Request::GetDeviceMap { device: Device::Wireless2, index: 0, offset: 96 },
-            Request::GetDeviceMap { device: Device::Other, index: 2, offset: 0 },
+            Request::GetDeviceMap { device: Device::Aux2, index: 2, offset: 0 },
             Request::GetMapEntry { kind: 1, index: 31 },
             Request::SetMapEntry { kind: 3, index: 0, data: Vec::from_slice(&[1, 2, 3, 4, 5, 6]).unwrap() },
             Request::GetMacros(2000),
             Request::SetMacros { offset: 56, data: Vec::from_slice(&[b'x'; MACRO_PIECE]).unwrap() },
             Request::GetMapSetting(21),
             Request::SetMapSetting(7, 175),
-            Request::MonitorDevice(Device::Other, true),
+            Request::MonitorDevice(Device::Aux2, true),
             Request::GetOverride(Device::Wireless4, 7),
             Request::SetOverride(
-                Device::Other,
+                Device::Aux2,
                 1,
                 Some(FieldOverride { iface: 3, report_id: 1, bit: 270, bits: 12, flags: field::SIGNED, target: 0x46 }),
             ),
@@ -3962,7 +4007,7 @@ mod tests {
             Request::SetConfig(ConfigValue::HostLayout(Host::Bt2, 12)),
             Request::GetModuleLog(70_000),
             Request::BtEraseAll,
-            Request::AdoptModule(Port::Other),
+            Request::AdoptModule(Port::Aux2),
             Request::AskControl,
             Request::SetConfig(ConfigValue::BtControl(3, true)),
             Request::GetKeycodes { keymap: 3, layer: 7, first: 280 },
@@ -3976,7 +4021,7 @@ mod tests {
             Request::SetAxisRule { keymap: 2, layer: 0, input: 13, rule: [6, 1, 0, 1, 20, 16] },
             Request::WatchControls(2),
             Request::GetControls(Device::Wireless2),
-            Request::GetCalibration(Device::Other, 9),
+            Request::GetCalibration(Device::Aux2, 9),
             Request::SetCalibration(Device::Mouse, 3, AxisCal { min: -30000, centre: 120, max: 31000, deadzone: 12 }),
             Request::SetConfig(ConfigValue::ProfileKeymap(7, Some(3))),
             Request::SetConfig(ConfigValue::ProfileKeymap(0, None)),
@@ -4107,7 +4152,7 @@ mod tests {
             (
                 req::GET_DEVICE_MAP,
                 Response::DeviceMap {
-                    device: Device::Other,
+                    device: Device::Aux2,
                     index: 3,
                     iface: 5,
                     interfaces: 4,
@@ -4153,7 +4198,7 @@ mod tests {
             (
                 req::GET_CONTROLS,
                 Response::Controls(
-                    Device::Other,
+                    Device::Aux2,
                     Controls {
                         keyboard: false,
                         mouse_buttons: 0,
@@ -4165,7 +4210,7 @@ mod tests {
                     },
                 ),
             ),
-            (req::GET_CALIBRATION, Response::Calibration(Device::Other, 2, AxisCal::NONE)),
+            (req::GET_CALIBRATION, Response::Calibration(Device::Aux2, 2, AxisCal::NONE)),
             (
                 req::GET_BT_FOUND,
                 Response::BtFound(Some(BtFound {
@@ -4201,7 +4246,7 @@ mod tests {
         }
         for e in [
             Event::Switched(Pc::Pc1, SwitchSource::Hotkey),
-            Event::PortChanged(Port::Other),
+            Event::PortChanged(Port::Aux2),
             Event::Fault(FaultKind::OverCurrent, Some(Port::Keyboard)),
             Event::Fault(FaultKind::LinkDown, None),
             Event::Fault(FaultKind::BtSettingsHeld, None),
@@ -4213,7 +4258,7 @@ mod tests {
             Event::Control(283, true),
             Event::Axis(9, -32767),
             Event::Report {
-                device: Device::Other,
+                device: Device::Aux2,
                 iface: 3,
                 offset: 56,
                 total: 64,
@@ -4241,8 +4286,16 @@ mod tests {
             assert!(d.takes(PortMode::Auto) && d.takes(PortMode::Off));
         }
         assert_eq!(Device::wireless_slot(1), Some(Device::Wireless1));
+        assert_eq!(Device::Wireless4.wireless(), Some(BT_DEVICES as u8));
         assert_eq!((Device::wireless_slot(0), Device::wireless_slot(5)), (None, None));
-        assert!(!Device::Wireless2.takes(PortMode::Passthrough) && Device::Other.takes(PortMode::Passthrough));
+        assert!(!Device::Wireless2.takes(PortMode::Passthrough) && Device::Aux2.takes(PortMode::Passthrough));
+        // Aux 1 has no router: every mode but Passthrough.
+        assert!(!Device::Aux1.takes(PortMode::Passthrough) && Device::Aux1.takes(PortMode::MirroredIdentity));
+        assert_eq!(Device::Aux1.modes().len(), PortMode::ALL.len() - 1);
+        for p in Port::ALL {
+            assert_eq!(Port::from_name(p.name()), Some(*p));
+            assert_eq!(p.has_router(), *p != Port::Aux1);
+        }
         for r in Routing::ALL {
             assert_eq!((Routing::from_u8(r.to_u8()), Routing::from_name(r.name())), (Some(r), Some(r)));
         }
@@ -4255,7 +4308,9 @@ mod tests {
             }
         }
         assert_eq!(key::profile_of(key::PROFILE_MODES_BASE + 8, key::PROFILE_MODES_BASE), None);
-        assert_eq!((key::mode_of(0x0036), key::mode_of(0x0037), key::route_of(0x003E)), (Some(6), None, Some(6)));
+        // Eight devices fill the mode and routing keys up to the next setting.
+        assert_eq!((key::mode_of(0x0037), key::mode_of(0x0038), key::route_of(0x003F)), (Some(7), None, Some(7)));
+        assert_eq!(key::route_of(key::SW_SWITCH_ALLOWED), None);
         assert_eq!(Advertised::from_cc_mv(0), Advertised::None);
         assert_eq!(Advertised::from_cc_mv(420), Advertised::Default);
         assert_eq!(Advertised::from_cc_mv(940), Advertised::A1_5);

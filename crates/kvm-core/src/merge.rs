@@ -256,7 +256,7 @@ mod tests {
             ..Translation::default()
         };
         let mut m = Merger::new();
-        assert_eq!(m.apply(Device::Other, 0, &pad(1, HAT_CENTRE, 20000)).gamepad.unwrap().axes[0], 20000);
+        assert_eq!(m.apply(Device::Aux2, 0, &pad(1, HAT_CENTRE, 20000)).gamepad.unwrap().axes[0], 20000);
         let both = m.apply(Device::Wireless1, 0, &pad(4, 2, 0)).gamepad.unwrap();
         assert_eq!((both.buttons, both.hat, both.axes[0]), (5, 2, 20000), "the second one's X rests: no takeover");
         let moved = m.apply(Device::Wireless1, 0, &pad(4, 2, -9000)).gamepad.unwrap();

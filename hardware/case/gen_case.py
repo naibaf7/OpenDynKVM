@@ -13,8 +13,10 @@ keeps out of the repository's environment (../../pyproject.toml), which follows 
 
 - **Tray:** floor and walls. Under each of the board's four M3 holes sits a corner post with a hole for an M3 heat-set
   insert (or a self-tapping screw, FASTENER). The front wall has a notch per USB-A port (open at the top, the lid
-  closes it) and a window per side LED; the rear wall has a window per USB-C port. The windows take a cable's plug
-  body, not just the receptacle.
+  closes it) and a window per side LED; the rear wall has a window per USB-C port and one for the extension
+  connector. The windows take a cable's plug body, not just the receptacle. Since board 0.19.0 the side LEDs are on
+  the board's underside: their windows are below the board (under a USB-A notch they run into it), and the two front
+  posts keep only their outboard arm towards the front wall, so the PC1 / PC2 LEDs beside them shine past.
 - **Lid:** a flat plate on the walls: a countersunk M3 hole over each post, a cutout for the keycap, a pinhole over
   the bootloader button, and the OpenDynKVM logo (../../branding/) raised on top, centred over the key.
 - **Spacers:** four tubes between the board and the lid. One M3 countersunk screw per corner clamps lid, spacer,
@@ -84,7 +86,11 @@ USB_A_Z = 3.6                   # opening centre above the board (Molex 67643, 7
 USB_A_HALF = 4.8                # notch bottom this far under the opening centre
 USB_A_R = 1.5
 LED_WIN = (5.0, 3.0, 0.6)       # front windows over the side LEDs (SK6812SIDE-A: 4.0 mm wide, light from the side)
-LED_Z = -0.3                    # window bottom relative to the board's top
+LED_Z = -0.3                    # window bottom relative to the board's top (an LED on the top side)
+LED_Z_UNDER = 0.5               # window top relative to the board's underside (an LED on the bottom side, 0.19.0): it
+                                # reaches the USB-A notch above it (notch bottom 0.4 mm above the underside)
+EXT_WIN = (7.5, 4.5, 0.8)       # rear window for the extension connector (JST SH: a Qwiic plug is about 6 x 3 mm)
+EXT_Z = 1.5                     # opening centre above the board (SM04B-SRSS-TB, 2.95 mm tall)
 KEY_CUT = 19.6                  # keycap 18.1 mm (footprint's outline) + 0.75 mm round it
 KEY_CUT_R = 1.5
 PINHOLE_D = 2.0                 # over SW501, the bootloader button: a paper clip reaches it
@@ -101,10 +107,10 @@ TOP_PARTS = {                   # footprint name prefix: height above the board 
     'SOT-23': 1.45, 'SOT-583': 0.6, 'QFN-': 1.0, 'TI_RUX0012A': 1.0, 'Texas_RMG0012A': 0.8,
     'Crystal_SMD_3225': 1.0, 'D_SOD-123F': 1.1, 'C_0402': 0.6, 'C_0603': 0.9, 'C_0805': 1.3, 'R_0402': 0.4,
     'Tag-Connect': 0.0, 'TestPoint': 0.0, 'MountingHole': 0.0, 'OSHW-Logo': 0.0, 'OpenDynKVM_Logo': 0.0,
-    'ESP32-C3-MINI-1': 2.55,
+    'ESP32-MINI-1': 2.55, 'JST_SH_SM04B-SRSS-TB': 3.0,
 }
 UNDER_PARTS = {                 # on the bottom side
-    'LED_SK6812MINI-E': 2.0, 'C_0402': 0.6, 'C_0603': 0.9, 'R_0402': 0.4,
+    'LED_SK6812MINI-E': 2.0, 'LED_SK6812SIDE-A': 2.0, 'C_0402': 0.6, 'C_0603': 0.9, 'R_0402': 0.4,
     'TestPoint': 0.0,
 }
 LEADS = {'USB_A_Molex_67643': 2.5}            # through-hole leads under the board
@@ -212,9 +218,7 @@ def check(c):
         hx, hy = c.xy(h['x'], h['y'])
         sx, sy = math.copysign(1, hx), math.copysign(1, hy)
         wx, wy = sx * c.in_x, sy * c.in_y
-        post = [(sorted((hx, wx)), sorted((hy - POST_R, hy + POST_R))),           # the post's shape, as tray()
-                (sorted((hx - POST_R, hx + POST_R)), sorted((hy, wy))),           # builds it: arms to both walls,
-                (sorted((hx, wx)), sorted((hy, wy)))]                             # the corner, a round end
+        post = [(x, y) for x0, x1, y0, y1 in post_boxes(c, hx, hy) for x, y in [(sorted((x0, x1)), sorted((y0, y1)))]]
         for p in f['parts']:
             if p['ref'] == h['ref']:
                 continue
@@ -245,8 +249,12 @@ def check(c):
 
     # Openings in the front wall: ribs between the USB-A notches and the LED windows.
     spans = [(c.centre(p)[0] - USB_A_W / 2, c.centre(p)[0] + USB_A_W / 2, p['ref']) for p in f['usb_a']]
-    spans += [(c.xy(p['x'], p['y'])[0] - LED_WIN[0] / 2, c.xy(p['x'], p['y'])[0] + LED_WIN[0] / 2, p['ref'])
-              for p in f['leds']]
+    notches = list(spans)
+    for p in f['leds']:
+        a0, a1 = c.xy(p['x'], p['y'])[0] - LED_WIN[0] / 2, c.xy(p['x'], p['y'])[0] + LED_WIN[0] / 2
+        if p.get('side') == 'bottom' and any(n0 <= a0 and a1 <= n1 for n0, n1, _ in notches):
+            continue                     # under its port's notch: one opening, the window runs up into the notch
+        spans.append((a0, a1, p['ref']))
     spans.sort()
     for (a0, a1, ra), (b0, b1, rb) in zip(spans, spans[1:]):
         if b0 - a1 < MIN_RIB:
@@ -254,10 +262,12 @@ def check(c):
                             f'want {MIN_RIB}')
     notes.append(f'front wall: narrowest rib {min(b0 - a1 for (a0, a1, _), (b0, b1, _) in zip(spans, spans[1:])):.2f}'
                  f' mm')
-    spans = sorted((c.centre(p)[0] - USB_C_WIN[0] / 2, c.centre(p)[0] + USB_C_WIN[0] / 2) for p in f['usb_c'])
+    spans = sorted([(c.centre(p)[0] - USB_C_WIN[0] / 2, c.centre(p)[0] + USB_C_WIN[0] / 2) for p in f['usb_c']] +
+                   [(c.centre(p)[0] - EXT_WIN[0] / 2, c.centre(p)[0] + EXT_WIN[0] / 2) for p in f.get('ext', ())])
     for (a0, a1), (b0, b1) in zip(spans, spans[1:]):
         if b0 - a1 < MIN_RIB:
-            problems.append('rear wall: USB-C windows overlap')
+            problems.append(f'rear wall: {b0 - a1:.2f} mm between two windows, want {MIN_RIB}')
+    notes.append(f'rear wall: narrowest rib {min(b0 - a1 for (a0, a1), (b0, b1) in zip(spans, spans[1:])):.2f} mm')
     if c.z_top + USB_C_Z + USB_C_WIN[1] / 2 > c.z_lid - MIN_RIB:
         problems.append('rear wall: no rib left over the USB-C windows')
 
@@ -288,6 +298,28 @@ def check(c):
     return problems, notes
 
 
+def post_boxes(c, hx, hy):
+    """A corner post's square parts besides its round end, as (x0, x1, y0, y1): an arm to the side wall, the corner
+    between the hole and both walls, and - at the rear posts only - an arm to the rear wall across the hole's width.  The
+    front posts have no such arm since board 0.19.0: the PC1 / PC2 LEDs sit on the board's underside just inboard of the
+    front holes, and their light leaves through the front wall where that arm was."""
+    sx, sy = math.copysign(1, hx), math.copysign(1, hy)
+    wx, wy = sx * c.in_x, sy * c.in_y
+    boxes = [(hx, wx, hy - POST_R, hy + POST_R), (hx, wx, hy, wy)]
+    if sy > 0:                                           # the rear wall (case y points to the rear)
+        boxes.append((hx - POST_R, hx + POST_R, hy, wy))
+    return boxes
+
+
+def led_window_z(c, p):
+    """(bottom, top) of a side LED's window: over the board's top for a top-side LED, below the underside (reaching up
+    into a USB-A notch above it) for one on the bottom."""
+    h = LED_WIN[1]
+    if p.get('side') == 'bottom':
+        return c.z_board + LED_Z_UNDER - h, c.z_board + LED_Z_UNDER
+    return c.z_top + LED_Z, c.z_top + LED_Z + h
+
+
 # ── Solids ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 def wall_cut(sketch, x, y, z, depth):
     """A sketch in the XZ plane, centred at (x, z), cut through the wall at y."""
@@ -300,14 +332,11 @@ def tray(c):
     body = chamfer(body.edges().group_by(Axis.Z)[0], BOTTOM_CHAMFER)       # the bottom outline, nothing else yet
     body -= Pos(0, 0, c.z_floor) * extrude(RectangleRounded(2 * c.in_x, 2 * c.in_y, INNER_R), c.z_lid)
 
-    # Corner posts: round at the hole, square out to both walls.
+    # Corner posts: round at the hole, square out to the walls (post_boxes).
     for hx, hy in c.holes():
-        sx, sy = math.copysign(1, hx), math.copysign(1, hy)
         h = c.z_board - c.z_floor
-        wx, wy = sx * c.in_x, sy * c.in_y
         post = Pos(hx, hy, c.z_floor + h / 2) * Cylinder(POST_R, h)
-        for x0, x1, y0, y1 in ((hx, wx, hy - POST_R, hy + POST_R), (hx - POST_R, hx + POST_R, hy, wy),
-                               (hx, wx, hy, wy)):
+        for x0, x1, y0, y1 in post_boxes(c, hx, hy):
             post += Pos((x0 + x1) / 2, (y0 + y1) / 2, c.z_floor + h / 2) * Box(abs(x1 - x0) + 0.01,
                                                                                abs(y1 - y0) + 0.01, h)
         body += post
@@ -332,7 +361,12 @@ def tray(c):
     w, h, r = LED_WIN
     for p in f['leds']:
         x, _ = c.xy(p['x'], p['y'])
-        body -= wall_cut(RectangleRounded(w, h, r), x, -c.in_y - WALL_PORTS / 2, c.z_top + LED_Z + h / 2, depth)
+        z0, z1 = led_window_z(c, p)
+        body -= wall_cut(RectangleRounded(w, h, r), x, -c.in_y - WALL_PORTS / 2, (z0 + z1) / 2, depth)
+    w, h, r = EXT_WIN
+    for p in f.get('ext', ()):
+        x, _ = c.centre(p)
+        body -= wall_cut(RectangleRounded(w, h, r), x, c.in_y + WALL_PORTS / 2, c.z_top + EXT_Z, depth)
     return body
 
 

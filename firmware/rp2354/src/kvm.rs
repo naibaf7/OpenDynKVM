@@ -9,7 +9,7 @@ use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMu
 use embassy_sync::signal::Signal;
 use kvm_core::config::Config;
 use kvm_core::engine::{Engine, FwOp, Output};
-use kvm_proto::ctrl::{FwState, FwTarget, Info, Pc, Port, RebootTarget};
+use kvm_proto::ctrl::{FwState, FwTarget, Info, PORTS, Pc, Port, RebootTarget};
 use kvm_proto::link::LinkMsg;
 use kvm_proto::link::msg::{CTRL_REPLY_CHUNK, Command, CtrlStatus, fragments};
 
@@ -28,13 +28,13 @@ static MODULE_UPDATE: AtomicBool = AtomicBool::new(false);
 pub static SAVE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static REBOOT: Signal<CriticalSectionRawMutex, RebootTarget> = Signal::new();
 /// Port whose VBUS should be cycled (passthrough switch with `power-cycle-on-switch`, a probe's last retry).
-pub static POWER_CYCLE: [Signal<CriticalSectionRawMutex, ()>; 3] = [const { Signal::new() }; 3];
+pub static POWER_CYCLE: [Signal<CriticalSectionRawMutex, ()>; PORTS] = [const { Signal::new() }; PORTS];
 /// Port to unplug on its data lines and plug into Hub-0 again (`power::port_power`): the router goes off for a moment,
-/// so Hub-0 sees the device leave and come back, and resets it; VBUS stays on. Taking a device back from passthrough,
+/// so Hub-0 sees the device leave and come back, and resets it; VBUS stays on (Aux 1, without a router: VBUS off). Taking a device back from passthrough,
 /// re-detecting it, retrying a failed probe.
-pub static REPLUG: [Signal<CriticalSectionRawMutex, ()>; 3] = [const { Signal::new() }; 3];
+pub static REPLUG: [Signal<CriticalSectionRawMutex, ()>; PORTS] = [const { Signal::new() }; PORTS];
 /// Counts every `Output::Route` per port, so a replug doesn't put back Hub-0 over a route the engine set meanwhile.
-pub static ROUTE_GEN: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+pub static ROUTE_GEN: [AtomicU32; PORTS] = [const { AtomicU32::new(0) }; PORTS];
 pub static DROPPED: AtomicU32 = AtomicU32::new(0);
 
 pub fn init(config: Config, info: Info, serial: &str, board: Board) {

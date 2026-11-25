@@ -24,10 +24,10 @@ uv run tools/make_fab.py
 | Upload | File | Content |
 |---|---|---|
 | PCB | `kvm_gerbers.zip` | 4 copper, 2 mask, 2 paste, 2 silkscreen, outline, plated + non-plated drill, job file (with the stack-up) |
-| BOM | `bom/jlcpcb_bom.csv` | 41 lines, every part with an LCSC number (with the Bluetooth module) |
-| CPL | `bom/jlcpcb_cpl.csv` | 251 parts: 217 top, 34 bottom, JLC rotation/offset corrections applied |
-| BOM, no Bluetooth | `bom/jlcpcb_bom_nobt.csv` | 40 lines: the module U1601 and its seven passives (Fit = BT) left out |
-| CPL, no Bluetooth | `bom/jlcpcb_cpl_nobt.csv` | 243 parts: 209 top, 34 bottom |
+| BOM | `bom/jlcpcb_bom.csv` | 45 lines (0.19.0), every part with an LCSC number (with the Bluetooth module) |
+| CPL | `bom/jlcpcb_cpl.csv` | 269 parts: 222 top, 47 bottom (0.19.0: the six status LEDs and their caps are on the bottom), JLC rotation/offset corrections applied |
+| BOM, no Bluetooth | `bom/jlcpcb_bom_nobt.csv` | 44 lines: the module U1601 and its passives (Fit = BT) left out |
+| CPL, no Bluetooth | `bom/jlcpcb_cpl_nobt.csv` | 262 parts: 216 top, 46 bottom |
 
 Upload one BOM/CPL pair.  Without the module the board works as 0.15.0 does: the firmware finds no module at boot and
 offers no Bluetooth (design.md §16); the module's pads and its antenna keep-out stay bare.
@@ -223,7 +223,7 @@ From `uv run tools/jlc_stock.py` on 2026-11-09, for 5 assembled boards with the 
 | RP2354B | C39843328 | 5 | 632 | in stock again (0 on 2026-10-28) |
 | USB-A receptacle | C2798029 | 15 | 3848 | |
 | TLV73311 | C2865431 | 5 | 3924 | |
-| ESP32-C3-MINI-1-H4X (U1601, Bluetooth variant only) | C41349510 | 5 | 4772 | |
+| ESP32-MINI-1-N4 (U1601, Bluetooth variant only; 0.16.0-0.18.0: ESP32-C3-MINI-1-H4X, C41349510) | C2980305 | 5 | 3178 | |
 | 12 MHz crystal | C20625731 | 15 | 9411 | |
 | the other 34 lines | | | 7800+ | |
 
@@ -270,10 +270,12 @@ is `180 - phi + theta`, and the part offset is mirrored in x.  In JLC's placemen
 - A few of the 32 caps, to confirm the bottom transform in general.  They are not polarized, so any 180 degree error
   there is harmless.
 
-On the top side, also check **U1601** (Bluetooth variant): the module's antenna end (the end with no pads under it) at
-the east board edge, 0.45 mm inside it, over the bare antenna keep-out; pin 1 (GND) is the east end of the pad row
-along the module's north side, next to the antenna.  JLC's footprint for C41349510 matched ours with no rotation or
-offset correction (`jlc_corrections.json`).
+On the top side, also check **U1601** (Bluetooth variant, the ESP32-MINI-1 since 0.19.0): the module's antenna end
+(the end with no pads under it) at the east board edge, 0.5 mm inside it, over the bare antenna keep-out; pin 1 (GND)
+is the east end of the pad row along the module's north side, next to the antenna.  Our footprint is JLC's own land
+pattern for C2980305, so it needs no rotation or offset correction (`jlc_corrections.json`; the same held for 0.16.0-
+0.18.0's ESP32-C3-MINI-1, C41349510).  On the bottom side, 0.19.0 adds the six status LEDs D1502-D1507 along the front
+edge (lens towards the edge, pads away from it) and, on the Bluetooth variant, R1602 under the module.
 
 ## 10. Fitted after delivery
 
@@ -321,7 +323,7 @@ Run from `hardware/`; each tool prints what it measured from the board file, the
 |---|---|---|
 | §2, §6, §9 | `uv run tools/fab_facts.py` | outline and cut-outs, stack-up, zones, track widths, design rules, vias and vias in pads, holes by size and owner, parts at the edges, parts per side, through-hole parts |
 | §4 | `uv run tools/zsolve.py --corners` (about 3 min) | the pair's differential and common-mode impedance on the board's stack-up, each fab tolerance, their spread, the stacked worst cases and the 7628 build |
-| §5 | `uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1403=0.5 U403=0.5` (add `--inner 30` for 1 oz inner) | DC drop at each load, loss per layer, the most loaded segments with their current density and IPC-2221 rise |
+| §5 | `uv run tools/dc_drop.py +5V U402.1,U402.8 U1203=0.5 U1303=0.5 U1702=0.5 U1403=0.5 U403=0.5` (add `--inner 30` for 1 oz inner) | DC drop at each load, loss per layer, the most loaded segments with their current density and IPC-2221 rise |
 | §5 | `uv run tools/dc_drop.py VBUS_PWR J301 U402.7=2.0`, `... VBUS_KB U1203.6 J1201=0.5` | the adapter feed and a port leg |
 | §5 | `uv run tools/zsolve.py --corners --prepreg 0.092` | the pair on JLC's 1 oz-inner 3313 build |
 | §8 | `uv run tools/jlc_stock.py [--boards N]` (network) | stock, part class and need per BOM line; exits 1 if a line blocks the order |

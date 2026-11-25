@@ -137,7 +137,9 @@ def rail_width(i, t, rise=20.0, drop=None):
 # each rail's width follows the current it carries between its source and its targets (rail_width, 20 C rise): as
 # wide as the source can drive and the targets draw, and no wider - on each layer for that layer's copper
 POWER_CURRENT = {'+5V': 2.24,                      # TPS2121 output: 3 x 0.5 A port switches + logic and LEDs (2.4 A limit)
-                 'VBUS_KB': 2.24, 'VBUS_MS': 2.24, 'VBUS_OT': 2.24,  # TPS2553 -> USB-A VBUS (0.5 A load + inrush)
+                 'VBUS_KB': 2.24, 'VBUS_MS': 2.24, 'VBUS_A2': 2.24,  # TPS2553 -> USB-A VBUS (0.5 A load + inrush)
+                 'VBUS_A1': 2.24,                                    # the Aux 1 port (0.19.0), the same switch and limit
+                 'EXT_3V3': 0.2,                                     # the extension connector's switched 3.3 V (136 mA)
                  'VBUS_PC1': 1.96, 'VBUS_PC2': 1.96,                 # PC port -> LM66200: that PC's whole branch
                  'VBUS_PWR': 1.96, 'VBUS_PCS': 1.96,                 # adapter / PC-OR output into the TPS2121
                  'SW_3V3': 1.96,                                     # TLV62569 switch node
@@ -266,15 +268,45 @@ XTAL_LANES = {'RP_XIN': [
     ('seg', (147.70, 141.85, 152.75, 141.85, W_SIG, 1)),
     ('via', (152.75, 141.85)),
     ('seg', (152.75, 141.85, 159.30, 141.85, W_SIG, 0)), ('seg', (159.30, 141.85, 159.75, 142.30, W_SIG, 0))]}
+# Rail feeds laid as fixed copper with the crystal lanes (reserve_xtal_lanes), before the hub pairs and the SPI buses,
+# so they plan round it.  +5V (0.19.0): the TPS2121's output (C415's + pad) down the gap between the RP2354B and AT32 #2
+# to the port switches' trunk.  Measured on 0.19.0's first full run: with the Aux 2 lanes on B.Cu down that gap, Hub-2's
+# Mouse lane on F.Cu across it (y 146-148) and the logo's via-free box below it, the rail found no full-width way south
+# ("in the way: VBUS_PC1, VBUS_PWR" - those close the power block's south side once they are in), and the ports' whole
+# feed ended up on the LEDs' 0.3 mm light branch: 2 A through 0.3 mm on In2.Cu (~190 K), 280-320 mV at the ports
+# (dc_drop).  This is the full-width way the rail phase then found itself once its exit from the power block was held
+# (third full run: 83-124 mV at the four ports at 0.5 A each, 6 K on the 1.1 mm F/B.Cu, 15 K on the 1.39 mm In2.Cu), laid
+# whole so the result repeats and no planned piece is left over as a dead end.  F.Cu out of C415, B.Cu south-west under
+# C411's corner, F.Cu down x 174.1 (over the Aux 2 pairs on B.Cu), In2.Cu down x 174.65 (under Hub-0's Aux 2 pair, which
+# runs at full speed and may be crossed there: keep_in2_under_pairs), and B.Cu diagonally under the logo (tracks are
+# allowed there, vias are not) to (186.5, 155.7), just south of the logo, where the trunk joins it.  Two vias at every
+# layer change for the 2.24 A, but one at the In2.Cu -> B.Cu step: a second via there lands in the logo or within
+# 0.25 mm of J501's guide hole.
+_w5 = RAIL_LW['+5V']
+RAIL_LANES = {'+5V': [
+    ('seg', (181.65, 112.4, 181.65, 114.6, _w5[0], 0)),
+    ('via', (181.65, 114.6)), ('via', (181.1, 115.15)),      # (not further south-west: R412's GND pad, 0.19.0 run 4)
+    ('seg', (181.65, 114.6, 178.35, 117.9, _w5[1], 1)),
+    ('via', (178.95, 117.3)), ('via', (178.35, 117.9)),
+    ('seg', (178.95, 117.3, 174.1, 122.15, _w5[0], 0)),
+    ('seg', (174.1, 122.15, 174.1, 131.25, _w5[0], 0)),
+    ('via', (174.1, 130.4)), ('via', (174.1, 131.25)),
+    ('seg', (174.1, 130.4, 174.1, 131.25, _w5[2], 2)),
+    ('seg', (174.1, 131.25, 174.65, 131.8, _w5[2], 2)),
+    ('seg', (174.65, 131.8, 174.65, 140.9, _w5[2], 2)),
+    ('seg', (174.65, 140.9, 174.05, 141.5, _w5[2], 2)),      # x 174.05, not 173.95: J501's guide hole (0.25 mm)
+    ('seg', (174.05, 141.5, 174.05, 143.05, _w5[2], 2)),
+    ('seg', (174.05, 143.05, 173.95, 143.15, _w5[2], 2)),
+    ('via', (173.95, 143.15)),
+    ('seg', (173.95, 143.15, 186.5, 155.7, _w5[1], 1))]}
 _hub_fan = dict(zone=_sides(0.4, 0.4, 0.4, 0.4), max=_sides(3.6, 3.6, 3.6, 3.6), end=_sides(2.5, 2.5, 2.5, 2.5),
                 step=_sides(*[FANOUT_STEP] * 4))
-FANOUT_IC['U701'] = dict(_hub_fan, max=_sides(2.4, 3.6, 3.6, 3.6), lanes={'b': [163.75, 167.0], 'l': [118.0]})
+FANOUT_IC['U701'] = dict(_hub_fan, max=_sides(2.4, 3.6, 3.6, 3.6), lanes={'b': [163.75], 'l': [118.0]})
 # Hub-0's west side is shallower than the other three (2.4 mm): the service switch sits 3 mm off that row (rev 8,
 # gen_pcb.py PLACEMENT), so the deepest via row must stay clear of its pads.
-#  - 'b' 163.75 is the midpoint of the hub's port-4 pins 9/8, whose stub to R707/R708 is a pair like any other from rev 8
-#    on: with the lane declared the south fan-out keeps PAIR_LANE (0.7 mm) off that corridor, so the pair can leave the
-#    pins southwards.  167.0 clamps the fan-out's eastern end (its corner spread otherwise reaches x 167.0) so the pair
-#    can climb back north to the resistors' escape: it goes south past the row, east, then north at x 167.0.
+#  - 'b' 163.75 is the midpoint of the hub's port-4 pins 9/8, the Aux port's pair since 0.19.0 (a stub pair to the
+#    R707/R708 strap from rev 8 to 0.18.0): with the lane declared the south fan-out keeps PAIR_LANE (0.7 mm) off that
+#    corridor, so the pair can leave the pins southwards.
 #  - 'l' 118.0 is the service pair's crossing (U601's USB1 pins to the service ESD, U301): that pair has to pass *through*
 #    the west fan-out row, and the hub's other lanes cross theirs the same way (U801/U901's upstream lanes).  The row's
 #    vias then stay at y >= 118.7 and the pair crosses at 118.0, north of the hub's own west pads.
@@ -318,9 +350,9 @@ FANOUT_LEN['VSNS_PWR'] = 3.40  # RP pin 49 to R304.1 (divider leg), pad edge to 
 # first, its 5.5 mm link takes that corridor and the two long through-rails go round it - the same rule the signal
 # phase applies with "short local nets before the long ones that pass by".
 POWER_ORDER = ['VBUS_PC1', 'VBUS_PWR', 'VBUS_PC2', 'VBUS_PCS', 'SW_3V3', 'RP_VREG', '+1V1',   # into the power path
-               '+5V', 'VBUS_KB', 'VBUS_MS', 'VBUS_OT']                                       # then out of it
+               '+5V', 'VBUS_KB', 'VBUS_MS', 'VBUS_A1', 'VBUS_A2', 'EXT_3V3']                 # then out of it
 NOROUTE_BODY = {'J101': (0,), 'J201': (0,), 'J301': (0,), 'J1201': (0,), 'J1301': (0,), 'J1401': (0,),
-                'SW501': (0,)}
+                'J1701': (0,), 'J1801': (0,), 'SW501': (0,)}
 EP_PADS = {('U501', '81'): 3, ('U701', '37'): 3, ('U801', '37'): 3, ('U901', '37'): 3}   # n x n via arrays
 # Footprints whose GND pads join their own layer's GND pour instead of taking a via each (0.16.0): the Bluetooth module
 # U1601 (on F.Cu since 2026-11-12, on B.Cu before).  Its 22 ground pads (a row of 13 along the antenna end, four
@@ -333,13 +365,14 @@ POUR_PADS = {'U1601'}
 # as a dense IC's pins: the edge-mounted parts would otherwise have no escape left, and the 0.5 mm-pitch power path
 # is closed off by the 0.5-0.6 mm rails around it
 PAD_ESCAPE = {
-    'edge': ('J101', 'J201', 'J301', 'J1201', 'J1301', 'J1401',                    # USB-C and USB-A connectors
-             'D1501', 'D1502', 'D1503', 'D1504', 'D1505', 'D1506',                 # key and status LEDs
-             'C1501', 'C1502', 'C1503', 'C1504', 'C1505', 'C1506', 'C1507', 'C1508'),   # their decoupling
+    'edge': ('J101', 'J201', 'J301', 'J1201', 'J1301', 'J1401', 'J1701', 'J1801',  # USB-C, USB-A, extension connectors
+             'D1501', 'D1502', 'D1503', 'D1504', 'D1505', 'D1506', 'D1507',        # key and status LEDs
+             'C1501', 'C1502', 'C1503', 'C1504', 'C1505', 'C1506', 'C1507', 'C1508', 'C1509'),   # their decoupling
     'radial': ('U401', 'U402', 'U403', 'U404',                                    # power path (TPS2121 is 0.5 mm pitch)
-               'U1201', 'U1301', 'U1401',                                         # port ESDs: their VBUS pad needs the
+               'U1201', 'U1301', 'U1401', 'U1701',                                # port ESDs: their VBUS pad needs the
                #                                                                    via the port rail leaves by
-               'U1203', 'U1303', 'U1403',                                         # port VBUS switches (EN, FLT, ILIM)
+               'U1203', 'U1303', 'U1403', 'U1702',                                # port VBUS switches (EN, FLT, ILIM)
+               'U1801', 'U1802',                                                  # the extension's switch and ESD
                'R1004', 'R1005', 'R1104', 'R1105'),                                # AT32 CC series resistors: their pads
     #                                                                               sit in the AT32 <-> RP2354B SPI
     #                                                                               corridor, where the SPI closes them in
@@ -640,6 +673,11 @@ class Board:
                     if z.IsOnLayer(lyr):
                         self.keep_trk[L] |= dist <= W_SIG / 2 + EPS
         self.noroute = np.zeros((NL, NY, NX), bool)
+        # GND vias may stand under a USB-A body (0.19.0): the port's status LED sits on the bottom right under it, and its
+        # GND pad and its cap's had no via spot at all - the router counted on the B.Cu pour, which the LED chain's
+        # +5V track cut into islands (two floating port LEDs in the fifth full run, DRC "missing connection").  A tented
+        # GND via under the connector's GND shell is harmless; tracks and other nets' vias stay out as before.
+        self.usba_body = np.zeros((NY, NX), bool)
         # ... and the inside of a fine-pitch QFN (the band between its pin ring and its exposed pad) separately: no
         # F.Cu *track* may run there, but a via may - that is where a bottom-side decoupling cap's supply via belongs,
         # 0.5-1.0 mm from the cap's pad, so its loop stays inside the package (rev 9, 2026-10-26)
@@ -657,13 +695,17 @@ class Board:
             y0, y1 = MM(bb.GetTop()) + 0.4, MM(bb.GetBottom()) - 0.4
             if fp.GetFPID().GetLibItemName().wx_str().startswith('USB_A_'):
                 y0 = MM(fp.GetPosition().y) + 1.2
-            elif fp.GetFPID().GetLibItemName().wx_str().startswith('USB_C_'):
-                # body behind the pad row only: the pads must stay reachable from the board side
+            elif fp.GetFPID().GetLibItemName().wx_str().startswith(('USB_C_', 'JST_SH_')):
+                # body behind the pad row only: the pads must stay reachable from the board side (the JST SH extension
+                # connector, 0.19.0, the same: with its whole courtyard as the box, its SMD signal pads had no way out
+                # and EXT_3V3 / EXT_SDA / EXT_SCL failed at J1801.2-4 in the first full run)
                 row = [MM(p.GetBoundingBox().GetBottom()) for p in fp.Pads() if p.GetAttribute() == pcbnew.PAD_ATTRIB_SMD]
                 y1 = min(y1, max(row))
             box = (X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1) & ~inside_any_pad
             for L in NOROUTE_BODY[ref]:
                 self.noroute[L] |= box
+            if fp.GetFPID().GetLibItemName().wx_str().startswith('USB_A_'):
+                self.usba_body |= box
         self.escape_axis = np.zeros((NY, NX), np.uint8)   # 1 vertical-only, 2 horizontal-only F.Cu moves (escape zones)
         # fine-pitch QFNs: no F.Cu inside the pin ring (between the pins and the exposed pad), no vias just outside it,
         # and radial-only F.Cu moves in the escape zone in front of each side, so every pin keeps a straight way out
@@ -1104,7 +1146,7 @@ class NetRouter:
         vthr = CLR + vr + EPS
         self.via_ok = (np.all(fd >= vthr, axis=0) & (edge >= EDGE_CLR + vr) & ~band & ~B.keep_via[sl]
                        & (True if guard is None else guard.min(axis=0) >= XTAL_GUARD + vr)
-                       & ~B.noroute[0][sl] & ~B.noroute[1][sl]
+                       & (~(B.noroute[0][sl] | B.noroute[1][sl]) | (B.usba_body[sl] if name == 'GND' else False))
                        & (B.drill.d[sl] >= HOLE_CLR + VIA_DRILL / 2 + (vr - VIA_D / 2))
                        & (B.smd.d[sl] >= vr + 0.05))
         for vx, vy in own_vias:          # planned, not yet committed vias of this net: same hole clearance
@@ -2253,7 +2295,7 @@ PAIR_VIA_RUN = 15        # straight cells before and after a lane via pair, so b
 # was so short that offset_polyline()'s mitre at the 45-degree entry collapsed both lines onto one point - the row then
 # put the P via 0.15 mm from its own partner ("lines only -0.150 mm apart at (144.25,153.97)"); 0.5 mm of straight run
 # keeps both lines apart until the turn, and H0_MS routes (P 48.91 / N 48.88 mm, skew 0.02 mm, 6 vias).
-PAIR_END_RUNS = {('H0_OT_DP', 'B'): 10, ('H0_MS_DP', 'A'): 10,
+PAIR_END_RUNS = {('H0_A2_DP', 'B'): 10, ('H0_MS_DP', 'A'): 10,
                  # Rev 8, third configuration (switch at (140,114) rot 270): both channel pairs leave its west side and
                  # turn immediately to wrap round the chip, and SVC's own A end is the switch - with the default 4 cells
                  # the turn sits on the escape and the offset lines fold (measured "lines only 0.141 mm apart at
@@ -2423,12 +2465,18 @@ def relane(B, name, pin, via, avoid):
 def reserve_xtal_lanes(B, log):
     """XTAL_LANES: lay a crystal line's way out as fixed copper before the dense fan-outs are planned (see XTAL_LANES).
     A planned way out of another pin that it touches (none in a full run: the plans come after) is re-laid or dropped."""
-    for name, items in XTAL_LANES.items():
+    for name, items in list(XTAL_LANES.items()) + list(RAIL_LANES.items()):
         if name not in B.netcode or len(terminals(B, name)) <= 1:
             continue
         hit = sorted({n for n, k, d in B.tracks if n != name and any(items_clash(it, (k, d)) for it in items)})
         if hit:
             log.append(f'{name}: crystal lane not reserved, copper of {hit} in the way')
+            print(log[-1], flush=True)
+            continue
+        # a rail lane is checked against everything foreign, pads included (the track test above sees no pads: 0.19.0's
+        # fourth run laid the +5V lane's second via on R412's GND pad, a short only the DRC found)
+        if name in RAIL_LANES and not items_legal(B, name, [(name, k, d) for k, d in items]):
+            log.append(f'{name}: rail lane not laid, {items_conflict(B, name, [(name, k, d) for k, d in items])}')
             print(log[-1], flush=True)
             continue
         # Another net's planned way out that touches the lane goes, pin by pin (a pin's items are its lane segments up
@@ -3486,6 +3534,11 @@ def route_net(B, name, width, log, plan=None):
     root = min(heavy, key=lambda k: (centers[k][0] - cx) ** 2 + (centers[k][1] - cy) ** 2)
     tree = set(allcells[root])
     tree_pts = [centers[root]]
+    # A heavy load joins the heavy part of the tree only (the root, the heavy loads and their branches), never a light
+    # branch: 0.19.0's first full run fed all four port switches through the LEDs' 0.3 mm branch, because once the
+    # rail's own way to them had failed, a later pass joined them to the nearest copper of the net - the thin branch
+    # that had reached the LED row.  A heavy load that cannot reach the heavy tree now fails instead.
+    heavy_tree, heavy_pts = set(tree), list(tree_pts)
     remaining = [k for k in range(len(pads)) if k != root]
     failed = []
     while remaining:
@@ -3493,12 +3546,16 @@ def route_net(B, name, width, log, plan=None):
                                                             for p in tree_pts)))
         remaining.remove(k)
         ref, tgt = pads[k]
-        if tgt & tree:
+        src, src_pts = (tree, tree_pts) if is_light[k] else (heavy_tree, heavy_pts)
+        if tgt & src:
             tree |= allcells[k]
             tree_pts.append(centers[k])
+            if not is_light[k]:
+                heavy_tree |= allcells[k]
+                heavy_pts.append(centers[k])
             continue
         path = None
-        near = min(tree_pts, key=lambda p: (p[0] - centers[k][0]) ** 2 + (p[1] - centers[k][1]) ** 2)
+        near = min(src_pts, key=lambda p: (p[0] - centers[k][0]) ** 2 + (p[1] - centers[k][1]) ** 2)
         rail = name in POWER
         wk = min(width, LIGHT_W) if is_light[k] else width
         widths = {wk} if rail else {width, min(width, 0.25), W_SIG}
@@ -3507,12 +3564,12 @@ def route_net(B, name, width, log, plan=None):
                 win = window_of([near, centers[k]], grow)
                 R = NetRouter(B, name, w, win, own_vias=own_vias, avoid=avoid, neck=rail)
                 # the first (small) window is searched directly: in C a sealed-off region fails fast anyway
-                if grow != WINDOW and not R.reachable(tree, tgt):
+                if grow != WINDOW and not R.reachable(src, tgt):
                     p['windows'].append(win)
                     continue
-                path = R.search(tree, tgt, centers[k])
+                path = R.search(src, tgt, centers[k])
                 if not path:      # from the open side the search can run out of expansions before it finds a pin's
-                    path = R.search(tgt, tree, near)          # escape channel in a dense fan-out: from the pin
+                    path = R.search(tgt, src, near)           # escape channel in a dense fan-out: from the pin
                 p['windows'].append(R.explored if path and R.explored else win)
                 if path:
                     break
@@ -3527,6 +3584,9 @@ def route_net(B, name, width, log, plan=None):
         own_vias += [d for kind, d in tr if kind == 'via']
         tree |= allcells[k] | track_cells(tr)
         tree_pts.append(centers[k])
+        if not is_light[k]:
+            heavy_tree |= allcells[k] | track_cells(tr)
+            heavy_pts.append(centers[k])
     if plan is None:
         for kind, data in p['tracks']:
             B.add_track(name, kind, data)
@@ -4004,7 +4064,7 @@ def legal_via(B, x, y, name, ignore_smd=False, static_only=False, qfn_ok=False):
                     or (B.keep_via[j, i] and not (qfn_ok and B.qfn_inside[j, i]))):
         why = f'edge {B.edge[j, i]:.2f}' + (' keep_via' if B.keep_via[j, i] else '')
     if not why and not ignore_smd and ((B.noroute[0, j, i] or B.noroute[1, j, i])
-                              and not (qfn_ok and B.qfn_inside[j, i])):
+                              and not (qfn_ok and B.qfn_inside[j, i]) and not (name == 'GND' and B.usba_body[j, i])):
         why = 'noroute'
     if not why and (B.drill_static.d if static_only else B.drill.d)[j, i] < HOLE_CLR + VIA_DRILL / 2:
         why = 'drill'
@@ -5059,10 +5119,10 @@ def live_result(name, ok):
 
 
 # ── link list ─────────────────────────────────────────────────────────────────
-PORTS = ['KB', 'MS', 'OT']
-HUB_DS = {1: {'KB': ('2', '1'), 'MS': ('4', '3'), 'OT': ('7', '6'), 'AT': ('9', '8')},    # AT32 #1 east of Hub-1
-          2: {'AT': ('2', '1'), 'KB': ('4', '3'), 'MS': ('7', '6'), 'OT': ('9', '8')}}    # AT32 #2 west of Hub-2
-HUB_DS[0] = {'KB': ('2', '1'), 'MS': ('4', '3'), 'OT': ('7', '6')}
+PORTS = ['KB', 'MS', 'A2']        # A2 = Aux 2, the Other port (OT) up to 0.18.0: older notes quote OT names
+HUB_DS = {1: {'KB': ('2', '1'), 'MS': ('4', '3'), 'A2': ('7', '6'), 'AT': ('9', '8')},    # AT32 #1 east of Hub-1
+          2: {'AT': ('2', '1'), 'KB': ('4', '3'), 'MS': ('7', '6'), 'A2': ('9', '8')}}    # AT32 #2 west of Hub-2
+HUB_DS[0] = {'KB': ('2', '1'), 'MS': ('4', '3'), 'A2': ('7', '6'), 'A1': ('9', '8')}   # A1: the Aux 1 port (0.19.0)
 HUB_REF = {0: 'U701', 1: 'U801', 2: 'U901'}
 # hub -> (P pin, N pin) on the TS3USB3031.  **Rev 6 (the MHL fix):** the MHL channel is on Hub-0 and USB2 on Hub-1,
 # so the two pin groups swap ends: Hub-0's pairs leave the *west-facing* MHL pins 7/8 and Hub-1's the
@@ -5075,7 +5135,7 @@ HUB_REF = {0: 'U701', 1: 'U801', 2: 'U901'}
 # their two lanes on opposite sides of each other and needs the layer change below (see the lane plan).
 MUX_PINS = {0: ('7', '8'), 1: ('5', '6'), 2: ('3', '4')}
 E, W, N, S = (1, 0), (-1, 0), (0, -1), (0, 1)
-NE = (1, -1)                   # a waypoint inside a diagonal leg (DIRS has all eight)
+NE, NW, SE, SW = (1, -1), (-1, -1), (1, 1), (-1, 1)    # waypoints inside a diagonal leg (DIRS has all eight)
 # Lane plan (port router -> hub): waypoints (x, y, layer after it, travel direction), each in the middle of a
 # straight run (or at both ends of a corner, so a lane cannot cut across the inside of the corner where the next
 # lane runs).  The routers sit left of their USB-A ports: each has its MHL pins facing west, its USB1/USB2 pins
@@ -5093,117 +5153,46 @@ NE = (1, -1)                   # a waypoint inside a diagonal leg (DIRS has all 
 #  - Hub-2 lanes run straight down from the hub, then west along a band above the key (between the RP2354B and
 #    the switch's pin holes) and drop into their routers.
 #  - Lanes nest (the outermost lane turns last) so none crosses another.
+# 0.19.0: the front was re-laid for four ports (gen_pcb.py PORT_C / COLUMN_DX): the Mouse router stayed at
+# (146.5, 153.75), the Keyboard router moved 9 mm east (to 120.5), the Other router 14.5 mm east (to 196.0, under
+# AT32 #2), and the Aux port's pair (Hub-0 port 4 -> its ESD at (173.5, 160.3)) is new.  The plan, by region:
+#  - West: Hub-1's Keyboard lane as before (down the west edge, F.Cu), east along y 150.45 - between AT32 #1's
+#    passives (y <= 149.9) and the router - into the router's north-west pins; Hub-0's Keyboard lane leaves the MHL
+#    pins west on B.Cu (via pair at x 117, KEEP_FREE_CIRCLES) and joins its 0.18.0 lane at x 105; Hub-1's Mouse lane is
+#    0.18.0's.
+#  - Hub-2's four pairs come straight down from the hub's south row (AT, Keyboard, Mouse, Other, west to east) and
+#    nest: AT turns south-west first (its 0.18.0 lane), Mouse and Other follow it south-west, north of the Bluetooth
+#    module's passives (x >= 203.4, y 145.4-148.8).  Keyboard drops to B.Cu at y 137.5 instead and goes the long way:
+#    straight south under the module (B.Cu is free there), west along y 163.3 behind all four ports (B.Cu under the
+#    columns' parts, crossing the connector -> ESD pairs), north at x 125.5 and into the Keyboard router's north-east
+#    pins on F.Cu.  The others cross over it.
+#  - Hub-2's Mouse lane runs west on F.Cu along y 148 - across the OpenDynKVM logo, which allows no via (gen_pcb.py
+#    LOGOS) - and across the key on the one F.Cu corridor there (y 146.1, measured in 0.18.0: C517 below, the switch's
+#    pin hole above), and into the Mouse router's north-east pins: no via at all.
+#  - Hub-1's Other lane leaves the Other router's north-west pins on a via pair (H2_OT reaches its pins from the
+#    north-east diagonal, so the pair has room), goes west on B.Cu under the logo, north-west through the gap between
+#    the RP2354B and AT32 #2, and on along 0.18.0's corridor under Hub-0's south pad row to Hub-1.  Hub-0's Other lane is
+#    the outer arc of the same shape (B.Cu, south-west of it, via pair west of the router at x 191, outside the logo).
+#  - The Aux pair leaves Hub-0's port-4 pins south-east (clear of H0_OT's via pair), comes down on F.Cu through the
+#    2.9 mm gap between the RP2354B's crystal (Y501) and its SWD pads (J501), passes the key's east side on B.Cu (east of
+#    the hot-swap socket's pad) and climbs back onto F.Cu just north of its ESD.  It is a full-speed line (Hub-0 runs
+#    behind the RP2354B's full-speed host), so its vias cost nothing.
 LANES = {
-    # the keyboard lane leaves the north face and turns west 2.5 mm out (a pair needs room for its first turn,
-    # measured: 0.66 mm gave "lines only -0.150 mm apart"); then down the west edge on F.Cu, as before
-    (1, 'KB'): [(111.1, 150.4, 0, N), (108.9, 150.4, 0, W), (104.5, 150.4, 0, W), (102.5, 148.4, 0, N),
+    (1, 'KB'): [(120.1, 150.45, 0, N), (117.9, 150.45, 0, W), (104.5, 150.45, 0, W), (102.5, 148.45, 0, N),
                 (102.5, 129.2, 0, N), (104.5, 127.2, 0, E), (110.0, 127.2, 0, E)],
-    # The mouse and Other lanes are planned against one measured limit: *both* Hub-1's (pins 5/6) and Hub-2's
-    # (pins 3/4) pairs leave their router on the north row (y 152.863), and a pair terminal reserves its escape
-    # corridor on **both** layers - to y 150.863 on B.Cu and to 148.863 on F.Cu (route.py, the reserve() pair at the
-    # head of the pair phase).  So across the three routers' x-bands (110.5-113, 144.5-146.5, 179.5-181) any lane
-    # needs y <= 150.21 on B.Cu or y <= 148.21 on F.Cu, whatever layer it runs on.  The rev-5 lanes ran through that
-    # band on their own pad row (y 152.863) and at 150.8/151.3, which only ever fitted when they were routed before
-    # the keyboard pair - measured in one run, in every other order the group tried:
-    #   "leg 2 -> (112.5, 152.863) on B.Cu | blocked by ['#-9', 'H2_KB_DM']",
-    #   "leg 4 -> (105.5, 152.2) on B.Cu   | blocked by ['#-9', 'H0_KB_DM']",
-    #   "leg 5 -> (112.0, 151.3) on B.Cu   | blocked by ['#-9', 'H1_MS_DM', 'H2_KB_DM']".
-    # Both lanes therefore drop to 149.6 / 148.6 - north of that band, 1.0 mm apart, each 1.0 mm below the keyboard
-    # lane's 150.4 - and change to F.Cu at x 109.5 / 108.0, west of the keyboard router's corridor (x 110.45-111.75)
-    # and east of the west-edge corridor those three nest in.  Running them on B.Cu all the way west was tried and
-    # fails on the plan, not on room: Hub-0's keys' pair owns B.Cu there (its lane turns north at x 105.0 and runs out
-    # diagonally), and two B.Cu lanes cannot cross without one of them re-planning.
-    # The mouse lane descends 45 degrees (6 mm over 6 mm) to its own y and then runs one straight leg west on B.Cu,
-    # entering its via pair at (108.5, 146.2) travelling west.  A *steep* descent, or a 45-degree arrival at a waypoint
-    # marked W, folds the pair's inside line - measured "lines only -0.175 mm apart (want 0.150 mm) at (113.15,145.30)
-    # on F.Cu" twice, with the second attempt also producing "-0.278 mm apart at (104.76,128.81)".  y 146.2 is 1.3 mm
-    # north of Hub-0's keyboard lane's elbow (110.5, 147.5) and 1.0 mm south of the F.Cu keyboard corridors' boxes.
-    # STILL OPEN: a *square* via pair does not fit at the west edge (H1_KB at x 102.5 and H1_OT at 104.5 on F.Cu), and a
-    # staggered pair's two connecting diagonals run towards each other and pinch to 0.129 mm ("P via (109.25,145.75) /
-    # N track (109.71,146.00)-(109.36,146.35)", measured 2026-10-25).  Moving the change east fixes it for this pair -
-    # at x 118 it routes as "1487 cells, P 78.86 mm N 78.99 mm (skew 0.13 mm), 4 vias, gap 0.150" with the Other lane's
-    # corridor dipped to 144.7 - but that dip then takes Hub-2's keyboard lane's via site at (138.0, 147.0) away
-    # ("no via-pair site near waypoint 2"), so both lanes cannot have their way at once.  The real fix is in store()'s
-    # staggered composition: each line must reach its via by its own perpendicular fan-out at that via's axial position,
-    # instead of by the single diagonal that currently runs towards its partner.
-    # rev 9, 2026-10-27: that west-edge detour (83 mm, and in all six first-pass orders in conflict with the
-    # keyboard lane at the keyboard router) is gone.  The mouse pair now runs straight at the hub: F.Cu north-west out of
-    # the router and west along y 145.95 (over Hub-0's Mouse B.Cu run and its via pair at (139.6, 147.3)), across Hub-0's
-    # KB pair (B.Cu, y 142.75) on F.Cu, one via pair, then **B.Cu** north under AT32 #1's east pin row (clear of its
-    # fan-out vias at (120.4, 138.35) / (121.1, 139.15) and of H1_AT's twist via at (116.65, 132.4)) and under H1_AT
-    # itself, and a second via pair at (116.25, 128.85) heading straight up into pins 4/3.  Found by searching the fat
-    # line on the routed pair stage with Hub-1's Other pair removed: 48.2 mm with two layer changes (a cheaper via cost
-    # finds 41 mm with four).  The first via pair is asked for as far south as Hub-0's KB pair allows (the site search
-    # puts it at (120.3, 141.5)), because AT32 #1's SPI pins 14-17 (y 139.75-141.25) have no fan-out via: they are bus
-    # stubs that leave east on F.Cu to the RP's stubs at x 140 (FANOUT_LEN).  At (119.85, 141.0) the pair sat in front
-    # of AT1_CS / AT1_SCK and the bus found no way out in any of its 24 orders; 0.5 mm further south it routes (order
-    # SCK, MISO, CS, MOSI, 25.0-28.4 mm; AT1_CS leaves F.Cu once to get past it, 2 vias).
+    (1, 'A2'): [(195.6, 150.4, 1, N), (194.4, 149.4, 1, W), (186.5, 149.4, 1, W), (182.3, 145.3, 1, NW),
+                (176.05, 137.0, 1, N), (176.05, 127.5, 1, N), (173.5, 124.95, 1, W), (166.0, 124.95, 1, W),
+                (158.0, 123.6, 1, W), (148.0, 124.1, 1, W), (130.0, 124.3, 1, W), (123.5, 124.3, 1, W),
+                (118.6, 128.3, 1, W), (117.75, 126.75, 0, N)],
+    (2, 'KB'): [(120.9, 150.75, 0, N), (122.4, 150.45, 0, E), (124.0, 150.45, 0, E), (125.5, 151.6, 0, S),
+                (125.5, 154.5, 1, S), (125.5, 161.8, 1, S), (127.0, 163.3, 1, E), (204.75, 163.3, 1, E),
+                (206.25, 161.8, 1, N), (206.25, 139.5, 1, N), (206.25, 136.0, 0, N)],
+    (2, 'MS'): [(146.9, 150.8, 0, N), (149.3, 148.4, 0, NE), (151.6, 146.1, 0, E), (170.0, 146.1, 0, E),
+                (172.0, 148.0, 0, SE), (190.0, 148.0, 0, E), (197.5, 148.0, 0, E), (203.75, 141.75, 0, NE),
+                (207.75, 137.0, 0, N)],
+    (2, 'A2'): [(196.4, 151.4, 0, N), (198.6, 149.2, 0, NE), (205.0, 142.8, 0, NE), (208.75, 139.0, 0, N)],
     (1, 'MS'): [(139.0, 145.95, 0, W), (124.5, 145.95, 0, W), (120.3, 141.95, 1, N), (120.3, 140.0, 1, N),
                 (117.85, 135.0, 1, N), (116.25, 128.85, 0, N)],
-    # The Other lane comes from the far end of the router row, so it drops as soon as it is clear of Hub-2's Other
-    # corridor (x 179.25-180.55), and it crosses the key on **F.Cu**, at y 146.1-146.4 - the one corridor there is.
-    # Measured on the placed board (pair centre needs 0.375 mm from every pad): across x 150..170 F.Cu is free only at
-    # y 145.75-146.50 (C517 at x 159.7-160.9 below, the socket's 3.05 mm pad at x 160.6-164.4 from y 146.9 above), and
-    # B.Cu only to 146.4 (SW1501's through-hole pins).  That is *one* pair-width per layer, so the two pairs that have
-    # to get past the key cannot share a layer: with this lane on B.Cu at 148.2 the search slid it north to 146.15 and
-    # H2_MS's lane at 146.65 then read "leg 2 -> (165.0, 146.65) on B.Cu | blocked by ['#-9', 'H1_OT_DM']", and its run
-    # west also crossed Hub-0's Other pair's forced north leg at x 177.5 (that pair's MHL pads face west, so it turns
-    # north immediately) - which is why Hub-0's Other pair failed in every Hub-0 order too.
-    # On F.Cu both of those crossings are over/under instead of into, and the pair needs no via pair at all: the pads,
-    # the key crossing and the west-edge corridor (x 102.5-104.5) are all F.Cu.  Two obstacles shape the exact heights:
-    # C1501 (the key's debounce cap, its KEY pad at x 171.89-172.51, y 152.04-153.56) sits on the pad-row height at
-    # 152.2, so the lane descends at 45 degrees from x 174 - before it - and C517 (x 159.7-160.9, up to y 145.5) plus
-    # H2_MS's layer-change vias at (150.5, 146.2 / 147.1) set the crossing: 146.1-146.4 across the key, 145.45 at
-    # x 150.  R505 at (172, 145.5) is what keeps the crossing from going lower than 146.1 east of x 168.
-    #
-    # rev 9, 2026-10-27: the key crossing is the one F.Cu corridor H1_MS / H0_MS / H2_MS also need, so this pair
-    # now goes north, round the RP2354B *and* under the hub row, and leaves the key crossing to them.  A first try went
-    # west through the 1.0-1.3 mm gap between the hubs' south pads and the RP's north via row (y 125.4 at x 141) and
-    # died at a via pair there: Hub-0's KB pair owns B.Cu at y 126.4-126.7 (x 137.4-157.9), the RP's own USB pair
-    # crosses the gap diagonally on F.Cu, and a +3V3 via at (158.3, 124.4) plugs the gap at Hub-0's west side.
-    # The lane below was found by searching the pair's fat line on the routed pair stage with every later pair's lane
-    # (H0_MS, H0_OT and Hub-2's three) kept clear and nothing south of y 125 allowed between x 122 and 176:
-    #  - out of the router's Hub-1 pins straight north, east of Hub-2's Mouse via pair at (181.0, 147.3), then up the
-    #    empty strip at x 176 on **F.Cu** (Hub-0's Other lane runs parallel on B.Cu at x 177.5-178, 1.5-2 mm east);
-    #  - one via pair at (173.5, 124.95), clear of Hub-0's east caps (x <= 170.5), and from there **B.Cu** west, under
-    #    Hub-0's south pad row (F.Cu pads; its bottom-side caps and exposed-pad vias are further north), stepping up to
-    #    y 123.6 at x 158 to pass north of that +3V3 via, then at y 124.1-124.3 under the F.Cu parts between the hubs -
-    #    north of Hub-0's KB wall, so no Hub-0 lane is touched;
-    #  - at y 124.3 until x 123.5 (2 mm clear of the hub's east fan-out via at (120.6, 124.4)), then one steep V under
-    #    Hub-1's AT pair (F.Cu): down at 45 degrees to y 128.3, 0.9 mm west, and back up into a via pair heading north
-    #    at (117.75, 126.75), straight into the hub's pins 6/7 between its Mouse pins and its AT pins (H1_AT's lane keeps
-    #    it room).  The first version ran west along y 128.6 from x 125.3 and walled the B.Cu south of the hub; the V
-    #    keeps everything south of y 128.6 free for Hub-1's Mouse pair, which now comes up from the south on B.Cu.
-    # (The jog east out of the router's column is over by y 148.4: Hub-2's Mouse pair changes layer at (181.0, 147.3)
-    # with its run straight down x 181, and a later jog ran this pair over that via pair - Hub-2's Mouse then stayed on
-    # B.Cu and walled Hub-0's Other lane at x 177.5.)
-    (1, 'OT'): [(181.1, 150.0, 0, N), (182.3, 148.4, 0, N), (182.3, 147.2, 0, N), (176.05, 137.0, 0, N),
-                (176.05, 127.5, 0, N), (173.5, 124.95, 1, W), (166.0, 124.95, 1, W), (158.0, 123.6, 1, W),
-                (148.0, 124.1, 1, W), (130.0, 124.3, 1, W), (123.5, 124.3, 1, W), (118.6, 128.3, 1, W),
-                (117.75, 126.75, 0, N)],
-    # Hub-2 Keyboard used to cross the board at y 145.5 on B.Cu, straight through the band between the key and the USB
-    # switches - which is exactly where the four single-ended USB lines (KB_DP/DM, MS_DP/DM), the three SEL pairs and
-    # the reset lines have to get from AT32 #2 (x 174) west to the switches.  Those nets were left unrouted on rev 9's
-    # first full runs, and the pair itself paid for the wall it made: H0_MS then had to take an early layer change onto
-    # that same B.Cu (measured, "P track (142.98,153.60)-(142.80,153.83) / N via (142.75,153.60)", lines 0.193 mm
-    # apart).  The lane now goes the long way south, where B.Cu is empty for 4 mm between the switch row's bottom pads
-    # (y 160.4) and the USB-A pads (y 166.0): east 8.5 mm on F.Cu, down at x 120.5 (its own column between the keyboard
-    # switch's escape corridor x 110.5-113 and the KB port at x 125), east along y 161.5 under all three ports, and
-    # back up at x 186 - the 4 mm gap east of the Other switch (x 185.1) and west of the Other lane's F.Cu run at
-    # y 150.6.  161.5 leaves 1.1 mm to the switch row's copper and 4.5 mm to the ports, and the two corners have a
-    # straight run either side so the via rows sit where the pair is straight; the north leg keeps to B.Cu until
-    # y 150.0, which is 0.6 mm below the Other lane's F.Cu, and changes back at (188, 147) as before - north of Hub-2's
-    # mouse lane, whose B.Cu diagonal crosses x 186 at y 148.2.
-    (2, 'KB'): [(111.9, 151.5, 0, N), (121.5, 150.6, 0, E), (120.5, 155.0, 1, S), (120.5, 161.5, 1, S),
-                (184.0, 161.5, 1, E), (186.0, 159.5, 1, N), (186.0, 150.0, 1, N), (188.0, 147.0, 0, E),
-                (195.0, 147.0, 0, E), (206.25, 135.0, 0, N)],
-    # Hub-2's mouse lane changes back to F.Cu for x 174-181: Hub-0's Other pair has to turn north at x 177.5 (its MHL
-    # pads face west, so that is its own escape), and this lane's east run crosses it there.  The layer change is what
-    # makes that a crossing instead of a block, and 174/181.0 is where the two via pairs clear R505 (x 172, its pad to
-    # 172.5) and Hub-0's Other lane's vias; F.Cu above the key at y 147 is free - R505 and C519 are the only parts there.
-    (2, 'MS'): [(146.9, 150.0, 0, N), (150.5, 146.65, 1, E), (165.0, 146.65, 1, E), (174.0, 146.9, 0, E),
-                (181.0, 147.3, 1, S), (189.5, 148.8, 0, E), (197.0, 148.8, 0, E), (207.75, 136.0, 0, N)],
-    (2, 'OT'): [(181.9, 151.5, 0, N), (196.0, 150.6, 0, E), (208.75, 137.0, 0, N)],
 }
 # PC1 / PC2 ESD -> hub upstream (west side): west just below the ESD, then south well clear of the hub, so the hub's
 # north-west corner (NR0 / +3V3 pins and the NR0 strap resistor) stays free.  Measured when the ESDs moved 1.0 mm north
@@ -5216,28 +5205,16 @@ UPSTREAM_LANES = {n: [(x - 2.0, 116.9, 0, W), (x - 4.2, 119.0, 0, S)] for n, x i
 AT_LANES = {1: [(119.8, 130.0, 0, N), (119.8, 127.6, 0, N)],
             2: [(198.0, 145.5, 0, E), (205.25, 135.0, 0, N)]}            # #2 wraps around its east side, up to
                                                                          # Hub-2's west end
-PORT_C = {'KB': 125.0, 'MS': 160.0, 'OT': 195.0}                       # USB-A centres (tools/gen_pcb.py)
-H0_LANES = {'KB': [(107.0, 153.75, 1, W), (105.0, 153.75, 1, W), (105.0, 150.5, 1, N), (110.5, 147.5, 1, NE),
+PORT_C = {'KB': 121.0, 'MS': 147.0, 'A1': 173.0, 'A2': 199.0}         # USB-A centres (tools/gen_pcb.py)
+H0_LANES = {'KB': [(117.0, 153.75, 1, W), (105.0, 153.75, 1, W), (105.0, 150.5, 1, N), (110.5, 147.5, 1, NE),
                    (132.0, 132.0, 1, N), (157.9, 126.55, 0, E)],
-            # 0.15.0: (110.5, 147.5) heads NE, the way the lane leaves it.  Marked N, it made the search turn E -> N ->
-            # NE within 0.1 mm and the inner line folded back on itself: "lines only 0.137 mm apart (want 0.150 mm) at
-            # (109.79,147.60) on B.Cu", the link's failure in every unseeded --pairs-only run (0.12.0's sources too).
-            # rev 6: the MHL pads (7/8) are on this lane's own row, so it runs west 3.75 mm along that row - where the
-            # pair sits exactly on its two pads - and drops to B.Cu at the via pair in the reserved box; that is what
-            # lets the Hub-1 lane escape over it on F.Cu.  Then north on B.Cu (west of AT32 #1's crystal, whose GND pad
-            # reaches x 111.70), north-east to the point where the old diagonal clears AT32 #1, and on into Hub-0's
-            # keyboard pins.  (The north leg and the diagonal must not reverse direction: a dogleg back east made the
-            # pair's two lines cross - "lines only -0.150 mm apart".)
-            # rev 9, 2026-10-26: the old lane crossed *under* the RP2354B - (145.95,137.05) and (148.0,132.0)
-            # are inside its 143-153 x 131-141 body - and that is now where the chip's per-pin decoupling caps sit on
-            # B.Cu.  A lane west of the chip and east along y 128.6 did not route either: that band is the RP's north
-            # via row ("leg 5 -> (152.5, 128.6) on B.Cu | blocked by ['RP_VREG']"), and its climb at x 139.6 would
-            # have crossed Hub-0's KB pair, which owns B.Cu at y 126.4-126.7.  2026-10-27: with Hub-1's Other pair
-            # moved north the key band is free, so this pair goes *east* of the chip instead (found by searching its
-            # fat line on the routed pair stage): B.Cu from the via pair at (139.6, 147.3) east along y 145.45 (under
-            # the RP's south via row, 0.2 mm clear of Hub-2's Mouse via pair at (150.5, 146.2)), north-east to x 156
-            # - east of the RP's body and its bottom-side caps - and north-east again to x 161.25, straight up into a
-            # via pair right under Hub-0's pins 4/3.
+            'A2': [(191.0, 153.75, 1, W), (186.0, 153.75, 1, W), (177.0, 144.75, 1, NW), (174.6, 141.5, 1, N),
+                   (174.6, 133.5, 1, N), (172.6, 131.5, 1, NW), (165.5, 129.5, 1, W), (162.75, 127.6, 0, N)],
+            # the ESD's escape ends at y ~156.95 (fanout(): 0.5 mm more straight for VBUS's via between the lines), so
+            # the first waypoint lies beyond it - at 157.3 it sat on that via ("blocked by ['VBUS_AX']", 0.19.0 run 2)
+            'A1': [(173.5, 156.3, 0, N), (171.0, 153.8, 0, NW), (168.75, 151.3, 1, N), (168.75, 147.6, 1, N),
+                   (166.5, 145.35, 1, NW), (164.75, 143.0, 0, N), (164.75, 131.0, 0, N), (165.5, 128.0, 0, N),
+                   (163.75, 126.4, 0, NW)],
             'MS': [(143.0, 153.75, 0, W), (139.6, 150.2, 0, N), (139.6, 147.3, 1, N), (141.5, 145.45, 1, E),
                    (151.0, 145.45, 1, E), (156.0, 139.0, 1, N), (161.25, 131.0, 1, N), (161.25, 127.0, 0, N)],
             # rev 9: this lane climbed the x 139.5 slot on F.Cu and changed layer at the top of it, at the hairpin
@@ -5261,25 +5238,7 @@ H0_LANES = {'KB': [(107.0, 153.75, 1, W), (105.0, 153.75, 1, W), (105.0, 150.5, 
             # ... F.Cu north-west past the mouse router first (clear of the Hub-2 lanes' corner), then B.Cu under
             # the RP2354B's south side and up through its north fan-out lane at x 161.35 into Hub-0's mouse pins.
             # This is the leg length that measured clean (P 48.71 / N 49.08 mm, skew 0.37 mm, 4 vias, gap 0.150 mm)
-            # ... Other: west 3.25 mm along its pad row (long enough for the pair's first turn and for the via pair of
-            # the layer change, whose site the Hub-1 Other lane keeps free by staying on F.Cu there), then north at
-            # x 177.5 into the diagonal that reaches Hub-0's Other pins.  Tried and measured on 2026-10-24, and *not*
-            # used: descending earlier, at x 172 (east of the key's courtyard) and crossing west above the key the way
-            # Hub-0's mouse pair does - "PAIR FAIL leg 2 -> (172.0, 143.0) on B.Cu": that corridor is blocked, the
-            # hot-swap socket's own bottom-side pads are on B.Cu there, so the Other router cannot reach the mouse
-            # pair's corridor at 161.35.  The eastward excursion this plan has (to x 186.05, AT32 #2's fan-out edge,
-            # and back) is *not* the search's preference: the tight PAIR_WINDOW has no answer for this leg, and it is
-            # the 15 / 40 mm grow ladder below that finds the far-east path.  Capping that ladder for pair legs (and
-            # letting the two-layer PAIR_VIA_COST candidate stand in) is the next thing to try here.
-            # The last waypoint is Hub-0's *Other* pins' own centre (162.75 = the mid of pins 6/7 at 162.5/163.0), not
-            # 164.6: a planned lane is a wall for every other pair, and at 164.6 this lane's closing run north sat
-            # inside the port-4 pair's corridor (x 163.525-163.975, y 125.75-127.9), so Hub-0's port-4 stub pair had
-            # "no pair path from (0, 515, 1275) to (0, 570, 1278) within 52 mm of the direct line" in every order the
-            # Hub-0 group tried.  The pair's pins are 0.55 mm west of port 4's, so both reach the hub side by side.
-            'OT': [(177.5, 153.75, 1, W), (177.5, 151.55, 1, N), (178.0, 141.0, 1, N), (170.0, 131.5, 1, N),
-                   (162.75, 127.6, 0, N)]}
-
-
+}
 
 
 def pair_links(B):
@@ -5346,37 +5305,27 @@ def pair_links(B):
                   [(145.4, 118.5, 0, W), (137.7, 118.5, 0, N), (137.95, 114.0, 0, E)]))
     links.append(('RP_USB_DP_PIN', 'RP_USB_DM_PIN', ('pads', 'U501', '67', '66'),
                   ('padpair', 'R503', '1', 'R504', '1', S), (0, 1), 2.0, ()))
-    # Hub-0's port 4 is unused - its two lines are pulled to +3V3 by R707/R708 to tell the hub the port is not removable -
-    # but the copper from the hub's pins to those resistors is a pair like any other, so it is routed as one (again with
-    # padpair_terminal spanning the two resistors).  The enforcement check in main() refuses to leave it to the signal
-    # phase, which is how it was found: as a single it had 2.36 mm of skew and the SI table flagged it.  Its escape
-    # direction is given as S because R707/R708 end up side by side (their two pad-1s 1.25 mm apart along x), so the
-    # pair leaves south and meets the hub's own south escape; W would put both lines on top of each other.
-    # This pair is *drawn*, not searched ('direct' in b_cost - the link has nothing between its ends): DP is on the hub's
-    # pin 9 at x 164.0 and on R707's pad 1 at 164.55, DM on pin 8 at 163.5 and R708's pad 1 at 163.30, so both lines run
-    # straight and slightly apart at both ends - same side, no P/N swap.  What the pair phase cannot do here is *start*:
-    # the two escapes are 2.75 mm apart, the fan-out itself is 0.8 mm deep, and the search's fat centre line (0.45 wide)
-    # cannot begin inside its own converging stubs - measured on the rev-8 geometry as a straight attempt at (163.75,
-    # 125.75) whose nearest foreign copper is 0.716 mm away (H0_OT's line) while the router's own field for the fat line
-    # reads 0.075, so "no pair path from (0, 515, 1275) to (0, 570, 1278)" in every Hub-0 order.  Two straight tracks
-    # between the pads are exact here, and they are the same 4.56 mm for both lines (skew 0.00).
-    links.append(('H0_D4_DP', 'H0_D4_DM', ('pads', HUB_REF[0], '9', '8'),
-                  ('padpair', 'R707', '1', 'R708', '1', N), (0, 1), 'direct', ()))
+    # (0.18.0 had Hub-0's unused port 4 here: a drawn stub pair to its strap resistors R707/R708.  Since 0.19.0 the port
+    # is the Aux port's, routed below with the hub's other links.)
     for n, at in ((1, 'U1001'), (2, 'U1101')):
         links.append((f'H{n}_AT_DP', f'H{n}_AT_DM', ('pads', at, '27', '26'), ('pads', HUB_REF[n], *HUB_DS[n]['AT']),
                       (0, 1), (2.0, 'A'), AT_LANES[n]))
     for k, p in enumerate(PORTS):
         b = 12 + k
-        # USB-A -> ESD left of it: north out of the connector, west, north into the ESD
-        links.append((f'{p}_DP', f'{p}_DM', ('pads', f'J{b}01', '3', '2'), ('pads', f'U{b}01', '3', '1'), (0,), 9.9,
-                      [(PORT_C[p] - 7.0, 163.8, 0, W)]))
+        # USB-A -> ESD right behind its pins (0.19.0; up to 0.18.0 the ESD sat 13.5 mm west of the port), -> router
+        links.append((f'{p}_DP', f'{p}_DM', ('pads', f'J{b}01', '3', '2'), ('pads', f'U{b}01', '3', '1'), (0,), 9.9, ()))
         links.append((f'{p}_DP', f'{p}_DM', ('pads', f'U{b}01', '4', '6'), ('pads', f'U{b}02', '11', '10'), (0,), 9.9, ()))
+    # the Aux 1 port (0.19.0): USB-A -> ESD, and the ESD straight to Hub-0's port 4 (no router); the hub link is routed
+    # with Hub-0's group (main), not with the singles
+    links.append(('A1_DP', 'A1_DM', ('pads', 'J1701', '3', '2'), ('pads', 'U1701', '3', '1'), (0,), 9.9, ()))
+    links.append(('A1_DP', 'A1_DM', ('pads', 'U1701', '4', '6'), ('pads', HUB_REF[0], *HUB_DS[0]['A1']), (0, 1), 0.9,
+                  H0_LANES.get('A1', ())))
     for hub in (1, 2):
         for k, p in enumerate(PORTS):
             b = 12 + k
             pp, pn = MUX_PINS[hub]
             links.append((f'H{hub}_{p}_DP', f'H{hub}_{p}_DM', ('pads', f'U{b}02', pp, pn),
-                          ('pads', HUB_REF[hub], *HUB_DS[hub][p]), (0, 1), 1.0, LANES[(hub, p)]))
+                          ('pads', HUB_REF[hub], *HUB_DS[hub][p]), (0, 1), 1.0, LANES.get((hub, p), ())))
     # Hub-0 (full speed) is routed last, after the AT32 SPI: it prefers B.Cu and hops layers across the HS lanes;
     # KB is the long one and gets a B.Cu lane north of AT32 #1, so it leaves the AT32's F.Cu side free
     for k, p in enumerate(PORTS):
@@ -5411,7 +5360,8 @@ def main():
     # demanded CLR + PAIR_FAT/2 = 0.375 mm of clearance from a line that is only PAIR_O = 0.15 mm away at the fan-out:
     # the leg search could not leave its own stubs and failed at "leg 0" however the lane was planned (2026-10-24).
     pair_nets = sorted({(f'PC{n}_DP', f'PC{n}_DM') for n in (1, 2)} | {(f'H{n}_AT_DP', f'H{n}_AT_DM') for n in (1, 2)} |
-                       {(f'{p}_DP', f'{p}_DM') for p in PORTS} | {(f'H{h}_{p}_DP', f'H{h}_{p}_DM') for h in (0, 1, 2) for p in PORTS} |
+                       {(f'{p}_DP', f'{p}_DM') for p in PORTS + ['A1']} |
+                       {(f'H{h}_{p}_DP', f'H{h}_{p}_DM') for h in (0, 1, 2) for p in PORTS} |
                        {('H0_UP_DP', 'H0_UP_DM'), ('SVC_DP', 'SVC_DM'), ('RP_DP', 'RP_DM'),
                         ('RP_USB_DP_PIN', 'RP_USB_DM_PIN')})
     B = Board(board, pair_nets)
@@ -5437,7 +5387,8 @@ def main():
     # check_copper's per-net connectivity because both paths are the same net).  The pair link is the one that stays:
     # it is what length-matches the two lines and what check_usb_si.py measures as a channel.
     for esd, dm, dp in [('U101', 'PC1_DM', 'PC1_DP'), ('U201', 'PC2_DM', 'PC2_DP'), ('U301', 'SVC_DM', 'SVC_DP'),
-                        ('U1201', 'KB_DM', 'KB_DP'), ('U1301', 'MS_DM', 'MS_DP'), ('U1401', 'OT_DM', 'OT_DP')]:
+                        ('U1201', 'KB_DM', 'KB_DP'), ('U1301', 'MS_DM', 'MS_DP'), ('U1401', 'A2_DM', 'A2_DP'),
+                        ('U1701', 'A1_DM', 'A1_DP')]:
         esd_through(B, fpr[esd], dm, dp)
     ep_vias(B, log)
     # the bottom-side decoupling caps share their pin's via: the tie is laid here, before the fan-outs, so
@@ -5624,9 +5575,11 @@ def main():
     # runs through the west and key-ward space Hub-1's lanes use, so it gets the board to itself.  H0_UP used to be at
     # the front too, from when it needed a hand-built breakout off the old TSSOP part; on the rev-8 switch it is a 12 mm
     # pad-to-pad pair, so it goes last of the singles.
+    ax_hub = lambda l: l[0] == 'A1_DP' and l[3][1] == HUB_REF[0]      # the Aux 1 port's hub link: Hub-0's group
     singles = ([l for l in links if l[0].startswith('SVC')] +
                [l for l in links if l[0].startswith('H0_KB')] + [
-        l for l in links if not l[0].startswith(('SVC', 'H0_', 'H1_KB', 'H1_MS', 'H1_OT', 'H2_KB', 'H2_MS', 'H2_OT'))] + [
+        l for l in links if not l[0].startswith(('SVC', 'H0_', 'H1_KB', 'H1_MS', 'H1_A2', 'H2_KB', 'H2_MS', 'H2_A2'))
+        and not ax_hub(l)] + [
         l for l in links if l[0].startswith('H0_UP')])
     for link in singles:
         run(link)
@@ -5657,7 +5610,8 @@ def main():
         dense_fanout(B, log, ref)                    # seeded: the seed has these fan-outs
 
     for hub in (() if from_cache else (1, 2, 0)):
-        group = [l for l in links if l[0].startswith(f'H{hub}_') and not l[0].startswith(f'H{hub}_AT')
+        group = [l for l in links if (l[0].startswith(f'H{hub}_') or (hub == 0 and ax_hub(l)))
+                 and not l[0].startswith(f'H{hub}_AT')
                  and not l[0].startswith(f'H{hub}_UP')      # H0_UP is routed first, in the singles list above
                  and not (hub == 0 and l[0].startswith('H0_KB'))]   # so is H0_KB, before any Hub-1 lane
         if hub == 0:

@@ -58,7 +58,7 @@ VIA_PAIRED_MM = 1.5           # the two lanes' vias this close are one layer cha
 CROSSTALK_MM = 0.60           # a foreign track this close to a pair line can couple to it
 XTALK_LEN = 5.0               # mm of parallel run before it is worth mentioning
 SAMPLE = 0.15                 # mm step for the coupling profile
-STAIRS = ('H0_', 'H1_', 'H2_', 'PC1_', 'PC2_', 'KB_', 'MS_', 'OT_', 'SVC_', 'RP')
+STAIRS = ('H0_', 'H1_', 'H2_', 'PC1_', 'PC2_', 'KB_', 'MS_', 'A1_', 'A2_', 'SVC_', 'RP')
 LAYER_NAME = {pcbnew.F_Cu: 'F.Cu', pcbnew.B_Cu: 'B.Cu', pcbnew.In1_Cu: 'In1.Cu', pcbnew.In2_Cu: 'In2.Cu'}
 SIGNAL_LAYERS = ('F.Cu', 'B.Cu')
 
