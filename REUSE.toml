@@ -24,9 +24,23 @@ path = [
 SPDX-FileCopyrightText = "2026 Fabian Tschopp"
 SPDX-License-Identifier = "MIT OR Apache-2.0"
 
-# kvm-vial: the keycode ranges and the Vial request handlers are adapted from RMK (crates/kvm-vial/LICENSE-RMK-MIT).
+# The Bluetooth module's copy of trouble-host 0.8.0 (https://github.com/embassy-rs/trouble), its changes marked
+# "OpenDynKVM:" (firmware/esp32c3/Cargo.toml says why).
 [[annotations]]
-path = ["crates/kvm-vial/src/keycode.rs", "crates/kvm-vial/src/protocol.rs"]
+path = "firmware/esp32c3/trouble-host/**"
+SPDX-FileCopyrightText = ["The TrouBLE authors", "2026 Fabian Tschopp"]
+SPDX-License-Identifier = "Apache-2.0 OR MIT"
+
+# The ESP32 module's copy of esp-radio 1.0.0-beta.1 (https://github.com/esp-rs/esp-hal), its changes marked
+# "OpenDynKVM:" (firmware/esp32/Cargo.toml says why).
+[[annotations]]
+path = "firmware/esp32/esp-radio/**"
+SPDX-FileCopyrightText = ["The esp-rs authors", "2026 Fabian Tschopp"]
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+# kvm-map: the keycode ranges and the Vial request handlers are adapted from RMK (crates/kvm-map/LICENSE-RMK-MIT).
+[[annotations]]
+path = ["crates/kvm-map/src/keycode.rs", "crates/kvm-map/src/protocol.rs"]
 SPDX-FileCopyrightText = ["2024 HaoboGu", "2026 Fabian Tschopp"]
 SPDX-License-Identifier = "MIT OR Apache-2.0"
 

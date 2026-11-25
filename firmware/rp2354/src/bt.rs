@@ -1,6 +1,9 @@
-//! The Bluetooth module (ESP32-C3): whether it is there, its link, and its firmware (software.md §4.13). It is on the
-//! board (ESP32-C3-MINI-1, boards 0.16.0 on, when fitted), or an ESP32-C3 board on a front port (a *dongle*, for a
-//! KVM without it: [`dongle_task`]). Both run the same module firmware, and everything above the line is the same.
+//! The Bluetooth module: whether it is there, its link, and its firmware (software.md §4.13). It is on the board
+//! (ESP32-C3-MINI-1, boards 0.16.0 on, when fitted), or an ESP32 board on a front port (a *dongle*, for a KVM without
+//! it: [`dongle_task`]): an ESP32-C3's own USB serial port, or an original ESP32 behind its board's CP210x bridge. The
+//! module is an ESP32-C3 (Bluetooth LE) or an ESP32 (LE and Classic, `firmware/esp32`), on the board's UART or on a
+//! dongle alike; each runs its chip's firmware, says its chip in its `Hello` (else its ROM tells it: [`CHIP`]), and
+//! everything above the line is the same.
 //!
 //! - **Fitted or not:** boards 0.12–0.15 leave GPIO28/29 unconnected, and a 0.16.0 board can be built without the
 //!   module (assembly variant without `Fit = BT`). At boot `main` samples `ESP_TXD` (GPIO29) for up to 0.5 s with the
@@ -9,21 +12,20 @@
 //! - **Link:** UART0 (GPIO28 TX → the module's RXD0, GPIO29 RX ← its TXD0) at [`BAUD`], or the dongle's USB serial
 //!   port ([`crate::dongle`]): the AT32F405 links' frames and ARQ ([`kvm_proto::link::bt`]), the RP2354B as master, one
 //!   frame out and one back per exchange.
-//! - **Firmware:** the image is embedded (`build.rs`, from `cargo xtask dist`). A module that says `Hello` with another
-//!   version is reprogrammed by [`crate::espisp`], as is one that says nothing within [`HELLO_TIMEOUT`]:
-//!   - on the board, it is sent into its ROM bootloader (`EnterRom`), or caught there with a break on TX (blank, or a
-//!     firmware that doesn't come up and resets). Attempts as for the AT32F405s (`kvm_core::at32prog`): 5 failed in a
-//!     row, counted in flash, then no more until the image changes, the key is held at power-up, or
-//!     `RebootTarget::BtRetry`. The module's BOOT strap is on TX; its EN has a line from GPIO9 from 0.18.0 on
-//!     (through 1 kΩ, hardware/tools/gen_schematic.py block 16), with which a reset under a break catches it in its ROM
-//!     at once; before, only its RC, and the break waits for a reset the module makes by itself.
+//! - **Firmware:** the module runs the RP2354B's own version, which the RP2354B doesn't keep: the host software
+//!   streams it (`FwTarget::Module`, [`crate::modstream`]), and [`crate::espisp`] writes it as it arrives. A module that
+//!   says `Hello` with another version, or nothing within [`HELLO_TIMEOUT`], waits for that, Bluetooth off
+//!   ([`State::NeedsUpdate`]); a stream that comes while the module is up reprograms it too. Into its ROM bootloader:
+//!   - on the board, by `EnterRom`, or caught there with a break on TX (blank, or a firmware that doesn't come up and
+//!     resets). The module's BOOT strap is on TX; its EN has a line from GPIO9 from 0.18.0 on (through 1 kΩ,
+//!     hardware/tools/gen_schematic.py block 16), with which a reset under a break catches it in its ROM at once;
+//!     before, only its RC, and the break waits for a reset the module makes by itself.
 //!   - a dongle is sent `EnterRom` too, and restarted into its ROM by its DTR/RTS if it doesn't answer (DTR/RTS didn't
 //!     get one whose firmware runs there reliably). One that never said `Hello` is someone's ESP32 board, not the
-//!     module: it is only programmed if it is an ESP32-C3 with a blank first sector ([`espisp::blank_c3`]: new, erased,
-//!     or the module after a programming that broke off), else it is left as it is, an ordinary device. Attempts are
-//!     counted per board in RAM, the same 5.
+//!     module: it is only taken if it is an ESP32-C3 with a blank first sector ([`espisp::blank_c3`]: new, erased, or
+//!     the module after a programming that broke off), else it is left as it is, an ordinary device.
 //! - **State:** [`State`] goes to the engine (`Status.bt_module`, the diagnostics) and to the self-test
-//!   (`selftest::BT_FW`, `BT_GAVE_UP`).
+//!   (`selftest::BT_FW`).
 
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -37,22 +39,34 @@ use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use heapless::String;
-use kvm_core::at32prog::{self, Attempt, Next};
-use kvm_core::bt::BtOut;
+use kvm_core::bt::{BtOut, DongleKind};
+use kvm_proto::ctrl::FwState;
 use kvm_proto::ctrl::diag::BtModule;
-use kvm_proto::link::bt::{BAUD, BtMsg, Motion, ROLE};
+use kvm_proto::link::bt::{BAUD, BtMsg, Chip, Motion, ROLE, hello_flags};
 use kvm_proto::link::{Arq, FRAME_LEN, Frame, MAX_MSG, Msg, PROTOCOL_VERSION, Prio};
 
 use crate::dongle::Dongle;
-use crate::espisp::{self, Image, Line};
+use crate::espisp::{self, Line};
+use crate::kvm;
+use crate::modstream::{self, Incoming};
 use crate::uartlog::uart_log;
-use crate::{kvm, storage};
 
 const KEEPALIVE: Duration = Duration::from_millis(5);
 /// While a Bluetooth device is connected: the module can only answer, so its reports wait for the next exchange.
 const KEEPALIVE_DEVICES: Duration = Duration::from_millis(1);
 /// Bit n−1: device slot n's reports come (its last `Device` state said ready).
 static DEVICES_LIVE: AtomicU8 = AtomicU8::new(0);
+/// While a Bluetooth host's software talks to the KVM over the control service (software.md §8.1): its requests wait
+/// in the module for the next exchange, so the link runs at [`KEEPALIVE_DEVICES`] until this long after the last one.
+const CONTROL_BUSY: Duration = Duration::from_millis(500);
+/// When the last control request from a Bluetooth host came (ms since boot; 0: none yet).
+static CONTROL_AT: AtomicU32 = AtomicU32::new(0);
+
+/// A Bluetooth host's software is talking to the KVM: its answers and next requests go at once.
+fn control_busy() -> bool {
+    let at = CONTROL_AT.load(Ordering::Relaxed);
+    at != 0 && (Instant::now().as_millis() as u32).wrapping_sub(at) < CONTROL_BUSY.as_millis() as u32
+}
 /// A frame takes 0.24 ms at 3 Mbaud; the module answers within a millisecond.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(4);
 /// On a dongle a frame is two USB packets each way, one per millisecond (`dongle.rs`): about 4 ms an exchange, more
@@ -76,17 +90,14 @@ pub enum State {
     Unknown = 0,
     /// Not fitted (or a board before 0.16.0), and no dongle.
     Absent = 1,
-    /// The link is up and its firmware is the embedded one.
+    /// The link is up and it runs this firmware's version.
     Up = 2,
-    /// Being programmed.
+    /// Being programmed from the host software's stream.
     Programming = 3,
-    /// It doesn't answer or couldn't be programmed: Bluetooth is off until the next power-up (a dongle: until it is
-    /// plugged in again).
-    Failed = 4,
     /// Waiting for its `Hello` (after a reset, or after programming).
-    Starting = 5,
-    /// Programming failed [`at32prog::MAX_FAILS`] times in a row: not tried again (`kvm_core::at32prog`).
-    GaveUp = 6,
+    Starting = 4,
+    /// It runs another version, or none: waiting for the host software to stream this one's.
+    NeedsUpdate = 5,
 }
 
 pub static STATE: AtomicU8 = AtomicU8::new(State::Unknown as u8);
@@ -97,9 +108,8 @@ pub fn state() -> State {
         1 => State::Absent,
         2 => State::Up,
         3 => State::Programming,
-        4 => State::Failed,
-        5 => State::Starting,
-        6 => State::GaveUp,
+        4 => State::Starting,
+        5 => State::NeedsUpdate,
         _ => State::Unknown,
     }
 }
@@ -111,14 +121,27 @@ pub fn module(s: State) -> BtModule {
         State::Starting => BtModule::Starting,
         State::Up => BtModule::Up,
         State::Programming => BtModule::Programming,
-        State::Failed => BtModule::Failed,
-        State::GaveUp => BtModule::GaveUp,
+        State::NeedsUpdate => BtModule::NeedsUpdate,
     }
 }
 
 fn set_state(s: State) {
     STATE.store(s as u8, Ordering::Relaxed);
     kvm::with(|e| e.set_bt_module(module(s)));
+}
+
+/// The module's chip as last heard (`Chip` as a number): which image the host software streams for it.
+pub static CHIP: AtomicU8 = AtomicU8::new(Chip::Unknown as u8);
+
+fn set_chip(c: Chip) {
+    if CHIP.swap(c as u8, Ordering::Relaxed) != c as u8 {
+        uart_log!("Bluetooth module: {}", c.name());
+    }
+    kvm::with(|e| e.set_bt_chip(c));
+}
+
+fn chip() -> Chip {
+    Chip::from_u8(CHIP.load(Ordering::Relaxed))
 }
 
 type Queue = Channel<CriticalSectionRawMutex, Msg, 24>;
@@ -144,36 +167,53 @@ fn queue(m: &BtMsg) {
     }
 }
 
-/// The module's image embedded by `build.rs` (empty without one: then a module is used as it is, never programmed).
-mod embedded {
-    include!(concat!(env!("OUT_DIR"), "/esp_fw.rs"));
-    pub static HEAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/esp_head.bin.z"));
-    pub static TAIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/esp_tail.bin.z"));
+/// The version a module must run: this firmware's.
+fn wanted() -> u32 {
+    crate::FW_VERSION
 }
 
-fn image() -> Image {
-    Image {
-        head: embedded::HEAD,
-        head_len: embedded::ESP_HEAD_LEN,
-        tail: embedded::TAIL,
-        len: embedded::ESP_IMAGE_LEN,
-        md5: embedded::ESP_IMAGE_MD5,
-        blank_md5: embedded::ESP_BLANK_MD5,
-    }
+/// Programs the module from the host software's stream; its ROM loader listens. The update's state goes to the engine.
+/// The caller restarts an ESP32 into its new firmware ([`espisp::Done::ResetIt`]).
+async fn update<L: Line>(line: &mut L) -> Result<espisp::Done, espisp::Error> {
+    let mut src = Incoming::open().await?;
+    let h = *src.header();
+    let done = espisp::program(line, &h, &mut src, progress, differs).await?;
+    kvm::with(|e| e.set_fw_state(FwState::Done, h.file_len() as u32));
+    Ok(done)
 }
 
-fn has_image() -> bool {
-    !embedded::HEAD.is_empty()
+/// How programming the module went, into its log (`odkvmctl device log`): the diagnostics' ROM error is only the
+/// last one.
+fn note(e: espisp::Error) {
+    use core::fmt::Write as _;
+    let mut line: String<120> = String::new();
+    let _ = write!(line, "RP2354B: programming the module ({}) failed: {}", chip().name(), espisp::describe(e));
+    let now = Instant::now().as_millis() as u32;
+    kvm::with(|en| en.bt_log(&line, now));
 }
 
-/// The version a module must run: the embedded image's (None without one: any module is used as it is).
-fn wanted() -> Option<u32> {
-    has_image().then_some(embedded::ESP_FW_VERSION).flatten()
+fn note_done(ms: u64) {
+    use core::fmt::Write as _;
+    let mut line: String<120> = String::new();
+    let _ = write!(line, "RP2354B: the module ({}) programmed in {ms} ms", chip().name());
+    let now = Instant::now().as_millis() as u32;
+    kvm::with(|en| en.bt_log(&line, now));
 }
 
-/// Identifies the embedded image for the programming record (CRC-32 of its MD5; 0 without an image).
-pub fn image_crc() -> u32 {
-    if has_image() { kvm_proto::crc::crc32(embedded::ESP_IMAGE_MD5) } else { 0 }
+/// A piece of the flash after an image that didn't check out: its place, length and MD5, into the module's log (to
+/// compare with the image's, `odkvmctl device log`).
+fn differs(at: u32, len: u32, md5: &[u8; 32]) {
+    use core::fmt::Write as _;
+    let mut line: String<120> = String::new();
+    let _ = write!(line, "RP2354B: flash {at:#08x}+{len:#07x}: md5 {}", core::str::from_utf8(md5).unwrap_or("?"));
+    let now = Instant::now().as_millis() as u32;
+    kvm::with(|en| en.bt_log(&line, now));
+}
+
+/// Programming progress for the engine (`Status.bt_progress`).
+fn progress(done: usize, total: usize) {
+    let pct = (done * 100 / total.max(1)) as u8;
+    kvm::with(|e| e.set_bt_progress(pct));
 }
 
 /// Queues what the engine asks of the module; dropped while there is no module (or its link is down). Motion is
@@ -208,6 +248,7 @@ pub fn send(o: BtOut) {
         BtOut::EraseAll => BtMsg::EraseAll,
         BtOut::RequestMap(dev) => BtMsg::RequestMap { dev: *dev },
         BtOut::DeviceOutput { dev, id, data } => BtMsg::DeviceOutput { dev: *dev, id: *id, data },
+        BtOut::Control { host, data } => BtMsg::ControlReply { host: *host, data },
     };
     queue(&m);
 }
@@ -243,18 +284,26 @@ fn deliver(m: &[u8]) {
             let now = Instant::now().as_millis() as u32;
             kvm::with(|e| e.bt_log(text, now));
         }
+        BtMsg::ControlRequest { host, data } => {
+            let now = Instant::now().as_millis() as u32;
+            CONTROL_AT.store(now.max(1), Ordering::Relaxed);
+            kvm::with(|e| e.bt_control(host, data, now));
+        }
         _ => {}
     }
 }
 
 /// Why the link loop ended.
+#[derive(Clone, Copy)]
 enum Exit {
-    /// Another firmware version (on the board's UART the module was told to restart into its ROM bootloader).
+    /// Another firmware version (the module was told to restart into its ROM bootloader).
     Outdated(u32),
     /// No `Hello` in time: blank, a firmware that doesn't come up, or (a dongle) not the module at all.
     Silent,
     /// The link stopped answering.
     Lost,
+    /// The host software streams the module's firmware: a module that was up was told to restart into its ROM.
+    Update { was_up: bool },
 }
 
 /// A frame worth of the message `m`, for the ARQ.
@@ -313,15 +362,23 @@ async fn link_loop<L: Line>(
         }
     }
     push(&mut arq, &BtMsg::Hello { proto: PROTOCOL_VERSION, fw_version: crate::FW_VERSION, role: 0, flags: 0 });
-    // Set once the module on the board runs another version: `EnterRom` is on its way, return once it is acknowledged.
-    let mut leaving: Option<(u32, Instant)> = None;
+    // Set once the module is to go into its ROM (another version, or an update): `EnterRom` is on its way, return once
+    // it is acknowledged.
+    let mut leaving: Option<(Exit, Instant)> = None;
     let mut more = false;
     DEVICES_LIVE.store(0, Ordering::Relaxed);
     loop {
-        if let Some((found, since)) = leaving
+        if let Some((exit, since)) = leaving
             && (!arq.has_pending() || since.elapsed() > Duration::from_millis(300))
         {
-            return Exit::Outdated(found);
+            return exit;
+        }
+        if leaving.is_none() && modstream::WANTED.signaled() {
+            if !up {
+                return Exit::Update { was_up: false };
+            }
+            push(&mut arq, &BtMsg::EnterRom);
+            leaving = Some((Exit::Update { was_up: true }, Instant::now()));
         }
         if !up && leaving.is_none() && silent_after.is_some_and(|t| started.elapsed() > t) {
             return Exit::Silent;
@@ -345,7 +402,8 @@ async fn link_loop<L: Line>(
         }
         // The module had something to say last time: it may have more, so ask again at once.
         if !arq.has_pending() && !more {
-            let idle = if DEVICES_LIVE.load(Ordering::Relaxed) != 0 { KEEPALIVE_DEVICES } else { KEEPALIVE };
+            let busy = DEVICES_LIVE.load(Ordering::Relaxed) != 0 || control_busy();
+            let idle = if busy { KEEPALIVE_DEVICES } else { KEEPALIVE };
             let woke = select4(
                 TO_BT_HI.ready_to_receive(),
                 TO_BT_LO.ready_to_receive(),
@@ -374,10 +432,13 @@ async fn link_loop<L: Line>(
         }
         if let Some(m) = got {
             more = true;
-            if let Ok(BtMsg::Hello { fw_version, role, .. }) = BtMsg::decode(&m) {
+            if let Ok(BtMsg::Hello { fw_version, role, flags, .. }) = BtMsg::decode(&m) {
                 if role != ROLE {
                     continue;
                 }
+                // A firmware from before the chip was in `Hello` was the ESP32-C3's: there was no other.
+                let c = Chip::from_u8(flags & hello_flags::CHIP);
+                set_chip(if c == Chip::Unknown { Chip::Esp32C3 } else { c });
                 let current = check.is_none_or(|want| fw_version == want);
                 on_hello(current);
                 if !current {
@@ -385,7 +446,7 @@ async fn link_loop<L: Line>(
                     // alike: DTR/RTS didn't get a dongle whose firmware runs there reliably (first dongle, 2026-11-14),
                     // and on the board there is no other way.
                     push(&mut arq, &BtMsg::EnterRom);
-                    leaving = Some((fw_version, Instant::now()));
+                    leaving = Some((Exit::Outdated(fw_version), Instant::now()));
                     continue;
                 }
                 check = None;
@@ -409,28 +470,20 @@ pub async fn run(mut uart: BufferedUart, fitted: bool, seed: u8, mut en: Flex<'s
             set_state(State::Absent);
         }
         info!("no Bluetooth module on the board");
-        uart_log!("no Bluetooth module on the board (GPIO29 low): an ESP32-C3 board on a front port can be one");
+        uart_log!("no Bluetooth module on the board (GPIO29 low): an ESP32 board on a front port can be one");
         loop {
             Timer::after_secs(3600).await;
         }
     }
     uart_log!("Bluetooth module fitted");
     set_state(State::Starting);
-    let check = wanted();
-    let mut tries = 0u8;
-    let mut last: Option<Attempt> = None;
     let mut seed = seed;
-    let on_hello = |current: bool| {
-        if current {
-            storage::clear_bt_fails();
-        }
-    };
     loop {
         uart.set_baudrate(BAUD);
-        let exit = link_loop(&mut uart, seed, check, check.map(|_| HELLO_TIMEOUT), &on_hello).await;
+        let exit = link_loop(&mut uart, seed, Some(wanted()), Some(HELLO_TIMEOUT), &|_| {}).await;
         seed = seed.wrapping_add(0x55);
         kvm::with(|e| e.bt_link_down());
-        let in_rom = match exit {
+        match exit {
             Exit::Lost => {
                 // Maybe it restarted with TX low and sits in its ROM: then restart it once more, into its firmware.
                 warn!("Bluetooth module stopped answering");
@@ -446,54 +499,53 @@ pub async fn run(mut uart: BufferedUart, fitted: bool, seed: u8, mut en: Flex<'s
                 continue;
             }
             Exit::Outdated(found) => {
-                info!("Bluetooth module: firmware {=u32:#x}, embedded {:?}", found, check);
-                // It restarts into its ROM on EnterRom.
-                Timer::after_millis(300).await;
-                true
+                info!("Bluetooth module: firmware {=u32:#x}, wanted {=u32:#x}", found, wanted());
+                uart_log!("Bluetooth module runs another firmware: waiting for an update");
             }
-            Exit::Silent => false,
-        };
-        let fails = storage::bt_fails();
-        let next = if check.is_none() { Next::Wait } else { at32prog::next(fails, tries, last) };
-        match next {
-            Next::GiveUp => {
-                warn!("Bluetooth module: {} attempts in a row failed: not programming it again", fails);
-                uart_log!("Bluetooth module: {} attempts in a row failed: GAVE UP, Bluetooth off", fails);
-                park(&mut uart, State::GaveUp).await;
+            Exit::Silent => {
+                uart_log!("Bluetooth module doesn't answer: waiting for an update");
+                // Its chip, from its ROM, for the host software to pick the image; it waits there for the update.
+                if chip() == Chip::Unknown {
+                    catch_in_rom(&mut uart, &mut en).await;
+                    if let Ok(c) = espisp::chip(&mut uart).await {
+                        set_chip(c);
+                    }
+                }
             }
-            Next::Wait => {
-                // Nothing embedded to program with, or programmed but still not answering: the next power-up.
-                warn!("Bluetooth module doesn't run the embedded firmware: Bluetooth off");
-                uart_log!("Bluetooth module: not running the embedded firmware: Bluetooth off until the next power-up");
-                park(&mut uart, State::Failed).await;
-            }
-            Next::Program => {}
+            Exit::Update { .. } => {}
         }
-        tries += 1;
-        // In flash before the attempt: a power loss during it counts too.
-        storage::set_bt_fails(fails + 1).await;
+        if !matches!(exit, Exit::Update { .. }) {
+            // In its ROM (`EnterRom`) or not answering: Bluetooth off until the host software streams this version.
+            set_state(State::NeedsUpdate);
+        }
+        modstream::WANTED.wait().await;
         set_state(State::Programming);
-        uart_log!("Bluetooth module: programming (attempt {} of {})", fails + 1, at32prog::MAX_FAILS);
-        if !in_rom {
-            // Blank or not coming up: hold its BOOT strap (our TX) low across a reset: one by EN where there is one,
-            // else one of those it makes by itself (a ROM that finds no firmware restarts about every 3 s, by its TG0
-            // watchdog; the break lasts 6 s).
+        // It restarts into its ROM on EnterRom; a module that doesn't answer is caught there.
+        Timer::after_millis(300).await;
+        if !espisp::listening(&mut uart).await {
             catch_in_rom(&mut uart, &mut en).await;
         }
+        uart_log!("Bluetooth module: programming");
         let t = Instant::now();
-        match espisp::program(&mut uart, &image()).await {
-            Ok(()) => {
+        match update(&mut uart).await {
+            Ok(done) => {
                 uart_log!("Bluetooth module programmed in {} ms", t.elapsed().as_millis());
-                last = Some(Attempt::NoAnswer);
+                note_done(t.elapsed().as_millis());
+                // An ESP32 is restarted into it by EN, its BOOT strap high on our idle TX.
+                if done == espisp::Done::ResetIt {
+                    reset(&mut en).await;
+                }
             }
             Err(e) => {
                 warn!("Bluetooth module: programming failed: {}", e);
-                uart_log!("Bluetooth module: programming failed");
-                let _ = espisp::leave_rom(&mut uart).await;
-                last = Some(Attempt::TransferFailed);
+                note(e);
+                modstream::fail("programming");
+                if !espisp::leave_rom(&mut uart).await {
+                    reset(&mut en).await;
+                }
             }
         }
-        // The link now sees whether it answers with the embedded firmware (and clears the count if so).
+        // The link now sees whether it answers with this version.
         set_state(State::Starting);
     }
 }
@@ -528,22 +580,13 @@ async fn catch_in_rom(uart: &mut BufferedUart, en: &mut Flex<'static>) {
     }
 }
 
-/// Bluetooth stays off until the next power-up (or `BtRetry`): the module is let out of its ROM, if it is there, and
-/// left alone.
-async fn park(uart: &mut BufferedUart, s: State) -> ! {
-    set_state(s);
-    let _ = espisp::leave_rom(uart).await;
-    loop {
-        Timer::after_secs(3600).await;
-    }
-}
-
-// ── A dongle: an ESP32-C3 board on a front port ─────────────────────────────
+// ── A dongle: an ESP32 board on a front port ─────────────────────────────
 //
-// Every restart of the chip takes it off USB: its own (an erased chip's ROM finds no firmware and restarts every
-// 2.5 s or so, first board 2026-11-14), and the ones the RP2354B makes (DTR/RTS into the ROM, RTS out of it). So a
-// session ends with every restart, and what it found out stays with the board ([`Board`], by its USB serial number):
-// the next session, when it is back, carries on from there.
+// An ESP32-C3's own USB serial port: every restart of the chip takes it off USB: its own (an erased chip's ROM finds no
+// firmware and restarts every 2.5 s or so, first board 2026-11-14), and the ones the RP2354B makes (DTR/RTS into the
+// ROM, RTS out of it). So a session ends with every restart, and what it found out stays with the board ([`Board`],
+// by its USB serial number): the next session, when it is back, carries on from there. A CP210x bridge stays on USB
+// while its ESP32 restarts: the next session starts at once, over the same line ([`Outcome::Again`]).
 
 /// A front port's ESP32-C3 board for [`dongle_task`] (`host.rs`, when the engine wants it found out).
 pub static DONGLE: Channel<CriticalSectionRawMutex, Dongle, 1> = Channel::new();
@@ -566,6 +609,7 @@ mod step {
     pub const ROM_ANSWERS: u32 = 0x7;
     pub const INTO_ROM: u32 = 0x8;
     pub const LINES_FAILED: u32 = 0x9;
+    /// Blank, or adopted (`Request::AdoptModule`): taken from its ROM.
     pub const BLANK: u32 = 0xA;
     pub const DECLINED: u32 = 0xB;
     pub const PROGRAMMING: u32 = 0xC;
@@ -579,15 +623,16 @@ fn step(code: u32) {
     STEPS.store(STEPS.load(Ordering::Relaxed) << 4 | code, Ordering::Relaxed);
 }
 
-/// Restarts the chip into its ROM, and notes whether its DTR/RTS went through.
-/// Lets a board out of its ROM bootloader into its firmware: by the RTC watchdog, or by RTS if the ROM doesn't
-/// answer (RTS from the ROM brought a board back in the ROM, `espisp::watchdog_restart`).
+/// Lets a board out of its ROM bootloader into its firmware. An ESP32-C3's own port: by the RTC watchdog, or by RTS if
+/// the ROM doesn't answer (RTS from the ROM brought a board back in the ROM, `espisp::watchdog_restart`). A bridge's
+/// ESP32: by RTS, its GPIO0 released (it has no FORCE_DOWNLOAD_BOOT to clear).
 async fn out_of_rom(line: &mut crate::dongle::UsbLine) {
-    if espisp::watchdog_restart(line).await.is_err() {
+    if line.kind == DongleKind::Cp210x || espisp::watchdog_restart(line).await.is_err() {
         let _ = line.reset().await;
     }
 }
 
+/// Restarts the chip into its ROM, and notes whether its DTR/RTS went through.
 async fn into_rom(line: &mut crate::dongle::UsbLine) {
     step(step::INTO_ROM);
     if line.restart_into_rom().await.is_err() {
@@ -610,12 +655,8 @@ struct Board {
     rom_misses: u8,
     /// Not the module (another firmware or chip): an ordinary device, also when it comes back from its restart.
     declined_at: Option<Instant>,
-    /// Programming attempts that failed in a row, this session's tries and the last outcome (`at32prog`).
-    fails: u8,
-    tries: u8,
-    last: Option<Attempt>,
-    /// Bluetooth off for this board until the KVM restarts (*Try again*): it is left alone.
-    parked: Option<State>,
+    /// It won't go into its ROM bootloader: it can't be updated, and is left alone until the KVM restarts.
+    parked: bool,
 }
 
 const BOARDS: usize = 4;
@@ -641,10 +682,7 @@ fn board<'a>(boards: &'a mut heapless::Vec<Board, BOARDS>, serial: &String<24>) 
         want_rom: false,
         rom_misses: 0,
         declined_at: None,
-        fails: 0,
-        tries: 0,
-        last: None,
-        parked: None,
+        parked: false,
     });
     let last = boards.len() - 1;
     &mut boards[last]
@@ -655,6 +693,20 @@ enum Outcome {
     Declined,
     /// Unplugged, or off USB for a restart.
     Gone,
+    /// The chip behind a bridge restarted: the next session, over the same line.
+    Again,
+}
+
+/// The chip was just restarted (into its ROM, or its firmware): a bridge's next session starts once the chip is up, an
+/// ESP32-C3's when it is back on USB ([`rejoin`]).
+async fn restarted(kind: DongleKind, index: usize) -> Outcome {
+    match kind {
+        DongleKind::Cp210x => {
+            Timer::after_millis(300).await;
+            Outcome::Again
+        }
+        DongleKind::UsbJtag => rejoin(index).await,
+    }
 }
 
 /// The module as an ESP32-C3 board on a front port, for a KVM without it on the board (core 0).
@@ -667,12 +719,17 @@ pub async fn dongle_task(seed: u8) -> ! {
         let port = d.port;
         // Its port task signals this only once it has handed the board over: one left from the board before is void.
         DONGLE_GONE[port.index()].reset();
-        SESSIONS.fetch_add(1, Ordering::Relaxed);
-        let outcome = match select(serve(&mut d, &boards, seed), DONGLE_GONE[port.index()].wait()).await {
-            Either::First(o) => o,
-            Either::Second(()) => Outcome::Gone,
+        let outcome = loop {
+            SESSIONS.fetch_add(1, Ordering::Relaxed);
+            let o = match select(serve(&mut d, &boards, seed), DONGLE_GONE[port.index()].wait()).await {
+                Either::First(o) => o,
+                Either::Second(()) => Outcome::Gone,
+            };
+            seed = seed.wrapping_add(0x55);
+            if !matches!(o, Outcome::Again) {
+                break o;
+            }
         };
-        seed = seed.wrapping_add(0x55);
         match outcome {
             Outcome::Declined => {
                 uart_log!("port {}: the ESP32 board is not the Bluetooth module: an ordinary device", port.index());
@@ -684,7 +741,7 @@ pub async fn dongle_task(seed: u8) -> ! {
             }
             // Off USB: unplugged, or a restart (it comes back as a new device, and its board record carries on). The
             // engine has it from the port (`port_detached`: Bluetooth absent until a board is the module again).
-            Outcome::Gone => {
+            Outcome::Gone | Outcome::Again => {
                 kvm::with(|e| e.bt_link_down());
                 STATE.store(State::Absent as u8, Ordering::Relaxed);
             }
@@ -708,7 +765,12 @@ async fn serve(d: &mut Dongle, boards: &RefCell<heapless::Vec<Board, BOARDS>>, s
     let Dongle { port, line, serial } = d;
     let port = *port;
     let index = port.index();
-    let check = wanted();
+    let kind = line.kind;
+    // A bridge's UART on, at the link's speed (after the ROM's, from an earlier session).
+    if line.start().await.is_err() {
+        step(step::LINES_FAILED);
+    }
+    let check = Some(wanted());
     let rec = |f: &mut dyn FnMut(&mut Board)| f(board(&mut boards.borrow_mut(), serial));
     let get = |f: &dyn Fn(&Board) -> bool| f(board(&mut boards.borrow_mut(), serial));
     let claim = || {
@@ -723,17 +785,24 @@ async fn serve(d: &mut Dongle, boards: &RefCell<heapless::Vec<Board, BOARDS>>, s
         kvm::with(|e| e.dongle_claimed(port));
     };
 
+    // Asked to make it the module whatever it runs (`Request::AdoptModule`).
+    let adopt = kvm::with(|e| e.dongle_adopt(port));
+    if adopt {
+        rec(&mut |b| {
+            b.declined_at = None;
+            b.parked = false;
+            b.rom_misses = 0;
+        });
+    }
     if get(&|b| b.declined_at.is_some_and(|t| t.elapsed() < DECLINED_FOR)) {
         step(step::DECLINED);
         return Outcome::Declined;
     }
     if get(&|b| b.ours) {
         claim();
-        let mut parked = None;
-        rec(&mut |b| parked = b.parked);
-        if let Some(s) = parked {
+        if get(&|b| b.parked) {
             // Bluetooth off for this board until the KVM restarts: leave it alone.
-            set_state(s);
+            set_state(State::NeedsUpdate);
             return core::future::pending().await;
         }
         step(step::KNOWN);
@@ -757,12 +826,7 @@ async fn serve(d: &mut Dongle, boards: &RefCell<heapless::Vec<Board, BOARDS>>, s
             claim();
             if current {
                 step(step::UP);
-                rec(&mut |b| {
-                    b.fails = 0;
-                    b.tries = 0;
-                    b.last = None;
-                    b.rom_misses = 0;
-                });
+                rec(&mut |b| b.rom_misses = 0);
             }
         };
         let exit = link_loop(line, seed, check, Some(window), &on_hello).await;
@@ -775,16 +839,21 @@ async fn serve(d: &mut Dongle, boards: &RefCell<heapless::Vec<Board, BOARDS>>, s
                 set_state(State::Starting);
                 rec(&mut |b| b.waiting_since = Instant::now());
                 let _ = line.reset().await;
-                return rejoin(index).await;
+                return restarted(kind, index).await;
             }
             Exit::Outdated(found) => {
                 // It restarts into its ROM on EnterRom (DTR/RTS is the way in if it doesn't).
                 step(step::OUTDATED);
-                info!("Bluetooth module (port {}): firmware {=u32:#x}, embedded {:?}", index, found, check);
+                info!("Bluetooth module (port {}): firmware {=u32:#x}, wanted {=u32:#x}", index, found, wanted());
                 rec(&mut |b| b.want_rom = true);
-                return rejoin(index).await;
+                return restarted(kind, index).await;
             }
-            Exit::Silent => step(step::SILENT),
+            Exit::Update { was_up: true } => {
+                // Told to restart into its ROM for the update.
+                rec(&mut |b| b.want_rom = true);
+                return restarted(kind, index).await;
+            }
+            Exit::Silent | Exit::Update { was_up: false } => step(step::SILENT),
         }
     }
 
@@ -805,66 +874,90 @@ async fn serve(d: &mut Dongle, boards: &RefCell<heapless::Vec<Board, BOARDS>>, s
                 rec(&mut |b| b.declined_at = Some(Instant::now()));
                 return Outcome::Declined;
             }
-            rec(&mut |b| b.parked = Some(State::Failed));
-            set_state(State::Failed);
+            rec(&mut |b| b.parked = true);
+            set_state(State::NeedsUpdate);
             return core::future::pending().await;
         }
         into_rom(line).await;
-        return rejoin(index).await;
+        return restarted(kind, index).await;
     }
     step(step::ROM_ANSWERS);
     rec(&mut |b| {
         b.want_rom = false;
         b.rom_misses = 0;
     });
-    if !get(&|b| b.ours) {
-        // Someone's own ESP32 board unless it is a blank ESP32-C3.
-        let blank = has_image() && matches!(espisp::blank_c3(line, &image()).await, Ok(true));
-        if !blank {
+    if !get(&|b| b.ours) && adopt {
+        // Adopted: whatever its flash holds, it is the module now, and waits here for its firmware.
+        match espisp::chip(line).await {
+            Ok(c) => {
+                step(step::BLANK);
+                uart_log!("port {}: adopting the ESP32 board ({}) as the Bluetooth module", index, c.name());
+                set_chip(c);
+                claim();
+            }
+            Err(_) => {
+                // Not a chip the module can be.
+                step(step::DECLINED);
+                rec(&mut |b| b.declined_at = Some(Instant::now()));
+                out_of_rom(line).await;
+                return match kind {
+                    DongleKind::Cp210x => Outcome::Declined,
+                    DongleKind::UsbJtag => rejoin(index).await,
+                };
+            }
+        }
+    } else if !get(&|b| b.ours) {
+        // Someone's own ESP32 board unless it is a blank ESP32-C3 or ESP32 (or adopted, above).
+        let Ok(Some(c)) = espisp::blank(line).await else {
             step(step::DECLINED);
             rec(&mut |b| b.declined_at = Some(Instant::now()));
-            // Back to its own firmware; it comes back as a new device, which is then declined at once.
+            // Back to its own firmware: an ESP32-C3 comes back as a new device, which is then declined at once.
             out_of_rom(line).await;
-            return rejoin(index).await;
-        }
+            return match kind {
+                DongleKind::Cp210x => Outcome::Declined,
+                DongleKind::UsbJtag => rejoin(index).await,
+            };
+        };
         step(step::BLANK);
+        set_chip(c);
         claim();
+    } else if let Ok(c) = espisp::chip(line).await {
+        // The module in its ROM: its chip picks the image.
+        set_chip(c);
     }
 
-    let (mut fails, mut tries, mut last) = (0, 0, None);
-    rec(&mut |b| (fails, tries, last) = (b.fails, b.tries, b.last));
-    let next = if check.is_none() { Next::Wait } else { at32prog::next(fails, tries, last) };
-    if !matches!(next, Next::Program) {
-        let s = if matches!(next, Next::GiveUp) { State::GaveUp } else { State::Failed };
-        uart_log!("Bluetooth module on port {}: not running the embedded firmware: Bluetooth off", index);
-        rec(&mut |b| b.parked = Some(s));
-        set_state(s);
-        out_of_rom(line).await;
-        return rejoin(index).await;
+    // In its ROM: programmed as soon as the host software streams this version's firmware.
+    if !modstream::WANTED.signaled() {
+        uart_log!("Bluetooth module on port {}: runs another firmware, or none: waiting for an update", index);
+        set_state(State::NeedsUpdate);
     }
-    rec(&mut |b| {
-        b.tries += 1;
-        b.fails += 1;
-    });
+    modstream::WANTED.wait().await;
     set_state(State::Programming);
     step(step::PROGRAMMING);
-    uart_log!("Bluetooth module on port {}: programming (attempt {} of {})", index, fails + 1, at32prog::MAX_FAILS);
+    uart_log!("Bluetooth module on port {}: programming", index);
     let t = Instant::now();
     line.programming(true);
-    let result = espisp::program(line, &image()).await;
+    let result = update(line).await;
     line.programming(false);
     step(if result.is_ok() { step::PROGRAMMED } else { step::PROGRAM_FAILED });
     match result {
-        Ok(()) => uart_log!("Bluetooth module on port {} programmed in {} ms", index, t.elapsed().as_millis()),
+        Ok(done) => {
+            uart_log!("Bluetooth module on port {} programmed in {} ms", index, t.elapsed().as_millis());
+            note_done(t.elapsed().as_millis());
+            // An ESP32 behind a bridge: by RTS, with GPIO0 high.
+            if done == espisp::Done::ResetIt {
+                let _ = line.reset().await;
+            }
+        }
         Err(e) => {
             warn!("Bluetooth module (port {}): programming failed: {}", index, e);
-            uart_log!("Bluetooth module on port {}: programming failed", index);
+            note(e);
+            modstream::fail("programming");
         }
     }
     rec(&mut |b| {
-        b.last = Some(if result.is_ok() { Attempt::NoAnswer } else { Attempt::TransferFailed });
         b.waiting_since = Instant::now();
-        // A failed transfer is tried again from the ROM straight away.
+        // After a failed transfer it waits in its ROM for the next one.
         b.want_rom = result.is_err();
     });
     set_state(State::Starting);
@@ -873,5 +966,5 @@ async fn serve(d: &mut Dongle, boards: &RefCell<heapless::Vec<Board, BOARDS>>, s
     if result.is_err() {
         out_of_rom(line).await;
     }
-    rejoin(index).await
+    restarted(kind, index).await
 }

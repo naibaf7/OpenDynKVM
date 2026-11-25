@@ -3,10 +3,11 @@
 use kvm_core::hotkey::{format_spec, parse_spec};
 
 use crate::{fl, i18n};
+use kvm_hid::layouts::Layout;
 use kvm_proto::ctrl::{
     Accel, Advertised, AutoReason, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, DEVICES, Device, DevicePairing,
-    ErrorCode, FaultKind, FwState, HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Host, Hotkey, HotkeyAction,
-    HotkeyBinding, HotkeyKind, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, MAX_PROFILES, Mapping,
+    ErrorCode, FaultKind, FwState, GamepadOut, HOP_CORNER_MAX, HOP_RESISTANCE_MAX, HOP_SPEED, HopState, Host, Hotkey,
+    HotkeyAction, HotkeyBinding, HotkeyKind, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, MAX_PROFILES, Mapping,
     PROFILE_NAME_MAX, Polling, Port, PortMode, PortState, PowerSource, ProfileName, Rgb, Routing, Screen, Speed,
     Status, Supply, SwitchSource, Units, VialMode, class, diag, key,
 };
@@ -23,6 +24,7 @@ pub fn error(c: ErrorCode) -> String {
         ErrorCode::NeedsKeyPress => fl!("err-needs-key-press"),
         ErrorCode::NoDevice => fl!("err-no-device"),
         ErrorCode::NotActive => fl!("err-not-active"),
+        ErrorCode::NotAllowed => fl!("err-not-allowed"),
     }
 }
 
@@ -278,8 +280,7 @@ pub fn bt_module(m: diag::BtModule) -> String {
         diag::BtModule::Up => fl!("bt-module-up"),
         diag::BtModule::Starting => fl!("bt-module-starting"),
         diag::BtModule::Programming => fl!("bt-module-programming"),
-        diag::BtModule::Failed => fl!("bt-module-failed"),
-        diag::BtModule::GaveUp => fl!("bt-module-gave-up"),
+        diag::BtModule::NeedsUpdate => fl!("bt-module-needs-update"),
         diag::BtModule::Absent => fl!("bt-module-absent"),
     }
 }
@@ -304,7 +305,6 @@ pub fn selftest(bits: u32) -> String {
         (AT32_XTAL1, fl!("selftest-at32-xtal1")),
         (AT32_XTAL2, fl!("selftest-at32-xtal2")),
         (BT_FW, fl!("selftest-bt-fw")),
-        (BT_GAVE_UP, fl!("selftest-bt-gave-up")),
     ];
     let failed: Vec<String> = names.into_iter().filter(|(b, _)| bits & b != 0).map(|(_, n)| n).collect();
     match (failed.is_empty(), bits & RUNNING != 0) {
@@ -719,7 +719,7 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("software-switching", key::SW_SWITCH_ALLOWED),
     ("software-config", key::SW_CONFIG_ALLOWED),
     ("vial", key::VIAL),
-    ("keymap", key::KEYMAP),
+    ("gamepad", key::GAMEPAD),
     ("auto-select", key::AUTO_SELECT),
     ("standby-wake", key::STANDBY_WAKE),
     ("standby-glow", key::STANDBY_GLOW),
@@ -730,34 +730,50 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("profile0-modes", key::PROFILE_MODES_BASE),
     ("profile0-routes", key::PROFILE_ROUTES_BASE),
     ("profile0-arrangement", key::PROFILE_ARRANGEMENT_BASE),
+    ("profile0-keymap", key::PROFILE_KEYMAP_BASE),
+    ("profile0-fallback", key::PROFILE_FALLBACK_BASE),
     ("profile1-name", key::PROFILE_NAME_BASE + 1),
     ("profile1-modes", key::PROFILE_MODES_BASE + 1),
     ("profile1-routes", key::PROFILE_ROUTES_BASE + 1),
     ("profile1-arrangement", key::PROFILE_ARRANGEMENT_BASE + 1),
+    ("profile1-keymap", key::PROFILE_KEYMAP_BASE + 1),
+    ("profile1-fallback", key::PROFILE_FALLBACK_BASE + 1),
     ("profile2-name", key::PROFILE_NAME_BASE + 2),
     ("profile2-modes", key::PROFILE_MODES_BASE + 2),
     ("profile2-routes", key::PROFILE_ROUTES_BASE + 2),
     ("profile2-arrangement", key::PROFILE_ARRANGEMENT_BASE + 2),
+    ("profile2-keymap", key::PROFILE_KEYMAP_BASE + 2),
+    ("profile2-fallback", key::PROFILE_FALLBACK_BASE + 2),
     ("profile3-name", key::PROFILE_NAME_BASE + 3),
     ("profile3-modes", key::PROFILE_MODES_BASE + 3),
     ("profile3-routes", key::PROFILE_ROUTES_BASE + 3),
     ("profile3-arrangement", key::PROFILE_ARRANGEMENT_BASE + 3),
+    ("profile3-keymap", key::PROFILE_KEYMAP_BASE + 3),
+    ("profile3-fallback", key::PROFILE_FALLBACK_BASE + 3),
     ("profile4-name", key::PROFILE_NAME_BASE + 4),
     ("profile4-modes", key::PROFILE_MODES_BASE + 4),
     ("profile4-routes", key::PROFILE_ROUTES_BASE + 4),
     ("profile4-arrangement", key::PROFILE_ARRANGEMENT_BASE + 4),
+    ("profile4-keymap", key::PROFILE_KEYMAP_BASE + 4),
+    ("profile4-fallback", key::PROFILE_FALLBACK_BASE + 4),
     ("profile5-name", key::PROFILE_NAME_BASE + 5),
     ("profile5-modes", key::PROFILE_MODES_BASE + 5),
     ("profile5-routes", key::PROFILE_ROUTES_BASE + 5),
     ("profile5-arrangement", key::PROFILE_ARRANGEMENT_BASE + 5),
+    ("profile5-keymap", key::PROFILE_KEYMAP_BASE + 5),
+    ("profile5-fallback", key::PROFILE_FALLBACK_BASE + 5),
     ("profile6-name", key::PROFILE_NAME_BASE + 6),
     ("profile6-modes", key::PROFILE_MODES_BASE + 6),
     ("profile6-routes", key::PROFILE_ROUTES_BASE + 6),
     ("profile6-arrangement", key::PROFILE_ARRANGEMENT_BASE + 6),
+    ("profile6-keymap", key::PROFILE_KEYMAP_BASE + 6),
+    ("profile6-fallback", key::PROFILE_FALLBACK_BASE + 6),
     ("profile7-name", key::PROFILE_NAME_BASE + 7),
     ("profile7-modes", key::PROFILE_MODES_BASE + 7),
     ("profile7-routes", key::PROFILE_ROUTES_BASE + 7),
     ("profile7-arrangement", key::PROFILE_ARRANGEMENT_BASE + 7),
+    ("profile7-keymap", key::PROFILE_KEYMAP_BASE + 7),
+    ("profile7-fallback", key::PROFILE_FALLBACK_BASE + 7),
     ("host1-name", key::BT_NAME_BASE),
     ("host2-name", key::BT_NAME_BASE + 1),
     ("host3-name", key::BT_NAME_BASE + 2),
@@ -766,6 +782,16 @@ pub const CONFIG_NAMES: &[(&str, u16)] = &[
     ("host2-policy", key::BT_POLICY_BASE + 1),
     ("host3-policy", key::BT_POLICY_BASE + 2),
     ("host4-policy", key::BT_POLICY_BASE + 3),
+    ("host1-control", key::BT_CONTROL_BASE),
+    ("host2-control", key::BT_CONTROL_BASE + 1),
+    ("host3-control", key::BT_CONTROL_BASE + 2),
+    ("host4-control", key::BT_CONTROL_BASE + 3),
+    ("layout-pc1", key::LAYOUT_BASE),
+    ("layout-pc2", key::LAYOUT_BASE + 1),
+    ("layout-host1", key::LAYOUT_BASE + 2),
+    ("layout-host2", key::LAYOUT_BASE + 3),
+    ("layout-host3", key::LAYOUT_BASE + 4),
+    ("layout-host4", key::LAYOUT_BASE + 5),
     ("abs-pointer", key::ABS_POINTER),
     ("hop-accel", key::HOP_ACCEL),
     ("hop-speed", key::HOP_SPEED),
@@ -846,7 +872,7 @@ pub fn parse_color(s: &str) -> Result<Rgb, String> {
     Ok(Rgb::new(byte(0)?, byte(2)?, byte(4)?))
 }
 
-fn parse_bool(s: &str) -> Result<bool, String> {
+pub fn parse_bool(s: &str) -> Result<bool, String> {
     match s.to_ascii_lowercase().as_str() {
         "on" | "yes" | "true" | "1" => Ok(true),
         "off" | "no" | "false" | "0" => Ok(false),
@@ -886,8 +912,13 @@ pub fn format_value(v: &ConfigValue) -> String {
         ConfigValue::Hotkey(_, b) => format_binding(b),
         ConfigValue::BtName(_, n) | ConfigValue::ArrangementName(_, n) => n.as_str().into(),
         ConfigValue::BtPolicy(_, p) => p.name().into(),
+        ConfigValue::BtControl(_, b) => on_off(*b),
         ConfigValue::BtPointer(_, p) => p.name().into(),
-        ConfigValue::ProfileArrangement(_, a) => a.map_or("none".into(), |a| a.to_string()),
+        ConfigValue::ProfileArrangement(_, a)
+        | ConfigValue::ProfileKeymap(_, a)
+        | ConfigValue::ProfileFallback(_, a) => a.map_or("none".into(), |a| a.to_string()),
+        ConfigValue::HostLayout(_, l) => Layout::from_u8(*l).unwrap_or_default().name().into(),
+        ConfigValue::Gamepad(g) => gamepad_name(*g).into(),
         ConfigValue::DoubleTapMs(ms) | ConfigValue::LongPressMs(ms) => ms.to_string(),
         ConfigValue::LedBrightness(b) => b.to_string(),
         ConfigValue::ColorPc1(c) | ConfigValue::ColorPc2(c) => color(*c),
@@ -904,7 +935,6 @@ pub fn format_value(v: &ConfigValue) -> String {
         ConfigValue::PowerCycleOnSwitch(b)
         | ConfigValue::SwSwitchAllowed(b)
         | ConfigValue::SwConfigAllowed(b)
-        | ConfigValue::Keymap(b)
         | ConfigValue::AutoSelect(b)
         | ConfigValue::StandbyWake(b)
         | ConfigValue::StandbyGlow(b)
@@ -936,6 +966,9 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
             (k - key::BT_POLICY_BASE) as u8,
             BtPolicy::from_name(s).ok_or_else(|| fl!("parse-one-of", value = s, choices = "stay, on-select"))?,
         ),
+        k if (key::BT_CONTROL_BASE..key::BT_CONTROL_BASE + BT_HOSTS as u16).contains(&k) => {
+            ConfigValue::BtControl((k - key::BT_CONTROL_BASE) as u8, parse_bool(s)?)
+        }
         key::DOUBLE_TAP_MS => ConfigValue::DoubleTapMs(num(1000)? as u16),
         key::LONG_PRESS_MS => ConfigValue::LongPressMs(num(u16::MAX as u32)? as u16),
         key::REMEMBER_PROFILE => ConfigValue::RememberProfile(parse_bool(s)?),
@@ -959,7 +992,12 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
         key::VIAL => ConfigValue::Vial(
             VialMode::from_name(s).ok_or_else(|| fl!("parse-one-of", value = s, choices = "off, on, auto"))?,
         ),
-        key::KEYMAP => ConfigValue::Keymap(parse_bool(s)?),
+        key::GAMEPAD => ConfigValue::Gamepad(
+            [GamepadOut::Off, GamepadOut::Hid, GamepadOut::XInput]
+                .into_iter()
+                .find(|g| gamepad_name(*g) == s)
+                .ok_or_else(|| fl!("parse-one-of", value = s, choices = "off, hid, xinput"))?,
+        ),
         key::AUTO_SELECT => ConfigValue::AutoSelect(parse_bool(s)?),
         key::STANDBY_WAKE => ConfigValue::StandbyWake(parse_bool(s)?),
         key::STANDBY_GLOW => ConfigValue::StandbyGlow(parse_bool(s)?),
@@ -1006,6 +1044,16 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
             BtPointer::from_name(s.trim())
                 .ok_or_else(|| fl!("parse-one-of", value = s, choices = "absolute, relative"))?,
         ),
+        k if let Some(i) = key::profile_of(k, key::PROFILE_KEYMAP_BASE) => {
+            ConfigValue::ProfileKeymap(i, parse_arrangement(s)?)
+        }
+        k if let Some(i) = key::profile_of(k, key::PROFILE_FALLBACK_BASE) => {
+            ConfigValue::ProfileFallback(i, parse_arrangement(s)?)
+        }
+        k if (key::LAYOUT_BASE..key::LAYOUT_BASE + kvm_proto::ctrl::HOSTS as u16).contains(&k) => {
+            let h = Host::from_index((k - key::LAYOUT_BASE) as usize).unwrap_or(Host::Pc1);
+            ConfigValue::HostLayout(h, parse_layout(s)? as u8)
+        }
         k if let Some(i) = key::profile_of(k, key::PROFILE_ARRANGEMENT_BASE) => {
             ConfigValue::ProfileArrangement(i, parse_arrangement(s)?)
         }
@@ -1024,6 +1072,24 @@ pub fn parse_value(k: u16, s: &str) -> Result<ConfigValue, String> {
 }
 
 /// A profile's arrangement: `none` (screen hop off), or its number 0–3.
+/// The virtual gamepad setting's name (`config set gamepad`).
+pub const fn gamepad_name(g: GamepadOut) -> &'static str {
+    match g {
+        GamepadOut::Off => "off",
+        GamepadOut::Hid => "hid",
+        GamepadOut::XInput => "xinput",
+    }
+}
+
+/// An arrangement or keymap: `none` or 0–3.
+/// A host keyboard layout by its name (`us`, `de`, …).
+pub fn parse_layout(s: &str) -> Result<Layout, String> {
+    Layout::from_name(s.trim()).ok_or_else(|| {
+        let names = Layout::ALL.iter().map(|l| l.name()).collect::<Vec<_>>().join(", ");
+        fl!("parse-one-of", value = s, choices = names)
+    })
+}
+
 pub fn parse_arrangement(s: &str) -> Result<Option<u8>, String> {
     match s.trim() {
         "none" => Ok(None),

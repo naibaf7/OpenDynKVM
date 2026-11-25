@@ -1,0 +1,23 @@
+[build]
+target = "xtensa-esp32-none-elf"
+
+[target.xtensa-esp32-none-elf]
+# Normally the RP2354B programs the module (software.md §4.13); on the bench: espflash over the board's bridge.
+runner = "espflash flash --monitor --chip esp32"
+# No `-C force-frame-pointers` (the template's, for backtraces): with frame pointers the Xtensa backend passes a call's
+# stack arguments by moving the stack pointer (`movsp a1, a1-4`, 183 such moves), so the callee ran 4 bytes off the 16
+# its frame layout assumes; with 16-aligned values (u128: the LE stack's keys) it then computed a field's address as
+# `base | 4`, and trouble-host's `SecurityEventData::EnableEncryption` came out as another event: every LE pairing
+# crashed or hung right after its DHKey check (2026-11-25; trouble-host's own pairing example with `legacy-pairing`
+# did the same, and pairs without frame pointers). Without them the backend keeps the arguments in the frame (no moves
+# at all). The panic record's backtrace walks the windowed ABI's save areas, which doesn't need them.
+rustflags = ["-C", "link-arg=-nostartfiles", "-C", "link-arg=-Tlinkall.x"]
+
+[unstable]
+build-std = ["alloc", "core"]
+
+[env]
+ESP_LOG = "info"
+# The canary at the bottom of every task's stack, checked at each task switch: an overrun panics there and says so
+# (the record the next start sends), not later as a jump to wherever the overwritten return address points.
+ESP_RTOS_CONFIG_SW_TASK_OVERFLOW_DETECTION = "true"

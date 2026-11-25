@@ -18,20 +18,20 @@ the same places.
 
 PLA or PETG, 0.4 mm nozzle, 0.2 mm layers, no supports. Print each part the way it lies in its file:
 
-- **Tray:** standing on its floor. The windows in the walls bridge 13 mm at most.
+- **Tray:** standing on its floor. The windows in the walls bridge 14.5 mm at most.
 - **Lid:** flat side down, logo up. For a logo in a second colour: change filament at **2.5 mm** (the logo's first
   layer), or give the part named *logo* its own filament on a multi-material printer. The slicer loads the lid as one
   object with two parts, *lid* and *logo*.
 - **Spacers:** standing; all four are in one file.
 
-Size: 125.1 × 85.7 × 20.1 mm, plus the 0.8 mm logo.
+Size: 127.1 × 85.7 × 21.1 mm, plus the 0.8 mm logo.
 
 ## What else it takes
 
 - 4 × M3 heat-set inserts, M3 × 5.7 mm, 4.6 mm across (the posts have 4.0 mm holes; other inserts: `INSERT_D`,
   `INSERT_L` in `gen_case.py`)
-- 4 × M3 × 18 countersunk screws (ISO 10642 or DIN 7991). M3 × 16 and M3 × 20 fit too: they reach 2.9 and 6.9 mm
-  into the post, against 4.9 mm for the 18 mm screws.
+- 4 × M3 × 20 countersunk screws (ISO 10642 or DIN 7991): they reach 5.9 mm into the post. M3 × 18 reaches only
+  3.9 mm and M3 × 16 1.9 mm, too little for the insert.
 - Optional: four rubber feet.
 
 Without inserts, set `FASTENER = 'tap'` for 2.5 mm pilot holes and self-tapping screws.
@@ -43,7 +43,7 @@ Without inserts, set `FASTENER = 'tap'` for 2.5 mm pilot holes and self-tapping 
    openings.
 3. Put a spacer on each mounting hole.
 4. Lower the lid over the key: the keycap goes through its cutout (19.6 mm, for an 18 mm keycap) and stands about
-   9.5 mm proud of the lid.
+   8.5 mm proud of the lid.
 5. Screw down the four corners, gently: the screws clamp the board between the posts and the spacers.
 
 The small hole left of the logo is over SW501, the bootloader button: a paper clip reaches it ("hold the pinhole

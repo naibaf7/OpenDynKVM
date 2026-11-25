@@ -14,6 +14,10 @@
 //! device slots 1–4: a bond each, their report map, and a connection while they are on. Their input reports go to the
 //! RP2354B as they come ([`BtMsg::DeviceInput`]), which parses them with the map ([`BtMsg::DeviceMap`]) as it does a
 //! front-port device's.
+//!
+//! And it carries the control protocol for a Bluetooth host that may use it ([`control`]): a request a host writes to
+//! the module's control service goes to the RP2354B as [`BtMsg::ControlRequest`], and the answer, or an event, comes
+//! back as [`BtMsg::ControlReply`] for the module to notify.
 
 use super::frame::MAX_MSG;
 use crate::wire::{Reader, WireError, Writer, wire_enum};
@@ -24,6 +28,56 @@ pub const BAUD: u32 = 3_000_000;
 pub const MAX_HOSTS: usize = 4;
 /// `Hello.role` of the coprocessor.
 pub const ROLE: u8 = 3;
+/// The UART speed of a module behind a USB-to-UART bridge on a front port (an ESP32 board's CP2104, which goes to 2
+/// Mbaud): one both the bridge and the ESP32's UART make exactly (48 MHz / 48, 80 MHz / 80). A frame takes 0.72 ms,
+/// less than the USB frame the RP2354B polls the bridge in.
+pub const BRIDGE_BAUD: u32 = 1_000_000;
+
+/// The coprocessor's chip, in `Hello.flags` ([`hello_flags::CHIP`]): which module image is its (`modimage::Header`),
+/// and how its ROM is spoken to. 0: not known (a module that hasn't said `Hello`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[repr(u8)]
+pub enum Chip {
+    #[default]
+    Unknown = 0,
+    /// Bluetooth LE only: the hosts and LE devices.
+    Esp32C3 = 1,
+    /// The original ESP32, dual mode: LE and Classic (gamepads that pair only over Classic).
+    Esp32 = 2,
+}
+
+impl Chip {
+    pub const fn from_u8(v: u8) -> Chip {
+        match v {
+            1 => Chip::Esp32C3,
+            2 => Chip::Esp32,
+            _ => Chip::Unknown,
+        }
+    }
+
+    /// Its name, as the module image files carry it (`kvm-module-<name>.bin`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Chip::Unknown => "unknown",
+            Chip::Esp32C3 => "esp32c3",
+            Chip::Esp32 => "esp32",
+        }
+    }
+}
+
+/// `Hello.flags` of the coprocessor.
+pub mod hello_flags {
+    /// Its [`super::Chip`].
+    pub const CHIP: u8 = 0x0F;
+    /// It is a Bluetooth Classic host too: [`super::BtMsg::Found`] and [`super::DeviceState`] may carry a Classic
+    /// address ([`super::ADDR_CLASSIC`]).
+    pub const CLASSIC: u8 = 1 << 4;
+}
+
+/// The type byte of a Bluetooth Classic (BR/EDR) device's address in [`BtMsg::Found`], [`BtMsg::PairDevice`] and
+/// [`DeviceState::addr`]; LE addresses have 0 (public) or 1 (random).
+pub const ADDR_CLASSIC: u8 = 0x80;
 /// Largest report body after `host` and `id`.
 pub const REPORT_MAX: usize = MAX_MSG - 3;
 /// Device slots on the coprocessor (one bond each).
@@ -61,6 +115,50 @@ pub mod ty {
     pub const DEVICE_MAP: u8 = 0x75;
     pub const FOUND: u8 = 0x76;
     pub const LOG: u8 = 0x77;
+    /// RP → BT: [`super::BtMsg::ControlReply`] for host 1–4, at `CONTROL_REPLY + host − 1`: the host goes in the type,
+    /// so that a whole 64-byte report fits one message.
+    pub const CONTROL_REPLY: u8 = 0x50;
+    /// BT → RP: [`super::BtMsg::ControlRequest`] from host 1–4, at `CONTROL_REQUEST + host − 1`.
+    pub const CONTROL_REQUEST: u8 = 0x78;
+}
+
+/// The control protocol over Bluetooth (software.md §8.1, "Over Bluetooth"): one GATT service of the module's, with a
+/// characteristic a host writes its 64-byte requests to and one that notifies the 64-byte answers and events. Only a
+/// bonded, authenticated host reaches it (the attributes need an authenticated link), and the RP2354B answers it only
+/// while that host may control the KVM (`ctrl::ConfigValue::BtControl`).
+pub mod control {
+    /// The service, 98141409-422d-48a6-aba2-21d691a393cc (random, version 4).
+    pub const SERVICE: &str = "98141409-422d-48a6-aba2-21d691a393cc";
+    /// The requests a host writes (write, and write without response).
+    pub const REQUEST: &str = "98141410-422d-48a6-aba2-21d691a393cc";
+    /// The answers and events (notify).
+    pub const REPLY: &str = "98141411-422d-48a6-aba2-21d691a393cc";
+    /// The service's UUID as it goes on air (least significant byte first), for the advertising data.
+    pub const SERVICE_LE: [u8; 16] = [
+        0xcc, 0x93, 0xa3, 0x91, 0xd6, 0x21, 0xa2, 0xab, 0xa6, 0x48, 0x2d, 0x42, 0x09, 0x14, 0x14, 0x98,
+    ];
+    /// One report each way, as on the PCs' control interface.
+    pub const REPORT_LEN: usize = crate::ctrl::REPORT_LEN;
+    /// The ATT MTU a host's link needs for a whole report in one notification (3 bytes of ATT header).
+    pub const MIN_MTU: u16 = REPORT_LEN as u16 + 3;
+    /// Requests a host may have under way at once (`odkvmctl`'s window over Bluetooth): what the queues on the way
+    /// hold for every host at once.
+    pub const WINDOW: usize = 6;
+
+    /// The report as it goes over the link: without its trailing zeros (most answers are short), which the receiver
+    /// puts back ([`pad`]).
+    pub fn trim(report: &[u8]) -> &[u8] {
+        let n = report.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+        &report[..n.min(REPORT_LEN)]
+    }
+
+    /// A report from the link, zeros put back.
+    pub fn pad(data: &[u8]) -> [u8; REPORT_LEN] {
+        let mut r = [0u8; REPORT_LEN];
+        let n = data.len().min(REPORT_LEN);
+        r[..n].copy_from_slice(&data[..n]);
+        r
+    }
 }
 
 /// The reports a Bluetooth host gets: one HID service whose report map ([`report::MAP`]) every host accepts
@@ -73,6 +171,8 @@ pub mod report {
     pub const CONSUMER: u8 = 3;
     /// The absolute pointer of screen hop (protocol 9), for a host whose pointer is `BtPointer::Absolute`.
     pub const POINTER: u8 = 4;
+    /// The virtual gamepad (hid_mapping.md §6.1), for a host that subscribes to it.
+    pub const GAMEPAD: u8 = 5;
     /// Keyboard: modifiers, reserved, 6 key usages (the boot layout; more than 6 keys → 6 × ErrorRollOver).
     pub const KEYBOARD_LEN: usize = 8;
     /// Mouse: buttons (16 bits), X, Y (16 bits, signed), wheel, pan (8 bits, signed).
@@ -81,12 +181,18 @@ pub mod report {
     pub const CONSUMER_LEN: usize = 2;
     /// Absolute pointer: buttons (16 bits), X, Y (0–32767), wheel, pan (8 bits, signed).
     pub const POINTER_LEN: usize = 8;
+    /// Gamepad: 32 buttons, the hat (low nibble, 8 = centre), X, Y, Z, Rx, Ry, Rz (16 bits, signed; X/Y the left
+    /// stick, Rx/Ry the right one, Z and Rz the triggers).
+    pub const GAMEPAD_LEN: usize = 17;
+    /// The longest input report.
+    pub const INPUT_MAX: usize = GAMEPAD_LEN;
     /// Keyboard output report (LEDs: Num, Caps, Scroll, Compose, Kana).
     pub const LEDS_LEN: usize = 1;
 
-    /// The HID report map (descriptor) of the Bluetooth keyboard and mouse, 229 bytes. The absolute pointer is a
+    /// The HID report map (descriptor) of the Bluetooth keyboard and mouse, 305 bytes. The absolute pointer is a
     /// top-level collection of its own, of usage Pointer rather than Mouse, as on the PCs' USB interface: a host makes
-    /// it a device of its own, and one that takes no absolute pointer leaves it alone.
+    /// it a device of its own, and one that takes no absolute pointer leaves it alone. The gamepad likewise: a host
+    /// that takes none doesn't subscribe to its report, and the KVM sees that (`HostState::reports`).
     #[rustfmt::skip]
     pub const MAP: &[u8] = &[
         // Keyboard, report 1
@@ -114,11 +220,25 @@ pub mod report {
         0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
         0x05, 0x0C, 0x0A, 0x38, 0x02, 0x95, 0x01, 0x81, 0x06,
         0xC0, 0xC0,
+        // Gamepad, report 5: 32 buttons, a hat with a null state, X, Y, Z, Rx, Ry, Rz
+        0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, GAMEPAD,
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x20, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x20, 0x81, 0x02,
+        0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14, 0x75, 0x04, 0x95, 0x01,
+        0x81, 0x42,
+        0x65, 0x00, 0x45, 0x00, 0x81, 0x01,
+        0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x33, 0x09, 0x34, 0x09, 0x35, 0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F,
+        0x75, 0x10, 0x95, 0x06, 0x81, 0x02,
+        0xC0,
     ];
 
     /// The input report IDs and their lengths, in the order of the report map.
-    pub const INPUTS: [(u8, usize); 4] =
-        [(KEYBOARD, KEYBOARD_LEN), (MOUSE, MOUSE_LEN), (CONSUMER, CONSUMER_LEN), (POINTER, POINTER_LEN)];
+    pub const INPUTS: [(u8, usize); 5] = [
+        (KEYBOARD, KEYBOARD_LEN),
+        (MOUSE, MOUSE_LEN),
+        (CONSUMER, CONSUMER_LEN),
+        (POINTER, POINTER_LEN),
+        (GAMEPAD, GAMEPAD_LEN),
+    ];
 
     /// Length of input report `id`, if it is one.
     pub fn input_len(id: u8) -> Option<usize> {
@@ -196,6 +316,9 @@ pub mod host_flags {
     pub const ENCRYPTED: u8 = 1 << 2;
     /// The host enabled notifications of the keyboard input report.
     pub const SUBSCRIBED: u8 = 1 << 3;
+    /// The host enabled notifications of the control service's answers: its host software has a session open
+    /// ([`super::control`]), so the KVM's events go there too. Never kept with the bond: each session subscribes anew.
+    pub const CONTROL: u8 = 1 << 4;
 }
 
 /// `DeviceState.flags` bits.
@@ -235,6 +358,10 @@ pub struct DeviceState {
     /// it doesn't hold this one.
     pub map_len: u16,
     pub map_crc: u32,
+    /// Its USB vendor and product IDs as the module knows them (0, 0: not known), which pick a gamepad's profile
+    /// (`kvm_core::pads`): a Classic pad the module put in the USB form of its reports says the IDs of that form.
+    pub vid: u16,
+    pub pid: u16,
 }
 
 impl DeviceState {
@@ -263,9 +390,29 @@ pub struct HostState {
     pub addr: [u8; 7],
     /// Received signal strength in dBm (0 = unknown).
     pub rssi: i8,
+    /// The input reports the host subscribed to ([`reports`] bits).
+    pub reports: u8,
+}
+
+/// `HostState::reports` bits: the notifications a host switched on.
+pub mod reports {
+    pub const KEYBOARD: u8 = 1 << 0;
+    pub const MOUSE: u8 = 1 << 1;
+    pub const CONSUMER: u8 = 1 << 2;
+    pub const POINTER: u8 = 1 << 3;
+    // Bit 4: the battery level.
+    pub const GAMEPAD: u8 = 1 << 5;
+    /// The bits are the host's own: it was seen writing them. Until then every input report counts as on.
+    pub const KNOWN: u8 = 1 << 7;
+    pub const ALL: u8 = KEYBOARD | MOUSE | CONSUMER | POINTER | GAMEPAD;
 }
 
 impl HostState {
+    /// Whether the host took input report `bit` ([`reports`]): it subscribed, or hasn't said.
+    pub fn takes(&self, bit: u8) -> bool {
+        self.reports & reports::KNOWN == 0 || self.reports & bit != 0
+    }
+
     pub fn bonded(&self) -> bool {
         self.flags & host_flags::BONDED != 0
     }
@@ -336,6 +483,11 @@ pub enum BtMsg<'a> {
     /// BT → RP: a line of the module's log (at most [`LOG_MAX`] bytes), which the RP2354B keeps for
     /// `ctrl::Request::GetModuleLog`: on a dongle the module's own log pin goes nowhere.
     Log { text: &'a str },
+    /// BT → RP: a control-protocol request host 1–4 wrote to the control service ([`control`]), trailing zeros left
+    /// out ([`control::trim`]).
+    ControlRequest { host: u8, data: &'a [u8] },
+    /// RP → BT: the answer to one of host 1–4's requests, or an event for it, to notify; trailing zeros left out.
+    ControlReply { host: u8, data: &'a [u8] },
 }
 
 const PASSKEY_CANCEL: u32 = u32::MAX;
@@ -395,6 +547,7 @@ impl<'a> BtMsg<'a> {
                 w.u16(h.latency)?;
                 w.bytes(&h.addr)?;
                 w.u8(h.rssi as u8)?;
+                w.u8(h.reports)?;
             }
             BtMsg::Event { kind, host, value } => {
                 w.u8(ty::EVENT)?;
@@ -434,6 +587,8 @@ impl<'a> BtMsg<'a> {
                 w.bytes(&d.addr)?;
                 w.u16(d.map_len)?;
                 w.u32(d.map_crc)?;
+                w.u16(d.vid)?;
+                w.u16(d.pid)?;
                 w.lv(&name.as_bytes()[..name.len().min(NAME_MAX)])?;
             }
             BtMsg::DeviceMap { dev, offset, total, data } => {
@@ -456,6 +611,13 @@ impl<'a> BtMsg<'a> {
             BtMsg::Log { text } => {
                 w.u8(ty::LOG)?;
                 w.lv(text.as_bytes())?;
+            }
+            BtMsg::ControlRequest { host, data } | BtMsg::ControlReply { host, data } => {
+                let slot = host.checked_sub(1).filter(|s| (*s as usize) < MAX_HOSTS).ok_or(WireError::Invalid)?;
+                let base = if matches!(self, BtMsg::ControlRequest { .. }) { ty::CONTROL_REQUEST } else { ty::CONTROL_REPLY };
+                let data = control::trim(data);
+                w.u8(base + slot)?;
+                w.bytes(data)?;
             }
         }
         Ok(w.len())
@@ -486,6 +648,7 @@ impl<'a> BtMsg<'a> {
                 latency: r.u16()?,
                 addr: r.array()?,
                 rssi: r.u8()? as i8,
+                reports: r.u8()?,
             }),
             ty::EVENT => BtMsg::Event { kind: r.u8()?.try_into()?, host: r.u8()?, value: r.u32()? },
             ty::SCAN => BtMsg::Scan { on: r.bool()?, seconds: r.u8()? },
@@ -504,6 +667,8 @@ impl<'a> BtMsg<'a> {
                     addr: r.array()?,
                     map_len: r.u16()?,
                     map_crc: r.u32()?,
+                    vid: r.u16()?,
+                    pid: r.u16()?,
                 };
                 BtMsg::Device { state, name: name(&mut r)? }
             }
@@ -511,6 +676,12 @@ impl<'a> BtMsg<'a> {
             ty::LOG => BtMsg::Log { text: name(&mut r)? },
             ty::FOUND => {
                 BtMsg::Found { addr: r.array()?, rssi: r.u8()? as i8, appearance: r.u16()?, name: name(&mut r)? }
+            }
+            t if (ty::CONTROL_REQUEST..ty::CONTROL_REQUEST + MAX_HOSTS as u8).contains(&t) => {
+                BtMsg::ControlRequest { host: t - ty::CONTROL_REQUEST + 1, data: r.rest() }
+            }
+            t if (ty::CONTROL_REPLY..ty::CONTROL_REPLY + MAX_HOSTS as u8).contains(&t) => {
+                BtMsg::ControlReply { host: t - ty::CONTROL_REPLY + 1, data: r.rest() }
             }
             _ => return Err(WireError::Invalid),
         })
@@ -725,6 +896,42 @@ mod tests {
     }
 
     #[test]
+    fn control_reports_fit_one_message_each_way() {
+        // A whole report with no zeros at the end: the host goes in the type, so the 64 bytes fit.
+        let full = [0x5Au8; control::REPORT_LEN];
+        for host in 1..=MAX_HOSTS as u8 {
+            roundtrip(BtMsg::ControlRequest { host, data: &full });
+            roundtrip(BtMsg::ControlReply { host, data: &full });
+        }
+        // Trailing zeros stay off the link and come back with `pad`.
+        let mut short = [0u8; control::REPORT_LEN];
+        short[..3].copy_from_slice(&[0x82, 7, 1]);
+        let mut buf = [0u8; MAX_MSG];
+        let n = BtMsg::ControlReply { host: 2, data: &short }.encode(&mut buf).unwrap();
+        assert_eq!(n, 4);
+        let Ok(BtMsg::ControlReply { host: 2, data }) = BtMsg::decode(&buf[..n]) else { panic!() };
+        assert_eq!(control::pad(data), short);
+        // No host 0 or 5.
+        assert!(BtMsg::ControlRequest { host: 0, data: &short }.encode(&mut buf).is_err());
+        assert!(BtMsg::ControlReply { host: 5, data: &short }.encode(&mut buf).is_err());
+    }
+
+    #[test]
+    fn control_service_uuid_on_air() {
+        let hex: heapless::Vec<u8, 16> = control::SERVICE
+            .split('-')
+            .flat_map(|g| g.as_bytes().chunks(2))
+            .map(|p| u8::from_str_radix(core::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect();
+        let mut le = control::SERVICE_LE;
+        le.reverse();
+        assert_eq!(&le[..], &hex[..]);
+        // The characteristics share the service's UUID but for the first group.
+        assert_eq!(&control::REQUEST[8..], &control::SERVICE[8..]);
+        assert_eq!(&control::REPLY[8..], &control::SERVICE[8..]);
+    }
+
+    #[test]
     fn messages_roundtrip() {
         roundtrip(BtMsg::Hello { proto: 1, fw_version: 0x000100, role: ROLE, flags: 0 });
         roundtrip(BtMsg::Input { host: 2, id: report::KEYBOARD, data: &[2, 0, 4, 0, 0, 0, 0, 0] });
@@ -744,6 +951,7 @@ mod tests {
             latency: 0,
             addr: [1, 2, 3, 4, 5, 6, 7],
             rssi: -60,
+            reports: reports::KNOWN | reports::KEYBOARD,
         }));
         roundtrip(BtMsg::Event { kind: EventKind::PairFailed, host: 2, value: 5 });
         roundtrip(BtMsg::Event { kind: EventKind::SettingsHeld, host: 3, value: 0 });
@@ -764,6 +972,8 @@ mod tests {
             addr: [0, 1, 2, 3, 4, 5, 6],
             map_len: 200,
             map_crc: 0xDEAD_BEEF,
+            vid: 0x054C,
+            pid: 0x0CE6,
         };
         roundtrip(BtMsg::Device { state, name: "Desk keyboard" });
         roundtrip(BtMsg::DeviceMap { dev: 3, offset: 59, total: 200, data: &[0x05; MAP_CHUNK] });
@@ -793,7 +1003,7 @@ mod tests {
     fn map_is_well_formed() {
         // Every collection closed, and the report IDs in the map are the ones `INPUTS` lists.
         let mut depth = 0i32;
-        let mut ids = heapless::Vec::<u8, 4>::new();
+        let mut ids = heapless::Vec::<u8, 5>::new();
         let mut i = 0;
         while i < report::MAP.len() {
             let prefix = report::MAP[i];
@@ -811,9 +1021,12 @@ mod tests {
         }
         assert_eq!(depth, 0);
         assert_eq!(i, report::MAP.len());
-        assert_eq!(ids.as_slice(), &[report::KEYBOARD, report::MOUSE, report::CONSUMER, report::POINTER]);
+        assert_eq!(
+            ids.as_slice(),
+            &[report::KEYBOARD, report::MOUSE, report::CONSUMER, report::POINTER, report::GAMEPAD]
+        );
         assert!(report::MAP.len() <= 512, "a GATT attribute holds at most 512 bytes");
-        assert_eq!(report::MAP.len(), 229, "the length software.md §4.13 gives");
+        assert_eq!(report::MAP.len(), 305, "the length software.md §4.13 gives");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 use heapless::Vec;
 use kvm_hid::translate::ConsumerState;
 use kvm_hid::{KeyState, MouseInput, normalized};
+use kvm_proto::ctrl::GamepadOut;
 
 use crate::hop;
 use crate::presentation::Presentation;
@@ -159,9 +160,18 @@ impl PcOutput {
         (p.nkro.ep_in, report(&normalized::system_report(bits)))
     }
 
+    /// The virtual gamepad's report, on the NKRO interface or the XInput one (None: the PC has no gamepad).
+    pub fn gamepad(&self, pad: &normalized::Pad, p: &Presentation) -> Option<(u8, Report)> {
+        match p.gamepad {
+            GamepadOut::Hid => Some((p.nkro.ep_in, report(&normalized::gamepad_report(pad)))),
+            GamepadOut::XInput => p.xinput.map(|x| (x.ep_in, report(&normalized::xinput_report(pad)))),
+            GamepadOut::Off => None,
+        }
+    }
+
     /// Everything released, on every normalized interface (switching away from this PC): both pointers, where the
     /// absolute one was used, and it stays where it is.
-    pub fn release_all(&mut self, p: &Presentation) -> Vec<(u8, Report), 6> {
+    pub fn release_all(&mut self, p: &Presentation) -> Vec<(u8, Report), 7> {
         let none = KeyState::EMPTY;
         self.held = [0; 2];
         self.rel_sent = 0;
@@ -174,6 +184,9 @@ impl PcOutput {
         }
         let _ = out.push(self.consumer(&ConsumerState::default(), p));
         let _ = out.push(self.system(0, p));
+        if let Some(r) = self.gamepad(&normalized::Pad::default(), p) {
+            let _ = out.push(r);
+        }
         out
     }
 }

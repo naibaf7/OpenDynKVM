@@ -1,0 +1,395 @@
+//! SDP's server side (Core 5.4, Vol 3, Part B), as little as a pad needs. A pad that reconnects to its host opens SDP
+//! (PSM 1) before anything else, and the 5 series hung up within 150 ms when the module refused it (2026-11-25): a
+//! host is expected to answer. Two records, the SDP server's own and a Device ID record (PnP Information, the
+//! module's USB vendor and product), and the three requests answered from them: service search, service attribute,
+//! service search attribute. Without continuation: both records' attributes together are some 100 bytes, and a
+//! smaller byte count asked for gets the attributes that fit.
+
+use heapless::Vec;
+
+/// PDU IDs.
+pub mod pdu {
+    pub const ERROR: u8 = 0x01;
+    pub const SEARCH_REQUEST: u8 = 0x02;
+    pub const SEARCH_RESPONSE: u8 = 0x03;
+    pub const ATTRIBUTE_REQUEST: u8 = 0x04;
+    pub const ATTRIBUTE_RESPONSE: u8 = 0x05;
+    pub const SEARCH_ATTRIBUTE_REQUEST: u8 = 0x06;
+    pub const SEARCH_ATTRIBUTE_RESPONSE: u8 = 0x07;
+}
+
+/// Error codes.
+mod error {
+    pub const INVALID_HANDLE: u16 = 0x0002;
+    pub const INVALID_SYNTAX: u16 = 0x0003;
+}
+
+/// UUIDs (16-bit, on Bluetooth's base UUID).
+mod uuid {
+    pub const SDP: u16 = 0x0001;
+    pub const L2CAP: u16 = 0x0100;
+    pub const SDP_SERVER: u16 = 0x1000;
+    pub const PUBLIC_BROWSE_ROOT: u16 = 0x1002;
+    pub const PNP_INFORMATION: u16 = 0x1200;
+}
+
+/// Record handles.
+const SERVER_HANDLE: u32 = 0x0000_0000;
+const DEVICE_ID_HANDLE: u32 = 0x0001_0000;
+
+/// The biggest answer written: both records whole, with the PDU header.
+pub const MAX_RESPONSE: usize = 160;
+
+/// The server: the Device ID record's values.
+#[derive(Debug, Clone, Copy)]
+pub struct Server {
+    pub vendor: u16,
+    pub product: u16,
+    pub version: u16,
+}
+
+/// A data element, as SDP encodes it.
+enum El<'a> {
+    U16(u16),
+    U32(u32),
+    Bool(bool),
+    Uuid(u16),
+    Seq(&'a [El<'a>]),
+}
+
+impl El<'_> {
+    fn write(&self, out: &mut Vec<u8, MAX_RESPONSE>) -> Option<()> {
+        match self {
+            El::U16(v) => {
+                out.push(0x09).ok()?;
+                out.extend_from_slice(&v.to_be_bytes()).ok()
+            }
+            El::U32(v) => {
+                out.push(0x0A).ok()?;
+                out.extend_from_slice(&v.to_be_bytes()).ok()
+            }
+            El::Bool(v) => out.extend_from_slice(&[0x28, *v as u8]).ok(),
+            El::Uuid(v) => {
+                out.push(0x19).ok()?;
+                out.extend_from_slice(&v.to_be_bytes()).ok()
+            }
+            El::Seq(items) => {
+                let mut inner: Vec<u8, MAX_RESPONSE> = Vec::new();
+                for i in *items {
+                    i.write(&mut inner)?;
+                }
+                // A sequence with an 8-bit length.
+                out.extend_from_slice(&[0x35, inner.len() as u8]).ok()?;
+                out.extend_from_slice(&inner).ok()
+            }
+        }
+    }
+
+    /// Whether `u` is one of this element's UUIDs (at any depth).
+    fn has_uuid(&self, u: u16) -> bool {
+        match self {
+            El::Uuid(v) => *v == u,
+            El::Seq(items) => items.iter().any(|i| i.has_uuid(u)),
+            _ => false,
+        }
+    }
+}
+
+/// The protocol descriptor list of a record served over SDP itself: L2CAP on PSM 1, then SDP.
+const SDP_PROTOCOLS: El<'static> =
+    El::Seq(&[El::Seq(&[El::Uuid(uuid::L2CAP), El::U16(0x0001)]), El::Seq(&[El::Uuid(uuid::SDP)])]);
+const BROWSE: El<'static> = El::Seq(&[El::Uuid(uuid::PUBLIC_BROWSE_ROOT)]);
+
+impl Server {
+    /// The records' handles, and a record's attributes in ascending ID order (as SDP lists them).
+    fn with_record<R>(&self, handle: u32, f: impl FnOnce(&[(u16, El<'_>)]) -> R) -> Option<R> {
+        match handle {
+            SERVER_HANDLE => Some(f(&[
+                (0x0000, El::U32(SERVER_HANDLE)),
+                (0x0001, El::Seq(&[El::Uuid(uuid::SDP_SERVER)])),
+                (0x0004, SDP_PROTOCOLS),
+                (0x0005, BROWSE),
+            ])),
+            DEVICE_ID_HANDLE => Some(f(&[
+                (0x0000, El::U32(DEVICE_ID_HANDLE)),
+                (0x0001, El::Seq(&[El::Uuid(uuid::PNP_INFORMATION)])),
+                (0x0004, SDP_PROTOCOLS),
+                (0x0005, BROWSE),
+                (0x0009, El::Seq(&[El::Seq(&[El::Uuid(uuid::PNP_INFORMATION), El::U16(0x0103)])])),
+                // Specification 1.3, vendor and product, version, the primary record, vendor IDs from USB-IF.
+                (0x0200, El::U16(0x0103)),
+                (0x0201, El::U16(self.vendor)),
+                (0x0202, El::U16(self.product)),
+                (0x0203, El::U16(self.version)),
+                (0x0204, El::Bool(true)),
+                (0x0205, El::U16(0x0002)),
+            ])),
+            _ => None,
+        }
+    }
+
+    const HANDLES: [u32; 2] = [SERVER_HANDLE, DEVICE_ID_HANDLE];
+
+    /// Whether every UUID of `pattern` is in the record (SDP's search).
+    fn matches(&self, handle: u32, pattern: &[u16]) -> bool {
+        self.with_record(handle, |attrs| pattern.iter().all(|u| attrs.iter().any(|(_, v)| v.has_uuid(*u))))
+            .unwrap_or(false)
+    }
+
+    /// The record's attributes in `ranges` as an attribute list (a sequence of ID, value), at most `max` bytes: the
+    /// attributes that fit.
+    fn attribute_list(&self, handle: u32, ranges: &[(u16, u16)], max: usize, out: &mut Vec<u8, MAX_RESPONSE>) {
+        let list = self.with_record(handle, |attrs| {
+            let mut list: Vec<u8, MAX_RESPONSE> = Vec::new();
+            for (id, value) in attrs.iter().filter(|(id, _)| ranges.iter().any(|(a, b)| a <= id && id <= b)) {
+                let mut one: Vec<u8, MAX_RESPONSE> = Vec::new();
+                if El::U16(*id).write(&mut one).is_none() || value.write(&mut one).is_none() {
+                    break;
+                }
+                if 2 + list.len() + one.len() > max || list.extend_from_slice(&one).is_err() {
+                    break;
+                }
+            }
+            list
+        });
+        let list = list.unwrap_or_default();
+        let _ = out.extend_from_slice(&[0x35, list.len() as u8]);
+        let _ = out.extend_from_slice(&list);
+    }
+
+    /// The answer to the request PDU `req`, written to `out`: its length (None if `req` isn't one to answer).
+    pub fn respond(&self, req: &[u8], out: &mut [u8]) -> Option<usize> {
+        let (&id, rest) = req.split_first()?;
+        let tid = [*rest.first()?, *rest.get(1)?];
+        let len = u16::from_be_bytes([*rest.get(2)?, *rest.get(3)?]) as usize;
+        let params = rest.get(4..4 + len)?;
+        let mut body: Vec<u8, MAX_RESPONSE> = Vec::new();
+        let code = match self.answer(id, params, &mut body) {
+            Some(code) => code,
+            None => {
+                body.clear();
+                let _ = body.extend_from_slice(&error::INVALID_SYNTAX.to_be_bytes());
+                pdu::ERROR
+            }
+        };
+        let n = 5 + body.len();
+        let o = out.get_mut(..n)?;
+        o[0] = code;
+        o[1..3].copy_from_slice(&tid);
+        o[3..5].copy_from_slice(&(body.len() as u16).to_be_bytes());
+        o[5..].copy_from_slice(&body);
+        Some(n)
+    }
+
+    /// The response's code and parameters for request `id`; None for a request it can't read.
+    fn answer(&self, id: u8, p: &[u8], body: &mut Vec<u8, MAX_RESPONSE>) -> Option<u8> {
+        match id {
+            pdu::SEARCH_REQUEST => {
+                let (pattern, rest) = uuids(p)?;
+                let max = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+                let found: Vec<u32, 2> =
+                    Self::HANDLES.iter().copied().filter(|h| self.matches(*h, &pattern)).take(max).collect();
+                let count = (found.len() as u16).to_be_bytes();
+                body.extend_from_slice(&count).ok()?;
+                body.extend_from_slice(&count).ok()?;
+                for h in found {
+                    body.extend_from_slice(&h.to_be_bytes()).ok()?;
+                }
+                body.push(0).ok()?;
+                Some(pdu::SEARCH_RESPONSE)
+            }
+            pdu::ATTRIBUTE_REQUEST => {
+                let handle = u32::from_be_bytes(p.get(..4)?.try_into().ok()?);
+                let max = u16::from_be_bytes([*p.get(4)?, *p.get(5)?]) as usize;
+                let (ranges, _) = ranges(p.get(6..)?)?;
+                if self.with_record(handle, |_| ()).is_none() {
+                    body.extend_from_slice(&error::INVALID_HANDLE.to_be_bytes()).ok()?;
+                    return Some(pdu::ERROR);
+                }
+                let mut list: Vec<u8, MAX_RESPONSE> = Vec::new();
+                self.attribute_list(handle, &ranges, max, &mut list);
+                body.extend_from_slice(&(list.len() as u16).to_be_bytes()).ok()?;
+                body.extend_from_slice(&list).ok()?;
+                body.push(0).ok()?;
+                Some(pdu::ATTRIBUTE_RESPONSE)
+            }
+            pdu::SEARCH_ATTRIBUTE_REQUEST => {
+                let (pattern, rest) = uuids(p)?;
+                let max = u16::from_be_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+                let (ranges, _) = ranges(rest.get(2..)?)?;
+                let mut lists: Vec<u8, MAX_RESPONSE> = Vec::new();
+                for h in Self::HANDLES.iter().copied().filter(|h| self.matches(*h, &pattern)) {
+                    let room = max.saturating_sub(2 + lists.len());
+                    let mut one: Vec<u8, MAX_RESPONSE> = Vec::new();
+                    self.attribute_list(h, &ranges, room, &mut one);
+                    if 2 + lists.len() + one.len() > max || lists.extend_from_slice(&one).is_err() {
+                        break;
+                    }
+                }
+                let mut seq: Vec<u8, MAX_RESPONSE> = Vec::new();
+                seq.extend_from_slice(&[0x35, lists.len() as u8]).ok()?;
+                seq.extend_from_slice(&lists).ok()?;
+                body.extend_from_slice(&(seq.len() as u16).to_be_bytes()).ok()?;
+                body.extend_from_slice(&seq).ok()?;
+                body.push(0).ok()?;
+                Some(pdu::SEARCH_ATTRIBUTE_RESPONSE)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A data element sequence's contents and what follows it.
+fn sequence(p: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (&h, rest) = p.split_first()?;
+    if h >> 3 != 6 {
+        return None;
+    }
+    let (len, rest) = match h & 7 {
+        5 => (*rest.first()? as usize, rest.get(1..)?),
+        6 => (u16::from_be_bytes([*rest.first()?, *rest.get(1)?]) as usize, rest.get(2..)?),
+        7 => (u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize, rest.get(4..)?),
+        _ => return None,
+    };
+    Some((rest.get(..len)?, rest.get(len..)?))
+}
+
+/// A service search pattern (a sequence of UUIDs) as 16-bit UUIDs (one of 32 or 128 bits off Bluetooth's base: one
+/// no record has), and what follows it.
+fn uuids(p: &[u8]) -> Option<(Vec<u16, 12>, &[u8])> {
+    let (mut s, rest) = sequence(p)?;
+    let mut out = Vec::new();
+    while let Some((&h, r)) = s.split_first() {
+        let (n, value) = match h {
+            0x19 => (2, u16::from_be_bytes([*r.first()?, *r.get(1)?]) as u32),
+            0x1A => (4, u32::from_be_bytes(r.get(..4)?.try_into().ok()?)),
+            0x1C => {
+                const BASE: [u8; 12] = [0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB];
+                let b = r.get(..16)?;
+                let v = u32::from_be_bytes(b[..4].try_into().ok()?);
+                (16, if b[4..] == BASE { v } else { u32::MAX })
+            }
+            _ => return None,
+        };
+        let _ = out.push(u16::try_from(value).unwrap_or(0xFFFF));
+        s = r.get(n..)?;
+    }
+    Some((out, rest))
+}
+
+/// An attribute ID list (IDs and ranges) as inclusive ranges, and what follows it.
+fn ranges(p: &[u8]) -> Option<(Vec<(u16, u16), 12>, &[u8])> {
+    let (mut s, rest) = sequence(p)?;
+    let mut out = Vec::new();
+    while let Some((&h, r)) = s.split_first() {
+        match h {
+            0x09 => {
+                let id = u16::from_be_bytes([*r.first()?, *r.get(1)?]);
+                let _ = out.push((id, id));
+                s = r.get(2..)?;
+            }
+            0x0A => {
+                let a = u16::from_be_bytes([*r.first()?, *r.get(1)?]);
+                let b = u16::from_be_bytes([*r.get(2)?, *r.get(3)?]);
+                let _ = out.push((a, b));
+                s = r.get(4..)?;
+            }
+            _ => return None,
+        }
+    }
+    Some((out, rest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SERVER: Server = Server { vendor: 0x1209, product: 0x0001, version: 0x0100 };
+
+    fn ask(req: &[u8]) -> std::vec::Vec<u8> {
+        let mut out = [0u8; MAX_RESPONSE];
+        let n = SERVER.respond(req, &mut out).unwrap();
+        out[..n].to_vec()
+    }
+
+    fn request(id: u8, params: &[u8]) -> std::vec::Vec<u8> {
+        let mut v = std::vec![id, 0x00, 0x07];
+        v.extend_from_slice(&(params.len() as u16).to_be_bytes());
+        v.extend_from_slice(params);
+        v
+    }
+
+    #[test]
+    fn a_search_for_pnp_information_finds_the_device_id_record() {
+        // Pattern {0x1200}, at most 16 records, no continuation.
+        let r = ask(&request(pdu::SEARCH_REQUEST, &[0x35, 0x03, 0x19, 0x12, 0x00, 0x00, 0x10, 0x00]));
+        assert_eq!(r, [pdu::SEARCH_RESPONSE, 0x00, 0x07, 0x00, 0x09, 0, 1, 0, 1, 0, 1, 0, 0, 0]);
+        // L2CAP is in both records.
+        let r = ask(&request(pdu::SEARCH_REQUEST, &[0x35, 0x03, 0x19, 0x01, 0x00, 0x00, 0x10, 0x00]));
+        assert_eq!(&r[5..9], &[0, 2, 0, 2]);
+    }
+
+    #[test]
+    fn the_device_id_records_vendor_and_product_are_read() {
+        // Pattern {0x1200}, 0xFFFF bytes, attributes 0x0201–0x0202.
+        let r = ask(&request(
+            pdu::SEARCH_ATTRIBUTE_REQUEST,
+            &[0x35, 0x03, 0x19, 0x12, 0x00, 0xFF, 0xFF, 0x35, 0x05, 0x0A, 0x02, 0x01, 0x02, 0x02, 0x00],
+        ));
+        assert_eq!(r[0], pdu::SEARCH_ATTRIBUTE_RESPONSE);
+        let lists = &r[7..r.len() - 1];
+        assert_eq!(
+            lists,
+            [0x35, 0x0E, 0x35, 0x0C, 0x09, 0x02, 0x01, 0x09, 0x12, 0x09, 0x09, 0x02, 0x02, 0x09, 0x00, 0x01]
+        );
+        assert_eq!(u16::from_be_bytes([r[5], r[6]]) as usize, lists.len());
+        assert_eq!(*r.last().unwrap(), 0, "no continuation");
+    }
+
+    #[test]
+    fn all_attributes_of_both_records_fit_one_response() {
+        // Pattern {L2CAP}, every attribute (0x0000–0xFFFF).
+        let r = ask(&request(
+            pdu::SEARCH_ATTRIBUTE_REQUEST,
+            &[0x35, 0x03, 0x19, 0x01, 0x00, 0x02, 0xA0, 0x35, 0x05, 0x0A, 0x00, 0x00, 0xFF, 0xFF, 0x00],
+        ));
+        assert_eq!(r[0], pdu::SEARCH_ATTRIBUTE_RESPONSE);
+        assert!(r.len() < MAX_RESPONSE);
+        let (lists, rest) = sequence(&r[7..]).unwrap();
+        assert_eq!(rest, [0]);
+        let (first, more) = sequence(lists).unwrap();
+        let (second, none) = sequence(more).unwrap();
+        assert!(none.is_empty() && !first.is_empty() && !second.is_empty());
+    }
+
+    #[test]
+    fn a_record_by_handle_and_what_isnt_there() {
+        // The Device ID record's handle, attribute 0x0001: {0x1200}.
+        let r = ask(&request(
+            pdu::ATTRIBUTE_REQUEST,
+            &[0x00, 0x01, 0x00, 0x00, 0x00, 0x40, 0x35, 0x03, 0x09, 0x00, 0x01, 0x00],
+        ));
+        assert_eq!(&r[5..], &[0x00, 0x0A, 0x35, 0x08, 0x09, 0x00, 0x01, 0x35, 0x03, 0x19, 0x12, 0x00, 0x00]);
+        // No such handle; a request it can't read.
+        let r = ask(&request(pdu::ATTRIBUTE_REQUEST, &[0, 0, 0, 9, 0, 0x40, 0x35, 0x03, 0x09, 0, 1, 0]));
+        assert_eq!(&r[..], &[pdu::ERROR, 0x00, 0x07, 0x00, 0x02, 0x00, 0x02]);
+        let r = ask(&request(0x42, &[]));
+        assert_eq!(r[0], pdu::ERROR);
+        // A search for a UUID no record has: none.
+        let r = ask(&request(pdu::SEARCH_REQUEST, &[0x35, 0x03, 0x19, 0x11, 0x24, 0x00, 0x10, 0x00]));
+        assert_eq!(&r[5..9], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_small_byte_count_gets_the_attributes_that_fit() {
+        // Every attribute of the Device ID record, at most 12 bytes.
+        let r = ask(&request(
+            pdu::ATTRIBUTE_REQUEST,
+            &[0x00, 0x01, 0x00, 0x00, 0x00, 0x0C, 0x35, 0x05, 0x0A, 0x00, 0x00, 0xFF, 0xFF, 0x00],
+        ));
+        let n = u16::from_be_bytes([r[5], r[6]]) as usize;
+        assert!(n <= 12, "{n} bytes");
+        // The record handle (8 bytes with its ID) fits; the class list after it doesn't.
+        assert_eq!(&r[7..7 + n], &[0x35, 0x08, 0x09, 0x00, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x00]);
+    }
+}

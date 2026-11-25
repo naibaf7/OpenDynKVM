@@ -239,9 +239,8 @@ pub fn clock_source(c: ClockSource) -> Grade {
 pub fn bt_module(m: BtModule) -> Grade {
     match m {
         BtModule::Up => Grade::Ok,
-        // Programming takes about 10 s and happens after a firmware update.
-        BtModule::Programming => Grade::Warn,
-        BtModule::Failed | BtModule::GaveUp => Grade::Bad,
+        // Programming takes about 20 s and happens after a firmware update; until then Bluetooth is off.
+        BtModule::Programming | BtModule::NeedsUpdate => Grade::Warn,
         BtModule::Absent | BtModule::Starting => Grade::Info,
     }
 }

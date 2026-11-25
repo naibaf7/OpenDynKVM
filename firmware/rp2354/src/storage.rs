@@ -1,6 +1,6 @@
 //! Config, keymap and macros in the data partition, through the wear-levelled store (software.md §4.8; layout in
-//! [`crate::flash`]), and the counts of failed programming attempts of the AT32F405s (§4.9) and the Bluetooth module
-//! (§4.13), [`kvm_core::at32prog`].
+//! [`crate::flash`]), and the counts of failed programming attempts of the AT32F405s (§4.9),
+//! [`kvm_core::at32prog`].
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
@@ -21,10 +21,6 @@ use crate::kvm;
 /// Failed programming attempts in a row per AT32F405, for the embedded image ([`IMAGE_CRC`]).
 static FAILS: [AtomicU8; 2] = [const { AtomicU8::new(0) }; 2];
 static IMAGE_CRC: AtomicU32 = AtomicU32::new(0);
-/// The same for the Bluetooth module, for its embedded image; [`BT_IMAGE_CRC`] stays 0 without a module (or without
-/// an image), and then its record is never written.
-static BT_FAILS: AtomicU8 = AtomicU8::new(0);
-static BT_IMAGE_CRC: AtomicU32 = AtomicU32::new(0);
 /// Writes of the records asked for and done; the storage task (core 0) does them, as all flash writes.
 static RECORD_ASKED: AtomicU32 = AtomicU32::new(0);
 static RECORD_DONE: AtomicU32 = AtomicU32::new(0);
@@ -34,6 +30,10 @@ const RECORD_WAIT: Duration = Duration::from_secs(2);
 
 /// Mounts the store; returns it with the saved config (defaults if there is none, or no usable store).
 pub fn open() -> (Option<Store>, Config) {
+    if !crate::flash::layout_ours() {
+        warn!("not this firmware's partition table: defaults, nothing is saved");
+        return (None, Config::default());
+    }
     let mut f = DataFlash;
     match Store::mount(&mut f, DATA_SECTORS) {
         Ok(s) => {
@@ -61,7 +61,8 @@ pub fn load_at32_record(store: &Option<Store>, image_crc: u32, forget: bool) {
     IMAGE_CRC.store(image_crc, Ordering::Relaxed);
     let mut buf = [0u8; Record::LEN];
     let saved = store.as_ref().and_then(|s| s.read(&mut DataFlash, at32prog::ITEM, &mut buf));
-    let r = saved.map_or(Record { image_crc, fails: [0; 2] }, |n| Record::decode(&buf[..n.min(Record::LEN)], image_crc));
+    let r =
+        saved.map_or(Record { image_crc, fails: [0; 2] }, |n| Record::decode(&buf[..n.min(Record::LEN)], image_crc));
     let fails = if forget { [0; 2] } else { r.fails };
     for k in 0..2 {
         FAILS[k].store(fails[k], Ordering::Relaxed);
@@ -99,42 +100,6 @@ pub async fn set_at32_fails(k: usize, n: u8) {
     save_records().await;
 }
 
-/// Loads the Bluetooth module's programming record for its embedded image (`image_crc`), as [`load_at32_record`] does;
-/// only when a module is fitted.
-pub fn load_bt_record(store: &Option<Store>, image_crc: u32, forget: bool) {
-    BT_IMAGE_CRC.store(image_crc, Ordering::Relaxed);
-    let mut buf = [0u8; Record::LEN];
-    let saved = store.as_ref().and_then(|s| s.read(&mut DataFlash, at32prog::BT_ITEM, &mut buf));
-    let r = saved.map_or(Record { image_crc, fails: [0; 2] }, |n| Record::decode(&buf[..n.min(Record::LEN)], image_crc));
-    let fails = if forget { 0 } else { r.fails[0] };
-    BT_FAILS.store(fails, Ordering::Relaxed);
-    if fails != 0 {
-        info!("Bluetooth module programming: {} failed attempts in a row so far", fails);
-    }
-    if forget && r.fails[0] != 0 {
-        RECORD_ASKED.fetch_add(1, Ordering::Relaxed);
-        RECORD_SAVE.signal(());
-    }
-}
-
-pub fn bt_fails() -> u8 {
-    BT_FAILS.load(Ordering::Relaxed)
-}
-
-/// Sets the Bluetooth module's count and waits until it is in flash (before an attempt).
-pub async fn set_bt_fails(n: u8) {
-    BT_FAILS.store(n, Ordering::Relaxed);
-    save_records().await;
-}
-
-/// Back to 0 for the Bluetooth module (it answers with the embedded firmware); written without waiting.
-pub fn clear_bt_fails() {
-    if BT_FAILS.swap(0, Ordering::Relaxed) != 0 {
-        RECORD_ASKED.fetch_add(1, Ordering::Relaxed);
-        RECORD_SAVE.signal(());
-    }
-}
-
 /// Back to 0 for AT32F405 `k` (it answers with the embedded firmware); written without waiting.
 pub fn clear_at32_fails(k: usize) {
     if FAILS[k].swap(0, Ordering::Relaxed) != 0 {
@@ -153,15 +118,6 @@ fn write_record(store: &mut Option<Store>) {
         Some(Ok(())) => info!("AT32F405 programming record saved: {}", r),
         Some(Err(e)) => warn!("AT32F405 programming record not saved: {}", e),
         None => {}
-    }
-    let bt_crc = BT_IMAGE_CRC.load(Ordering::Relaxed);
-    if bt_crc != 0 {
-        let r = Record { image_crc: bt_crc, fails: [BT_FAILS.load(Ordering::Relaxed), 0] };
-        match store.as_mut().map(|s| s.write(&mut DataFlash, at32prog::BT_ITEM, &r.encode())) {
-            Some(Ok(())) => info!("Bluetooth module programming record saved: {}", r),
-            Some(Err(e)) => warn!("Bluetooth module programming record not saved: {}", e),
-            None => {}
-        }
     }
     RECORD_DONE.store(asked, Ordering::Relaxed);
 }

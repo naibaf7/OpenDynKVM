@@ -54,10 +54,13 @@ pub mod notify {
     pub const CONSUMER: u8 = 1 << 2;
     pub const POINTER: u8 = 1 << 3;
     // Bit 4: the battery level.
+    pub const GAMEPAD: u8 = 1 << 5;
     /// The bits below are the host's: set once it was seen. Until then the input reports count as on, which is what
-    /// every HID host sets.
+    /// every HID host sets. The same bits as `kvm_proto::link::bt::reports`, which the RP2354B is told.
     pub const KNOWN: u8 = 1 << 7;
-    pub const REPORTS: u8 = KEYBOARD | MOUSE | CONSUMER | POINTER;
+    pub const REPORTS: u8 = KEYBOARD | MOUSE | CONSUMER | POINTER | GAMEPAD;
+    const _: () =
+        assert!(GAMEPAD == kvm_proto::link::bt::reports::GAMEPAD && KNOWN == kvm_proto::link::bt::reports::KNOWN);
 }
 
 impl Slot {

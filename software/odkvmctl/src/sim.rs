@@ -8,9 +8,9 @@
 //!
 //! With `OPENDYN_SIM_BT=1` it is a 0.16.0 board with the Bluetooth module: a tablet in slot 1, connected, and a phone
 //! in slot 2, bonded and away (connect-when-selected). Pairing finds a "Laptop" that asks for a passkey (any six digits
-//! do), selecting the phone connects it after a moment. With `OPENDYN_SIM_BT=gave-up` the module is fitted, but
-//! programming it gave up after 5 attempts; `reboot bt-retry` (the GUI's Try again) acts out programming it, and then
-//! it is up as above. With `OPENDYN_SIM_BT=dongle` the board has no module, and an ESP32-C3 board on the Other port is
+//! do), selecting the phone connects it after a moment. With `OPENDYN_SIM_BT=needs-update` the module is fitted, but
+//! runs another firmware; streaming it the module's (`update --module`, the GUI's *Update the wireless module*) acts
+//! out programming it, and then it is up as above. With `OPENDYN_SIM_BT=dongle` the board has no module, and an ESP32-C3 board on the Other port is
 //! it (software.md §4.13), with the same hosts. Without any of these there is no module, as on most boards.
 //!
 //! With `OPENDYN_SIM_HOP=1` screen hop is set up and on in the first profile: the absolute pointer, PC1 with a
@@ -25,13 +25,12 @@ use heapless::{String as HString, Vec as HVec};
 use kvm_core::bt::BtOut;
 use kvm_core::config::Config;
 use kvm_core::diag::BoardDiag;
-use kvm_core::engine::{Engine, FwOp, KeyEvent, Output, PowerInfo, Probed};
+use kvm_core::engine::{Asker, Engine, FwOp, KeyEvent, Output, PowerInfo, Probed};
 use kvm_core::usbdesc::DeviceDesc;
 use kvm_proto::ctrl::DevicePairing;
 use kvm_proto::ctrl::diag::BtModule;
 use kvm_proto::ctrl::{
-    Advertised, DeviceMsg, ErrorCode, FwState, Info, Pc, Port, PowerSource, REPORT_LEN, RebootTarget, Response, Speed,
-    caps,
+    Advertised, DeviceMsg, ErrorCode, FwState, FwTarget, Info, Pc, Port, PowerSource, REPORT_LEN, Response, Speed, caps,
 };
 use kvm_proto::link::bt::{
     DeviceState, EventKind as BtEvent, HostState, MAP_CHUNK, appearance, device_flags, host_flags,
@@ -39,7 +38,7 @@ use kvm_proto::link::bt::{
 use kvm_proto::link::msg::{Status, UsbSpeed, UsbState};
 use kvm_proto::version_u32;
 
-use crate::transport::{Report, Transport};
+use crate::transport::{Link, Report, Transport};
 
 /// The simulated KVM runs the current firmware on the current board.
 pub const FW_VERSION: u32 = {
@@ -195,6 +194,99 @@ fn device_for(port: Port) -> Probed {
             ),
             &[(0, GAMING_MOUSE), (1, HIDPP)],
         ),
+        Port::Other if sim_pad() == Some(SimPad::Receiver) => probed(
+            0x045E,
+            0x0719,
+            "Simulated",
+            "Wireless receiver (simulated)",
+            // Four pads' interfaces and their headsets', interleaved.
+            config_descriptor(
+                &[
+                    Iface {
+                        class: (0xFF, 0x5D, 0x81),
+                        report_len: None,
+                        eps: &[(0x81, 32, 1), (0x01, 32, 8)],
+                        alt_with_iso: false,
+                    },
+                    Iface {
+                        class: (0xFF, 0x5D, 0x82),
+                        report_len: None,
+                        eps: &[(0x82, 32, 2), (0x02, 32, 4)],
+                        alt_with_iso: false,
+                    },
+                    Iface {
+                        class: (0xFF, 0x5D, 0x81),
+                        report_len: None,
+                        eps: &[(0x83, 32, 1), (0x03, 32, 8)],
+                        alt_with_iso: false,
+                    },
+                    Iface {
+                        class: (0xFF, 0x5D, 0x82),
+                        report_len: None,
+                        eps: &[(0x84, 32, 2), (0x04, 32, 4)],
+                        alt_with_iso: false,
+                    },
+                    Iface {
+                        class: (0xFF, 0x5D, 0x81),
+                        report_len: None,
+                        eps: &[(0x85, 32, 1), (0x05, 32, 8)],
+                        alt_with_iso: false,
+                    },
+                    Iface {
+                        class: (0xFF, 0x5D, 0x82),
+                        report_len: None,
+                        eps: &[(0x86, 32, 2), (0x06, 32, 4)],
+                        alt_with_iso: false,
+                    },
+                    Iface {
+                        class: (0xFF, 0x5D, 0x81),
+                        report_len: None,
+                        eps: &[(0x87, 32, 1), (0x07, 32, 8)],
+                        alt_with_iso: false,
+                    },
+                    Iface {
+                        class: (0xFF, 0x5D, 0x82),
+                        report_len: None,
+                        eps: &[(0x88, 32, 2), (0x08, 32, 4)],
+                        alt_with_iso: false,
+                    },
+                ],
+                260,
+            ),
+            &[],
+        ),
+        Port::Other if sim_pad() == Some(SimPad::Symmetric) => probed(
+            0x054C,
+            0x0CE6,
+            "Simulated",
+            "Gamepad with touch pad (simulated)",
+            config_descriptor(
+                &[Iface {
+                    class: (3, 0, 0),
+                    report_len: Some(SYMMETRIC_PAD.len()),
+                    eps: &[(0x84, 64, 4), (0x03, 64, 4)],
+                    alt_with_iso: false,
+                }],
+                500,
+            ),
+            &[(0, SYMMETRIC_PAD)],
+        ),
+        Port::Other if sim_pad().is_some() => probed(
+            0x0F0D,
+            0x00C1,
+            "Simulated",
+            "Gamepad (simulated)",
+            config_descriptor(
+                &[Iface {
+                    class: (3, 0, 0),
+                    report_len: Some(GAMEPAD.len()),
+                    eps: &[(0x81, 8, 1)],
+                    alt_with_iso: false,
+                }],
+                100,
+            ),
+            &[(0, GAMEPAD)],
+        ),
         // A high-speed device: it answers the device qualifier on Hub-0.
         Port::Other => Probed {
             high_speed: true,
@@ -236,7 +328,8 @@ fn pc_status(cc_mv: u16, vbus_mv: u16, state: UsbState) -> Status {
 }
 
 pub struct SimTransport {
-    engine: Engine,
+    /// On the heap: a fifth of a megabyte, which copied about on the stack overflowed a browser's 1 MB one.
+    engine: Box<Engine>,
     start: Instant,
     last_ms: u32,
     inbox: VecDeque<Report>,
@@ -252,6 +345,11 @@ pub struct SimTransport {
     proto: Option<u8>,
     /// The simulated module's Bluetooth device slots.
     devices: [Option<SimDevice>; 4],
+    /// The module's firmware being streamed (`FwTarget::Module`): its size.
+    module_stream: Option<u32>,
+    /// Who this program is to the simulated KVM: PC1, or wireless host 1 over the module's control service
+    /// (`OPENDYN_SIM_BT=wireless`).
+    asker: Asker,
 }
 
 /// An ESP32-C3 board's USB serial port (303A:1001: IAD, CDC-ACM, CDC data with bulk endpoints, the JTAG interface).
@@ -288,12 +386,57 @@ fn esp_board() -> Probed {
 const BT_READY: u8 = host_flags::BONDED | host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED;
 const DEVICE_READY: u8 = device_flags::BONDED | device_flags::CONNECTED | device_flags::ENCRYPTED | device_flags::READY;
 
+/// A generic gamepad (`OPENDYN_SIM_PAD=1`, on the Other port): 14 buttons, a hat with a null state, X, Y, Z, Rz.
+#[rustfmt::skip]
+const GAMEPAD: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x15, 0x00, 0x25, 0x01, 0x35, 0x00, 0x45, 0x01, 0x75, 0x01, 0x95, 0x0E, 0x05,
+    0x09, 0x19, 0x01, 0x29, 0x0E, 0x81, 0x02, 0x95, 0x02, 0x81, 0x01, 0x05, 0x01, 0x25, 0x07, 0x46, 0x3B, 0x01, 0x75,
+    0x04, 0x95, 0x01, 0x65, 0x14, 0x09, 0x39, 0x81, 0x42, 0x65, 0x00, 0x95, 0x01, 0x81, 0x01, 0x26, 0xFF, 0x00, 0x46,
+    0xFF, 0x00, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02, 0xC0,
+];
+
+/// A symmetric-stick pad with a touch pad (`OPENDYN_SIM_PAD=symmetric`), report 1 as the 5 series lays it out: X Y Z
+/// Rz Rx Ry, a vendor byte, the hat and 15 buttons, vendor data (the touch pad among it).
+#[rustfmt::skip]
+const SYMMETRIC_PAD: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
+    0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xFF, 0x00,
+    0x75, 0x08, 0x95, 0x06, 0x81, 0x02,
+    0x06, 0x00, 0xFF, 0x09, 0x20, 0x95, 0x01, 0x81, 0x02,
+    0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14, 0x75, 0x04,
+    0x95, 0x01, 0x81, 0x42,
+    0x65, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02,
+    0x06, 0x00, 0xFF, 0x09, 0x21, 0x95, 0x0D, 0x81, 0x02,
+    0x06, 0x00, 0xFF, 0x09, 0x22, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x34, 0x81, 0x02,
+    0xC0,
+];
+
+/// The gamepad the simulated KVM has on the Other port instead of the webcam (`OPENDYN_SIM_PAD`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimPad {
+    /// `1`: a generic HID gamepad.
+    Generic,
+    /// `receiver`: an XInput wireless receiver with a pad linked.
+    Receiver,
+    /// `symmetric`: a symmetric-stick pad with a touch pad.
+    Symmetric,
+}
+
+fn sim_pad() -> Option<SimPad> {
+    match crate::env_var("OPENDYN_SIM_PAD").as_deref() {
+        Some("1") => Some(SimPad::Generic),
+        Some("receiver") => Some(SimPad::Receiver),
+        Some("symmetric") => Some(SimPad::Symmetric),
+        _ => None,
+    }
+}
+
 /// A 3-button mouse with X, Y and a wheel (no report IDs), as a simulated Bluetooth mouse's report map.
 #[rustfmt::skip]
 const BT_MOUSE: &[u8] = &[
-    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00,
-    0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30,
-    0x09, 0x31, 0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0xC0, 0xC0,
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x01, 0xA1, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25,
+    0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02, 0x95, 0x01, 0x75, 0x05, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31,
+    0x09, 0x38, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0xC0, 0xC0,
 ];
 
 /// A Bluetooth device the simulated module knows: paired from the start, or one to find while looking.
@@ -341,12 +484,26 @@ fn device_state(slot: u8, d: &SimDevice, flags: u8) -> DeviceState {
         addr: d.addr,
         map_len: d.map.len() as u16,
         map_crc: kvm_proto::crc::crc32(d.map),
+        vid: 0,
+        pid: 0,
     }
 }
 
 fn sim_host(slot: u8, flags: u8) -> HostState {
+    use kvm_proto::link::bt::reports;
     let interval = if flags & host_flags::CONNECTED != 0 { 12 } else { 0 };
-    HostState { host: slot, flags, interval, latency: 0, addr: [1, 0x5A, 0x6E, 0x3B, 0x21, 0xC4, slot], rssi: -52 }
+    // The tablet on host 1 takes no gamepad (its fallback keymap shows), any other host every report.
+    let taken = if slot == 1 { reports::ALL & !reports::GAMEPAD } else { reports::ALL };
+    let reports = if flags & host_flags::CONNECTED != 0 { reports::KNOWN | taken } else { 0 };
+    HostState {
+        host: slot,
+        flags,
+        interval,
+        latency: 0,
+        addr: [1, 0x5A, 0x6E, 0x3B, 0x21, 0xC4, slot],
+        rssi: -52,
+        reports,
+    }
 }
 
 enum Delayed {
@@ -361,8 +518,8 @@ enum Delayed {
     PcsConfigured,
     KeyPress,
     FirmwareDone,
-    /// The Bluetooth module programmed (after `BtRetry`), then saying hello.
-    BtProgrammed,
+    /// The module's stream written and checked (its size), then the module saying hello.
+    ModuleWritten(u32),
     BtUp,
 }
 
@@ -373,14 +530,46 @@ impl Default for SimTransport {
 }
 
 impl SimTransport {
-    /// The simulated KVM, with the Bluetooth module if `OPENDYN_SIM_BT=1`, or a module that gave up with `gave-up`.
+    /// The simulated KVM, with the Bluetooth module if `OPENDYN_SIM_BT=1`, or one that needs an update with
+    /// `needs-update`.
     pub fn new() -> Self {
         match crate::env_var("OPENDYN_SIM_BT").as_deref() {
             Some("1") => Self::with_module(BtModule::Up),
-            Some("gave-up") => Self::with_module(BtModule::GaveUp),
+            Some("wireless") => Self::over_wireless(),
+            Some("needs-update") => Self::with_module(BtModule::NeedsUpdate),
             Some("dongle") => Self::with_dongle(),
             _ => Self::with_module(BtModule::Absent),
         }
+    }
+
+    /// The simulated KVM with its module, reached as wireless host 1 over the module's control service: it may not
+    /// control the KVM until it asks and the (simulated) key is pressed.
+    pub fn over_wireless() -> Self {
+        let mut sim = Self::with_module(BtModule::Up);
+        sim.asker = Asker::Bt(1);
+        if let Some(hosts) = sim.bt.as_mut() {
+            hosts[0].flags |= host_flags::CONTROL;
+            sim.engine.bt_host(hosts[0]);
+        }
+        while sim.engine.poll_output().is_some() {}
+        sim
+    }
+
+    /// An answer of the simulated KVM, for this program to read.
+    fn answer(&mut self, mut resp: Report) -> Result<(), String> {
+        if let (Some(proto), Ok(DeviceMsg::Response { id, request, response: Response::Info(i) })) =
+            (self.proto, DeviceMsg::decode(&resp))
+        {
+            resp = Response::Info(Info { proto, ..i }).encode(request, id).map_err(|e| format!("{e:?}"))?;
+        }
+        // Someone "presses the key" on the simulated KVM when it asks for it.
+        if let Ok(DeviceMsg::Response { response: Response::Error(ErrorCode::NeedsKeyPress), .. }) =
+            DeviceMsg::decode(&resp)
+        {
+            self.later(2500, Delayed::KeyPress);
+        }
+        self.inbox.push_back(resp);
+        Ok(())
     }
 
     /// The simulated KVM without the module on its board, and an ESP32-C3 board on the Other port as the module.
@@ -411,7 +600,8 @@ impl SimTransport {
         Self::with_module(if fitted { BtModule::Up } else { BtModule::Absent })
     }
 
-    /// The simulated KVM with its Bluetooth module `module`: absent, up, or given up (anything else counts as up).
+    /// The simulated KVM with its Bluetooth module `module`: absent, up, or needing an update (anything else counts as
+    /// up).
     pub fn with_module(module: BtModule) -> Self {
         let info = Info {
             proto: kvm_proto::ctrl::PROTOCOL_VERSION,
@@ -419,19 +609,35 @@ impl SimTransport {
             at_fw: [0; 2],
             hw: HW_VERSION,
             serial: *b"SIM00001",
-            caps: caps::MIRRORED | caps::IDENTITY | caps::PASSTHROUGH | caps::FW_UPDATE | caps::VIAL | caps::SIMULATED,
+            caps: caps::MIRRORED
+                | caps::IDENTITY
+                | caps::PASSTHROUGH
+                | caps::FW_UPDATE
+                | caps::BT_UPDATE
+                | caps::VIAL
+                | caps::SIMULATED,
             bt_fw: 0,
         };
-        let mut engine = Engine::new(Config::default(), info, "SIM00001");
+        let mut engine = Box::new(Engine::new(Config::default(), info, "SIM00001"));
         engine.pc_hello(Pc::Pc1, FW_VERSION);
         engine.pc_hello(Pc::Pc2, FW_VERSION);
         engine.pc_status(Pc::Pc1, pc_status(940, 5050, UsbState::Configured));
         engine.pc_status(Pc::Pc2, pc_status(420, 4980, UsbState::Configured));
         engine.set_power(PowerInfo { source: PowerSource::PcBus, adv_pwr: Advertised::None, vbus_pwr_mv: 0 });
-        engine.set_selftest(if module == BtModule::GaveUp { kvm_proto::ctrl::selftest::BT_GAVE_UP } else { 0 });
+        engine.set_selftest(if module == BtModule::NeedsUpdate { kvm_proto::ctrl::selftest::BT_FW } else { 0 });
         engine.set_board_diag(BoardDiag::TYPICAL);
+        if sim_pad().is_some() {
+            use kvm_proto::ctrl::{ConfigValue, Device, GamepadOut, PortMode};
+            let normalized = ConfigValue::Mode(Device::Other, PortMode::Normalized);
+            let _ = engine.set_config(normalized, kvm_core::config::Origin::Device);
+            let _ = engine.set_config(ConfigValue::Gamepad(GamepadOut::Hid), kvm_core::config::Origin::Device);
+        }
         for p in Port::ALL {
             engine.port_attached(*p, &device_for(*p));
+        }
+        // The receiver's pad is linked.
+        if sim_pad() == Some(SimPad::Receiver) {
+            engine.device_report(Port::Other, 0, &[0x08, 0x80], 0);
         }
         if crate::env_var("OPENDYN_SIM_HOP").as_deref() == Some("1") {
             Self::hop_demo(&mut engine);
@@ -439,8 +645,8 @@ impl SimTransport {
         // The simulation starts with everything already enumerated: boot-time outputs are not acted out.
         let bt = match module {
             BtModule::Absent => None,
-            BtModule::GaveUp => {
-                engine.set_bt_module(BtModule::GaveUp);
+            BtModule::NeedsUpdate => {
+                engine.set_bt_module(BtModule::NeedsUpdate);
                 None
             }
             _ => Some(Self::module_up(&mut engine)),
@@ -456,6 +662,8 @@ impl SimTransport {
             dongle: false,
             proto: None,
             devices: [None; 4],
+            module_stream: None,
+            asker: Asker::Pc(Pc::Pc1),
         };
         if sim.bt.is_some() {
             sim.devices_up();
@@ -546,6 +754,13 @@ impl SimTransport {
 
     /// The simulated module acts on what the engine asks of it.
     fn bt_out(&mut self, o: BtOut) {
+        // An answer or event over the control service: this program's, when it is that host.
+        if let BtOut::Control { host, data } = o {
+            if self.asker == Asker::Bt(host) {
+                let _ = self.answer(data);
+            }
+            return;
+        }
         let Some(hosts) = self.bt.as_mut() else { return };
         match o {
             BtOut::Pair { on: true, seconds } => {
@@ -633,7 +848,7 @@ impl SimTransport {
                     }
                 }
             }
-            BtOut::Input { .. } | BtOut::Policy { .. } | BtOut::DeviceOutput { .. } => {}
+            BtOut::Input { .. } | BtOut::Policy { .. } | BtOut::DeviceOutput { .. } | BtOut::Control { .. } => {}
         }
     }
 
@@ -736,7 +951,13 @@ impl SimTransport {
                 }
                 Delayed::KeyPress => self.engine.key(KeyEvent::Tap),
                 Delayed::FirmwareDone => self.engine.set_fw_state(FwState::Done, 0),
-                Delayed::BtProgrammed => self.engine.set_bt_module(BtModule::Starting),
+                Delayed::ModuleWritten(size) => {
+                    self.engine.set_fw_state(FwState::Done, size);
+                    self.engine.set_bt_module(BtModule::Starting);
+                    let bits = self.engine.selftest() & !kvm_proto::ctrl::selftest::BT;
+                    self.engine.set_selftest(bits);
+                    self.later(1500, Delayed::BtUp);
+                }
                 Delayed::BtUp => {
                     self.bt = Some(Self::module_up(&mut self.engine));
                     self.devices_up();
@@ -776,45 +997,56 @@ impl SimTransport {
                     while self.engine.take_save_item(&mut buf).is_some() {}
                     self.engine.config_saved();
                 }
-                Output::Firmware(FwOp::Commit) => self.later(2500, Delayed::KeyPress),
+                // The module's firmware streams through to the module as it comes, and needs no key.
+                Output::Firmware(FwOp::Begin { target, size, .. }) => {
+                    self.module_stream = (target == FwTarget::Module).then_some(size);
+                    if self.module_stream.is_some() {
+                        self.engine.bt_link_down();
+                        self.bt = None;
+                        self.engine.set_bt_module(BtModule::Programming);
+                    }
+                }
+                Output::Firmware(FwOp::Data { offset, data }) => {
+                    if let Some(size) = self.module_stream {
+                        let done = offset + data.len() as u32;
+                        self.engine.set_fw_state(FwState::Receiving, done);
+                        self.engine.set_bt_progress((done as u64 * 100 / size.max(1) as u64) as u8);
+                    }
+                }
+                Output::Firmware(FwOp::Commit) => match self.module_stream.take() {
+                    Some(size) => self.later(1200, Delayed::ModuleWritten(size)),
+                    None => self.later(2500, Delayed::KeyPress),
+                },
                 Output::Firmware(FwOp::Confirm) => self.later(1500, Delayed::FirmwareDone),
                 Output::Bt(b) => self.bt_out(b),
-                // The KVM restarts with the module's count cleared and programs it: acted out without the restart.
-                Output::Reboot(RebootTarget::BtRetry) if self.engine.status(None).bt_module == BtModule::GaveUp => {
-                    let bits = self.engine.selftest() & !kvm_proto::ctrl::selftest::BT;
-                    self.engine.set_selftest(bits);
-                    self.engine.set_bt_module(BtModule::Programming);
-                    self.later(4000, Delayed::BtProgrammed);
-                    self.later(5500, Delayed::BtUp);
-                }
                 _ => {}
             }
         }
     }
 }
 
+#[maybe_async::maybe_async(?Send)]
 impl Transport for SimTransport {
-    fn write(&mut self, report: &Report) -> Result<(), String> {
+    async fn write(&mut self, report: &Report) -> Result<(), String> {
         self.pump();
-        if let Some(mut resp) = self.engine.control(Some(Pc::Pc1), report) {
-            if let (Some(proto), Ok(DeviceMsg::Response { id, request, response: Response::Info(i) })) =
-                (self.proto, DeviceMsg::decode(&resp))
-            {
-                resp = Response::Info(Info { proto, ..i }).encode(request, id).map_err(|e| format!("{e:?}"))?;
+        match self.asker {
+            // Over the module: the answer comes back through it (`bt_out`).
+            Asker::Bt(n) => {
+                let now = self.now();
+                self.engine.bt_control(n, kvm_proto::link::bt::control::trim(report), now);
+                self.drain();
             }
-            // Someone "presses the key" on the simulated KVM when it asks for it.
-            if let Ok(DeviceMsg::Response { response: Response::Error(ErrorCode::NeedsKeyPress), .. }) =
-                DeviceMsg::decode(&resp)
-            {
-                self.later(2500, Delayed::KeyPress);
+            asker => {
+                if let Some(resp) = self.engine.control(asker, report) {
+                    self.answer(resp)?;
+                }
             }
-            self.inbox.push_back(resp);
         }
         self.pump();
         Ok(())
     }
 
-    fn read(&mut self, timeout: Duration) -> Result<Option<Report>, String> {
+    async fn read(&mut self, timeout: Duration) -> Result<Option<Report>, String> {
         let deadline = Instant::now() + timeout;
         loop {
             self.pump();
@@ -825,12 +1057,26 @@ impl Transport for SimTransport {
             if left.is_zero() {
                 return Ok(None);
             }
-            crate::time::sleep(left.min(Duration::from_millis(5)));
+            crate::time::pause(left.min(Duration::from_millis(5))).await;
         }
     }
 
     fn describe(&self) -> String {
         crate::fl!("simulated-kvm")
+    }
+
+    fn link(&self) -> Link {
+        match self.asker {
+            Asker::Bt(_) => Link::Bluetooth,
+            _ => Link::Simulated,
+        }
+    }
+
+    fn window(&self) -> usize {
+        match self.asker {
+            Asker::Bt(_) => kvm_proto::link::bt::control::WINDOW,
+            _ => 1,
+        }
     }
 
     fn simulated_keyboard(&self) -> Option<Sender<[u8; 8]>> {
@@ -882,14 +1128,15 @@ mod tests {
     }
 
     #[test]
-    fn a_module_that_gave_up_is_programmed_again_on_retry() {
-        let mut c = Client::new(Box::new(SimTransport::with_module(BtModule::GaveUp)));
+    fn a_module_that_needs_an_update_gets_it_streamed() {
+        let mut c = Client::new(Box::new(SimTransport::with_module(BtModule::NeedsUpdate)));
         let s = c.snapshot().unwrap();
         assert!(!s.has_bluetooth() && s.bt.is_empty(), "no Bluetooth while the module doesn't run");
-        assert_eq!(s.status.bt_module, BtModule::GaveUp);
-        assert_ne!(s.status.selftest & kvm_proto::ctrl::selftest::BT_GAVE_UP, 0);
-        c.reboot(RebootTarget::BtRetry).unwrap();
-        assert_eq!(c.status().unwrap().bt_module, BtModule::Programming);
+        assert_eq!(s.status.bt_module, BtModule::NeedsUpdate);
+        assert_ne!(s.status.selftest & kvm_proto::ctrl::selftest::BT_FW, 0);
+        let mut seen = Vec::new();
+        c.update_module(&[0x55; 3000], |state, done, _| seen.push((state, done))).unwrap();
+        assert!(seen.contains(&(FwState::Receiving, 3000)) && seen.last() == Some(&(FwState::Done, 3000)), "{seen:?}");
         let deadline = Instant::now() + Duration::from_secs(10);
         while c.status().unwrap().bt_module != BtModule::Up {
             assert!(Instant::now() < deadline, "the module never came up");
@@ -943,9 +1190,10 @@ mod tests {
         assert!(s.device(1).is_some_and(|d| d.ready() && d.name.as_str() == "Desk keyboard"));
         assert_eq!(s.routed_devices(), [Device::Keyboard, Device::Mouse, Device::Other, Device::Wireless1]);
         // The keyboard's report map as the KVM holds it (several pieces), and none for a free slot.
-        let map = c.bt_device_map(1).unwrap();
-        assert!(map.len() > kvm_proto::ctrl::BT_MAP_PIECE && kvm_hid::Layout::parse(&map).is_ok());
-        assert!(c.bt_device_map(3).unwrap().is_empty());
+        let (iface, interfaces, map) = c.device_map(Device::Wireless1, 0).unwrap();
+        assert_eq!((iface, interfaces), (0, 1));
+        assert!(map.len() > kvm_proto::ctrl::MAP_PIECE && kvm_hid::Layout::parse(&map).is_ok());
+        assert!(c.device_map(Device::Wireless3, 0).unwrap().2.is_empty(), "a free slot");
         // The module's log as the KVM keeps it: here its own line about the module's hello.
         assert!(c.module_log().unwrap().contains("the module said hello, firmware"));
         c.bt_scan(true).unwrap();
@@ -1009,10 +1257,99 @@ mod tests {
     }
 
     #[test]
+    fn over_the_wireless_module_the_kvm_waits_for_its_key_then_answers_in_batches() {
+        let mut c = Client::new(Box::new(SimTransport::over_wireless()));
+        assert_eq!(c.link(), crate::transport::Link::Bluetooth);
+        // Its identity, and nothing else until the key allowed it.
+        assert!(c.info_checked().is_ok());
+        assert_eq!(c.snapshot().err(), Some(crate::Error::Device(ErrorCode::NotAllowed)));
+        assert!(!c.request_control().unwrap(), "the KVM waits for its key");
+        // The simulator presses it after a while.
+        c.ask_control(|| {}).unwrap();
+        let s = c.snapshot().unwrap();
+        assert_eq!((s.status.asking_bt(), s.status.asking_pc()), (Some(1), None));
+        assert!(s.config.contains(&ConfigValue::BtControl(0, true)));
+        // A setting goes through, and its event comes back over the module.
+        c.set_config(ConfigValue::DoubleTapMs(450)).unwrap();
+        let ev = c.events(Duration::from_millis(50)).unwrap();
+        assert!(ev.contains(&Event::ConfigChanged(kvm_proto::ctrl::key::DOUBLE_TAP_MS)));
+        // What only USB may do.
+        assert_eq!(c.reboot(kvm_proto::ctrl::RebootTarget::Bootloader), Err(crate::Error::Device(ErrorCode::Unsupported)));
+    }
+
+    /// Over the wireless link the module drops an answer it has no room for (a switch's events came between): a read
+    /// is asked again, and one missed answer is no lost KVM; answers missing in a row are. Until 0.1.53 one was, and
+    /// the window let go of the KVM on a switch (2026-11-24).
+    #[test]
+    fn over_the_wireless_module_a_dropped_answer_is_no_lost_kvm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// The simulator over the wireless link, leaving out the next `drop` answers.
+        struct Lossy {
+            sim: SimTransport,
+            drop: Arc<AtomicUsize>,
+        }
+        impl Transport for Lossy {
+            fn write(&mut self, r: &Report) -> Result<(), String> {
+                self.sim.write(r)
+            }
+            fn read(&mut self, timeout: Duration) -> Result<Option<Report>, String> {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let Some(r) = self.sim.read(left)? else { return Ok(None) };
+                    let answer = matches!(DeviceMsg::decode(&r), Ok(DeviceMsg::Response { .. }));
+                    if answer && self.drop.load(Ordering::SeqCst) > 0 {
+                        self.drop.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    return Ok(Some(r));
+                }
+            }
+            fn describe(&self) -> String {
+                self.sim.describe()
+            }
+            fn link(&self) -> Link {
+                self.sim.link()
+            }
+            fn window(&self) -> usize {
+                self.sim.window()
+            }
+        }
+
+        let drop = Arc::new(AtomicUsize::new(0));
+        let mut c = Client::new(Box::new(Lossy { sim: SimTransport::over_wireless(), drop: drop.clone() }));
+        c.ask_control(|| {}).unwrap();
+        c.timeout = Duration::from_millis(100);
+        // A refresh, one of its answers gone: asked again.
+        drop.store(1, Ordering::SeqCst);
+        assert!(c.snapshot().is_ok());
+        drop.store(1, Ordering::SeqCst);
+        assert!(c.status().is_ok());
+        // A setting's answer gone: it isn't asked again (it did its work), and the KVM is still there.
+        drop.store(1, Ordering::SeqCst);
+        let e = c.set_config(ConfigValue::DoubleTapMs(450)).unwrap_err();
+        assert_eq!(e, crate::Error::Timeout);
+        assert!(!c.lost(&e));
+        assert!(c.status().is_ok());
+        // No answers any more: gone, after a few.
+        drop.store(usize::MAX / 2, Ordering::SeqCst);
+        let e = c.set_config(ConfigValue::DoubleTapMs(400)).unwrap_err();
+        assert!(!c.lost(&e));
+        let e = c.status().unwrap_err();
+        assert!(c.lost(&e), "three missed in a row");
+        // Over USB nothing is lost on the way: a missed answer is a KVM gone.
+        let c = Client::new(Box::new(SimTransport::new()));
+        assert!(c.lost(&crate::Error::Timeout));
+        assert!(!c.lost(&crate::Error::Device(ErrorCode::Busy)));
+    }
+
+    #[test]
     fn simulated_kvm_answers_like_a_real_one() {
         let mut c = Client::new(Box::new(SimTransport::new()));
         let s = c.snapshot().unwrap();
-        assert_eq!(s.status.asking, Some(Pc::Pc1));
+        assert_eq!(s.status.asking_pc(), Some(Pc::Pc1));
         assert_eq!(s.ports[Port::Keyboard.index()].effective, PortMode::Normalized);
         assert_eq!(s.ports[Port::Mouse.index()].effective, PortMode::Normalized, "HID++ alone doesn't force mirroring");
         assert_eq!(s.ports[Port::Other.index()].state, PortState::Passthrough);

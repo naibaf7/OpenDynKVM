@@ -13,6 +13,9 @@
 //!   or one its IRK resolves) and connects at once.
 //! - **Reports:** each input report's notification goes to the RP2354B with its report ID ([`BtMsg::DeviceInput`]);
 //!   output reports (a keyboard's LEDs) come back the other way ([`BtMsg::DeviceOutput`]).
+//! - **Classic devices** (the ESP32's firmware only, [`classic`]): its Classic host keeps its pads in the same slots, a
+//!   Classic address (type [`ADDR_CLASSIC`]) and the link key where an LE device has its LTK; this module's LE side
+//!   leaves those slots alone.
 
 use core::cell::RefCell;
 use core::ops::ControlFlow;
@@ -27,7 +30,7 @@ use embassy_time::{Duration, Instant, Timer, with_timeout};
 use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::DevicePairing;
 use kvm_proto::link::bt::{
-    BtMsg, DeviceState, EventKind, MAP_CHUNK, MAP_MAX, MAX_DEVICES, NAME_MAX, appearance, device_flags,
+    ADDR_CLASSIC, BtMsg, DeviceState, EventKind, MAP_CHUNK, MAP_MAX, MAX_DEVICES, NAME_MAX, appearance, device_flags,
 };
 use trouble_host::prelude::*;
 use trouble_host::scan::Scanner;
@@ -118,10 +121,14 @@ struct Adv {
     len: u8,
 }
 
-/// Takes the stack's advertising reports to the central task.
+/// Takes the stack's advertising reports to the central task, and the controller's packets sent to [`crate::stall`].
 pub struct Handler;
 
 impl EventHandler for Handler {
+    fn on_packets_completed(&self, _num_completed: usize) {
+        crate::stall::sent();
+    }
+
     fn on_adv_reports(&self, reports: LeAdvReportsIter) {
         for r in reports.flatten() {
             let mut data = [0u8; 31];
@@ -168,6 +175,11 @@ fn report(slot: usize) {
                 st.appearance = d.appearance;
                 st.map_len = d.map.len() as u16;
                 st.map_crc = crc32(&d.map);
+                // A Classic pad's reports go in its USB form, whose IDs pick its profile.
+                #[cfg(target_arch = "xtensa")]
+                if is_classic(d) {
+                    (st.vid, st.pid) = (kvm_classic::pad::VID, kvm_classic::pad::PID);
+                }
                 name = d.name.clone();
             }
             None => {
@@ -203,7 +215,7 @@ pub fn start(bonds: &'static mut DeviceBonds, stack: &St) {
     let mut devices = [DeviceState { battery: 0xFF, ..DeviceState::default() }; MAX_DEVICES];
     for (i, d) in devices.iter_mut().enumerate() {
         d.dev = i as u8 + 1;
-        if let Some(b) = &bonds.slots[i] {
+        if let Some(b) = bonds.slots[i].as_ref().filter(|b| !is_classic(b)) {
             let _ = stack.add_bond_information(b.bond());
         }
     }
@@ -234,6 +246,16 @@ pub fn handle(msg: &BtMsg, stack: &'static St) {
                 s.seen.clear();
             });
             event(if on { EventKind::ScanOpen } else { EventKind::ScanClosed }, 0, seconds as u32);
+            #[cfg(target_arch = "xtensa")]
+            crate::classic::ask(crate::classic::Ask::Scan(on));
+            WAKE.signal(());
+        }
+        #[cfg(target_arch = "xtensa")]
+        BtMsg::PairDevice { addr } if addr[0] == ADDR_CLASSIC => {
+            if with(|s| s.scan_until.take().is_some()) {
+                event(EventKind::ScanClosed, 0, 0);
+            }
+            crate::classic::ask(crate::classic::Ask::Pair(addr));
             WAKE.signal(());
         }
         BtMsg::PairDevice { addr } => {
@@ -253,6 +275,8 @@ pub fn handle(msg: &BtMsg, stack: &'static St) {
             // Out of the stack's keys too, or the device would get back in encrypted without pairing.
             crate::ble::tidy_keys(stack);
             for slot in (0..MAX_DEVICES).filter(|&i| picked(i)) {
+                #[cfg(target_arch = "xtensa")]
+                crate::classic::ask(crate::classic::Ask::Drop(slot));
                 DROP[slot].signal(());
                 set_flags(slot, |d| d.flags &= !(device_flags::BONDED | device_flags::READY));
                 report(slot);
@@ -288,6 +312,11 @@ fn send_map(dev: u8) {
     }
 }
 
+/// A Classic device's slot (the ESP32's [`classic`] host keeps it).
+fn is_classic(d: &Device) -> bool {
+    d.address[0] == ADDR_CLASSIC
+}
+
 /// A slot no bond and no connection holds.
 fn free_slot(s: &State) -> Option<usize> {
     (0..MAX_DEVICES).find(|&i| s.bonds.slots[i].is_none() && !s.live[i])
@@ -299,13 +328,13 @@ fn bonded_at(s: &State, addr: &Address) -> Option<usize> {
     (0..MAX_DEVICES).find(|&i| {
         !s.live[i]
             && s.retry_at[i].is_none_or(|t| now >= t)
-            && s.bonds.slots[i].as_ref().is_some_and(|d| d.identity().match_address(addr))
+            && s.bonds.slots[i].as_ref().is_some_and(|d| !is_classic(d) && d.identity().match_address(addr))
     })
 }
 
-/// A device with a bond that isn't connected: the central task watches for it.
+/// An LE device with a bond that isn't connected: the central task watches for it (a Classic one pages the module).
 fn missing(s: &State) -> bool {
-    (0..MAX_DEVICES).any(|i| s.bonds.slots[i].is_some() && !s.live[i])
+    (0..MAX_DEVICES).any(|i| s.bonds.slots[i].as_ref().is_some_and(|d| !is_classic(d)) && !s.live[i])
 }
 
 fn looking(s: &State) -> bool {
@@ -410,6 +439,17 @@ fn address_of(b: &[u8; 7]) -> Address {
     crate::bonds::identity_of(b, None).addr
 }
 
+/// How a reconnection listens for its device: the stack's 1 s windows on the ESP32-C3; on the ESP32, 30 ms every 60 ms
+/// (Bluedroid's fast connection parameters), so that its older controller keeps the hosts' connection events and
+/// a Classic pad's slots in between (2026-11-25: a phone host stuttered while a mouse tried to come back).
+fn reconnect_scan() -> ScanConfig<'static> {
+    if cfg!(target_arch = "xtensa") {
+        ScanConfig { interval: Duration::from_millis(60), window: Duration::from_millis(30), ..Default::default() }
+    } else {
+        ScanConfig::default()
+    }
+}
+
 fn connect_params() -> RequestedConnParams {
     RequestedConnParams {
         min_connection_interval: Duration::from_micros(7_500),
@@ -493,7 +533,7 @@ type Conn = Connection<'static, DefaultPacketPool>;
 async fn reconnect(spawner: Spawner, central: &mut Central, stack: &'static St, slot: usize, addr: Address) {
     let list = [addr];
     let config = ConnectConfig {
-        scan_config: ScanConfig { filter_accept_list: &list, ..Default::default() },
+        scan_config: ScanConfig { filter_accept_list: &list, ..reconnect_scan() },
         connect_params: connect_params(),
     };
     let conn = match with_timeout(Duration::from_secs(3), central.connect(&config)).await {
@@ -664,7 +704,10 @@ const CLIENT_RETRY: Duration = Duration::from_millis(100);
 /// that fails while the device is still connected is tried again: a keyboard waking while a mouse moved lost its
 /// client about 110 ms after it connected, again and again for 20 s, until the mouse was switched off (2026-11-20).
 /// The first failure and the last go to the log, with the stack's packet pool as it is then.
-async fn gatt_client(slot: usize, conn: &Conn, stack: &'static St) -> Option<Client> {
+///
+/// On the heap: a client is 4.7 KB, and each layer it came back through (the timeout's result, this one's) was a copy
+/// on the stack in `connection`'s poll, which with a bond's save on top ran the ESP32's 36 KB stack over (2026-11-25).
+async fn gatt_client(slot: usize, conn: &Conn, stack: &'static St) -> Option<alloc::boxed::Box<Client>> {
     let dev = slot + 1;
     for attempt in 1..=CLIENT_TRIES {
         let e = match with_timeout(SETUP_TIMEOUT, Client::new(stack, conn)).await {
@@ -672,7 +715,7 @@ async fn gatt_client(slot: usize, conn: &Conn, stack: &'static St) -> Option<Cli
                 if attempt > 1 {
                     log::line(format_args!("device {dev}: GATT client at try {attempt}"));
                 }
-                return Some(client);
+                return Some(alloc::boxed::Box::new(client));
             }
             Ok(Err(e)) => e,
             Err(_) => {
@@ -695,7 +738,7 @@ async fn gatt_client(slot: usize, conn: &Conn, stack: &'static St) -> Option<Cli
 }
 
 /// Free packets in the stack's pool, and how many it has: taken until none is left, and given back at once.
-fn free_packets() -> (usize, usize) {
+pub fn free_packets() -> (usize, usize) {
     let mut held: heapless::Vec<<DefaultPacketPool as PacketPool>::Packet, 64> = heapless::Vec::new();
     while let Some(p) = DefaultPacketPool::allocate() {
         if held.push(p).is_err() {
@@ -779,8 +822,18 @@ async fn discover(client: &Client, bond: &BondInformation, addr: &[u8; 7]) -> Op
     Some(d)
 }
 
-#[embassy_executor::task(pool_size = MAX_DEVICES)]
+/// LE device connections at once: one per slot, whatever the other slots hold (a slot takes an LE device or a Classic
+/// pad, and is free for either again once forgotten).
+const LE_CONNS: usize = MAX_DEVICES;
+
+/// A device's connection, its state on the heap while it lasts: on the ESP32 four tasks' worth of it (5 KB each) in
+/// static RAM took the main stack's room, and it held two LE devices at most.
+#[embassy_executor::task(pool_size = LE_CONNS)]
 async fn connection(slot: usize, new: bool, mine: u32, conn: Conn, stack: &'static St) {
+    alloc::boxed::Box::pin(connected(slot, new, mine, conn, stack)).await
+}
+
+async fn connected(slot: usize, new: bool, mine: u32, conn: Conn, stack: &'static St) {
     let dev = slot as u8 + 1;
     log::line(format_args!("device {dev}: connected{}", if new { " (pairing)" } else { "" }));
     let current = || with(|s| s.conn_gen[slot] == mine);
@@ -955,4 +1008,88 @@ fn end(slot: usize, new: bool, mine: u32, conn: &Conn, stack: &'static St, curre
     // A pairing that didn't end in a bond leaves its keys in the stack.
     crate::ble::tidy_keys(stack);
     WAKE.signal(());
+}
+
+/// The device slots as the ESP32's Classic host uses them (`firmware/esp32/src/classic.rs`): its pads' bonds, states
+/// and reports go through here, so that the RP2354B sees them as it sees an LE device's.
+#[cfg(target_arch = "xtensa")]
+pub mod classic {
+    use super::*;
+
+    /// The RP2354B is looking for devices to pair.
+    pub fn looking() -> bool {
+        with(|s| super::looking(s))
+    }
+
+    /// A Classic device answered an inquiry: to the RP2354B, unless it is bonded already.
+    pub fn found(addr: [u8; 7], rssi: i8, appearance: u16, name: &str) {
+        if with(|s| !super::looking(s) || s.bonds.slots.iter().flatten().any(|d| d.address == addr)) {
+            return;
+        }
+        link::send(&BtMsg::Found { addr, rssi, appearance, name });
+    }
+
+    /// The slot of the bonded Classic device at `addr`, and its link key.
+    pub fn bonded(addr: [u8; 7]) -> Option<(usize, [u8; 16])> {
+        with(|s| {
+            let slot = (0..MAX_DEVICES).find(|&i| s.bonds.slots[i].as_ref().is_some_and(|d| d.address == addr))?;
+            Some((slot, s.bonds.slots[slot].as_ref()?.ltk.to_le_bytes()))
+        })
+    }
+
+    /// A free slot for a device being paired, held from now on; None if all are taken.
+    pub fn take_slot() -> Option<usize> {
+        with(|s| {
+            let slot = free_slot(s)?;
+            s.live[slot] = true;
+            Some(slot)
+        })
+    }
+
+    /// A bonded device's slot is in use (it connected).
+    pub fn hold(slot: usize) {
+        with(|s| s.live[slot] = true);
+    }
+
+    /// The pad just paired into `slot`: its bond, with its report map (the USB form's), into flash.
+    pub fn bond(slot: usize, addr: [u8; 7], key: [u8; 16], authenticated: bool, name: &str, appearance: u16) {
+        let d = Device {
+            address: addr,
+            irk: None,
+            ltk: u128::from_le_bytes(key),
+            authenticated,
+            ediv: 0,
+            rand: [0; 8],
+            key_len: 16,
+            appearance,
+            name: kvm_proto::ctrl::bt_device_name(name),
+            battery: (0, 0),
+            reports: heapless::Vec::new(),
+            map: heapless::Vec::from_slice(kvm_classic::pad::DESCRIPTOR).unwrap_or_default(),
+        };
+        with(|s| s.bonds.set_new(slot, d));
+        report(slot);
+    }
+
+    /// Sets and clears `device_flags` of `slot` (sent if they change).
+    pub fn flags(slot: usize, on: u8, off: u8) {
+        set_flags(slot, |d| d.flags = (d.flags & !off) | on);
+    }
+
+    /// The link to `slot`'s device went: the slot is free for its next connection.
+    pub fn release(slot: usize) {
+        with(|s| s.live[slot] = false);
+        set_flags(slot, |d| d.flags &= !(device_flags::CONNECTED | device_flags::ENCRYPTED | device_flags::READY));
+    }
+
+    /// An input report of `slot`'s device (report `id`, without it).
+    pub fn input(slot: usize, id: u8, data: &[u8]) {
+        // A pad's report is its whole state: only the newest waits for the link (`link::send_latest`).
+        link::send_latest(slot as u8 + 1, &BtMsg::DeviceInput { dev: slot as u8 + 1, id, data });
+    }
+
+    /// The pairing's stage, for the RP2354B (None: no slot was free).
+    pub fn stage(p: DevicePairing, slot: Option<usize>) {
+        super::stage(p, slot);
+    }
 }

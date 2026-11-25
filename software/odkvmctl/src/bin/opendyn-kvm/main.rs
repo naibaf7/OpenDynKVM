@@ -11,6 +11,7 @@
 mod bluetooth;
 mod displays;
 mod install;
+mod keymaps;
 mod look;
 mod pages;
 mod screens;
@@ -39,6 +40,8 @@ enum Page {
     Ports,
     Displays,
     Keyboard,
+    /// The mapping editor (hid_mapping.md); only with a KVM.
+    Keymaps,
     Settings,
     Firmware,
     /// Only for a KVM with the Bluetooth module.
@@ -48,13 +51,14 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 8] = [
+    const ALL: [Page; 9] = [
         Page::Overview,
         Page::Ports,
         Page::Bluetooth,
         Page::Displays,
         Page::Screens,
         Page::Keyboard,
+        Page::Keymaps,
         Page::Settings,
         Page::Firmware,
     ];
@@ -64,7 +68,7 @@ impl Page {
     fn shown(self, s: Option<&Snapshot>) -> bool {
         match self {
             Page::Bluetooth => s.is_some_and(|s| s.status.bt_module != kvm_proto::ctrl::diag::BtModule::Absent),
-            Page::Screens => s.is_some(),
+            Page::Screens | Page::Keymaps => s.is_some(),
             _ => true,
         }
     }
@@ -75,6 +79,7 @@ impl Page {
             Page::Ports => fl!("page-ports"),
             Page::Displays => fl!("page-displays"),
             Page::Keyboard => fl!("page-keyboard"),
+            Page::Keymaps => fl!("page-keymaps"),
             Page::Settings => fl!("page-settings"),
             Page::Firmware => fl!("page-firmware"),
             Page::Bluetooth => fl!("page-wireless"),
@@ -89,6 +94,7 @@ impl Page {
             Page::Ports => ("🔌", Color32::from_rgb(245, 166, 35)),
             Page::Displays => ("🖥", Color32::from_rgb(46, 204, 113)),
             Page::Keyboard => ("⌨", Color32::from_rgb(176, 124, 255)),
+            Page::Keymaps => ("🎮", Color32::from_rgb(240, 98, 146)),
             Page::Settings => ("⚙", Color32::from_rgb(154, 165, 177)),
             Page::Firmware => ("⬆", Color32::from_rgb(255, 107, 107)),
             Page::Bluetooth => ("📶", bluetooth::violet()),
@@ -115,6 +121,10 @@ struct App {
     bt_names: [Option<String>; 4],
     /// "Erase all pairings" pressed once: the second press erases them.
     bt_erase_armed: bool,
+    /// The port whose ESP32 board is about to be made the wireless module (its button pressed once).
+    adopt_armed: Option<kvm_proto::ctrl::Port>,
+    /// A wireless host's "may control the KVM" just turned on here: the KVM waits for its key until then.
+    bt_allow_asked: Option<(u8, odkvmctl::time::Instant)>,
     hotkeys_loaded: bool,
     /// The hotkey row being learned from the KVM's keyboard, since when; how learning one last ended (Err: not learned).
     learning: Option<(usize, odkvmctl::time::Instant)>,
@@ -133,6 +143,8 @@ struct App {
     unlock_note: Option<String>,
     /// The firmware file the Firmware page installs.
     fw: install::Files,
+    /// The Keymaps page's state.
+    keymaps: keymaps::Editor,
     /// When the Firmware page last asked for the diagnostics.
     diag_asked: Option<odkvmctl::time::Instant>,
     quitting: bool,
@@ -258,6 +270,8 @@ impl App {
             hidden_page: None,
             bt_names: Default::default(),
             bt_erase_armed: false,
+            adopt_armed: None,
+            bt_allow_asked: None,
             hotkeys_loaded: false,
             learning: None,
             learn_note: None,
@@ -269,6 +283,7 @@ impl App {
             unlock_wait: None,
             unlock_note: None,
             fw: install::Files::new(),
+            keymaps: keymaps::Editor::default(),
             diag_asked: None,
             quitting: false,
             reopen: None,
@@ -486,10 +501,16 @@ impl App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let (snap, device, error, mismatch) = {
+        let (snap, device, error, mismatch, not_allowed) = {
             let sh = self.shared.lock().unwrap();
-            (sh.snap.clone(), sh.device.clone(), sh.error.clone(), sh.mismatch.is_some())
+            (sh.snap.clone(), sh.device.clone(), sh.error.clone(), sh.mismatch.is_some(), sh.not_allowed)
         };
+        // Off the Keymaps page the controls are no longer watched (nor kept from the hosts).
+        if self.page != Page::Keymaps {
+            for cmd in self.keymaps.leave() {
+                self.send(cmd);
+            }
+        }
         let palette = look::palette(ui);
         egui::Panel::left("nav")
             .exact_size(212.0)
@@ -518,12 +539,14 @@ impl App {
             if snap.as_ref().is_some_and(|s| s.info.caps & caps::SIMULATED != 0) {
                 self.sim_banner(ui);
             }
+            #[cfg(target_arch = "wasm32")]
+            self.web_banner(ui);
             if snap.as_ref().is_some_and(|s| s.status.bt_passkey != 0) && self.page != Page::Bluetooth {
                 self.passkey_banner(ui, snap.as_ref().map(|s| &s.status));
             }
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| match (self.page, snap.as_ref()) {
                 (Page::Displays, s) => {
-                    let this_pc = s.and_then(|s| s.status.asking);
+                    let this_pc = s.and_then(|s| s.status.asking_pc());
                     let profiles = displays::profile_rows(s);
                     let hosts = displays::host_rows(s);
                     let wake = self.wake.clone();
@@ -534,10 +557,12 @@ impl App {
                 (Page::Settings, s) => self.settings(ui, s),
                 (Page::Firmware, s) => self.firmware(ui, s),
                 (_, None) if mismatch => self.mismatch(ui),
+                (_, None) if not_allowed.is_some() => self.not_allowed(ui, not_allowed == Some(true)),
                 (_, None) => self.no_kvm(ui),
                 (Page::Overview, Some(s)) => self.overview(ui, s),
                 (Page::Ports, Some(s)) => self.ports(ui, s),
                 (Page::Keyboard, Some(s)) => self.keyboard(ui, s),
+                (Page::Keymaps, Some(s)) => self.keymaps(ui, s),
                 (Page::Bluetooth, Some(s)) => self.bluetooth(ui, s),
                 (Page::Screens, Some(s)) => self.screens(ui, s),
             });
@@ -1240,6 +1265,50 @@ mod tests {
             // The Ports page down to the Other port (OPENDYN_SIM_BT=dongle: the wireless module on it).
             app.page = Page::Ports;
             shot(&mut app, format!("{theme_name}-ports-full.ppm"), 1300);
+            // The mapping editor, each picture whole, a control selected (OPENDYN_SIM_PAD=1: a gamepad on Other).
+            app.page = Page::Keymaps;
+            for (kind, name, sel) in [
+                (keymaps::Kind::Keyboard, "keyboard", Some(0x39)),
+                (keymaps::Kind::Mouse, "mouse", Some(kvm_map::pos::MOUSE + 3)),
+                (keymaps::Kind::Gamepad, "gamepad", Some(kvm_map::pos::PAD)),
+            ] {
+                app.keymaps.show(kind, sel);
+                shot(&mut app, format!("{theme_name}-keymaps-{name}.ppm"), 1500);
+            }
+            // Learning: the banner with its countdown, what is held, how to stop.
+            app.keymaps.learning(true);
+            app.keymaps.show(keymaps::Kind::Keyboard, Some(0x0F));
+            shot(&mut app, format!("{theme_name}-keymaps-learning.ppm"), 1500);
+            app.keymaps.learning(false);
+            // A German PC's keyboard: ISO, its legends.
+            app.set(ConfigValue::HostLayout(kvm_proto::ctrl::Host::Pc1, kvm_hid::layouts::Layout::De as u8));
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            app.keymaps.show(keymaps::Kind::Keyboard, Some(0x1C));
+            shot(&mut app, format!("{theme_name}-keymaps-keyboard-de.ppm"), 1500);
+            app.set(ConfigValue::HostLayout(kvm_proto::ctrl::Host::Pc1, 0));
+            app.keymaps.show(keymaps::Kind::Keyboard, None);
+            // The other sections, with a combo and a tap dance set; the monitor on the mouse, which the simulator moves.
+            let combo = [0x00, 0x74, 0x01, 0x74, 0, 0, 0, 0, 0x29, 0].to_vec();
+            app.send(UiCmd::SetEntry(kvm_map::keymap::Dynamic::Combo, 0, combo));
+            let dance = [0x04, 0, 0xD2, 0, 0, 0, 0, 0, 0, 0].to_vec();
+            app.send(UiCmd::SetEntry(kvm_map::keymap::Dynamic::TapDance, 0, dance));
+            app.send(UiCmd::Monitor(kvm_proto::ctrl::Device::Mouse, true));
+            for (sec, name) in [
+                (keymaps::Section::Macros, "macros"),
+                (keymaps::Section::Dances, "dances"),
+                (keymaps::Section::Combos, "combos"),
+                (keymaps::Section::Overrides, "overrides"),
+                (keymaps::Section::Repeats, "repeats"),
+                (keymaps::Section::Settings, "settings"),
+                (keymaps::Section::Monitor, "monitor"),
+                (keymaps::Section::Hosts, "hosts"),
+            ] {
+                app.keymaps.section(sec, Some(kvm_proto::ctrl::Device::Mouse));
+                shot(&mut app, format!("{theme_name}-keymaps-{name}.ppm"), 1300);
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                shot(&mut app, format!("{theme_name}-keymaps-{name}.ppm"), 1300);
+            }
+            app.keymaps.section(keymaps::Section::Layers, None);
             // The "are you sure" before a software lock.
             app.page = Page::Settings;
             app.confirm_lock = Some(ConfigValue::SwConfigAllowed(false));

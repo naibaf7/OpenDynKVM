@@ -7,16 +7,19 @@ use heapless::{Deque, String, Vec};
 use kvm_hid::neutral::neutral_report;
 use kvm_hid::parser::ReportType;
 use kvm_hid::translate::{ConsumerState, caps};
-use kvm_hid::{KeyState, Layout, MouseInput, Translator};
+use kvm_hid::{KeyState, Layout, MouseInput, Translator, normalized};
 use kvm_proto::crc::crc32;
 use kvm_proto::ctrl::diag::{self as cdiag, BtModule, ClockSource, Grade, Item, id};
 use kvm_proto::ctrl::{
     self, Advertised, AutoReason, BtPointer, ConfigValue, DEVICES, Device, DevicePairing, ErrorCode, Event, FaultKind,
-    FwState, HOSTS, HopState, Host, Hotkey, HotkeyAction, Info, KeyAction, LearnEnd, LinkState, MAX_ARRANGEMENTS, Pc,
-    Port, PortInfo, PortMode, PortState, PowerSource, RebootTarget, Request, Response, Routing, Speed, StringKind,
-    SwitchSource, Target, VialMode, status_flags,
+    FwState, FwTarget, GamepadOut, HOSTS, HopState, Host, Hotkey, HotkeyAction, Info, KeyAction, LearnEnd, LinkState,
+    MAX_ARRANGEMENTS, Pc, Port, PortInfo, PortMode, PortState, PowerSource, RebootTarget, Request, Response, Routing,
+    Speed, StringKind, SwitchSource, Target, VialMode, status_flags,
 };
-use kvm_proto::link::bt::{DeviceState, EventKind as BtEventKind, HostState as BtHostState, report as btreport};
+use kvm_proto::link::bt::{
+    DeviceState, EventKind as BtEventKind, HostState as BtHostState, control as btcontrol, host_flags as bthost,
+    report as btreport, reports as btreports,
+};
 use kvm_proto::link::msg::{Status as AtStatus, UsbSpeed, UsbState};
 
 use crate::bt::{self, BtOut, BtState, Devices, PasskeyStep};
@@ -38,7 +41,7 @@ pub const MAX_HID_IFACES: usize = 4;
 pub const MAX_CTRL_DATA: usize = 256;
 pub const OUTPUT_QUEUE: usize = 48;
 /// Largest item [`Engine::take_save_item`] produces.
-pub const SAVE_ITEM_MAX: usize = kvm_vial::keymap::MACRO_BUFFER;
+pub const SAVE_ITEM_MAX: usize = kvm_map::keymap::MACRO_BUFFER;
 /// Electronics' own draw, subtracted from the advertised current for the budget (information only: the warning comes
 /// from the measured 5 V, `supply`). design.md §6 estimated about 0.5 A before the board existed; the
 /// first board took under 1 W from the PWR port in every state, its front devices included (2026-11-17): under 200 mA.
@@ -52,8 +55,8 @@ const AUTOSAVE_MS: u32 = 5000;
 /// Flash wear cap (the `store` module documentation has the numbers): saves go ahead as they come up to `SAVE_BURST`
 /// in a row, then at most one per `SAVE_PACE_MS`, which is also how fast the allowance comes back. Setting the KVM up
 /// never meets it. A host script that changes, or changes and saves, the config every few seconds, day and night, is
-/// held to one save a minute: 1 440 a day, about 14 years before a sector reaches its rated erases with the config at
-/// its largest. Unpaced, a change every 6 s would take under two years, and `SaveConfig` in a loop days.
+/// held to one save a minute: 1 440 a day, about 50 years before a sector reaches its rated erases with the config at
+/// its largest. Unpaced, a change every 6 s would take about five years, and `SaveConfig` in a loop days.
 const SAVE_BURST: u8 = 30;
 const SAVE_PACE_MS: u32 = 60_000;
 
@@ -111,10 +114,43 @@ pub enum KeyEvent {
     Long,
 }
 
+/// Who sent a control-protocol request (software.md §8.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Asker {
+    /// The service port, or the simulator's own tests: no PC of its own.
+    Service,
+    /// A PC's control interface.
+    Pc(Pc),
+    /// Bluetooth host slot 1–4, over the module's control service.
+    Bt(u8),
+}
+
+impl Asker {
+    /// The PC that asked, if a PC did.
+    pub const fn pc(self) -> Option<Pc> {
+        match self {
+            Asker::Pc(pc) => Some(pc),
+            _ => None,
+        }
+    }
+
+    /// The host that asked, as `Status.asking` names it.
+    pub const fn host(self) -> Option<Host> {
+        match self {
+            Asker::Service => None,
+            Asker::Pc(pc) => Some(Host::pc(pc)),
+            Asker::Bt(n) => Host::bt(n),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum FwOp {
+    /// RP2354B images go to the update writer, the module's to the module (software.md §4.13).
     Begin {
+        target: FwTarget,
         size: u32,
         crc32: u32,
     },
@@ -190,6 +226,10 @@ pub enum Output {
 struct Hosted {
     probed: Probed,
     translators: Vec<(u8, Translator), MAX_HID_IFACES>,
+    /// The XInput interfaces (no report descriptor: `kvm_hid::xinput` decodes them), wired or a receiver's pads.
+    xinput: Vec<(u8, kvm_hid::xinput::Kind), MAX_HID_IFACES>,
+    /// How its gamepad becomes the standard one (`pads`).
+    profile: crate::pads::Profile,
     summary: DeviceSummary,
     /// Length of the last raw report per interface (for neutral XInput reports).
     last_len: Vec<(u8, u8), MAX_HID_IFACES>,
@@ -198,6 +238,15 @@ struct Hosted {
 impl Hosted {
     fn translator(&self, iface: u8) -> Option<&Translator> {
         self.translators.iter().find(|(n, _)| *n == iface).map(|(_, t)| t)
+    }
+
+    fn xinput(&self, iface: u8) -> Option<kvm_hid::xinput::Kind> {
+        self.xinput.iter().find(|(n, _)| *n == iface).map(|(_, k)| *k)
+    }
+
+    /// The receiver pad interface the KVM polls (`ConfigInfo::polled`: the first).
+    fn receiver_pad(&self) -> Option<u8> {
+        self.xinput.iter().find(|(_, k)| *k == kvm_hid::xinput::Kind::Wireless).map(|(n, _)| *n)
     }
 }
 
@@ -310,6 +359,44 @@ struct CacheEntry {
     data: CtrlData,
 }
 
+/// Watching the controls of the normalized devices for the host software (`Request::WatchControls`): learning one in
+/// the mapping editor.
+#[derive(Debug, Clone, Copy)]
+struct Watch {
+    /// Who asked (None: the service port or the simulator), and whether the controls are kept from the hosts meanwhile.
+    pc: Option<Pc>,
+    swallow: bool,
+    /// The positions last told; the axes last told, motion summed since, and when each was last told.
+    held: kvm_map::PosSet,
+    axes: [i32; kvm_map::axes::INPUTS],
+    moved: [i32; kvm_map::axes::RELATIVE],
+    told_at: [u32; kvm_map::axes::INPUTS],
+    /// When it ends unless asked again: a host program that went away doesn't keep the controls.
+    until: u32,
+}
+
+/// How often an axis is told while watching, and how far an absolute one must move for it.
+const WATCH_AXIS_MS: u32 = 50;
+const WATCH_AXIS_STEP: i32 = 1024;
+/// How long a watch lasts after the request that started or renewed it.
+pub const WATCH_MS: u32 = 10_000;
+
+/// Streaming one device's raw reports to the host software (`Request::MonitorDevice`, hid_mapping.md §9): a report
+/// that changed, at most one per [`MONITOR_MS`] per interface and report ID (one held back is not sent later: the
+/// next change brings it up to date). Ends as a watch does.
+#[derive(Debug, Clone, Copy)]
+struct Monitor {
+    pc: Option<Pc>,
+    device: Device,
+    until: u32,
+    /// Per interface and report ID: a hash of the report last told, and when.
+    sent: [(u8, u8, u32, u32); MONITOR_SLOTS],
+    used: u8,
+}
+
+const MONITOR_MS: u32 = 16;
+const MONITOR_SLOTS: usize = 8;
+
 pub struct Engine {
     config: Config,
     /// Unsaved changes (config or keymap) since then; saved [`AUTOSAVE_MS`] after the last one.
@@ -330,7 +417,7 @@ pub struct Engine {
     save_allowance: u8,
     save_paced: u32,
     /// Keymap, keymap engine and Vial sessions (software.md §4.11).
-    vial: kvm_vial::Vial,
+    vial: kvm_map::Vial,
     keymap_changes: u32,
     hotkeys: HotkeyEngine,
     /// The devices whose input goes to the active target: normalized ones (forwarded through the KVM's interfaces)
@@ -348,7 +435,22 @@ pub struct Engine {
     forwarded_consumer: ConsumerState,
     forwarded_system: u8,
     /// Mouse buttons the keymap holds.
-    keymap_buttons: u8,
+    keymap_buttons: u16,
+    /// The axis rules' state (hid_mapping.md), and the axis directions they hold down as keymap positions.
+    axes: kvm_map::axes::Axes,
+    axis_buttons: kvm_map::PosSet,
+    /// The virtual gamepad: what the active target should have now, and what the active PC was sent.
+    pad: normalized::Pad,
+    pad_sent: normalized::Pad,
+    /// Watching the controls for the host software (`Request::WatchControls`).
+    watch: Option<Watch>,
+    /// Streaming a device's raw reports to the host software (`Request::MonitorDevice`).
+    monitor: Option<Monitor>,
+    /// The keymap running now: the active profile's, or its fallback while the input's host can't take the virtual
+    /// gamepad (`Config::keymap`).
+    keymap_now: Option<u8>,
+    /// Gamepad axis calibration and field overrides per device identity.
+    cal: crate::known::KnownDevices,
     pcs: [PcSlot; 2],
     ports: [PortSlot; 3],
     presentation: Presentation,
@@ -358,8 +460,11 @@ pub struct Engine {
     info: Info,
     serial: String<16>,
     fw: (FwState, u32),
-    /// The firmware's update writer is busy with flash: FwBegin/FwData get Busy, and the host retries.
+    /// The firmware's update writer is busy with flash, or the module's stream is full: FwBegin/FwData get Busy, and
+    /// the host retries.
     fw_busy: bool,
+    /// What the update under way writes.
+    fw_target: FwTarget,
     identify_until: u32,
     /// `ctrl::selftest` bits, and when the self-test finished (its result shows on the LEDs for a while).
     selftest: u32,
@@ -367,8 +472,15 @@ pub struct Engine {
     bt_module: BtModule,
     /// The module is on the board (`set_bt_fitted`, from what the firmware read at boot): then no dongle is taken.
     bt_fitted: bool,
+    /// How far programming the module has got (`set_bt_progress`, percent).
+    bt_progress: u8,
+    /// The module's chip (`set_bt_chip`): which firmware image is its.
+    bt_chip: kvm_proto::link::bt::Chip,
     /// A front port's ESP32-C3 board that is, or may be, the module (software.md §4.13).
     dongle: Dongle,
+    /// A front port whose ESP32 board is to become the module whatever it runs (`Request::AdoptModule`), until the
+    /// board is the module or the port has another device.
+    adopt: Option<Port>,
     selftest_done_at: Option<u32>,
     /// When the active profile last changed (its number shows on the LEDs for a while).
     profile_changed_at: Option<u32>,
@@ -417,11 +529,15 @@ struct Learning {
     learner: Learner,
 }
 
-/// Which software locks a tap on the key would lift, and until when.
+/// Which software locks a tap on the key would lift, or the Bluetooth host it would let control the KVM, and until
+/// when. A host's request and the locks' don't share a tap (`Busy`), nor do two hosts': a tap grants only what the one
+/// asking is told it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Unlock {
     switching: bool,
     config: bool,
+    /// Bluetooth host slot 1–4 that asked to control the KVM (`Request::AskControl`, or `BtControl` set from a PC).
+    host: Option<u8>,
     until: u32,
 }
 
@@ -462,7 +578,7 @@ impl Engine {
             place_pending: [None; 2],
             save_allowance: SAVE_BURST,
             save_paced: 0,
-            vial: kvm_vial::Vial::new(),
+            vial: kvm_map::Vial::new(),
             keymap_changes: 0,
             hotkeys: HotkeyEngine::EMPTY,
             norm: Merger::new(),
@@ -476,6 +592,14 @@ impl Engine {
             forwarded_consumer: ConsumerState { usages: [0; kvm_hid::normalized::CONSUMER_SLOTS] },
             forwarded_system: 0,
             keymap_buttons: 0,
+            axes: kvm_map::axes::Axes::new(),
+            axis_buttons: kvm_map::PosSet::EMPTY,
+            pad: normalized::Pad { buttons: 0, dpad: 0, axes: [0; 8] },
+            pad_sent: normalized::Pad { buttons: 0, dpad: 0, axes: [0; 8] },
+            watch: None,
+            monitor: None,
+            keymap_now: None,
+            cal: crate::known::KnownDevices::new(),
             pcs: [PcSlot::NEW, PcSlot::NEW],
             ports: [PortSlot::new(), PortSlot::new(), PortSlot::new()],
             presentation: Presentation::EMPTY,
@@ -486,11 +610,15 @@ impl Engine {
             serial: String::new(),
             fw: (FwState::Idle, 0),
             fw_busy: false,
+            fw_target: FwTarget::Rp2354,
             identify_until: 0,
             selftest: ctrl::selftest::RUNNING,
             bt_module: BtModule::Absent,
             bt_fitted: false,
+            bt_progress: 0,
+            bt_chip: kvm_proto::link::bt::Chip::Unknown,
             dongle: Dongle::None,
+            adopt: None,
             selftest_done_at: None,
             profile_changed_at: None,
             unlock: None,
@@ -600,7 +728,7 @@ impl Engine {
         p
     }
 
-    pub fn status(&self, asking: Option<Pc>) -> ctrl::Status {
+    pub fn status(&self, asking: Option<Host>) -> ctrl::Status {
         let adv_pc =
             |i: usize| self.pcs[i].status.map_or(Advertised::None, |s| Advertised::from_cc_mv(s.cc1_mv.max(s.cc2_mv)));
         let adv = [adv_pc(0), adv_pc(1)];
@@ -669,6 +797,8 @@ impl Engine {
             bt_found: self.wireless.found.len() as u8,
             bt_device_pairing: self.wireless.pairing,
             bt_device_passkey: self.wireless.passkey,
+            bt_progress: if self.bt_module == BtModule::Programming { self.bt_progress } else { 0 },
+            bt_chip: self.bt_chip,
         }
     }
 
@@ -814,6 +944,31 @@ impl Engine {
         for pc in [Pc::Pc1, Pc::Pc2] {
             self.event_to(pc, e);
         }
+        // The Bluetooth hosts' sessions get what tells them something changed; the streams (a control, an axis, a
+        // device's reports, the cursor's place) are for a PC that asked, and would fill the module's link.
+        if matches!(e, Event::Control(..) | Event::Axis(..) | Event::Report { .. } | Event::PlaceCursor(_)) {
+            return;
+        }
+        for n in 1..=ctrl::BT_HOSTS as u8 {
+            if self.bt_session(n) {
+                self.bt_reply(n, e.encode().ok());
+            }
+        }
+    }
+
+    /// Bluetooth host `n` has a control session open (its software subscribed to the control service's answers), and
+    /// may control the KVM: it hears of changes as the PCs do.
+    fn bt_session(&self, n: u8) -> bool {
+        let Some(i) = (n as usize).checked_sub(1).filter(|i| *i < ctrl::BT_HOSTS) else { return false };
+        let h = &self.bt.hosts[i];
+        self.bt.present && self.config.bt_control[i] && h.connected() && h.flags & bthost::CONTROL != 0
+    }
+
+    /// A report for Bluetooth host `n`'s session: an answer or an event.
+    fn bt_reply(&mut self, n: u8, report: Option<[u8; ctrl::REPORT_LEN]>) {
+        if let Some(data) = report {
+            self.emit(Output::Bt(BtOut::Control { host: n, data }));
+        }
     }
 
     fn event_to(&mut self, pc: Pc, e: Event) {
@@ -834,6 +989,237 @@ impl Engine {
             self.config_dirty = true;
         }
         self.event(Event::ConfigChanged(key));
+    }
+
+    /// What identifies the device in slot `d` across ports and restarts (calibration, the host software's names for its
+    /// controls): VID, PID and serial number on a front port, the address as a Bluetooth device. None: no device.
+    fn identity(&self, d: Device) -> Option<u32> {
+        match (d.port(), d.wireless()) {
+            (Some(p), _) => {
+                let dev = self.ports[p.index()].dev.as_ref()?;
+                let desc = &dev.probed.device;
+                Some(crate::known::identity(&[
+                    &desc.vid.to_le_bytes(),
+                    &desc.pid.to_le_bytes(),
+                    dev.probed.serial.as_bytes(),
+                ]))
+            }
+            (None, Some(n)) => {
+                let w = self.wireless.slot(n)?;
+                w.state.bonded().then(|| crate::known::identity(&[&w.state.addr]))
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// What the device in slot `d` has (`Request::GetControls`).
+    fn controls(&self, d: Device) -> Option<ctrl::Controls> {
+        let identity = self.identity(d)?;
+        let mut c = ctrl::Controls { identity, ..ctrl::Controls::default() };
+        let mut add = |t: &Translator| {
+            let k = t.controls();
+            c.keyboard |= k.keyboard;
+            c.mouse_buttons |= k.mouse_buttons;
+            c.pad_buttons |= k.pad_buttons;
+            c.mouse_axes |= k.mouse_axes;
+            c.pad_axes |= k.pad_axes;
+            c.hat |= k.hat;
+        };
+        match (d.port(), d.wireless()) {
+            (Some(p), _) => {
+                let dev = self.ports[p.index()].dev.as_ref()?;
+                dev.translators.iter().for_each(|(_, t)| add(t));
+                // XInput pads, and the order the device's profile puts its buttons and axes in.
+                if !dev.xinput.is_empty() {
+                    c.pad_buttons |= kvm_hid::xinput::BUTTONS_PRESENT;
+                    c.pad_axes |= kvm_hid::xinput::present();
+                    c.hat = true;
+                }
+                (c.pad_buttons, c.pad_axes) = dev.profile.controls(c.pad_buttons, c.pad_axes);
+            }
+            (None, Some(n)) => add(self.wireless.slot(n)?.translator.as_ref()?),
+            (None, None) => {}
+        }
+        let (buttons, axes) = self.cal.override_controls(identity);
+        c.pad_buttons |= buttons;
+        c.pad_axes |= axes;
+        Some(c)
+    }
+
+    /// A device's raw report for the host software monitoring it ([`Monitor`]).
+    fn monitor_report(&mut self, d: Device, iface: u8, data: &[u8]) {
+        let Some(mut m) = self.monitor.filter(|m| m.device == d) else { return };
+        let ids = self.translator(d, iface).is_some_and(|t| t.layout().uses_report_ids);
+        let id = if ids { data.first().copied().unwrap_or(0) } else { 0 };
+        let hash = crate::known::identity(&[data]);
+        let used = m.used as usize;
+        let i = match m.sent[..used].iter().position(|s| (s.0, s.1) == (iface, id)) {
+            Some(i) => {
+                let (_, _, h, at) = m.sent[i];
+                if h == hash || self.now.wrapping_sub(at) < MONITOR_MS {
+                    return;
+                }
+                i
+            }
+            None if used < MONITOR_SLOTS => {
+                m.used += 1;
+                used
+            }
+            None => return,
+        };
+        m.sent[i] = (iface, id, hash, self.now);
+        self.monitor = Some(m);
+        let total = data.len().min(u8::MAX as usize);
+        for (k, chunk) in data[..total].chunks(ctrl::REPORT_PIECE).enumerate() {
+            let mut piece = [0u8; ctrl::REPORT_PIECE];
+            piece[..chunk.len()].copy_from_slice(chunk);
+            let offset = (k * ctrl::REPORT_PIECE) as u8;
+            let e = Event::Report { device: d, iface, offset, total: total as u8, len: chunk.len() as u8, data: piece };
+            self.tell(m.pc, e);
+        }
+    }
+
+    /// Ends watching the controls; those still held after a watch that kept them go nowhere until released, as after a
+    /// switch.
+    fn end_watch(&mut self) {
+        if self.watch.take().is_some_and(|w| w.swallow) {
+            self.suppressed_keys = self.norm.keys();
+            self.suppressed_buttons = self.norm.buttons();
+        }
+    }
+
+    /// The controls held down, and the axes, told to the host software watching them (`Request::WatchControls`).
+    /// Returns whether it keeps them from the hosts.
+    fn watch_controls(&mut self, keys: &KeyState, m: &crate::merge::Merged) -> bool {
+        use kvm_map::axes::{INPUTS, RELATIVE};
+        let Some(mut w) = self.watch else { return false };
+        let mut pos = kvm_map::PosSet::from_keys(keys);
+        pos.add_mask(kvm_map::pos::MOUSE, self.norm.buttons() as u32, kvm_map::pos::MOUSE_BUTTONS);
+        let pad = self.norm.gamepad();
+        pos.add_mask(kvm_map::pos::PAD, pad.buttons, kvm_map::pos::PAD_BUTTONS);
+        pos.add_mask(kvm_map::pos::HAT, pad.dpad() as u32, 4);
+        let mut told = 0;
+        for p in 0..kvm_map::POSITIONS as u16 {
+            let down = pos.has(p);
+            // Up to 8 a report: a keyboard's NKRO report rarely changes more.
+            if down != w.held.has(p) && told < 8 {
+                w.held.set(p, down);
+                told += 1;
+                self.tell(w.pc, Event::Control(p, down));
+            }
+        }
+        if let Some(mo) = m.mouse {
+            for (i, d) in [mo.x, mo.y, mo.wheel, mo.pan].iter().enumerate() {
+                w.moved[i] += d;
+            }
+        }
+        for i in 0..INPUTS {
+            if self.now.wrapping_sub(w.told_at[i]) < WATCH_AXIS_MS {
+                continue;
+            }
+            let v = if i < RELATIVE { core::mem::take(&mut w.moved[i]) } else { pad.axes[i - RELATIVE] };
+            let tell = if i < RELATIVE { v != 0 } else { (v - w.axes[i]).abs() >= WATCH_AXIS_STEP };
+            if tell {
+                w.axes[i] = v;
+                w.told_at[i] = self.now;
+                self.tell(w.pc, Event::Axis(i as u8, v.clamp(-32767, 32767) as i16));
+            }
+        }
+        self.watch = Some(w);
+        w.swallow
+    }
+
+    fn tell(&mut self, pc: Option<Pc>, e: Event) {
+        match pc {
+            Some(pc) => self.event_to(pc, e),
+            None => self.event(e),
+        }
+    }
+
+    /// What host `h` is offered and took ([`ctrl::outputs`]): a PC everything its interfaces carry while its link is up,
+    /// a Bluetooth host the reports it subscribed to.
+    fn outputs(&self, h: Host) -> (u8, u8) {
+        use ctrl::outputs as o;
+        if let Some(n) = h.bt_slot() {
+            let Some(hs) = self.bt.hosts.get(n as usize - 1).copied() else { return (0, 0) };
+            if !self.bt.present || !hs.bonded() {
+                return (0, 0);
+            }
+            let offered = o::KEYBOARD | o::MOUSE | o::MEDIA | o::POINTER | o::GAMEPAD;
+            let mut taken = 0;
+            if hs.ready() {
+                for (bit, r) in [
+                    (o::KEYBOARD, btreports::KEYBOARD),
+                    (o::MOUSE, btreports::MOUSE),
+                    (o::MEDIA, btreports::CONSUMER),
+                    (o::POINTER, btreports::POINTER),
+                    (o::GAMEPAD, btreports::GAMEPAD),
+                ] {
+                    if hs.takes(r) {
+                        taken |= bit;
+                    }
+                }
+            }
+            return (offered, taken);
+        }
+        let p = &self.presentation;
+        let mut offered = 0;
+        for (on, bit) in [
+            (p.nkro.ep_in != 0, o::KEYBOARD | o::MEDIA),
+            (p.mouse.ep_in != 0, o::MOUSE),
+            (p.mouse_abs, o::POINTER),
+            (p.gamepad == GamepadOut::Hid, o::GAMEPAD),
+            (p.xinput.is_some(), o::XINPUT),
+            (p.vial.is_some(), o::VIAL),
+            (!p.mirrors.is_empty(), o::MIRRORS),
+        ] {
+            if on {
+                offered |= bit;
+            }
+        }
+        let pc = if h == Host::Pc2 { Pc::Pc2 } else { Pc::Pc1 };
+        let up = self.pcs[pc.index()].link == LinkState::Connected;
+        (offered, if up { offered } else { 0 })
+    }
+
+    /// Whether the input's host takes the virtual gamepad: a PC while it is on (`gamepad`), a Bluetooth host that
+    /// subscribed to its report.
+    fn takes_gamepad(&self) -> bool {
+        match self.bt.active {
+            Some(n) => self.bt.hosts.get(n as usize - 1).is_some_and(|h| h.takes(btreports::GAMEPAD)),
+            None => self.presentation.gamepad != GamepadOut::Off,
+        }
+    }
+
+    /// The input's host changed, or what it takes: the keymap that runs for it (a profile's fallback where it can't
+    /// take the gamepad), and the keyboard layout macro text is typed through.
+    fn host_changed(&mut self) {
+        self.vial.remap.set_layout(self.config.keyboard_layout(self.active_host()));
+        if self.config.keymap(self.takes_gamepad()) != self.keymap_now {
+            self.keymap_switched();
+        }
+    }
+
+    /// The active profile's keymap changed (another profile, or its keymap): whatever the old one held is let go, and
+    /// the controls still held stay hidden until released, as after a switch; Vial now edits the new one.
+    fn keymap_switched(&mut self) {
+        let steps = self.vial.remap.release_all();
+        self.keymap_now = self.config.keymap(self.takes_gamepad());
+        self.vial.keymap.set_active(self.keymap_now.unwrap_or(0) as usize);
+        let keys = self.norm.keys().without(&self.suppressed_keys);
+        self.apply_steps(&steps, &keys);
+        self.keymap_buttons = 0;
+        let ax = self.axes.reset();
+        self.axis_buttons = kvm_map::PosSet::EMPTY;
+        self.apply_axes(&ax);
+        self.pad.buttons = 0;
+        self.pad.dpad = 0;
+        self.send_pad();
+        self.suppressed_keys = self.norm.keys();
+        self.suppressed_buttons = self.norm.buttons();
+        self.send_keyboard(KeyState::EMPTY);
+        self.send_mouse(MouseInput::default());
+        self.send_media(&kvm_map::remap::Out::default());
     }
 
     /// Re-arms the autosave if the keymap changed (Vial, or a persistent default-layer key).
@@ -873,6 +1259,7 @@ impl Engine {
             if changed {
                 self.emit(Output::DescriptorSetChanged);
             }
+            self.host_changed();
         }
     }
 
@@ -917,7 +1304,7 @@ impl Engine {
             let _ = out.write_str(base);
             if vial {
                 let _ = out.write_str(if base.is_empty() { "" } else { " " });
-                let _ = out.write_str(kvm_vial::SERIAL_MAGIC);
+                let _ = out.write_str(kvm_map::SERIAL_MAGIC);
             }
         };
         with_magic(&mut kvm_serial, &self.serial);
@@ -933,6 +1320,7 @@ impl Engine {
             vial,
             normalized: !wide,
             mouse_abs: self.config.abs_pointer,
+            gamepad: self.config.gamepad,
         };
         // If the mirrors don't fit, the PC still gets the KVM's own interfaces.
         presentation::build(&params, buf)
@@ -992,6 +1380,8 @@ impl Engine {
             return;
         }
         self.end_learning(LearnEnd::Cancelled, Hotkey::NONE);
+        self.end_watch();
+        self.monitor = None;
         let old = self.active;
         if from_bt.is_none() {
             // 1. Release everything on the PC we leave.
@@ -1038,6 +1428,10 @@ impl Engine {
         self.forwarded_system = 0;
         let _ = self.vial.remap.release_all();
         self.keymap_buttons = 0;
+        let _ = self.axes.reset();
+        self.axis_buttons = kvm_map::PosSet::EMPTY;
+        self.pad = normalized::Pad::default();
+        self.pad_sent = normalized::Pad::default();
     }
 
     /// The target after the current one in the order PC1, PC2, Bluetooth hosts 1–4 that are ready: `Some(slot)` for a
@@ -1072,6 +1466,8 @@ impl Engine {
         }
         let _ = source;
         self.end_learning(LearnEnd::Cancelled, Hotkey::NONE);
+        self.end_watch();
+        self.monitor = None;
         match self.bt.active {
             Some(_) => self.leave_bt(),
             None => self.release_pc(self.active),
@@ -1090,6 +1486,9 @@ impl Engine {
         self.regroup();
         self.bt_select();
         self.apply_leds();
+        // The new host gets the gamepad as it is.
+        self.pad_sent = normalized::Pad::default();
+        self.host_changed();
     }
 
     /// Tells the module which host is the active target and which ones devices are pinned to, if that changed.
@@ -1176,12 +1575,15 @@ impl Engine {
             self.bt_input(n, btreport::POINTER, &kvm_proto::link::bt::pointer_report(0, x, y, 0, 0));
         }
         self.bt_input(n, btreport::CONSUMER, &[0; btreport::CONSUMER_LEN]);
+        if self.bt.hosts.get(n as usize - 1).is_some_and(|h| h.takes(btreports::GAMEPAD)) {
+            self.bt_input(n, btreport::GAMEPAD, &bt::gamepad(&normalized::Pad::default()));
+        }
         self.hold_over();
         self.bt_select();
     }
 
     fn bt_input(&mut self, host: u8, id: u8, data: &[u8]) {
-        let data = Vec::from_slice(&data[..data.len().min(btreport::MOUSE_LEN)]).unwrap_or_default();
+        let data = Vec::from_slice(&data[..data.len().min(btreport::INPUT_MAX)]).unwrap_or_default();
         self.emit(Output::Bt(BtOut::Input { host, id, data }));
     }
 
@@ -1299,15 +1701,28 @@ impl Engine {
                 let _ = translators.push((*iface, Translator::new(l)));
             }
         }
+        let mut xinput = Vec::new();
         let summary = match parse_config(&probed.config) {
-            Some(cfg) => DeviceSummary::new(&probed.device, &cfg, probed.speed.unwrap_or(Speed::Unknown), |n| {
-                translators.iter().find(|(i, _)| *i == n).map(|(_, t)| t.verdict())
-            }),
+            Some(cfg) => {
+                for i in &cfg.interfaces {
+                    if let Some(k) = i.xinput() {
+                        let _ = xinput.push((i.number, k));
+                    }
+                }
+                DeviceSummary::new(&probed.device, &cfg, probed.speed.unwrap_or(Speed::Unknown), |n| {
+                    translators.iter().find(|(i, _)| *i == n).map(|(_, t)| t.verdict())
+                })
+            }
             None => DeviceSummary::default(),
         };
+        let profile = crate::pads::profile(probed.device.vid, probed.device.pid, !xinput.is_empty());
         let dongle = self.takes_dongle(port, probed);
+        if !dongle && self.adopt == Some(port) {
+            // Not an ESP32 board the module can be: nothing to adopt.
+            self.adopt = None;
+        }
         let s = &mut self.ports[port.index()];
-        s.dev = Some(Hosted { probed: probed.clone(), translators, summary, last_len: Vec::new() });
+        s.dev = Some(Hosted { probed: probed.clone(), translators, xinput, profile, summary, last_len: Vec::new() });
         s.probe_until = None;
         s.reports = 0;
         s.rate_hz = 0;
@@ -1338,11 +1753,18 @@ impl Engine {
     /// Whether the device just probed on `port` is tried as the Bluetooth module (software.md §4.13): an ESP32-C3's
     /// USB serial port ([`bt::dongle_endpoints`]), on a KVM without the module on board and without another dongle,
     /// on a port not set to passthrough (that keeps an ESP32 board of one's own reachable from a PC as it is).
+    /// A board being adopted (`Request::AdoptModule`) is taken whatever its port is set to.
     fn takes_dongle(&self, port: Port, probed: &Probed) -> bool {
         !self.bt_fitted
             && self.dongle == Dongle::None
-            && !self.config.mode(port.into()).is_passthrough()
+            && (self.adopt == Some(port) || !self.config.mode(port.into()).is_passthrough())
             && bt::dongle_endpoints(&probed.device, &probed.config).is_some()
+    }
+
+    /// The board on `port` is to be made the module whatever it runs (`Request::AdoptModule`): the firmware programs it
+    /// rather than leave it alone.
+    pub fn dongle_adopt(&self, port: Port) -> bool {
+        self.adopt == Some(port)
     }
 
     /// The KVM has the module on its board (what the firmware read at boot): ESP32 boards on the front ports are then
@@ -1363,12 +1785,19 @@ impl Engine {
             self.ports[port.index()].state = PortState::Module;
             self.event(Event::PortChanged(port));
         }
+        if self.adopt == Some(port) {
+            self.adopt = None;
+        }
     }
 
     /// The device on `port` is not the module (another firmware, another chip): an ordinary device from now on.
     pub fn dongle_declined(&mut self, port: Port) {
         if self.dongle == Dongle::Probing(port) {
             self.dongle = Dongle::None;
+            if self.adopt == Some(port) {
+                // Not even adopted (its ROM never answered): it stays an ordinary device.
+                self.adopt = None;
+            }
             self.settle(port);
         }
     }
@@ -1448,8 +1877,19 @@ impl Engine {
         // Modes changed, so may where the devices' input goes.
         self.after_switch();
         for &port in Port::ALL {
-            if changed[port.index()] || touched[port.index()] {
+            let i = port.index();
+            if changed[i] || touched[i] {
                 self.event(Event::PortChanged(port));
+                // A wireless receiver the KVM now reads: asked whether a pad is linked (it says so, and the pad gets
+                // its LED, `device_report`).
+                let s = &self.ports[i];
+                if s.state == PortState::Hosted
+                    && s.effective == PortMode::Normalized
+                    && let Some(iface) = s.dev.as_ref().and_then(Hosted::receiver_pad)
+                {
+                    let data = report(&kvm_hid::xinput::INQUIRY);
+                    self.emit(Output::DeviceOut { port, iface, data });
+                }
             }
         }
     }
@@ -1545,7 +1985,27 @@ impl Engine {
                 let _ = d.last_len.push((iface, data.len() as u8));
             }
         }
-        let t = d.translator(iface).map(|t| t.translate(data)).unwrap_or_default();
+        use kvm_hid::xinput::{self, Kind, Wireless};
+        let pad = |g| kvm_hid::Translation { gamepad: g, ..Default::default() };
+        let t = match d.xinput(iface) {
+            Some(Kind::Wired) => pad(xinput::wired(data)),
+            Some(Kind::Wireless) => match xinput::wireless(data) {
+                Wireless::Input(g) => pad(Some(g)),
+                // A pad that links gets its player LED; one that leaves lets go of everything.
+                Wireless::Link(true) => {
+                    let slot = d.xinput.iter().filter(|(_, k)| *k == Kind::Wireless).position(|(n, _)| *n == iface);
+                    let data = report(&xinput::led(slot.unwrap_or(0) as u8));
+                    self.emit(Output::DeviceOut { port, iface, data });
+                    return;
+                }
+                Wireless::Link(false) => {
+                    let rest = kvm_hid::GamepadInput { present: xinput::present(), ..Default::default() };
+                    pad(Some(rest))
+                }
+                Wireless::Other => return,
+            },
+            None => d.translator(iface).map(|t| t.translate(data)).unwrap_or_default(),
+        };
         self.input(port.into(), iface, &t, data, now);
     }
 
@@ -1569,6 +2029,7 @@ impl Engine {
 
     /// A device's report, translated: to the devices that follow the active target, or to the host it is pinned to.
     fn input(&mut self, d: Device, iface: u8, t: &kvm_hid::translate::Translation, data: &[u8], now: u32) {
+        self.monitor_report(d, iface, data);
         let mode = self.running(d);
         if mode == PortMode::Off {
             return;
@@ -1579,6 +2040,24 @@ impl Engine {
             return self.pinned_input(d, target, iface, t, data, normalized, now);
         }
         self.join(d, None);
+        // The device's profile (its gamepad in the standard order), its field overrides, then a gamepad's axes through
+        // its calibration, before they merge with anything.
+        let mut t = *t;
+        if let Some(dev) = d.port().and_then(|p| self.ports[p.index()].dev.as_ref()) {
+            let ids = dev.translator(iface).is_some_and(|tr| tr.layout().uses_report_ids);
+            dev.profile.apply(data, ids, &mut t.gamepad);
+        } else if let Some(w) = d.wireless().and_then(|n| self.wireless.slots.get(n as usize - 1)) {
+            let ids = w.translator.as_ref().is_some_and(|tr| tr.layout().uses_report_ids);
+            w.profile().apply(data, ids, &mut t.gamepad);
+        }
+        if let Some(id) = self.identity(d) {
+            let ids = self.translator(d, iface).is_some_and(|tr| tr.layout().uses_report_ids);
+            self.cal.apply_overrides(id, iface, data, ids, &mut t.gamepad);
+            if let Some(g) = t.gamepad.as_mut() {
+                self.cal.apply(id, g);
+            }
+        }
+        let t = &t;
         let merged = if normalized { self.norm.apply(d, iface, t) } else { self.mirr.apply(d, iface, t) };
 
         // A passkey for a pairing Bluetooth host is being typed: the keyboard goes to nobody else meanwhile.
@@ -1893,42 +2372,132 @@ impl Engine {
         self.suppressed_keys = self.suppressed_keys.intersect(&union);
         let swallowed = swallowed.unwrap_or(KeyState::EMPTY);
         let keys = self.norm.keys().without(&swallowed).without(&self.suppressed_keys);
-        if self.config.keymap {
-            let steps = self.vial.remap.input(&mut self.vial.keymap, &keys, self.now);
-            self.apply_steps(&steps, &keys);
-            self.note_keymap_changes();
-        } else {
-            self.send_keyboard(keys);
-        }
         if let Some(mouse) = m.mouse {
             self.suppressed_buttons &= mouse.buttons | self.mirr.buttons();
-            self.send_mouse(mouse);
+        }
+        // The host software learning a control: told, and (when it asked) kept from the hosts.
+        if self.watch_controls(&keys, &m) {
+            return;
+        }
+        match self.keymap_now {
+            Some(k) => self.map_input(k as usize, &keys, &m),
+            None => {
+                self.send_keyboard(keys);
+                if let Some(mouse) = m.mouse {
+                    self.send_mouse(mouse);
+                }
+                if m.gamepad.is_some() {
+                    self.pad_direct();
+                }
+            }
         }
         if m.consumer.is_some() || m.system.is_some() {
-            let extra = if self.config.keymap { *self.vial.remap.output() } else { kvm_vial::remap::Out::default() };
+            let extra =
+                if self.keymap_now.is_some() { *self.vial.remap.output() } else { kvm_map::remap::Out::default() };
             self.send_media(&extra);
         }
     }
 
+    /// Through the active profile's keymap `k`: the axis rules first (their directions are keymap positions), then
+    /// everything held down through the keymap engine.
+    fn map_input(&mut self, k: usize, keys: &KeyState, m: &crate::merge::Merged) {
+        let layers = self.vial.remap.layers(&self.vial.keymap);
+        let rel = m.mouse.map_or([0; kvm_map::axes::RELATIVE], |mo| [mo.x, mo.y, mo.wheel, mo.pan]);
+        let abs = m.gamepad.map(|g| g.axes);
+        let ax = self.axes.input(self.vial.keymap.axes(), k, layers, rel, abs.as_ref(), self.now);
+        self.apply_axes(&ax);
+        self.axis_buttons = ax.buttons;
+        let pos = self.positions(keys);
+        let steps = self.vial.remap.input(&mut self.vial.keymap, &pos, self.now);
+        self.apply_steps(&steps, keys);
+        self.note_keymap_changes();
+    }
+
+    /// Every control of the normalized devices held down now, as keymap positions (`kvm_map::pos`).
+    fn positions(&self, keys: &KeyState) -> kvm_map::PosSet {
+        use kvm_map::pos;
+        let mut p = kvm_map::PosSet::from_keys(keys);
+        p.add_mask(pos::MOUSE, (self.norm.buttons() & !self.suppressed_buttons) as u32, pos::MOUSE_BUTTONS);
+        let pad = self.norm.gamepad();
+        p.add_mask(pos::PAD, pad.buttons, pos::PAD_BUTTONS);
+        p.add_mask(pos::HAT, pad.dpad() as u32, 4);
+        p.union(&self.axis_buttons)
+    }
+
+    /// What the axis rules make: mouse motion now, the virtual gamepad's axes.
+    fn apply_axes(&mut self, ax: &kvm_map::axes::Out) {
+        if ax.mouse != [0; 4] {
+            let [x, y, wheel, pan] = ax.mouse;
+            self.send_pointer(MouseInput { buttons: 0, x, y, wheel, pan }, true);
+        }
+        if let Some(a) = ax.pad {
+            self.pad.axes = a;
+            self.send_pad();
+        }
+    }
+
+    /// Without a keymap: the gamepads' input 1:1 to the virtual gamepad (the brake and accelerator onto Z and Rz, its
+    /// triggers, where the gamepad has none of its own there).
+    fn pad_direct(&mut self) {
+        use kvm_hid::gamepad::axis;
+        let g = self.norm.gamepad();
+        let mut axes = [0i16; 8];
+        for (i, a) in axes.iter_mut().enumerate() {
+            *a = g.axes[i].clamp(-32767, 32767) as i16;
+        }
+        for (from, to) in [(axis::BRAKE, axis::Z), (axis::ACCELERATOR, axis::RZ)] {
+            if g.present & (1 << from) != 0 && g.present & (1 << to) == 0 {
+                axes[to] = g.axes[from].clamp(0, 32767) as i16;
+            }
+        }
+        self.pad = normalized::Pad { buttons: g.buttons, dpad: g.dpad(), axes };
+        self.send_pad();
+    }
+
+    /// The virtual gamepad's state to the active PC, if it changed and the PC has one (a Bluetooth host doesn't yet).
+    fn send_pad(&mut self) {
+        if self.pad == self.pad_sent {
+            return;
+        }
+        if let Some(n) = self.bt.active {
+            // A Bluetooth host that took the gamepad's report gets it; one that didn't has the profile's fallback.
+            if self.takes_gamepad() {
+                self.pad_sent = self.pad;
+                self.bt_input(n, btreport::GAMEPAD, &bt::gamepad(&self.pad));
+            }
+            return;
+        }
+        let pc = self.active;
+        if let Some((ep, r)) = self.pcs[pc.index()].out.gamepad(&self.pad, &self.presentation) {
+            self.pad_sent = self.pad;
+            self.send(pc, ep, r);
+        }
+    }
+
     /// Sends the keymap engine's steps to the active PC; `keys` are the physical keys it was given.
-    fn apply_steps(&mut self, steps: &[kvm_vial::Step], keys: &KeyState) {
+    fn apply_steps(&mut self, steps: &[kvm_map::Step], keys: &KeyState) {
+        let mut kvm: Vec<u8, 4> = Vec::new();
         // Usages beyond the matrix (0xE8–0xFF, never sent in practice) pass through as they are.
         let mut beyond = KeyState::EMPTY;
-        for k in keys.keys().filter(|k| *k as usize >= kvm_vial::POSITIONS) {
+        for k in keys.keys().filter(|k| *k as usize >= kvm_map::KEYBOARD) {
             beyond.press(k);
         }
         for step in steps {
             match step {
-                kvm_vial::Step::State(o) => {
+                kvm_map::Step::State(o) => {
                     self.send_keyboard(o.keys.union(&beyond));
                     self.send_media(o);
                     if o.buttons != self.keymap_buttons {
                         self.keymap_buttons = o.buttons;
                         self.send_mouse(MouseInput::default());
                     }
+                    if (o.pad, o.dpad) != (self.pad.buttons, self.pad.dpad) {
+                        (self.pad.buttons, self.pad.dpad) = (o.pad, o.dpad);
+                        self.send_pad();
+                    }
                 }
                 // Mouse keys accelerate themselves.
-                kvm_vial::Step::Motion(mo) => self.send_pointer(
+                kvm_map::Step::Motion(mo) => self.send_pointer(
                     MouseInput {
                         buttons: 0,
                         x: mo.x as i32,
@@ -1938,10 +2507,19 @@ impl Engine {
                     },
                     false,
                 ),
+                kvm_map::Step::Kvm(n) => {
+                    let _ = kvm.push(*n);
+                }
             }
         }
         let last = self.vial.remap.output().keys.union(&beyond);
         self.send_keyboard(last);
+        // KVM actions after what came before them reached the host (a switch lets go of everything there).
+        for n in kvm {
+            if let Some(a) = HotkeyAction::ALL.get(n as usize).copied().filter(|a| *a != HotkeyAction::None) {
+                self.hotkey_action(a);
+            }
+        }
     }
 
     fn send_keyboard(&mut self, keys: KeyState) {
@@ -1965,7 +2543,7 @@ impl Engine {
     }
 
     /// Media and system keys: the physical ones plus the keymap's.
-    fn send_media(&mut self, extra: &kvm_vial::remap::Out) {
+    fn send_media(&mut self, extra: &kvm_map::remap::Out) {
         let pc = self.active;
         let out = self.pcs[pc.index()].out;
         let mut c = self.norm.consumer();
@@ -2004,7 +2582,9 @@ impl Engine {
     /// other PC) and the keymap's. With screen hop the KVM moves the pointer itself (`accelerate`: as a mouse moves it).
     fn send_pointer(&mut self, m: MouseInput, accelerate: bool) {
         let pc = self.active;
-        let mut buttons = (self.norm.buttons() & !self.suppressed_buttons) | self.keymap_buttons as u16;
+        // With a keymap the buttons are what it makes of them.
+        let physical = if self.keymap_now.is_some() { 0 } else { self.norm.buttons() & !self.suppressed_buttons };
+        let mut buttons = physical | self.keymap_buttons;
         if self.bt.active.is_some() {
             // A Bluetooth host's mouse also carries a mirrored device's buttons.
             buttons |= self.mirr.buttons() & !self.suppressed_buttons;
@@ -2183,7 +2763,7 @@ impl Engine {
     fn vial_request(&mut self, pc: Pc, data: &[u8]) {
         let Some(v) = self.presentation.vial else { return };
         let physical = self.norm.keys().union(&self.mirr.keys());
-        let ctx = kvm_vial::Context {
+        let ctx = kvm_map::Context {
             pc: pc.index(),
             active: pc == self.active,
             writable: self.config.sw_config_allowed,
@@ -2325,7 +2905,7 @@ impl Engine {
     pub fn pc_out_report(&mut self, pc: Pc, ep: u8, data: &[u8], now: u32) {
         self.now = now;
         if ep == self.presentation.control.ep_out {
-            if let Some(resp) = self.control(Some(pc), data) {
+            if let Some(resp) = self.control(Asker::Pc(pc), data) {
                 let ep_in = self.presentation.control.ep_in;
                 self.send(pc, ep_in, report(&resp));
             }
@@ -2405,6 +2985,9 @@ impl Engine {
                 }
                 if let Some(u) = self.unlock.take() {
                     self.allow_software(u.switching, u.config);
+                    if let Some(n) = u.host {
+                        self.allow_host(n);
+                    }
                 }
             }
             KeyEvent::Tap => self.key_action(self.config.key_tap),
@@ -2423,8 +3006,20 @@ impl Engine {
         }
     }
 
+    /// Lets Bluetooth host slot `n` control the KVM: only at the device (the key confirming its request), and only
+    /// while it holds a bond.
+    fn allow_host(&mut self, n: u8) {
+        let Some(i) = n.checked_sub(1).filter(|i| (*i as usize) < ctrl::BT_HOSTS) else { return };
+        if self.bt.hosts[i as usize].bonded() {
+            let _ = self.set_config(ConfigValue::BtControl(i, true), Origin::Device);
+        }
+    }
+
     /// Software asks to turn a lock off (`v` false: done now) or back on (armed until a tap on the key, or it times out).
     fn request_lock(&mut self, v: ConfigValue) -> Result<Response, ErrorCode> {
+        if let ConfigValue::BtControl(i, on) = v {
+            return self.request_host(i, on);
+        }
         let (switching, on) = match v {
             ConfigValue::SwSwitchAllowed(on) => (true, on),
             ConfigValue::SwConfigAllowed(on) => (false, on),
@@ -2435,7 +3030,11 @@ impl Engine {
             if now_on {
                 return Ok(Response::Config(v));
             }
-            let u = self.unlock.get_or_insert(Unlock { switching: false, config: false, until: 0 });
+            // A Bluetooth host's request waits for the key: one tap, one thing.
+            if self.unlock.is_some_and(|u| u.host.is_some()) {
+                return Err(ErrorCode::Busy);
+            }
+            let u = self.unlock.get_or_insert(Unlock { switching: false, config: false, host: None, until: 0 });
             if switching {
                 u.switching = true;
             } else {
@@ -2452,8 +3051,40 @@ impl Engine {
                 u.config = false;
             }
         }
-        self.unlock = self.unlock.filter(|u| u.switching || u.config);
+        self.unlock = self.unlock.filter(|u| u.switching || u.config || u.host.is_some());
         Ok(Response::Config(self.set_config(v, Origin::Software)?))
+    }
+
+    /// Bluetooth host slot index `i` (0–3) is to control the KVM (`on`: armed until a tap on the key, as the locks) or
+    /// not any more (at once, a configuration change like any other).
+    fn request_host(&mut self, i: u8, on: bool) -> Result<Response, ErrorCode> {
+        let Some(&now_on) = self.config.bt_control.get(i as usize) else { return Err(ErrorCode::InvalidValue) };
+        let n = i + 1;
+        if on {
+            if now_on {
+                return Ok(Response::Config(ConfigValue::BtControl(i, true)));
+            }
+            if !self.bt.present {
+                return Err(ErrorCode::Unsupported);
+            }
+            if !self.bt.hosts[i as usize].bonded() {
+                return Err(ErrorCode::NoDevice);
+            }
+            // The tap grants exactly what the one asking is told: not the locks a PC waits for, nor another host.
+            if self.unlock.is_some_and(|u| u.switching || u.config || u.host.is_some_and(|h| h != n)) {
+                return Err(ErrorCode::Busy);
+            }
+            let until = self.now.wrapping_add(UNLOCK_WAIT_MS);
+            self.unlock = Some(Unlock { switching: false, config: false, host: Some(n), until });
+            return Err(ErrorCode::NeedsKeyPress);
+        }
+        if !self.config.sw_config_allowed {
+            return Err(ErrorCode::Locked);
+        }
+        if self.unlock.is_some_and(|u| u.host == Some(n)) {
+            self.unlock = None;
+        }
+        Ok(Response::Config(self.set_config(ConfigValue::BtControl(i, false), Origin::Software)?))
     }
 
     fn key_action(&mut self, a: KeyAction) {
@@ -2539,8 +3170,22 @@ impl Engine {
     pub fn set_bt_module(&mut self, m: BtModule) {
         if self.bt_module != m {
             self.bt_module = m;
+            self.bt_progress = 0;
             self.event(Event::BtChanged(0));
         }
+    }
+
+    /// The module's chip, from its `Hello` or its ROM (`Status.bt_chip`: the host software sends that chip's image).
+    pub fn set_bt_chip(&mut self, chip: kvm_proto::link::bt::Chip) {
+        if self.bt_chip != chip {
+            self.bt_chip = chip;
+            self.event(Event::BtChanged(0));
+        }
+    }
+
+    /// How far programming the module has got, in percent (`Status.bt_progress`; the window polls it).
+    pub fn set_bt_progress(&mut self, percent: u8) {
+        self.bt_progress = percent.min(100);
     }
 
     /// Frames lost on each link since boot (saturating), for `Status`.
@@ -2743,17 +3388,35 @@ impl Engine {
             // The later of the two, when the allowance is spent.
             if self.save_allowance == 0 && paced.wrapping_sub(quiet) as i32 > 0 { paced } else { quiet }
         });
-        let keymap = if self.config.keymap { self.vial.remap.deadline(&self.vial.keymap) } else { None };
+        let (keymap, axes) = match self.keymap_now {
+            Some(_) => (self.vial.remap.deadline(&self.vial.keymap), self.axes.deadline()),
+            None => (None, None),
+        };
         let unlock = self.unlock.map(|u| u.until);
         let learn = self.learning.as_ref().map(|l| l.until);
         let learn_tap = self.learning.as_ref().and_then(|l| l.learner.deadline());
         // A place waiting for the next millisecond.
         let place = self.place_pending.iter().any(Option::is_some).then(|| self.now.wrapping_add(1));
         let scan = self.wireless.scan_until;
-        [self.hotkeys.deadline(), save, keymap, unlock, learn, learn_tap, self.bt.pairing_until, scan, place]
-            .into_iter()
-            .flatten()
-            .min_by_key(|t| t.wrapping_sub(self.now) as i32)
+        let watch = self.watch.map(|w| w.until);
+        let monitor = self.monitor.map(|m| m.until);
+        [
+            self.hotkeys.deadline(),
+            save,
+            keymap,
+            axes,
+            unlock,
+            learn,
+            learn_tap,
+            self.bt.pairing_until,
+            scan,
+            place,
+            watch,
+            monitor,
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|t| t.wrapping_sub(self.now) as i32)
     }
 
     pub fn tick(&mut self, now: u32) {
@@ -2762,10 +3425,21 @@ impl Engine {
         if let Some(k) = self.hotkeys.tick(now) {
             self.replay_tap(k);
         }
-        if self.config.keymap {
+        if let Some(k) = self.keymap_now {
+            let keys = self.norm.keys().without(&self.hidden_keys()).without(&self.suppressed_keys);
+            if self.axes.deadline().is_some_and(|t| now.wrapping_sub(t) as i32 >= 0) {
+                let layers = self.vial.remap.layers(&self.vial.keymap);
+                let ax = self.axes.tick(self.vial.keymap.axes(), k as usize, layers, now);
+                self.apply_axes(&ax);
+                if ax.buttons != self.axis_buttons {
+                    self.axis_buttons = ax.buttons;
+                    let pos = self.positions(&keys);
+                    let steps = self.vial.remap.input(&mut self.vial.keymap, &pos, now);
+                    self.apply_steps(&steps, &keys);
+                }
+            }
             let steps = self.vial.remap.tick(&mut self.vial.keymap, now);
             if !steps.is_empty() {
-                let keys = self.norm.keys().without(&self.hidden_keys()).without(&self.suppressed_keys);
                 self.apply_steps(&steps, &keys);
             }
             self.note_keymap_changes();
@@ -2784,6 +3458,12 @@ impl Engine {
                 w.rate_hz = rate(&mut w.reports);
             }
             self.rate_epoch = now;
+        }
+        if self.watch.is_some_and(|w| now.wrapping_sub(w.until) as i32 >= 0) {
+            self.end_watch();
+        }
+        if self.monitor.is_some_and(|m| now.wrapping_sub(m.until) as i32 >= 0) {
+            self.monitor = None;
         }
         if self.unlock.is_some_and(|u| now.wrapping_sub(u.until) as i32 >= 0) {
             // Nobody pressed the key: the locks stay.
@@ -2858,7 +3538,7 @@ impl Engine {
     /// The firmware wrote everything [`Engine::take_save_item`] gave it. A change made since then is still to save, and
     /// keeps its autosave.
     pub fn config_saved(&mut self) {
-        if !self.config_dirty && self.arrangements_dirty == 0 && !self.vial.keymap.is_dirty() {
+        if !self.config_dirty && self.arrangements_dirty == 0 && !self.vial.keymap.is_dirty() && !self.cal.is_dirty() {
             self.dirty_since = None;
         }
     }
@@ -2882,7 +3562,7 @@ impl Engine {
             buf[..n].copy_from_slice(&item[..n]);
             return Some((config::ITEM, n));
         }
-        self.vial.keymap.take_dirty(buf)
+        self.vial.keymap.take_dirty(buf).or_else(|| self.cal.take_dirty(buf))
     }
 
     /// At boot: an item read from flash that is not the config (an arrangement, keymap, macros, keymap settings).
@@ -2892,13 +3572,20 @@ impl Engine {
             self.arrangements_dirty &= !(1 << a);
             return;
         }
+        if (crate::known::ITEM..crate::known::ITEM + crate::known::MAX_DEVICES as u16).contains(&key) {
+            self.cal.restore(key, data);
+            return;
+        }
         self.vial.keymap.restore(key, data);
         self.keymap_changes = self.vial.keymap.changes();
     }
 
     /// Store keys [`Engine::restore_item`] takes.
     pub fn item_keys() -> impl Iterator<Item = u16> {
-        (0..MAX_ARRANGEMENTS as u16).map(|a| config::ARRANGEMENT_ITEM + a).chain(kvm_vial::Keymap::item_keys())
+        (0..MAX_ARRANGEMENTS as u16)
+            .map(|a| config::ARRANGEMENT_ITEM + a)
+            .chain(kvm_map::Keymap::item_keys())
+            .chain(crate::known::KnownDevices::item_keys())
     }
 
     pub fn set_config(&mut self, v: ConfigValue, origin: Origin) -> Result<ConfigValue, ErrorCode> {
@@ -2928,6 +3615,7 @@ impl Engine {
             // Another arrangement: the pointer starts over on the active host's main screen there.
             self.hop.forget_all();
         }
+        self.host_changed();
         if self.config.profile != before.profile {
             self.profile_changed_at = Some(self.now);
             if changed.iter().all(|v| v.key() != ctrl::key::PROFILE) {
@@ -2952,21 +3640,16 @@ impl Engine {
                 self.redecide([false; 3]);
                 self.rebuild_presentation();
             }
-            ConfigValue::Keymap(false) => {
-                let _ = self.vial.remap.release_all();
-                self.keymap_buttons = 0;
-                let keys = self.norm.keys().without(&self.suppressed_keys);
-                self.send_keyboard(keys);
-                self.send_media(&kvm_vial::remap::Out::default());
-            }
+            // The virtual gamepad comes or goes: both PCs enumerate the interfaces again.
+            ConfigValue::Gamepad(_) => self.rebuild_presentation(),
             _ => {}
         }
     }
 
     // ── control protocol ─────────────────────────────────────────────────────
 
-    /// Handles one control-protocol report from `pc` (None: service port or simulator); returns the response.
-    pub fn control(&mut self, pc: Option<Pc>, raw: &[u8]) -> Option<[u8; ctrl::REPORT_LEN]> {
+    /// Handles one control-protocol report from `asker`; returns the response.
+    pub fn control(&mut self, asker: Asker, raw: &[u8]) -> Option<[u8; ctrl::REPORT_LEN]> {
         let request_type = raw.first().copied().unwrap_or(0);
         let (id, req) = match Request::decode(raw) {
             Ok(r) => r,
@@ -2976,16 +3659,63 @@ impl Engine {
                     .ok();
             }
         };
-        let resp = match self.handle(pc, &req) {
+        let resp = match self.handle(asker, &req) {
             Ok(r) => r,
             Err(e) => Response::Error(e),
         };
         resp.encode(req.type_byte(), id).ok()
     }
 
-    fn handle(&mut self, pc: Option<Pc>, req: &Request) -> Result<Response, ErrorCode> {
-        // Allowing software control again goes through the key, so it is asked for even while locked.
-        if let Request::SetConfig(v @ (ConfigValue::SwSwitchAllowed(true) | ConfigValue::SwConfigAllowed(true))) = req {
+    /// A control-protocol request Bluetooth host `host` wrote to the module's control service (software.md §8.1, "Over
+    /// Bluetooth"); the answer goes back the same way.
+    pub fn bt_control(&mut self, host: u8, data: &[u8], now: u32) {
+        self.now = now;
+        if !(1..=ctrl::BT_HOSTS as u8).contains(&host) {
+            return;
+        }
+        let raw = btcontrol::pad(data);
+        let resp = self.control(Asker::Bt(host), &raw);
+        self.bt_reply(host, resp);
+    }
+
+    /// What a Bluetooth host may ask: `Some` answers it here, `None` lets the request through. One that may not control
+    /// the KVM gets its identity (to see whether it speaks this protocol) and may ask to; one that may doesn't get what
+    /// only the USB control interface can see through (firmware: the module that carries the request is the one being
+    /// replaced; a restart into a bootloader, which only USB brings back), nor what streams to a PC or needs its
+    /// cursor.
+    fn bt_gate(&self, n: u8, req: &Request) -> Result<Option<Response>, ErrorCode> {
+        let allowed = (n as usize).checked_sub(1).is_some_and(|i| self.config.bt_control.get(i) == Some(&true));
+        Ok(match req {
+            Request::GetInfo | Request::AskControl => None,
+            _ if !allowed => return Err(ErrorCode::NotAllowed),
+            Request::FwBegin { .. } | Request::FwData { .. } | Request::FwCommit => return Err(ErrorCode::Unsupported),
+            Request::Reboot(t) if *t != RebootTarget::Normal => return Err(ErrorCode::Unsupported),
+            // Stopping what it can't start: nothing to stop.
+            Request::LearnHotkey(false) | Request::WatchControls(0) | Request::MonitorDevice(_, false) => {
+                Some(Response::Ok)
+            }
+            Request::LearnHotkey(true)
+            | Request::WatchControls(_)
+            | Request::MonitorDevice(_, true)
+            | Request::PointerAt(_)
+            | Request::PlaceCursor(_) => return Err(ErrorCode::NotActive),
+            _ => None,
+        })
+    }
+
+    fn handle(&mut self, asker: Asker, req: &Request) -> Result<Response, ErrorCode> {
+        if let Asker::Bt(n) = asker
+            && let Some(r) = self.bt_gate(n, req)?
+        {
+            return Ok(r);
+        }
+        let pc = asker.pc();
+        // Allowing software control again goes through the key, so it is asked for even while locked; so does letting
+        // a Bluetooth host control the KVM.
+        if let Request::SetConfig(
+            v @ (ConfigValue::SwSwitchAllowed(true) | ConfigValue::SwConfigAllowed(true) | ConfigValue::BtControl(..)),
+        ) = req
+        {
             return self.request_lock(*v);
         }
         if req.is_config_change() && !self.config.sw_config_allowed {
@@ -3002,7 +3732,13 @@ impl Engine {
                 }
                 Response::Info(info)
             }
-            Request::GetStatus => Response::Status(self.status(pc)),
+            Request::GetStatus => Response::Status(self.status(asker.host())),
+            // Not a configuration change: it only arms the key, as allowing software control again does.
+            Request::AskControl => {
+                let Asker::Bt(n) = asker else { return Err(ErrorCode::Unsupported) };
+                self.request_host(n - 1, true)?;
+                Response::Ok
+            }
             Request::GetPort(p) => Response::Port(self.port_info(*p)),
             Request::GetPortString(p, kind) => {
                 let d = self.ports[p.index()].dev.as_ref().ok_or(ErrorCode::NoDevice)?;
@@ -3073,14 +3809,22 @@ impl Engine {
                 self.event(Event::PortChanged(*p));
                 Response::Ok
             }
-            Request::FwBegin { size, crc32, .. } => {
-                if self.info.caps & ctrl::caps::FW_UPDATE == 0 {
+            Request::FwBegin { target, size, crc32 } => {
+                let cap = match target {
+                    FwTarget::Rp2354 => ctrl::caps::FW_UPDATE,
+                    FwTarget::Module => ctrl::caps::BT_UPDATE,
+                };
+                if self.info.caps & cap == 0 {
                     return Err(ErrorCode::Unsupported);
+                }
+                if *target == FwTarget::Module && self.bt_module == BtModule::Absent {
+                    return Err(ErrorCode::NoDevice);
                 }
                 if self.fw_busy || self.out.is_full() {
                     return Err(ErrorCode::Busy);
                 }
-                self.emit(Output::Firmware(FwOp::Begin { size: *size, crc32: *crc32 }));
+                self.fw_target = *target;
+                self.emit(Output::Firmware(FwOp::Begin { target: *target, size: *size, crc32: *crc32 }));
                 self.fw = (FwState::Receiving, 0);
                 Response::Fw { state: self.fw.0, progress: 0 }
             }
@@ -3096,7 +3840,9 @@ impl Engine {
             }
             Request::FwCommit => {
                 self.emit(Output::Firmware(FwOp::Commit));
-                self.fw = (FwState::AwaitingKey, self.fw.1);
+                // The module's firmware needs no key: the module checks and writes its first sector now.
+                let next = if self.fw_target == FwTarget::Module { FwState::Writing } else { FwState::AwaitingKey };
+                self.fw = (next, self.fw.1);
                 Response::Fw { state: self.fw.0, progress: self.fw.1 }
             }
             Request::FwStatus => Response::Fw { state: self.fw.0, progress: self.fw.1 },
@@ -3218,22 +3964,30 @@ impl Engine {
             }
             Request::GetBtFound(i) => Response::BtFound(self.wireless.found.get(*i as usize).cloned()),
             Request::GetModuleLog(at) => {
-                let (first, end, at, data) = self.module_log.read(*at, ctrl::BT_MAP_PIECE);
+                let (first, end, at, data) = self.module_log.read(*at, ctrl::MAP_PIECE);
                 Response::ModuleLog { first, end, at, data: Vec::from_slice(&data).unwrap_or_default() }
             }
-            Request::GetBtDeviceMap { slot, offset } => {
-                if self.wireless.slot(*slot).is_none() {
-                    return Err(ErrorCode::InvalidValue);
-                }
-                let map = self.wireless.map_of(*slot);
+            Request::GetDeviceMap { device, index, offset } => {
+                let (iface, interfaces, map): (u8, u8, &[u8]) = match (device.port(), device.wireless()) {
+                    (Some(p), _) => {
+                        let descs = self.ports[p.index()].dev.as_ref().map_or(&[][..], |d| &d.probed.report_descs[..]);
+                        match descs.get(*index as usize) {
+                            Some((i, m)) => (*i, descs.len() as u8, &m[..]),
+                            None => (0, descs.len() as u8, &[]),
+                        }
+                    }
+                    (None, Some(n)) => {
+                        if self.wireless.slot(n).is_none() {
+                            return Err(ErrorCode::InvalidValue);
+                        }
+                        (0, 1, if *index == 0 { self.wireless.map_of(n) } else { &[] })
+                    }
+                    (None, None) => return Err(ErrorCode::InvalidValue),
+                };
                 let from = (*offset as usize).min(map.len());
-                let data = &map[from..(from + ctrl::BT_MAP_PIECE).min(map.len())];
-                Response::BtDeviceMap {
-                    slot: *slot,
-                    total: map.len() as u16,
-                    offset: from as u16,
-                    data: Vec::from_slice(data).unwrap_or_default(),
-                }
+                let data = Vec::from_slice(&map[from..(from + ctrl::MAP_PIECE).min(map.len())]).unwrap_or_default();
+                let (total, offset) = (map.len() as u16, from as u16);
+                Response::DeviceMap { device: *device, index: *index, iface, interfaces, total, offset, data }
             }
             Request::BtPairDevice(addr) => {
                 if !self.bt.present {
@@ -3260,6 +4014,31 @@ impl Engine {
                 self.emit(Output::Bt(BtOut::ForgetDevice(*n)));
                 Response::Ok
             }
+            Request::AdoptModule(p) => {
+                // Only for a KVM without a module: none on its board, no board on a front port that is one.
+                if self.bt_fitted || matches!(self.dongle, Dongle::Claimed(_)) {
+                    return Err(ErrorCode::Busy);
+                }
+                if self.ports[p.index()].dev.is_none() {
+                    return Err(ErrorCode::NoDevice);
+                }
+                // A port set to passthrough keeps one's own board from being taken: this one is to be taken, also
+                // when it comes back after a restart, so the port goes back to Auto.
+                let device = Device::of_port(*p);
+                if self.config.mode(device).is_passthrough() {
+                    self.set_config(ConfigValue::Mode(device, PortMode::Auto), Origin::Software)?;
+                }
+                self.adopt = Some(*p);
+                self.module_log.push(self.now, "RP2354B: adopting the ESP32 board on a front port as the module");
+                if self.dongle == Dongle::Probing(*p) {
+                    // Being found out right now: the firmware asks `dongle_adopt` before it lets the board go.
+                    return Ok(Response::Ok);
+                }
+                self.release_port(*p);
+                self.reprobe(*p);
+                self.event(Event::PortChanged(*p));
+                Response::Ok
+            }
             Request::BtEraseAll => {
                 if !self.bt.present {
                     return Err(ErrorCode::Unsupported);
@@ -3268,6 +4047,184 @@ impl Engine {
                 // The module restarts: its hosts and devices come back empty with its next `Hello`.
                 self.emit(Output::Bt(BtOut::EraseAll));
                 Response::Ok
+            }
+            Request::GetKeycodes { keymap, layer, first } => {
+                let (k, l) = keymap_layer(*keymap, *layer)?;
+                let codes = (*first as usize..kvm_map::POSITIONS)
+                    .take(ctrl::KEYCODES_PER)
+                    .map(|p| self.vial.keymap.get_in(k, l, p))
+                    .collect();
+                Response::Keycodes { keymap: *keymap, layer: *layer, first: *first, codes }
+            }
+            Request::SetKeycodes { keymap, layer, first, codes } => {
+                let (k, l) = keymap_layer(*keymap, *layer)?;
+                if *first as usize + codes.len() > kvm_map::POSITIONS {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                for (i, c) in codes.iter().enumerate() {
+                    self.vial.keymap.set_in(k, l, *first as usize + i, *c);
+                }
+                self.note_keymap_changes();
+                Response::Ok
+            }
+            Request::GetAxisRules { keymap, layer, first } => {
+                let (k, l) = keymap_layer(*keymap, *layer)?;
+                let rules = (*first as usize..kvm_map::axes::INPUTS)
+                    .take(ctrl::RULES_PER)
+                    .map(|i| self.vial.keymap.axes().get(k, l, i).encode())
+                    .collect();
+                Response::AxisRules { keymap: *keymap, layer: *layer, first: *first, rules }
+            }
+            Request::SetAxisRule { keymap, layer, input, rule } => {
+                let (k, l) = keymap_layer(*keymap, *layer)?;
+                let r = kvm_map::axes::Rule::decode(rule).ok_or(ErrorCode::InvalidValue)?;
+                if *input as usize >= kvm_map::axes::INPUTS {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                self.vial.keymap.set_rule(k, l, *input as usize, r);
+                self.note_keymap_changes();
+                Response::Ok
+            }
+            Request::WatchControls(0) => {
+                if self.watch.is_some_and(|w| w.pc == pc) {
+                    self.end_watch();
+                }
+                Response::Ok
+            }
+            Request::WatchControls(mode) => {
+                // As with learning a hotkey: the inactive PC would see what is typed on the active one.
+                if pc.is_some_and(|p| p != self.active) || self.bt.active.is_some() {
+                    return Err(ErrorCode::NotActive);
+                }
+                let until = self.now.wrapping_add(WATCH_MS);
+                if let Some(w) = self.watch.as_mut().filter(|w| w.pc == pc) {
+                    // Renewed: what was told stays told.
+                    if w.swallow && *mode != 2 {
+                        self.suppressed_keys = self.norm.keys();
+                        self.suppressed_buttons = self.norm.buttons();
+                    }
+                    w.swallow = *mode == 2;
+                    w.until = until;
+                } else {
+                    self.end_watch();
+                    let mut w = Watch {
+                        pc,
+                        swallow: *mode == 2,
+                        held: kvm_map::PosSet::EMPTY,
+                        axes: [0; kvm_map::axes::INPUTS],
+                        moved: [0; kvm_map::axes::RELATIVE],
+                        told_at: [self.now.wrapping_sub(WATCH_AXIS_MS); kvm_map::axes::INPUTS],
+                        until,
+                    };
+                    // What is held now isn't news; absolute axes start from where they are.
+                    w.held = kvm_map::PosSet::from_keys(&self.norm.keys());
+                    w.held.add_mask(kvm_map::pos::MOUSE, self.norm.buttons() as u32, kvm_map::pos::MOUSE_BUTTONS);
+                    let pad = self.norm.gamepad();
+                    w.held.add_mask(kvm_map::pos::PAD, pad.buttons, kvm_map::pos::PAD_BUTTONS);
+                    for (i, a) in pad.axes.iter().enumerate() {
+                        w.axes[kvm_map::axes::RELATIVE + i] = *a;
+                    }
+                    self.watch = Some(w);
+                }
+                Response::Ok
+            }
+            Request::GetControls(d) => Response::Controls(*d, self.controls(*d).ok_or(ErrorCode::NoDevice)?),
+            Request::GetCalibration(d, axis) => {
+                let id = self.identity(*d).ok_or(ErrorCode::NoDevice)?;
+                if *axis as usize >= kvm_hid::gamepad::AXES {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                Response::Calibration(*d, *axis, self.cal.get(id, *axis as usize))
+            }
+            Request::SetCalibration(d, axis, c) => {
+                let id = self.identity(*d).ok_or(ErrorCode::NoDevice)?;
+                if !self.cal.set(id, *axis as usize, *c) {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                self.dirty_since = Some(self.now);
+                Response::Ok
+            }
+            Request::GetOverride(d, n) => {
+                let id = self.identity(*d).ok_or(ErrorCode::NoDevice)?;
+                if *n as usize >= ctrl::MAX_OVERRIDES {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                Response::Override(*d, *n, self.cal.get_override(id, *n as usize))
+            }
+            Request::SetOverride(d, n, o) => {
+                let id = self.identity(*d).ok_or(ErrorCode::NoDevice)?;
+                if !self.cal.set_override(id, *n as usize, *o) {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                self.dirty_since = Some(self.now);
+                Response::Ok
+            }
+            Request::GetMapEntry { kind, index } => {
+                let k = *kvm_map::keymap::Dynamic::ALL.get(*kind as usize).ok_or(ErrorCode::InvalidValue)?;
+                let mut b = [0u8; ctrl::MAP_ENTRY_MAX];
+                let n = self.vial.keymap.dynamic(k, *index as usize, &mut b).ok_or(ErrorCode::InvalidValue)?;
+                Response::MapEntry { kind: *kind, index: *index, data: Vec::from_slice(&b[..n]).unwrap_or_default() }
+            }
+            Request::SetMapEntry { kind, index, data } => {
+                let k = *kvm_map::keymap::Dynamic::ALL.get(*kind as usize).ok_or(ErrorCode::InvalidValue)?;
+                if !self.vial.keymap.set_dynamic(k, *index as usize, data) {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                self.note_keymap_changes();
+                Response::Ok
+            }
+            Request::GetMacros(offset) => {
+                let buf = self.vial.keymap.macros();
+                let from = (*offset as usize).min(buf.len());
+                let data = Vec::from_slice(&buf[from..(from + ctrl::MACRO_PIECE).min(buf.len())]).unwrap_or_default();
+                Response::Macros { offset: from as u16, total: buf.len() as u16, data }
+            }
+            Request::SetMacros { offset, data } => {
+                if *offset as usize + data.len() > kvm_map::keymap::MACRO_BUFFER {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                self.vial.keymap.write_macros(*offset as usize, data);
+                self.note_keymap_changes();
+                Response::Ok
+            }
+            Request::GetMapSetting(q) => {
+                let mut b = [0u8; 4];
+                let n = self.vial.keymap.settings.get(*q, &mut b).ok_or(ErrorCode::InvalidValue)?;
+                b[n..].fill(0);
+                Response::MapSetting(*q, u32::from_le_bytes(b))
+            }
+            Request::SetMapSetting(q, v) => {
+                if !self.vial.keymap.settings.set(*q, &v.to_le_bytes()) {
+                    return Err(ErrorCode::InvalidValue);
+                }
+                self.vial.keymap.settings_changed();
+                self.note_keymap_changes();
+                Response::Ok
+            }
+            Request::MonitorDevice(_, false) => {
+                if self.monitor.is_some_and(|m| m.pc == pc) {
+                    self.monitor = None;
+                }
+                Response::Ok
+            }
+            Request::MonitorDevice(d, true) => {
+                // As watching the controls: the inactive PC would see what is typed on the active one.
+                if pc.is_some_and(|p| p != self.active) || self.bt.active.is_some() {
+                    return Err(ErrorCode::NotActive);
+                }
+                let until = self.now.wrapping_add(WATCH_MS);
+                match self.monitor.as_mut().filter(|m| m.pc == pc && m.device == *d) {
+                    Some(m) => m.until = until,
+                    None => {
+                        self.monitor =
+                            Some(Monitor { pc, device: *d, until, sent: [(0, 0, 0, 0); MONITOR_SLOTS], used: 0 })
+                    }
+                }
+                Response::Ok
+            }
+            Request::GetOutputs(h) => {
+                let (offered, taken) = self.outputs(*h);
+                Response::Outputs { host: *h, offered, taken }
             }
             Request::PlaceCursor(placement) => {
                 // Only a PC has a cursor (not the service port).
@@ -3417,8 +4374,20 @@ impl Engine {
         if self.bt.active == Some(h.host) && !h.bonded() {
             self.switch(Target::Toggle, SwitchSource::Power);
         }
+        // Nor may it control the KVM: the next host to pair into the slot would have that. Any state without a bond
+        // ends it (the module sends every slot's after each `Hello`), so a change lost on the way, or before a save,
+        // doesn't stay.
+        if !h.bonded() && self.config.bt_control[slot] {
+            let _ = self.set_config(ConfigValue::BtControl(slot as u8, false), Origin::Device);
+            if self.unlock.is_some_and(|u| u.host == Some(h.host)) {
+                self.unlock = None;
+            }
+        }
         if was != h {
             self.event(Event::BtChanged(h.host));
+        }
+        if self.bt.active == Some(h.host) && was.reports != h.reports {
+            self.host_changed();
         }
     }
 
@@ -3451,6 +4420,14 @@ impl Engine {
     }
 }
 
+/// A keymap and layer as a request names them, checked.
+fn keymap_layer(keymap: u8, layer: u8) -> Result<(usize, usize), ErrorCode> {
+    if (keymap as usize) < kvm_map::KEYMAPS && (layer as usize) < kvm_map::LAYERS {
+        Ok((keymap as usize, layer as usize))
+    } else {
+        Err(ErrorCode::InvalidValue)
+    }
+}
 #[cfg(test)]
 // Bitmap offsets like `2 + 0x04 / 8` spell out which byte a usage lives in.
 #[allow(clippy::identity_op)]
@@ -3458,7 +4435,7 @@ mod tests {
     use super::*;
     use crate::usbdesc::fixtures::GAMING_MOUSE_CONFIG;
     use kvm_hid::normalized;
-    use kvm_proto::ctrl::{DeviceMsg, Hotkey};
+    use kvm_proto::ctrl::{AxisCal, DeviceMsg, GamepadOut, Hotkey};
     use kvm_proto::descset::DescSet;
 
     /// Interface 0 of the gaming-mouse config with a boot keyboard report descriptor, interface 1 a mouse.
@@ -4062,6 +5039,7 @@ mod tests {
     fn vial_remaps_a_normalized_keyboard_and_the_keymap_is_saved() {
         let mut e = engine();
         e.set_config(ConfigValue::Vial(VialMode::On), Origin::Software).unwrap();
+        e.set_config(ConfigValue::ProfileKeymap(0, Some(0)), Origin::Software).unwrap();
         e.port_attached(Port::Keyboard, &keyboard_and_mouse());
         drain(&mut e);
         let id = vial(&mut e, Pc::Pc2, &[0xFE, 0x00]);
@@ -4080,7 +5058,7 @@ mod tests {
         assert!(drain(&mut e).contains(&Output::Save));
         let mut buf = [0u8; SAVE_ITEM_MAX];
         let items: std::vec::Vec<u16> = core::iter::from_fn(|| e.take_save_item(&mut buf).map(|(k, _)| k)).collect();
-        assert_eq!(items, [config::ITEM, kvm_vial::keymap::item::LAYER]);
+        assert_eq!(items, [config::ITEM, kvm_map::keymap::item::LAYER]);
 
         // MT(MOD_LCTL, KC_ESC): nothing until decided; held past the tapping term it is Ctrl.
         vial(&mut e, Pc::Pc1, &[0x05, 0, 7, 1, 0x21, 0x29]);
@@ -4093,8 +5071,8 @@ mod tests {
         e.device_report(Port::Keyboard, 0, &[0; 8], 6300);
         drain(&mut e);
 
-        // With the keymap off, Caps Lock is Caps Lock again.
-        e.set_config(ConfigValue::Keymap(false), Origin::Software).unwrap();
+        // Without a keymap in the profile, Caps Lock is Caps Lock again.
+        e.set_config(ConfigValue::ProfileKeymap(0, None), Origin::Software).unwrap();
         e.device_report(Port::Keyboard, 0, &[0, 0, 0x39, 0, 0, 0, 0, 0], 6400);
         let r = reports(&drain(&mut e));
         let nkro = &r.last().unwrap().2;
@@ -4109,13 +5087,13 @@ mod tests {
         drain(&mut e);
         let ask = |e: &mut Engine, req: Request| {
             let raw = req.encode(3).unwrap();
-            match DeviceMsg::decode(&e.control(Some(Pc::Pc2), &raw).unwrap()).unwrap() {
+            match DeviceMsg::decode(&e.control(Asker::Pc(Pc::Pc2), &raw).unwrap()).unwrap() {
                 DeviceMsg::Response { id: 3, response, .. } => response,
                 other => panic!("{other:?}"),
             }
         };
         let Response::Status(s) = ask(&mut e, Request::GetStatus) else { panic!() };
-        assert_eq!((s.active, s.asking), (Pc::Pc1, Some(Pc::Pc2)));
+        assert_eq!((s.active, s.asking), (Pc::Pc1, Some(Host::Pc2)));
         let Response::Port(p) = ask(&mut e, Request::GetPort(Port::Keyboard)) else { panic!() };
         assert_eq!(
             (p.vid, p.state, p.effective, p.reason),
@@ -4381,7 +5359,7 @@ mod tests {
 
     fn ask_from(e: &mut Engine, pc: Option<Pc>, req: Request) -> Response {
         let raw = req.encode(7).unwrap();
-        match DeviceMsg::decode(&e.control(pc, &raw).unwrap()).unwrap() {
+        match DeviceMsg::decode(&e.control(pc.map_or(Asker::Service, Asker::Pc), &raw).unwrap()).unwrap() {
             DeviceMsg::Response { response, .. } => response,
             other => panic!("{other:?}"),
         }
@@ -4412,7 +5390,7 @@ mod tests {
     // ── Bluetooth hosts (software.md §4.13) ──────────────────────────────────
 
     fn bt_host(n: u8, flags: u8) -> BtHostState {
-        BtHostState { host: n, flags, interval: 12, latency: 0, addr: [0, 1, 2, 3, 4, 5, n], rssi: -55 }
+        BtHostState { host: n, flags, interval: 12, latency: 0, addr: [0, 1, 2, 3, 4, 5, n], rssi: -55, reports: 0 }
     }
 
     const BT_READY: u8 = kvm_proto::link::bt::host_flags::BONDED
@@ -4429,6 +5407,159 @@ mod tests {
         e.bt_host(bt_host(3, kvm_proto::link::bt::host_flags::BONDED));
         drain(&mut e);
         e
+    }
+
+    /// A control request from Bluetooth host `n` over the module's control service; its response, as the module would
+    /// notify it.
+    fn ask_bt(e: &mut Engine, n: u8, req: Request) -> Response {
+        let raw = req.encode(9).unwrap();
+        e.bt_control(n, btcontrol::trim(&raw), T0);
+        let out = drain(e);
+        let mut answers = out.iter().filter_map(|o| match o {
+            Output::Bt(BtOut::Control { host, data }) if *host == n => match DeviceMsg::decode(data).unwrap() {
+                DeviceMsg::Response { id: 9, response, .. } => Some(response),
+                _ => None,
+            },
+            _ => None,
+        });
+        let r = answers.next().expect("an answer");
+        assert!(answers.next().is_none());
+        r
+    }
+
+    /// The events `out` sends to Bluetooth host `n`'s control session.
+    fn bt_events(out: &[Output], n: u8) -> std::vec::Vec<Event> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::Bt(BtOut::Control { host, data }) if *host == n => match DeviceMsg::decode(data).ok()? {
+                    DeviceMsg::Event(e) => Some(e),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    const BT_SESSION: u8 = BT_READY | kvm_proto::link::bt::host_flags::CONTROL;
+
+    #[test]
+    fn a_bluetooth_host_controls_the_kvm_only_once_the_key_allowed_it() {
+        let mut e = with_bt();
+        e.bt_host(bt_host(2, BT_SESSION));
+        drain(&mut e);
+        // Not allowed yet: its identity, to see that it speaks this protocol, and nothing else.
+        let Response::Info(info) = ask_bt(&mut e, 2, Request::GetInfo) else { panic!() };
+        assert_eq!(info.proto, ctrl::PROTOCOL_VERSION);
+        assert_eq!(ask_bt(&mut e, 2, Request::GetStatus), Response::Error(ErrorCode::NotAllowed));
+        assert_eq!(ask_bt(&mut e, 2, Request::SetActive(Target::Pc2)), Response::Error(ErrorCode::NotAllowed));
+        // It can't allow itself by setting the value.
+        let on = ConfigValue::BtControl(1, true);
+        assert_eq!(ask_bt(&mut e, 2, Request::SetConfig(on)), Response::Error(ErrorCode::NotAllowed));
+        // It asks; the KVM waits for its key, and the tap allows it.
+        assert_eq!(ask_bt(&mut e, 2, Request::AskControl), Response::Error(ErrorCode::NeedsKeyPress));
+        assert!(!e.config().bt_control[1]);
+        e.key(KeyEvent::Tap);
+        assert!(e.config().bt_control[1]);
+        // A host that may hears of the change, as the PCs do.
+        let out = drain(&mut e);
+        assert!(bt_events(&out, 2).contains(&Event::ConfigChanged(ctrl::key::BT_CONTROL_BASE + 1)));
+        assert!(events_to(&out, Pc::Pc1).contains(&Event::ConfigChanged(ctrl::key::BT_CONTROL_BASE + 1)));
+        assert_eq!(ask_bt(&mut e, 2, Request::AskControl), Response::Ok);
+        let Response::Status(st) = ask_bt(&mut e, 2, Request::GetStatus) else { panic!() };
+        assert_eq!((st.asking, st.asking_bt(), st.asking_pc()), (Some(Host::Bt2), Some(2), None));
+        assert_eq!(ask_bt(&mut e, 2, Request::SetActive(Target::Pc2)), Response::Ok);
+        assert_eq!(e.active(), Pc::Pc2);
+        // AskControl is for Bluetooth hosts only.
+        assert_eq!(ask(&mut e, Request::AskControl), Response::Error(ErrorCode::Unsupported));
+    }
+
+    #[test]
+    fn a_bluetooth_host_gets_neither_firmware_nor_what_streams_to_a_pc() {
+        let mut e = with_bt();
+        e.bt_host(bt_host(2, BT_SESSION));
+        e.set_config(ConfigValue::BtControl(1, true), Origin::Device).unwrap();
+        drain(&mut e);
+        let refused = [
+            (Request::FwBegin { target: FwTarget::Rp2354, size: 4096, crc32: 0 }, ErrorCode::Unsupported),
+            (Request::FwCommit, ErrorCode::Unsupported),
+            (Request::Reboot(RebootTarget::Bootloader), ErrorCode::Unsupported),
+            (Request::LearnHotkey(true), ErrorCode::NotActive),
+            (Request::WatchControls(1), ErrorCode::NotActive),
+            (Request::MonitorDevice(Device::Keyboard, true), ErrorCode::NotActive),
+            (Request::PointerAt([10, 10]), ErrorCode::NotActive),
+        ];
+        for (req, code) in refused {
+            assert_eq!(ask_bt(&mut e, 2, req.clone()), Response::Error(code), "{req:?}");
+        }
+        // Stopping what it can't start is no error, and stops nobody else's.
+        assert_eq!(ask(&mut e, Request::WatchControls(1)), Response::Ok);
+        assert_eq!(ask_bt(&mut e, 2, Request::WatchControls(0)), Response::Ok);
+        assert!(e.watch.is_some(), "PC1's watch goes on");
+        assert!(matches!(ask_bt(&mut e, 2, Request::FwStatus), Response::Fw { .. }));
+    }
+
+    #[test]
+    fn events_reach_only_the_bluetooth_hosts_that_may_and_listen() {
+        let mut e = with_bt();
+        e.bt_host(bt_host(2, BT_SESSION));
+        e.bt_host(bt_host(3, kvm_proto::link::bt::host_flags::BONDED | kvm_proto::link::bt::host_flags::CONTROL));
+        e.set_config(ConfigValue::BtControl(1, true), Origin::Device).unwrap();
+        drain(&mut e);
+        e.set_config(ConfigValue::DoubleTapMs(400), Origin::Software).unwrap();
+        let out = drain(&mut e);
+        assert_eq!(bt_events(&out, 2), [Event::ConfigChanged(ctrl::key::DOUBLE_TAP_MS)]);
+        assert!(bt_events(&out, 3).is_empty(), "host 3 may not control the KVM");
+        // Without its session (its software left), nothing goes to host 2 either.
+        e.bt_host(bt_host(2, BT_READY));
+        drain(&mut e);
+        e.set_config(ConfigValue::DoubleTapMs(300), Origin::Software).unwrap();
+        assert!(bt_events(&drain(&mut e), 2).is_empty());
+    }
+
+    #[test]
+    fn a_slot_without_its_bond_may_not_control_the_kvm_any_more() {
+        let mut e = with_bt();
+        e.set_config(ConfigValue::BtControl(1, true), Origin::Device).unwrap();
+        // Still bonded: it keeps it across states.
+        e.bt_host(bt_host(2, kvm_proto::link::bt::host_flags::BONDED));
+        assert!(e.config().bt_control[1]);
+        // Forgotten: the next host to pair into slot 2 starts without.
+        e.bt_host(bt_host(2, 0));
+        assert!(!e.config().bt_control[1]);
+        // A free slot can't be allowed, from a PC either.
+        let on = ConfigValue::BtControl(1, true);
+        assert_eq!(ask(&mut e, Request::SetConfig(on)), Response::Error(ErrorCode::NoDevice));
+    }
+
+    #[test]
+    fn a_pc_allows_a_host_with_the_key_and_one_tap_grants_one_thing() {
+        let mut e = with_bt();
+        let on = ConfigValue::BtControl(1, true);
+        assert_eq!(ask(&mut e, Request::SetConfig(on)), Response::Error(ErrorCode::NeedsKeyPress));
+        // While host 2 waits, neither the locks nor another host can share the tap.
+        assert_eq!(
+            ask(&mut e, Request::SetConfig(ConfigValue::SwConfigAllowed(true))),
+            Response::Config(ConfigValue::SwConfigAllowed(true)),
+            "already on: nothing to wait for"
+        );
+        e.set_config(ConfigValue::SwSwitchAllowed(false), Origin::Software).unwrap();
+        assert_eq!(ask(&mut e, Request::SetConfig(ConfigValue::SwSwitchAllowed(true))), Response::Error(ErrorCode::Busy));
+        assert_eq!(
+            ask(&mut e, Request::SetConfig(ConfigValue::BtControl(2, true))),
+            Response::Error(ErrorCode::Busy)
+        );
+        e.key(KeyEvent::Tap);
+        assert!(e.config().bt_control[1]);
+        assert!(!e.config().sw_switch_allowed);
+        // Off at once, like any other setting.
+        let off = ConfigValue::BtControl(1, false);
+        assert_eq!(ask(&mut e, Request::SetConfig(off)), Response::Config(off));
+        assert!(!e.config().bt_control[1]);
+        // Nobody tapped: it stays off.
+        assert_eq!(ask(&mut e, Request::SetConfig(on)), Response::Error(ErrorCode::NeedsKeyPress));
+        e.tick(T0 + UNLOCK_WAIT_MS + 1000);
+        e.key(KeyEvent::Tap);
+        assert!(!e.config().bt_control[1]);
     }
 
     fn bt_inputs(out: &[Output]) -> std::vec::Vec<(u8, u8, std::vec::Vec<u8>)> {
@@ -4595,15 +5726,16 @@ mod tests {
         let Response::Status(st) = ask(&mut e, Request::GetStatus) else { panic!() };
         assert_eq!(st.bt_module, BtModule::Up);
 
-        // Fitted but silent: red, and `Status` says so, though there is no Bluetooth (no `Hello`, no capability).
+        // Fitted but on another firmware: amber, and `Status` says so, though there is no Bluetooth (no `Hello`, no
+        // capability).
         let mut silent = engine();
-        silent.set_bt_module(BtModule::GaveUp);
+        silent.set_bt_module(BtModule::NeedsUpdate);
         let items = bt_items(&mut silent);
-        assert_eq!(items.iter().find(|i| i.id == id::BT_MODULE).map(|i| i.grade), Some(Grade::Bad));
+        assert_eq!(items.iter().find(|i| i.id == id::BT_MODULE).map(|i| i.grade), Some(Grade::Warn));
         let Response::Info(i) = ask(&mut silent, Request::GetInfo) else { panic!() };
         assert_eq!((i.caps & ctrl::caps::BLUETOOTH, i.bt_fw), (0, 0));
         let Response::Status(st) = ask(&mut silent, Request::GetStatus) else { panic!() };
-        assert_eq!(st.bt_module, BtModule::GaveUp);
+        assert_eq!(st.bt_module, BtModule::NeedsUpdate);
         // It still draws its current.
         let pwr = PowerInfo { source: PowerSource::PwrPort, adv_pwr: Advertised::A3_0, vbus_pwr_mv: 5100 };
         plain.set_power(pwr);
@@ -4695,6 +5827,35 @@ mod tests {
         e.port_attached(Port::Other, &esp_board());
         assert!(!e.dongle_wanted(Port::Other));
         assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+    }
+
+    #[test]
+    fn a_declined_esp32_board_is_adopted_when_asked() {
+        // Declined (another firmware): an ordinary device, until it is adopted.
+        let mut e = engine();
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Passthrough), Origin::Software).unwrap();
+        e.port_attached(Port::Other, &esp_board());
+        assert!(!e.dongle_wanted(Port::Other));
+        drain(&mut e);
+        assert_eq!(ask(&mut e, Request::AdoptModule(Port::Other)), Response::Ok);
+        assert!(drain(&mut e).contains(&Output::Reprobe(Port::Other)));
+        // Probed again: taken, the firmware told to program it, and its port no longer passthrough.
+        e.port_detached(Port::Other);
+        e.port_attached(Port::Other, &esp_board());
+        assert!(e.dongle_wanted(Port::Other) && e.dongle_adopt(Port::Other));
+        assert_eq!(e.config().mode(Device::Other), PortMode::Auto);
+        e.dongle_claimed(Port::Other);
+        assert!(!e.dongle_adopt(Port::Other));
+        // With a module now: no second one.
+        assert_eq!(ask(&mut e, Request::AdoptModule(Port::Mouse)), Response::Error(ErrorCode::Busy));
+        // An empty port has nothing to adopt; a device that can't be the module ends the adoption.
+        let mut e = engine();
+        assert_eq!(ask(&mut e, Request::AdoptModule(Port::Other)), Response::Error(ErrorCode::NoDevice));
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        assert_eq!(ask(&mut e, Request::AdoptModule(Port::Keyboard)), Response::Ok);
+        e.port_detached(Port::Keyboard);
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        assert!(!e.dongle_adopt(Port::Keyboard) && !e.dongle_wanted(Port::Keyboard));
     }
 
     #[test]
@@ -5306,6 +6467,8 @@ mod tests {
             addr: [0, 9, 9, 9, 9, 9, n],
             map_len: map.len() as u16,
             map_crc: crc32(map),
+            vid: 0,
+            pid: 0,
         }
     }
 
@@ -5471,5 +6634,505 @@ mod tests {
         drain(&mut e);
         assert!(!wide(&e), "the Bluetooth keyboard needs the KVM's keyboard interface");
         assert_eq!(e.wireless().slot(2).map(|w| w.live()), Some(true));
+    }
+
+    // ── the mapping engine (hid_mapping.md) ─────────────────────────────────────
+
+    /// A report of the KVM's own interfaces read back through its descriptor.
+    fn read_back(desc: &[u8], data: &[u8]) -> kvm_hid::Translation {
+        Translator::new(Layout::parse(desc).unwrap()).translate(data)
+    }
+
+    /// The last report on `ep` in `out`.
+    fn last_on(out: &[Output], ep: u8) -> Option<std::vec::Vec<u8>> {
+        reports(out).into_iter().filter(|(_, e, _)| *e == ep).map(|(_, _, d)| d).next_back()
+    }
+
+    fn mouse_desc(e: &Engine) -> &'static [u8] {
+        if e.presentation().mouse_abs { normalized::MOUSE_ABS_DESC } else { normalized::MOUSE_DESC }
+    }
+
+    /// A generic gamepad (14 buttons, a hat, X, Y, Z, Rz of 8 bits) on interface 0, a mouse on interface 1.
+    fn gamepad() -> Probed {
+        let pad = &[
+            0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x15, 0x00, 0x25, 0x01, 0x35, 0x00, 0x45, 0x01, 0x75, 0x01, 0x95, 0x0E,
+            0x05, 0x09, 0x19, 0x01, 0x29, 0x0E, 0x81, 0x02, 0x95, 0x02, 0x81, 0x01, 0x05, 0x01, 0x25, 0x07, 0x46, 0x3B,
+            0x01, 0x75, 0x04, 0x95, 0x01, 0x65, 0x14, 0x09, 0x39, 0x81, 0x42, 0x65, 0x00, 0x95, 0x01, 0x81, 0x01, 0x26,
+            0xFF, 0x00, 0x46, 0xFF, 0x00, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x75, 0x08, 0x95, 0x04, 0x81,
+            0x02, 0xC0,
+        ][..];
+        let mut p = keyboard_and_mouse();
+        p.device = DeviceDesc { vid: 0x0F0D, pid: 0x00C1, ..Default::default() };
+        p.report_descs[0].1 = Vec::from_slice(pad).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_keymap_maps_across_device_kinds() {
+        use kvm_map::keycode::KC_BTN1;
+        use kvm_map::pos;
+        let mut e = engine();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        let on = Request::SetConfig(ConfigValue::ProfileKeymap(0, Some(1)));
+        assert_eq!(ask(&mut e, on), Response::Config(ConfigValue::ProfileKeymap(0, Some(1))));
+        let set = |e: &mut Engine, first: u16, kc: u16| {
+            let codes = Vec::from_slice(&[kc]).unwrap();
+            ask(e, Request::SetKeycodes { keymap: 1, layer: 0, first, codes })
+        };
+        // Keymap 2: mouse button 3 types Escape, A clicks button 1.
+        assert_eq!(set(&mut e, pos::MOUSE + 2, 0x29), Response::Ok);
+        assert_eq!(set(&mut e, 0x04, KC_BTN1), Response::Ok);
+        let Response::Keycodes { codes, .. } = ask(&mut e, Request::GetKeycodes { keymap: 1, layer: 0, first: 0 })
+        else {
+            panic!()
+        };
+        assert_eq!((codes[4], codes[5]), (KC_BTN1, 0x05));
+        drain(&mut e);
+        let (nkro, mouse) = (e.presentation().nkro.ep_in, e.presentation().mouse.ep_in);
+        e.device_report(Port::Keyboard, 1, &[0b100, 0, 0], 10);
+        let out = drain(&mut e);
+        let keys = read_back(normalized::NKRO_DESC, &last_on(&out, nkro).unwrap()).keyboard.unwrap();
+        assert!(keys.is_pressed(0x29) && keys.key_count() == 1);
+        assert!(last_on(&out, mouse).is_none_or(|m| read_back(mouse_desc(&e), &m).mouse.unwrap().buttons == 0));
+        e.device_report(Port::Keyboard, 1, &[0, 0, 0], 20);
+        // Motion still moves: the axis rules' default.
+        e.device_report(Port::Keyboard, 1, &[0, 5, 0xFB], 30);
+        let m = read_back(mouse_desc(&e), &last_on(&drain(&mut e), mouse).unwrap()).mouse.unwrap();
+        assert_eq!((m.x, m.y, m.buttons), (5, -5, 0));
+        e.device_report(Port::Keyboard, 0, &[0, 0, 0x04, 0, 0, 0, 0, 0], 40);
+        let out = drain(&mut e);
+        assert_eq!(read_back(mouse_desc(&e), &last_on(&out, mouse).unwrap()).mouse.unwrap().buttons, 1);
+        assert!(last_on(&out, nkro).is_none_or(|k| read_back(normalized::NKRO_DESC, &k).keyboard.unwrap().is_empty()));
+        // Saved 5 s after the last change: the config and keymap 2's layer 0.
+        e.device_report(Port::Keyboard, 0, &[0; 8], 50);
+        e.tick(5100);
+        assert!(drain(&mut e).contains(&Output::Save));
+        let mut buf = [0u8; SAVE_ITEM_MAX];
+        let items: std::vec::Vec<u16> = core::iter::from_fn(|| e.take_save_item(&mut buf).map(|(k, _)| k)).collect();
+        assert_eq!(items, [config::ITEM, kvm_map::keymap::item::LAYER + 8]);
+    }
+
+    #[test]
+    fn a_gamepad_goes_to_the_virtual_gamepad() {
+        let mut e = engine();
+        e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Other, &gamepad());
+        drain(&mut e);
+        let nkro = e.presentation().nkro.ep_in;
+        assert_eq!(e.presentation().gamepad, GamepadOut::Hid);
+        // Without a keymap, 1:1: button 2, the hat right, X full left, Rz three quarters.
+        e.device_report(Port::Other, 0, &[0b10, 0, 2, 0, 128, 128, 224], 10);
+        let r = last_on(&drain(&mut e), nkro).unwrap();
+        let g = read_back(&normalized::NKRO_PAD_DESC, &r).gamepad.unwrap();
+        assert_eq!((g.buttons, g.hat, g.axes[0], g.axes[1], g.axes[5]), (0b10, 2, -32767, 128, 24800));
+        // With a keymap: button 2 types B, the rest is as before.
+        e.set_config(ConfigValue::ProfileKeymap(0, Some(0)), Origin::Software).unwrap();
+        let codes = Vec::from_slice(&[0x05]).unwrap();
+        ask(&mut e, Request::SetKeycodes { keymap: 0, layer: 0, first: kvm_map::pos::PAD + 1, codes });
+        e.device_report(Port::Other, 0, &[0, 0, 0x0F, 128, 128, 128, 128], 20);
+        drain(&mut e);
+        e.device_report(Port::Other, 0, &[0b10, 0, 0x0F, 128, 128, 128, 128], 30);
+        let out = drain(&mut e);
+        assert!(
+            read_back(normalized::NKRO_DESC, &last_on(&out, nkro).unwrap())
+                .keyboard
+                .is_some_and(|k| k.is_pressed(0x05))
+        );
+    }
+
+    #[test]
+    fn the_mouse_pushes_a_stick_of_the_virtual_gamepad() {
+        use kvm_map::axes::{Rule, Target, input};
+        let mut e = engine();
+        e.set_config(ConfigValue::Gamepad(GamepadOut::XInput), Origin::Software).unwrap();
+        e.set_config(ConfigValue::ProfileKeymap(0, Some(0)), Origin::Software).unwrap();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        let x = e.presentation().xinput.unwrap();
+        // Mouse X → the right stick's X (Rx), springing back by a quarter per tick.
+        let rule = Rule { target: Target::Pad(3), flags: 0, scale: 256, deadzone: 0, param: 64 }.encode();
+        assert_eq!(
+            ask(&mut e, Request::SetAxisRule { keymap: 0, layer: 0, input: input::MOUSE_X as u8, rule }),
+            Response::Ok
+        );
+        drain(&mut e);
+        e.device_report(Port::Keyboard, 1, &[0, 20, 0], 10);
+        let out = drain(&mut e);
+        let r = last_on(&out, x.ep_in).unwrap();
+        assert_eq!(i16::from_le_bytes([r[10], r[11]]), 20 * 256, "XInput's right stick X");
+        assert!(last_on(&out, e.presentation().mouse.ep_in).is_none(), "the pointer doesn't move");
+        let t = e.deadline().unwrap();
+        e.tick(t);
+        let r = last_on(&drain(&mut e), x.ep_in).unwrap();
+        assert_eq!(i16::from_le_bytes([r[10], r[11]]), 15 * 256);
+    }
+
+    #[test]
+    fn learning_a_control_tells_it_and_keeps_it_from_the_host() {
+        let mut e = engine();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        drain(&mut e);
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc1), Request::WatchControls(2)), Response::Ok);
+        e.device_report(Port::Keyboard, 1, &[0b10, 0, 0], 10);
+        let out = drain(&mut e);
+        assert_eq!(events_to(&out, Pc::Pc1), [Event::Control(kvm_map::pos::MOUSE + 1, true)]);
+        assert!(events_to(&out, Pc::Pc2).is_empty());
+        assert!(reports(&out).is_empty(), "nothing reaches the PC");
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc1), Request::WatchControls(0)), Response::Ok);
+        // Held while learning: hidden until released.
+        e.device_report(Port::Keyboard, 1, &[0b10, 1, 0], 20);
+        let m = read_back(mouse_desc(&e), &last_on(&drain(&mut e), e.presentation().mouse.ep_in).unwrap());
+        assert_eq!(m.mouse.unwrap().buttons, 0);
+    }
+
+    #[test]
+    fn only_the_active_pc_watches_the_controls_and_not_for_ever() {
+        let mut e = engine();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        drain(&mut e);
+        // The inactive PC would see what is typed on the active one.
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc2), Request::WatchControls(1)), Response::Error(ErrorCode::NotActive));
+        // Asked again within WATCH_MS, it goes on; otherwise it ends, and what it kept reaches the PC again.
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc1), Request::WatchControls(2)), Response::Ok);
+        e.tick(WATCH_MS - 1000);
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc1), Request::WatchControls(2)), Response::Ok);
+        e.tick(WATCH_MS + 1000);
+        e.device_report(Port::Keyboard, 1, &[0b1, 0, 0], WATCH_MS + 1000);
+        assert!(reports(&drain(&mut e)).is_empty(), "renewed: still kept");
+        e.device_report(Port::Keyboard, 1, &[0, 0, 0], WATCH_MS + 1010);
+        drain(&mut e);
+        assert_eq!(e.deadline(), Some(2 * WATCH_MS - 1000));
+        e.tick(2 * WATCH_MS - 1000);
+        e.device_report(Port::Keyboard, 1, &[0b1, 0, 0], 2 * WATCH_MS);
+        let out = drain(&mut e);
+        assert!(events_to(&out, Pc::Pc1).is_empty());
+        let m = read_back(mouse_desc(&e), &last_on(&out, e.presentation().mouse.ep_in).unwrap());
+        assert_eq!(m.mouse.unwrap().buttons, 1);
+        // A switch ends it too.
+        assert_eq!(ask_from(&mut e, Some(Pc::Pc1), Request::WatchControls(1)), Response::Ok);
+        assert_eq!(ask(&mut e, Request::SetActive(Target::Pc2)), Response::Ok);
+        drain(&mut e);
+        e.device_report(Port::Keyboard, 1, &[0, 0, 0], 2 * WATCH_MS + 10);
+        assert!(events_to(&drain(&mut e), Pc::Pc1).is_empty());
+    }
+
+    #[test]
+    fn a_gamepads_calibration_follows_it_and_is_saved() {
+        let mut e = engine();
+        e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Other, &gamepad());
+        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Other)) else { panic!() };
+        assert_eq!((c.pad_buttons, c.hat, c.pad_axes, c.mouse_buttons), ((1 << 14) - 1, true, 0b10_0111, 0b111));
+        assert_ne!(c.identity, 0);
+        // X rests at 140 (raw) and reaches only 20 and 235.
+        let cal = AxisCal { min: -27500, centre: 1542, max: 27500, deadzone: 8 };
+        assert_eq!(ask(&mut e, Request::SetCalibration(Device::Other, 0, cal)), Response::Ok);
+        assert_eq!(
+            ask(&mut e, Request::GetCalibration(Device::Other, 0)),
+            Response::Calibration(Device::Other, 0, cal)
+        );
+        drain(&mut e);
+        e.device_report(Port::Other, 0, &[0, 0, 0x0F, 134, 128, 128, 128], 10);
+        let r = last_on(&drain(&mut e), e.presentation().nkro.ep_in).unwrap();
+        assert_eq!(read_back(&normalized::NKRO_PAD_DESC, &r).gamepad.unwrap().axes[0], 0, "at rest");
+        e.device_report(Port::Other, 0, &[0, 0, 0x0F, 235, 128, 128, 128], 20);
+        let r = last_on(&drain(&mut e), e.presentation().nkro.ep_in).unwrap();
+        assert_eq!(read_back(&normalized::NKRO_PAD_DESC, &r).gamepad.unwrap().axes[0], 32767);
+        e.tick(5100);
+        let mut buf = [0u8; SAVE_ITEM_MAX];
+        let items: std::vec::Vec<u16> = core::iter::from_fn(|| e.take_save_item(&mut buf).map(|(k, _)| k)).collect();
+        assert!(items.contains(&crate::known::ITEM), "{items:?}");
+    }
+
+    #[test]
+    fn a_kvm_action_on_a_mouse_button_switches_the_pc() {
+        let mut e = engine();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        e.set_config(ConfigValue::ProfileKeymap(0, Some(0)), Origin::Software).unwrap();
+        // Mouse button 3: select-pc2, the hotkey list's fifth action.
+        assert_eq!(HotkeyAction::ALL[4], HotkeyAction::SelectHost(Host::Pc2));
+        let codes = Vec::from_slice(&[kvm_map::keycode::KVM_ACTION + 4]).unwrap();
+        ask(&mut e, Request::SetKeycodes { keymap: 0, layer: 0, first: kvm_map::pos::MOUSE + 2, codes });
+        drain(&mut e);
+        e.device_report(Port::Keyboard, 1, &[0b100, 0, 0], 10);
+        drain(&mut e);
+        assert_eq!(e.active(), Pc::Pc2);
+    }
+
+    #[test]
+    fn a_field_override_makes_undeclared_bits_a_button_and_an_axis() {
+        let mut e = engine();
+        e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Other, &gamepad());
+        drain(&mut e);
+        let nkro = e.presentation().nkro.ep_in;
+        // The padding after the 14 buttons (bit 14) as button 20, the nibble after the hat (bits 20–23) as the slider.
+        let button = ctrl::FieldOverride { iface: 0, report_id: 0, bit: 14, bits: 1, flags: 0, target: 19 };
+        let slider =
+            ctrl::FieldOverride { iface: 0, report_id: 0, bit: 20, bits: 4, flags: 0, target: ctrl::field::AXIS + 6 };
+        assert_eq!(ask(&mut e, Request::SetOverride(Device::Other, 0, Some(button))), Response::Ok);
+        assert_eq!(ask(&mut e, Request::SetOverride(Device::Other, 1, Some(slider))), Response::Ok);
+        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Other)) else { panic!() };
+        assert!(c.pad_buttons & (1 << 19) != 0 && c.pad_axes & (1 << 6) != 0, "{c:?}");
+        e.device_report(Port::Other, 0, &[0, 0b0100_0000, 0xFF, 128, 128, 128, 128], 10);
+        let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
+        assert_eq!((g.buttons, g.axes[6]), (1 << 19, 32767));
+        assert_eq!(
+            ask(&mut e, Request::GetOverride(Device::Other, 0)),
+            Response::Override(Device::Other, 0, Some(button))
+        );
+        assert_eq!(ask(&mut e, Request::SetOverride(Device::Mouse, 0, None)), Response::Error(ErrorCode::NoDevice));
+    }
+
+    #[test]
+    fn the_monitor_tells_the_active_pc_a_devices_changed_reports() {
+        let mut e = engine();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        drain(&mut e);
+        let start = |e: &mut Engine, pc| ask_from(e, Some(pc), Request::MonitorDevice(Device::Keyboard, true));
+        assert_eq!(start(&mut e, Pc::Pc2), Response::Error(ErrorCode::NotActive));
+        assert_eq!(start(&mut e, Pc::Pc1), Response::Ok);
+        let told = |e: &mut Engine, d: &[u8], t| {
+            e.device_report(Port::Keyboard, 1, d, t);
+            events_to(&drain(e), Pc::Pc1).into_iter().filter(|ev| matches!(ev, Event::Report { .. })).count()
+        };
+        assert_eq!(told(&mut e, &[1, 5, 0], 100), 1);
+        assert_eq!(told(&mut e, &[1, 5, 0], 200), 0, "unchanged");
+        assert_eq!(told(&mut e, &[1, 6, 0], 210), 1);
+        assert_eq!(told(&mut e, &[1, 7, 0], 215), 0, "too soon after the last told");
+        assert_eq!(told(&mut e, &[1, 8, 0], 240), 1);
+        let r = ask(&mut e, Request::GetDeviceMap { device: Device::Keyboard, index: 1, offset: 0 });
+        let Response::DeviceMap { iface, interfaces, total, .. } = r else { panic!("{r:?}") };
+        assert_eq!((iface, interfaces, total), (1, 2, 50));
+        // Not asked again: it ends.
+        e.tick(WATCH_MS + 300);
+        assert_eq!(told(&mut e, &[1, 9, 0], WATCH_MS + 400), 0);
+    }
+
+    #[test]
+    fn a_bluetooth_host_gets_the_gamepad_or_the_profiles_fallback() {
+        let mut e = with_bt();
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Other, &gamepad());
+        // Host 2 subscribed to every report, the gamepad's too.
+        e.bt_host(BtHostState { reports: btreports::KNOWN | btreports::ALL, ..bt_host(2, BT_READY) });
+        assert_eq!(ask(&mut e, Request::SetActive(Target::Bt2)), Response::Ok);
+        drain(&mut e);
+        e.device_report(Port::Other, 0, &[0b1, 0, 0x0F, 128, 128, 128, 128], 10);
+        let out = bt_inputs(&drain(&mut e));
+        let pad = out.iter().rev().find(|(h, id, _)| *h == 2 && *id == btreport::GAMEPAD).expect("a gamepad report");
+        assert_eq!((pad.2[0], pad.2[4]), (1, kvm_hid::gamepad::HAT_CENTRE), "button 1, the hat at rest");
+        use ctrl::outputs as o;
+        let all = o::KEYBOARD | o::MOUSE | o::MEDIA | o::POINTER | o::GAMEPAD;
+        assert_eq!(
+            ask(&mut e, Request::GetOutputs(Host::Bt2)),
+            Response::Outputs { host: Host::Bt2, offered: all, taken: all }
+        );
+        // Now it takes no gamepad: profile 0's fallback keymap 1 types A for button 1.
+        e.set_config(ConfigValue::ProfileFallback(0, Some(1)), Origin::Software).unwrap();
+        ask(
+            &mut e,
+            Request::SetKeycodes {
+                keymap: 1,
+                layer: 0,
+                first: kvm_map::pos::PAD,
+                codes: Vec::from_slice(&[0x04]).unwrap(),
+            },
+        );
+        let some = btreports::KNOWN | btreports::KEYBOARD | btreports::MOUSE | btreports::CONSUMER;
+        e.bt_host(BtHostState { reports: some, ..bt_host(2, BT_READY) });
+        e.device_report(Port::Other, 0, &[0, 0, 0x0F, 128, 128, 128, 128], 20);
+        drain(&mut e);
+        e.device_report(Port::Other, 0, &[0b1, 0, 0x0F, 128, 128, 128, 128], 30);
+        let out = bt_inputs(&drain(&mut e));
+        assert!(out.iter().all(|(_, id, _)| *id != btreport::GAMEPAD), "{out:?}");
+        assert!(out.iter().any(|(h, id, d)| *h == 2 && *id == btreport::KEYBOARD && d[2] == 0x04), "{out:?}");
+        let Response::Outputs { taken, .. } = ask(&mut e, Request::GetOutputs(Host::Bt2)) else { panic!() };
+        assert_eq!(taken & o::GAMEPAD, 0);
+    }
+
+    #[test]
+    fn the_keymaps_shared_entries_macros_and_settings_over_the_control_protocol() {
+        let mut e = engine();
+        let combo: Vec<u8, { ctrl::MAP_ENTRY_MAX }> =
+            Vec::from_slice(&[0x04, 0, 0x05, 0, 0, 0, 0, 0, 0x29, 0]).unwrap();
+        assert_eq!(ask(&mut e, Request::SetMapEntry { kind: 1, index: 3, data: combo.clone() }), Response::Ok);
+        assert_eq!(
+            ask(&mut e, Request::GetMapEntry { kind: 1, index: 3 }),
+            Response::MapEntry { kind: 1, index: 3, data: combo }
+        );
+        assert_eq!(ask(&mut e, Request::GetMapEntry { kind: 4, index: 0 }), Response::Error(ErrorCode::InvalidValue));
+        assert_eq!(
+            ask(&mut e, Request::SetMacros { offset: 0, data: Vec::from_slice(b"hi\0").unwrap() }),
+            Response::Ok
+        );
+        let Response::Macros { total, data, .. } = ask(&mut e, Request::GetMacros(0)) else { panic!() };
+        assert_eq!((total as usize, &data[..3]), (kvm_map::keymap::MACRO_BUFFER, &b"hi\0"[..]));
+        assert_eq!(ask(&mut e, Request::SetMapSetting(7, 250)), Response::Ok);
+        assert_eq!(ask(&mut e, Request::GetMapSetting(7)), Response::MapSetting(7, 250));
+        assert_eq!(ask(&mut e, Request::GetMapSetting(999)), Response::Error(ErrorCode::InvalidValue));
+    }
+
+    #[test]
+    fn macro_text_follows_the_hosts_keyboard_layout() {
+        let mut e = engine();
+        e.port_attached(Port::Keyboard, &keyboard_and_mouse());
+        e.set_config(ConfigValue::ProfileKeymap(0, Some(0)), Origin::Software).unwrap();
+        let de = ConfigValue::HostLayout(Host::Pc1, kvm_hid::layouts::Layout::De as u8);
+        e.set_config(de, Origin::Software).unwrap();
+        ask(&mut e, Request::SetMacros { offset: 0, data: Vec::from_slice(b"z\0").unwrap() });
+        ask(
+            &mut e,
+            Request::SetKeycodes { keymap: 0, layer: 0, first: 0x3A, codes: Vec::from_slice(&[0x7700]).unwrap() },
+        );
+        drain(&mut e);
+        let nkro = e.presentation().nkro.ep_in;
+        e.device_report(Port::Keyboard, 0, &[0, 0, 0x3A, 0, 0, 0, 0, 0], 10);
+        let mut typed = std::vec::Vec::new();
+        for t in (10..40).step_by(2) {
+            e.tick(t);
+            for (_, ep, d) in reports(&drain(&mut e)) {
+                if ep == nkro
+                    && let Some(k) = read_back(normalized::NKRO_DESC, &d).keyboard
+                {
+                    typed.extend(k.keys());
+                }
+            }
+        }
+        // A German host's z is on the key where a US one has y.
+        assert!(typed.contains(&0x1C) && !typed.contains(&0x1D), "{typed:?}");
+    }
+
+    #[test]
+    fn a_saved_profile_keymap_runs_from_the_start() {
+        let mut config = Config::default();
+        config.set(ConfigValue::ProfileKeymap(0, Some(2)), crate::config::Origin::Software).unwrap();
+        let info =
+            Info { proto: 1, rp_fw: 0x000100, at_fw: [0; 2], hw: 0x000C00, serial: *b"TEST0001", caps: 0, bt_fw: 0 };
+        let e = Engine::new(config, info, "TEST0001");
+        assert_eq!((e.keymap_now, e.vial.keymap.active()), (Some(2), 2));
+    }
+
+    /// Device outputs (reports to a device's OUT endpoint) in a run of outputs: (port, interface, data).
+    fn device_outs(out: &[Output]) -> std::vec::Vec<(Port, u8, std::vec::Vec<u8>)> {
+        out.iter()
+            .filter_map(|o| match o {
+                Output::DeviceOut { port, iface, data } => Some((*port, *iface, data.to_vec())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_wireless_receivers_pad_is_read_when_normalized() {
+        use crate::usbdesc::fixtures::RECEIVER_CONFIG;
+        use kvm_hid::xinput;
+        let mut e = engine();
+        e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
+        let rx = Probed {
+            device: DeviceDesc { vid: 0x045E, pid: 0x0719, ..Default::default() },
+            speed: Some(Speed::Full),
+            config: Vec::from_slice(RECEIVER_CONFIG).unwrap(),
+            ..Default::default()
+        };
+        // Auto: the PC gets the receiver as it is.
+        e.port_attached(Port::Other, &rx);
+        assert_eq!(e.port_info(Port::Other).state, PortState::Passthrough);
+        // Normalized: the KVM reads its first pad, and asks the receiver whether one is linked.
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
+        e.port_attached(Port::Other, &rx);
+        let out = drain(&mut e);
+        assert_eq!(
+            (e.port_info(Port::Other).state, e.port_info(Port::Other).effective),
+            (PortState::Hosted, PortMode::Normalized)
+        );
+        assert!(device_outs(&out).contains(&(Port::Other, 0, xinput::INQUIRY.to_vec())), "{:?}", device_outs(&out));
+        // A pad links: its player LED.
+        e.device_report(Port::Other, 0, &[0x08, 0x80], 10);
+        assert_eq!(device_outs(&drain(&mut e)), [(Port::Other, 0, xinput::led(0).to_vec())]);
+        // Its input: A and the left stick to the right, on the virtual gamepad.
+        let mut r = [0u8; 29];
+        r[1] = 0x01;
+        r[6] = 0x00;
+        r[7] = 0x10;
+        r[10..12].copy_from_slice(&20000i16.to_le_bytes());
+        e.device_report(Port::Other, 0, &r, 20);
+        let nkro = e.presentation().nkro.ep_in;
+        let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
+        assert_eq!((g.buttons, g.axes[0]), (1, 20000));
+        // What it has, in the standard order.
+        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Other)) else { panic!() };
+        assert_eq!((c.pad_buttons, c.hat), (xinput::BUTTONS_PRESENT, true));
+        // The pad leaves: everything let go.
+        e.device_report(Port::Other, 0, &[0x08, 0x00], 30);
+        let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
+        assert_eq!((g.buttons, g.axes[0]), (0, 0));
+    }
+
+    #[test]
+    fn a_symmetric_pad_reaches_the_virtual_gamepad_in_the_standard_order() {
+        // As the 5 series lays out report 1: X Y Z Rz Rx Ry, a vendor byte, the hat and 15 buttons, vendor data.
+        #[rustfmt::skip]
+        let desc = &[
+            0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x01,
+            0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x09, 0x33, 0x09, 0x34, 0x15, 0x00, 0x26, 0xFF, 0x00,
+            0x75, 0x08, 0x95, 0x06, 0x81, 0x02,
+            0x06, 0x00, 0xFF, 0x09, 0x20, 0x95, 0x01, 0x81, 0x02,
+            0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14, 0x75, 0x04,
+            0x95, 0x01, 0x81, 0x42,
+            0x65, 0x00, 0x05, 0x09, 0x19, 0x01, 0x29, 0x0F, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02,
+            0x06, 0x00, 0xFF, 0x09, 0x21, 0x95, 0x0D, 0x81, 0x02,
+            0x06, 0x00, 0xFF, 0x09, 0x22, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x34, 0x81, 0x02,
+            0xC0,
+        ][..];
+        let mut e = engine();
+        e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
+        e.set_config(ConfigValue::Mode(Device::Other, PortMode::Normalized), Origin::Software).unwrap();
+        let mut p = keyboard_and_mouse();
+        p.device = DeviceDesc { vid: 0x054C, pid: 0x0CE6, ..Default::default() };
+        p.report_descs[0].1 = Vec::from_slice(desc).unwrap();
+        e.port_attached(Port::Other, &p);
+        drain(&mut e);
+        let nkro = e.presentation().nkro.ep_in;
+        // Cross (its button 2) and the right stick pushed left (its Z), a finger on the touch pad.
+        let mut r = [0u8; 64];
+        r[0] = 1;
+        r[1..5].copy_from_slice(&[128, 128, 0, 128]);
+        r[8] = 0x08 | 0x20;
+        r[1 + 32] = 0x01;
+        e.device_report(Port::Other, 0, &r, 10);
+        let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
+        assert_eq!(g.buttons, 1 | 1 << (crate::pads::TOUCH_BUTTON - 1), "the bottom face button, the touch");
+        assert_eq!(g.axes[3], -32767, "the right stick on Rx");
+        let Response::Controls(_, c) = ask(&mut e, Request::GetControls(Device::Other)) else { panic!() };
+        assert!(c.pad_buttons & (1 << 16) != 0 && c.pad_buttons & (1 << 19) != 0, "Home and the touch: {c:?}");
+    }
+
+    #[test]
+    fn a_symmetric_pad_over_bluetooth_classic_reads_as_on_a_usb_port() {
+        // The ESP32 module's form of it (`kvm_classic::pad`), with the USB IDs that pick its profile.
+        let mut e = with_bt();
+        e.set_config(ConfigValue::Gamepad(GamepadOut::Hid), Origin::Software).unwrap();
+        let map = kvm_classic::pad::DESCRIPTOR;
+        let state = DeviceState { vid: 0x054C, pid: 0x0CE6, ..wireless_state(2, map) };
+        e.bt_device(state, "Pad");
+        assert!(drain(&mut e).contains(&Output::Bt(BtOut::RequestMap(2))));
+        let chunk = kvm_proto::link::bt::MAP_CHUNK;
+        for (i, piece) in map.chunks(chunk).enumerate() {
+            e.bt_device_map(2, (i * chunk) as u16, map.len() as u16, piece);
+        }
+        drain(&mut e);
+        let nkro = e.presentation().nkro.ep_in;
+        // Cross (its button 2) and the right stick pushed left (its Z), a finger on the touch pad.
+        let mut d = [0u8; kvm_classic::pad::USB_LEN];
+        d[..4].copy_from_slice(&[128, 128, 0, 128]);
+        d[7] = 0x08 | 0x20;
+        d[32] = 0x01;
+        e.bt_device_input(2, 1, &d, 10);
+        let g = read_back(&normalized::NKRO_PAD_DESC, &last_on(&drain(&mut e), nkro).unwrap()).gamepad.unwrap();
+        assert_eq!(g.buttons, 1 | 1 << (crate::pads::TOUCH_BUTTON - 1), "the bottom face button, the touch");
+        assert_eq!(g.axes[3], -32767, "the right stick on Rx");
     }
 }

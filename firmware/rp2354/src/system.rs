@@ -58,11 +58,6 @@ pub async fn reboots() -> ! {
                 }
                 cortex_m::peripheral::SCB::sys_reset();
             }
-            // The same for the Bluetooth module (software.md §4.13).
-            RebootTarget::BtRetry => {
-                storage::set_bt_fails(0).await;
-                cortex_m::peripheral::SCB::sys_reset();
-            }
         }
     }
 }

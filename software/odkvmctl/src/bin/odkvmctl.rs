@@ -3,12 +3,13 @@
 
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use kvm_core::hop::main_screen;
 use kvm_core::hotkey::format_spec;
+use kvm_proto::ctrl::diag::BtModule;
 use kvm_proto::ctrl::{
     BT_DEVICES, BtDeviceInfo, BtFound, ConfigValue, Device, DevicePairing, ErrorCode, Event, FwState, Host, Hotkey,
     HotkeyAction, HotkeyBinding, LearnEnd, MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, Mapping, Pc, Port, PortMode,
@@ -17,7 +18,8 @@ use kvm_proto::ctrl::{
 use odkvmctl::bootsel::{self, Board};
 use odkvmctl::client::{BtHostView, DeviceSlot, HopView, ProfileView, Snapshot};
 use odkvmctl::ddc::{self, mccs};
-use odkvmctl::{Client, firmware, fl, image, local, names};
+use odkvmctl::transport::Link;
+use odkvmctl::{Client, firmware, fl, image, keycodes, local, names};
 
 #[derive(Parser)]
 #[command(name = "odkvmctl", version, about = fl!("cli-about"))]
@@ -62,6 +64,41 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<DeviceAction>,
     },
+    #[command(about = fl!("cli-keymap"))]
+    Keymap {
+        #[command(subcommand)]
+        action: Option<KeymapAction>,
+    },
+    #[command(about = fl!("cli-calibrate"))]
+    Calibrate {
+        #[arg(help = fl!("cli-calibrate-device"))]
+        device: String,
+        #[command(subcommand)]
+        action: Option<CalAction>,
+    },
+    #[command(about = fl!("cli-monitor"))]
+    Monitor {
+        #[arg(help = fl!("cli-calibrate-device"))]
+        device: String,
+        #[arg(default_value_t = 20)]
+        seconds: u32,
+    },
+    #[command(about = fl!("cli-field"))]
+    Field {
+        #[arg(help = fl!("cli-calibrate-device"))]
+        device: String,
+        #[command(subcommand)]
+        action: Option<FieldAction>,
+    },
+    #[command(about = fl!("cli-outputs"))]
+    Outputs,
+    #[command(about = fl!("cli-layout"))]
+    Layout {
+        #[arg(help = fl!("cli-layout-host"))]
+        host: Option<String>,
+        #[arg(help = fl!("cli-layout-name"))]
+        layout: Option<String>,
+    },
     #[command(about = fl!("cli-profile"))]
     Profile {
         #[arg(help = fl!("cli-profile-which"))]
@@ -91,6 +128,8 @@ enum Cmd {
     Update {
         #[arg(help = fl!("cli-update-file"))]
         file: Option<PathBuf>,
+        #[arg(long, help = fl!("cli-update-module"))]
+        module: bool,
     },
     #[command(about = fl!("cli-reboot"))]
     Reboot {
@@ -147,6 +186,20 @@ enum HostAction {
     Policy { slot: u8, policy: String },
     #[command(about = fl!("cli-wireless-erase"))]
     Erase,
+    #[command(about = fl!("cli-wireless-adopt"))]
+    Adopt {
+        #[arg(help = fl!("cli-wireless-adopt-port"))]
+        port: PortArg,
+        #[arg(long, help = fl!("cli-wireless-adopt-firmware"))]
+        firmware: Option<PathBuf>,
+    },
+    #[command(about = fl!("cli-hosts-allow"))]
+    Allow {
+        #[arg(help = fl!("cli-hosts-allow-slot"))]
+        slot: Option<u8>,
+    },
+    #[command(about = fl!("cli-hosts-disallow"))]
+    Disallow { slot: u8 },
 }
 
 #[derive(Subcommand)]
@@ -177,9 +230,136 @@ enum DeviceAction {
     #[command(about = fl!("cli-route"))]
     Route { slot: u8, route: String },
     #[command(about = fl!("cli-device-map"))]
-    Map { slot: u8 },
+    Map {
+        #[arg(help = fl!("cli-device-map-which"))]
+        device: String,
+    },
     #[command(about = fl!("cli-device-log"))]
     Log,
+}
+
+#[derive(Subcommand)]
+enum KeymapAction {
+    #[command(about = fl!("cli-keymap-show"))]
+    Show { keymap: Option<u8> },
+    #[command(about = fl!("cli-keymap-set"))]
+    Set { keymap: u8, layer: u8, control: String, keycode: String },
+    #[command(about = fl!("cli-keymap-axis"))]
+    Axis {
+        keymap: u8,
+        layer: u8,
+        #[arg(help = fl!("cli-keymap-axis-input"))]
+        input: String,
+        #[arg(help = fl!("cli-keymap-axis-target"))]
+        target: String,
+        #[arg(long, default_value_t = 1.0, allow_negative_numbers = true)]
+        scale: f32,
+        #[arg(long)]
+        invert: bool,
+        #[arg(long, default_value_t = 0, help = fl!("cli-keymap-axis-deadzone"))]
+        deadzone: u8,
+        #[arg(long, default_value = "linear", help = "linear, quadratic, cubic")]
+        curve: String,
+        #[arg(long, help = fl!("cli-keymap-axis-param"))]
+        param: Option<u8>,
+    },
+    #[command(about = fl!("cli-keymap-learn"))]
+    Learn {
+        #[arg(default_value_t = 20)]
+        seconds: u32,
+    },
+    #[command(about = fl!("cli-keymap-use"))]
+    Use { profile: u8, keymap: String },
+    #[command(about = fl!("cli-keymap-fallback"))]
+    Fallback { profile: u8, keymap: String },
+    #[command(about = fl!("cli-keymap-macro"))]
+    Macro {
+        n: Option<u8>,
+        #[arg(help = fl!("cli-keymap-macro-steps"), allow_hyphen_values = true)]
+        steps: Vec<String>,
+    },
+    #[command(about = fl!("cli-keymap-dance"))]
+    Dance {
+        n: Option<u8>,
+        tap: Option<String>,
+        hold: Option<String>,
+        double: Option<String>,
+        tap_hold: Option<String>,
+        #[arg(long, help = fl!("cli-keymap-dance-term"))]
+        term: Option<u16>,
+    },
+    #[command(about = fl!("cli-keymap-combo"))]
+    Combo {
+        n: Option<u8>,
+        #[arg(help = fl!("cli-keymap-combo-keys"))]
+        keys: Option<String>,
+        output: Option<String>,
+    },
+    #[command(about = fl!("cli-keymap-override"))]
+    Override {
+        n: Option<u8>,
+        trigger: Option<String>,
+        replacement: Option<String>,
+        #[arg(long, help = fl!("cli-keymap-override-mods"))]
+        mods: Option<String>,
+        #[arg(long, help = fl!("cli-keymap-override-negative"))]
+        negative: Option<String>,
+        #[arg(long, help = fl!("cli-keymap-override-suppress"))]
+        suppress: Option<String>,
+        #[arg(long, help = fl!("cli-keymap-override-layers"))]
+        layers: Option<String>,
+        #[arg(long, help = fl!("cli-keymap-off"))]
+        off: bool,
+    },
+    #[command(about = fl!("cli-keymap-repeat"))]
+    Repeat {
+        n: Option<u8>,
+        keycode: Option<String>,
+        alt: Option<String>,
+        #[arg(long, help = fl!("cli-keymap-repeat-mods"))]
+        mods: Option<String>,
+        #[arg(long, help = fl!("cli-keymap-off"))]
+        off: bool,
+    },
+    #[command(about = fl!("cli-keymap-setting"))]
+    Setting { name: Option<String>, value: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum FieldAction {
+    #[command(about = fl!("cli-field-list"))]
+    List,
+    #[command(about = fl!("cli-field-set"))]
+    Set {
+        n: u8,
+        iface: u8,
+        report_id: u8,
+        bit: u16,
+        bits: u8,
+        #[arg(help = fl!("cli-field-target"))]
+        target: String,
+        #[arg(long)]
+        signed: bool,
+        #[arg(long)]
+        invert: bool,
+    },
+    #[command(about = fl!("cli-field-remove"))]
+    Remove { n: u8 },
+}
+
+#[derive(Subcommand)]
+enum CalAction {
+    #[command(about = fl!("cli-calibrate-show"))]
+    Show,
+    #[command(about = fl!("cli-calibrate-set"))]
+    Set { axis: String, min: i16, centre: i16, max: i16, deadzone: Option<u8> },
+    #[command(about = fl!("cli-calibrate-measure"))]
+    Measure {
+        #[arg(default_value_t = 10)]
+        seconds: u32,
+    },
+    #[command(about = fl!("cli-calibrate-reset"))]
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -253,8 +433,6 @@ enum RebootArg {
     At32Dfu2,
     #[value(help = fl!("cli-reboot-at32-retry"))]
     At32Retry,
-    #[value(help = fl!("cli-reboot-wireless-retry"))]
-    WirelessRetry,
 }
 
 impl From<PortArg> for Port {
@@ -339,7 +517,7 @@ fn print_status(c: &Client, s: &Snapshot) {
         m => println!("{}", fl!("cli-module-state", state = names::bt_module(m))),
     }
     let this =
-        st.asking.map_or(String::new(), |p| format!("   ({})", fl!("cli-this-computer", pc = p.name().to_uppercase())));
+        st.asking_pc().map_or(String::new(), |p| format!("   ({})", fl!("cli-this-computer", pc = p.name().to_uppercase())));
     match s.bt.iter().find(|h| h.slot == st.bt_active).filter(|_| st.bt_active != 0) {
         Some(h) => println!(
             "{}{this}",
@@ -389,8 +567,8 @@ fn print_status(c: &Client, s: &Snapshot) {
     if st.selftest & (selftest::AT32_GAVE_UP1 | selftest::AT32_GAVE_UP2) != 0 {
         println!("  {}", fl!("cli-try-again", command = "odkvmctl reboot at32-retry"));
     }
-    if st.selftest & selftest::BT_GAVE_UP != 0 {
-        println!("  {}", fl!("cli-try-again", command = "odkvmctl reboot wireless-retry"));
+    if st.selftest & selftest::BT_FW != 0 {
+        println!("  {}", fl!("cli-module-update-hint", command = "odkvmctl update --module"));
     }
     println!("{}", fl!("cli-ports"));
     for p in Port::ALL {
@@ -528,8 +706,14 @@ fn print_hosts(s: &Snapshot) {
             println!("{mark} {}  ({})", h.slot, fl!("slot-free"));
             continue;
         }
+        let control = match (h.may_control, h.in_session()) {
+            (true, true) => format!(", {}", fl!("host-controls-now")),
+            (true, false) => format!(", {}", fl!("host-may-control")),
+            (false, _) => String::new(),
+        };
+        let this = if s.status.asking_bt() == Some(h.slot) { format!("   ({})", fl!("cli-this-computer-host")) } else { String::new() };
         println!(
-            "{mark} {}  {:<12}  {:<22} {}  {}{}",
+            "{mark} {}  {:<12}  {:<22} {}  {}{}{control}{this}",
             h.slot,
             h.name,
             host_state(h),
@@ -898,7 +1082,683 @@ fn print_event(e: &Event) {
         Event::BtDeviceChanged(n) => println!("{}", fl!("cli-ev-device-changed", slot = u32::from(*n))),
         // Screen hop's placements, for the window's placer: `Client` keeps none.
         Event::PlaceCursor(_) => {}
+        Event::Control(p, down) => {
+            let state = if *down { fl!("cli-control-down") } else { fl!("cli-control-up") };
+            println!("{}", fl!("cli-ev-control", control = keycodes::control_name(*p), state = state))
+        }
+        Event::Axis(i, v) => {
+            let name = keycodes::AXES.get(*i as usize).copied().unwrap_or("?");
+            println!("{}", fl!("cli-ev-axis", axis = name, value = i32::from(*v)))
+        }
+        // The monitor's pieces, which `odkvmctl monitor` puts together.
+        Event::Report { .. } => {}
     }
+}
+
+/// How often a watch of the controls is asked again: the KVM ends one after 10 s (`WATCH_MS`).
+const WATCH_RENEW: Duration = Duration::from_secs(4);
+
+/// `odkvmctl keymap …` (hid_mapping.md).
+fn keymap(c: &mut Client, action: KeymapAction) -> Result<()> {
+    use kvm_map::axes::{Rule, flags};
+    let check = |k: u8, l: u8| {
+        if (k as usize) < kvm_map::KEYMAPS && (l as usize) < kvm_map::LAYERS {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(fl!("cli-keymap-range")))
+        }
+    };
+    match action {
+        KeymapAction::Show { keymap } => {
+            let profiles = c.snapshot()?.profiles().map(|(_, n, list)| (n, list));
+            for k in keymap.map_or(0..kvm_map::KEYMAPS as u8, |k| k..k + 1) {
+                check(k, 0)?;
+                let used: Vec<String> = profiles
+                    .iter()
+                    .flat_map(|(n, list)| {
+                        list.iter().take(*n as usize).filter(|p| p.keymap == Some(k)).map(|p| p.name.clone())
+                    })
+                    .collect();
+                let used = if used.is_empty() { fl!("cli-keymap-unused") } else { used.join(", ") };
+                println!("{}", fl!("cli-keymap-title", keymap = u32::from(k), profiles = used));
+                let mut any = false;
+                for l in 0..kvm_map::LAYERS as u8 {
+                    let codes = c.keycodes(k, l)?;
+                    for (p, kc) in codes.iter().enumerate() {
+                        let fresh = if l == 0 { kvm_map::keymap::identity(p) } else { kvm_map::keycode::KC_TRNS };
+                        if *kc != fresh {
+                            any = true;
+                            let (ctl, code) = (keycodes::control_name(p as u16), keycodes::keycode_name(*kc));
+                            println!(
+                                "  {}",
+                                fl!("cli-keymap-entry", layer = u32::from(l), control = ctl, keycode = code)
+                            );
+                        }
+                    }
+                    for (i, r) in c.axis_rules(k, l)?.iter().enumerate() {
+                        if r.target != kvm_map::axes::Target::Transparent {
+                            any = true;
+                            let target = keycodes::target_name(r.target);
+                            let scale = format!("{:.2}", r.scale as f32 / 256.0);
+                            println!(
+                                "  {}",
+                                fl!(
+                                    "cli-keymap-axis-entry",
+                                    layer = u32::from(l),
+                                    axis = keycodes::AXES[i],
+                                    target = target,
+                                    scale = scale
+                                )
+                            );
+                        }
+                    }
+                }
+                if !any {
+                    println!("  {}", fl!("cli-keymap-fresh"));
+                }
+            }
+        }
+        KeymapAction::Set { keymap, layer, control, keycode } => {
+            check(keymap, layer)?;
+            let p = keycodes::parse_control(&control).map_err(anyhow::Error::msg)?;
+            let kc = keycodes::parse_keycode(&keycode).map_err(anyhow::Error::msg)?;
+            c.set_keycodes(keymap, layer, p, &[kc])?;
+            let (ctl, code) = (keycodes::control_name(p), keycodes::keycode_name(kc));
+            println!("{}", fl!("cli-keymap-entry", layer = u32::from(layer), control = ctl, keycode = code));
+        }
+        KeymapAction::Axis { keymap, layer, input, target, scale, invert, deadzone, curve, param } => {
+            check(keymap, layer)?;
+            let i = keycodes::parse_axis(&input).map_err(anyhow::Error::msg)?;
+            let target = keycodes::parse_target(&target).map_err(anyhow::Error::msg)?;
+            let curve = match curve.as_str() {
+                "linear" => 0,
+                "quadratic" => 1,
+                "cubic" => 2,
+                other => bail!(fl!("parse-one-of", value = other, choices = "linear, quadratic, cubic")),
+            };
+            let rule = Rule {
+                target,
+                flags: (u8::from(invert) * flags::INVERT) | (curve << flags::CURVE_SHIFT),
+                scale: (scale * 256.0).round().clamp(-32768.0, 32767.0) as i16,
+                deadzone: keycodes::in_256ths(deadzone as u32),
+                param: param.unwrap_or(kvm_map::axes::DEFAULT_PARAM),
+            };
+            c.set_axis_rule(keymap, layer, i as u8, rule)?;
+            let scale = format!("{:.2}", rule.scale as f32 / 256.0);
+            let target = keycodes::target_name(target);
+            println!(
+                "{}",
+                fl!(
+                    "cli-keymap-axis-entry",
+                    layer = u32::from(layer),
+                    axis = keycodes::AXES[i],
+                    target = target,
+                    scale = scale
+                )
+            );
+        }
+        KeymapAction::Learn { seconds } => {
+            c.watch_controls(1)?;
+            println!("{}", fl!("cli-keymap-learning", seconds = seconds));
+            let until = Instant::now() + Duration::from_secs(seconds as u64);
+            let mut renew = Instant::now() + WATCH_RENEW;
+            let r = (|| -> Result<()> {
+                while Instant::now() < until {
+                    if Instant::now() >= renew {
+                        c.watch_controls(1)?;
+                        renew = Instant::now() + WATCH_RENEW;
+                    }
+                    for e in c.events(Duration::from_millis(200))? {
+                        if matches!(e, Event::Control(..) | Event::Axis(..)) {
+                            print_event(&e);
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            c.watch_controls(0)?;
+            r?;
+        }
+        KeymapAction::Fallback { profile, keymap } => {
+            let k = names::parse_arrangement(&keymap).map_err(anyhow::Error::msg)?;
+            c.set_config(ConfigValue::ProfileFallback(profile, k))?;
+            let k = k.map_or_else(|| "none".to_string(), |k| k.to_string());
+            println!("{}", fl!("cli-keymap-fallback-used", profile = u32::from(profile), keymap = k));
+        }
+        KeymapAction::Macro { n, steps } => macro_cmd(c, n, &steps)?,
+        KeymapAction::Dance { n, tap, hold, double, tap_hold, term } => {
+            use kvm_map::keymap::{Dynamic, TAP_DANCES};
+            let show = |c: &mut Client, i: u8| -> Result<()> {
+                let b = c.map_entry(Dynamic::TapDance, i)?;
+                let kc = |at: usize| keycodes::keycode_name(u16::from_le_bytes([b[at], b[at + 1]]));
+                let term = u16::from_le_bytes([b[8], b[9]]);
+                let line = fl!(
+                    "cli-dance-entry",
+                    n = u32::from(i),
+                    tap = kc(0),
+                    hold = kc(2),
+                    double = kc(4),
+                    taphold = kc(6),
+                    term = u32::from(term)
+                );
+                println!("{line}");
+                Ok(())
+            };
+            match (n, tap) {
+                (None, _) => {
+                    for i in 0..TAP_DANCES as u8 {
+                        if c.map_entry(Dynamic::TapDance, i)?.iter().any(|b| *b != 0) {
+                            show(c, i)?;
+                        }
+                    }
+                }
+                (Some(i), None) => show(c, i)?,
+                (Some(i), Some(tap)) => {
+                    let mut b = [0u8; 10];
+                    for (at, kc) in [Some(tap), hold, double, tap_hold].into_iter().enumerate() {
+                        let k = kc.map(|k| keycodes::parse_keycode(&k)).transpose().map_err(anyhow::Error::msg)?;
+                        b[2 * at..2 * at + 2].copy_from_slice(&k.unwrap_or(0).to_le_bytes());
+                    }
+                    b[8..10].copy_from_slice(&term.unwrap_or(0).to_le_bytes());
+                    c.set_map_entry(Dynamic::TapDance, i, &b)?;
+                    show(c, i)?;
+                }
+            }
+        }
+        KeymapAction::Combo { n, keys, output } => {
+            use kvm_map::keymap::{COMBOS, Dynamic};
+            let show = |c: &mut Client, i: u8| -> Result<()> {
+                let b = c.map_entry(Dynamic::Combo, i)?;
+                let kc = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+                let keys: Vec<String> =
+                    (0..4).map(|k| kc(2 * k)).take_while(|k| *k != 0).map(keycodes::keycode_name).collect();
+                let line = fl!(
+                    "cli-combo-entry",
+                    n = u32::from(i),
+                    keys = keys.join(","),
+                    output = keycodes::keycode_name(kc(8))
+                );
+                println!("{line}");
+                Ok(())
+            };
+            match (n, keys) {
+                (None, _) => {
+                    for i in 0..COMBOS as u8 {
+                        if c.map_entry(Dynamic::Combo, i)?[..2] != [0, 0] {
+                            show(c, i)?;
+                        }
+                    }
+                }
+                (Some(i), None) => show(c, i)?,
+                (Some(i), Some(keys)) => {
+                    let mut b = [0u8; 10];
+                    if keys != "none" {
+                        let ks: Vec<u16> = keys
+                            .split(',')
+                            .map(keycodes::parse_keycode)
+                            .collect::<Result<_, _>>()
+                            .map_err(anyhow::Error::msg)?;
+                        if ks.is_empty() || ks.len() > 4 {
+                            bail!(fl!("cli-combo-keys"));
+                        }
+                        for (k, kc) in ks.iter().enumerate() {
+                            b[2 * k..2 * k + 2].copy_from_slice(&kc.to_le_bytes());
+                        }
+                        let out =
+                            output.as_deref().map(keycodes::parse_keycode).transpose().map_err(anyhow::Error::msg)?;
+                        b[8..10].copy_from_slice(&out.unwrap_or(0).to_le_bytes());
+                    }
+                    c.set_map_entry(Dynamic::Combo, i, &b)?;
+                    show(c, i)?;
+                }
+            }
+        }
+        KeymapAction::Override { n, trigger, replacement, mods, negative, suppress, layers, off } => {
+            use kvm_map::keymap::{Dynamic, KEY_OVERRIDES, ko};
+            let show = |c: &mut Client, i: u8| -> Result<()> {
+                let b = c.map_entry(Dynamic::KeyOverride, i)?;
+                let kc = |at: usize| keycodes::keycode_name(u16::from_le_bytes([b[at], b[at + 1]]));
+                let state = if b[9] & ko::ENABLED != 0 { fl!("cli-entry-on") } else { fl!("cli-entry-off") };
+                let line = fl!(
+                    "cli-override-entry",
+                    n = u32::from(i),
+                    mods = keycodes::mods_name_or_none(b[6]),
+                    trigger = kc(0),
+                    replacement = kc(2),
+                    state = state
+                );
+                println!("{line}");
+                Ok(())
+            };
+            match (n, trigger) {
+                (None, _) => {
+                    for i in 0..KEY_OVERRIDES as u8 {
+                        if c.map_entry(Dynamic::KeyOverride, i)?.iter().any(|b| *b != 0) {
+                            show(c, i)?;
+                        }
+                    }
+                }
+                (Some(i), None) => show(c, i)?,
+                (Some(i), Some(trigger)) => {
+                    let kc = |s: &str| keycodes::parse_keycode(s).map_err(anyhow::Error::msg);
+                    let m = |s: Option<String>| {
+                        s.map_or(Ok(0), |s| keycodes::parse_mod_names(&s).map_err(anyhow::Error::msg))
+                    };
+                    let layers = match layers {
+                        None => 0xFFFFu16,
+                        Some(l) => l
+                            .split(',')
+                            .try_fold(0u16, |acc, n| {
+                                n.trim()
+                                    .parse::<u8>()
+                                    .ok()
+                                    .filter(|n| (*n as usize) < kvm_map::LAYERS)
+                                    .map(|n| acc | 1 << n)
+                            })
+                            .ok_or_else(|| anyhow::anyhow!(fl!("cli-keymap-range")))?,
+                    };
+                    let t = kc(&trigger)?.to_le_bytes();
+                    let r = kc(replacement.as_deref().unwrap_or("none"))?.to_le_bytes();
+                    let options = ko::ACTIVATION_TRIGGER_DOWN
+                        | ko::ACTIVATION_REQUIRED_MOD_DOWN
+                        | if off { 0 } else { ko::ENABLED };
+                    let l = layers.to_le_bytes();
+                    let b = [t[0], t[1], r[0], r[1], l[0], l[1], m(mods)?, m(negative)?, m(suppress)?, options];
+                    c.set_map_entry(Dynamic::KeyOverride, i, &b)?;
+                    show(c, i)?;
+                }
+            }
+        }
+        KeymapAction::Repeat { n, keycode, alt, mods, off } => {
+            use kvm_map::keymap::{ALT_REPEATS, Dynamic, arep};
+            let show = |c: &mut Client, i: u8| -> Result<()> {
+                let b = c.map_entry(Dynamic::AltRepeat, i)?;
+                let kc = |at: usize| keycodes::keycode_name(u16::from_le_bytes([b[at], b[at + 1]]));
+                let state = if b[5] & arep::ENABLED != 0 { fl!("cli-entry-on") } else { fl!("cli-entry-off") };
+                println!("{}", fl!("cli-repeat-entry", n = u32::from(i), keycode = kc(0), alt = kc(2), state = state));
+                Ok(())
+            };
+            match (n, keycode) {
+                (None, _) => {
+                    for i in 0..ALT_REPEATS as u8 {
+                        if c.map_entry(Dynamic::AltRepeat, i)?.iter().any(|b| *b != 0) {
+                            show(c, i)?;
+                        }
+                    }
+                }
+                (Some(i), None) => show(c, i)?,
+                (Some(i), Some(k)) => {
+                    let kc = |s: &str| keycodes::parse_keycode(s).map_err(anyhow::Error::msg);
+                    let k = kc(&k)?.to_le_bytes();
+                    let a = kc(alt.as_deref().unwrap_or("none"))?.to_le_bytes();
+                    let m = mods.map_or(Ok(0), |s| keycodes::parse_mod_names(&s)).map_err(anyhow::Error::msg)?;
+                    let options = if off { 0 } else { arep::ENABLED };
+                    c.set_map_entry(Dynamic::AltRepeat, i, &[k[0], k[1], a[0], a[1], m, options])?;
+                    show(c, i)?;
+                }
+            }
+        }
+        KeymapAction::Setting { name, value } => {
+            let show = |c: &mut Client, (n, q, flag): (&str, u16, bool)| -> Result<()> {
+                let v = c.map_setting(q)?;
+                let v = if flag { if v != 0 { "on".into() } else { "off".into() } } else { v.to_string() };
+                println!("{}", fl!("cli-setting-entry", name = n, value = v));
+                Ok(())
+            };
+            match name {
+                None => {
+                    for s in keycodes::SETTINGS {
+                        show(c, s)?;
+                    }
+                }
+                Some(name) => {
+                    let s = keycodes::SETTINGS.iter().copied().find(|(n, ..)| *n == name).ok_or_else(|| {
+                        let names = keycodes::SETTINGS.iter().map(|(n, ..)| *n).collect::<Vec<_>>().join(", ");
+                        anyhow::anyhow!(fl!("parse-one-of", value = name.clone(), choices = names))
+                    })?;
+                    if let Some(v) = value {
+                        let v = if s.2 {
+                            u32::from(names::parse_bool(&v).map_err(anyhow::Error::msg)?)
+                        } else {
+                            v.trim()
+                                .parse::<u32>()
+                                .map_err(|_| anyhow::anyhow!(fl!("parse-number", value = v.clone(), max = u32::MAX)))?
+                        };
+                        c.set_map_setting(s.1, v)?;
+                    }
+                    show(c, s)?;
+                }
+            }
+        }
+        KeymapAction::Use { profile, keymap } => {
+            let k = names::parse_arrangement(&keymap).map_err(anyhow::Error::msg)?;
+            c.set_config(ConfigValue::ProfileKeymap(profile, k))?;
+            let k = k.map_or_else(|| "none".to_string(), |k| k.to_string());
+            println!("{}", fl!("cli-keymap-used", profile = u32::from(profile), keymap = k));
+        }
+    }
+    Ok(())
+}
+
+/// A device by name (`keyboard`, `mouse`, `other`, `wireless1`–`4`), or a Bluetooth device slot's number.
+fn parse_device(s: &str) -> Result<Device> {
+    Device::from_name(s).or_else(|| s.parse::<u8>().ok().and_then(Device::wireless_slot)).ok_or_else(|| {
+        anyhow::anyhow!(fl!("parse-one-of", value = s, choices = "keyboard, mouse, other, wireless1…wireless4"))
+    })
+}
+
+/// `odkvmctl keymap macro [<n> [<step>…]]`: the shared macros (hid_mapping.md §5.4).
+fn macro_cmd(c: &mut Client, n: Option<u8>, steps: &[String]) -> Result<()> {
+    use kvm_map::keymap::{MACRO_BUFFER, MACRO_COUNT};
+    use odkvmctl::keycodes::MacroStep;
+    let buf = c.macros()?;
+    let count = MACRO_COUNT as usize;
+    let show = |buf: &[u8], i: usize| {
+        let m = kvm_map::macros::get(buf, i);
+        if m.is_empty() {
+            println!("{}", fl!("cli-macro-empty", n = (i as u32)));
+        } else {
+            let words: Vec<String> = MacroStep::read(m).iter().map(MacroStep::name).collect();
+            println!("{}", fl!("cli-macro-entry", n = (i as u32), steps = words.join("  ")));
+        }
+    };
+    match n {
+        None => (0..count).filter(|i| !kvm_map::macros::get(&buf, *i).is_empty()).for_each(|i| show(&buf, i)),
+        Some(i) if i as usize >= count => {
+            let max = count as u32 - 1;
+            bail!(fl!("cli-macro-range", max = max))
+        }
+        Some(i) if steps.is_empty() => show(&buf, i as usize),
+        Some(i) => {
+            let m = if steps == ["none"] {
+                Vec::new()
+            } else {
+                let parsed: Vec<MacroStep> =
+                    steps.iter().map(|s| MacroStep::parse(s)).collect::<Result<_, _>>().map_err(anyhow::Error::msg)?;
+                MacroStep::write(&parsed).ok_or_else(|| anyhow::anyhow!(fl!("cli-macro-too-long")))?
+            };
+            let after = kvm_map::macros::replace::<MACRO_BUFFER>(&buf, count, i as usize, &m)
+                .ok_or_else(|| anyhow::anyhow!(fl!("cli-macro-too-long")))?;
+            c.set_macros(&buf, &after)?;
+            show(&after, i as usize);
+        }
+    }
+    Ok(())
+}
+
+/// `odkvmctl monitor <device>`: its raw reports as they change, with the fields its descriptor declares (hid_mapping.md
+/// §9), to find what a field override should read.
+fn monitor(c: &mut Client, device: &str, seconds: u32) -> Result<()> {
+    let d = parse_device(device)?;
+    for (iface, map) in c.device_maps(d)? {
+        let Ok(l) = kvm_hid::Layout::parse(&map) else { continue };
+        println!("{}", fl!("cli-monitor-iface", iface = u32::from(iface), fields = l.fields.len()));
+        for f in l.fields.iter().filter(|f| f.ty == kvm_hid::ReportType::Input) {
+            let usage = f.usages.first().map_or(0, |u| u.min);
+            let line = fl!(
+                "cli-monitor-field",
+                id = u32::from(f.report_id),
+                bit = u32::from(f.bit_offset),
+                bits = u32::from(f.bit_size),
+                count = u32::from(f.count),
+                usage = format!("{:04x}:{:04x}", usage >> 16, usage & 0xFFFF)
+            );
+            println!("  {line}");
+        }
+    }
+    c.monitor(d, true)?;
+    println!("{}", fl!("cli-monitor-start", seconds = seconds));
+    let until = Instant::now() + Duration::from_secs(seconds as u64);
+    let mut renew = Instant::now() + WATCH_RENEW;
+    let mut pieces: std::collections::BTreeMap<u8, Vec<u8>> = Default::default();
+    let mut last: std::collections::BTreeMap<(u8, u8), Vec<u8>> = Default::default();
+    let r = (|| -> Result<()> {
+        while Instant::now() < until {
+            if Instant::now() >= renew {
+                c.monitor(d, true)?;
+                renew = Instant::now() + WATCH_RENEW;
+            }
+            for e in c.events(Duration::from_millis(100))? {
+                let Event::Report { iface, offset, total, len, data, .. } = e else { continue };
+                let buf = pieces.entry(iface).or_default();
+                if offset == 0 {
+                    buf.clear();
+                }
+                buf.extend_from_slice(&data[..len as usize]);
+                if buf.len() < total as usize {
+                    continue;
+                }
+                let report = std::mem::take(buf);
+                let before = last.insert((iface, report[0]), report.clone()).unwrap_or_default();
+                let hex: Vec<String> =
+                    report
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| {
+                            if before.get(i).is_some_and(|o| o != b) {
+                                format!("{b:02x}*")
+                            } else {
+                                format!("{b:02x} ")
+                            }
+                        })
+                        .collect();
+                println!("{}", fl!("cli-monitor-report", iface = u32::from(iface), bytes = hex.concat()));
+            }
+        }
+        Ok(())
+    })();
+    c.monitor(d, false)?;
+    r
+}
+
+/// `odkvmctl field <device> …`: the bits of its reports made controls (hid_mapping.md §9).
+fn field(c: &mut Client, device: &str, action: FieldAction) -> Result<()> {
+    use kvm_proto::ctrl::{FieldOverride, MAX_OVERRIDES, field};
+    let d = parse_device(device)?;
+    let target_name = |t: u8| match t.checked_sub(field::AXIS) {
+        Some(a) => keycodes::AXES[kvm_map::axes::RELATIVE + a as usize].to_string(),
+        None => format!("pad{}", t + 1),
+    };
+    let show = |c: &mut Client, n: u8| -> Result<()> {
+        if let Some(o) = c.field_override(d, n)? {
+            let mut flags = Vec::new();
+            if o.flags & field::SIGNED != 0 {
+                flags.push("signed");
+            }
+            if o.flags & field::INVERT != 0 {
+                flags.push("invert");
+            }
+            let line = fl!(
+                "cli-field-entry",
+                n = u32::from(n),
+                iface = u32::from(o.iface),
+                id = u32::from(o.report_id),
+                bit = u32::from(o.bit),
+                bits = u32::from(o.bits),
+                target = target_name(o.target),
+                flags = flags.join(" ")
+            );
+            println!("{line}");
+        }
+        Ok(())
+    };
+    match action {
+        FieldAction::List => {
+            for n in 0..MAX_OVERRIDES as u8 {
+                show(c, n)?;
+            }
+        }
+        FieldAction::Set { n, iface, report_id, bit, bits, target, signed, invert } => {
+            let t = match target.strip_prefix("pad").and_then(|n| n.parse::<u8>().ok()) {
+                Some(b @ 1..=32) => b - 1,
+                _ => {
+                    let a = keycodes::AXES[kvm_map::axes::RELATIVE..]
+                        .iter()
+                        .position(|a| *a == target)
+                        .ok_or_else(|| anyhow::anyhow!(fl!("cli-field-target-bad", value = target.clone())))?;
+                    field::AXIS + a as u8
+                }
+            };
+            let flags = if signed { field::SIGNED } else { 0 } | if invert { field::INVERT } else { 0 };
+            c.set_field_override(d, n, Some(FieldOverride { iface, report_id, bit, bits, flags, target: t }))?;
+            show(c, n)?;
+        }
+        FieldAction::Remove { n } => c.set_field_override(d, n, None)?,
+    }
+    Ok(())
+}
+
+/// `odkvmctl outputs`: what each host is offered and took (hid_mapping.md §6.1).
+fn outputs(c: &mut Client) -> Result<()> {
+    use kvm_proto::ctrl::outputs as o;
+    const NAMES: [(u8, &str); 8] = [
+        (o::KEYBOARD, "keyboard"),
+        (o::MOUSE, "mouse"),
+        (o::MEDIA, "media"),
+        (o::POINTER, "pointer"),
+        (o::GAMEPAD, "gamepad"),
+        (o::XINPUT, "xinput"),
+        (o::VIAL, "vial"),
+        (o::MIRRORS, "mirrors"),
+    ];
+    let s = c.snapshot()?;
+    let hosts: Vec<Host> = Host::ALL.iter().copied().filter(|h| h.bt_slot().is_none() || s.has_bluetooth()).collect();
+    for h in hosts {
+        let (offered, taken) = c.outputs(h)?;
+        let list =
+            |bits: u8| NAMES.iter().filter(|(b, _)| bits & b != 0).map(|(_, n)| *n).collect::<Vec<_>>().join(", ");
+        let name = names::host_name(h);
+        if offered == 0 {
+            println!("{}", fl!("cli-outputs-none", host = name));
+        } else if taken == 0 {
+            println!("{}", fl!("cli-outputs-idle", host = name, outputs = list(offered)));
+        } else if offered & !taken == 0 {
+            println!("{}", fl!("cli-outputs-all", host = name, outputs = list(taken)));
+        } else {
+            println!("{}", fl!("cli-outputs-some", host = name, taken = list(taken), left = list(offered & !taken)));
+        }
+    }
+    Ok(())
+}
+
+/// `odkvmctl layout [<host> [<layout>]]`: each host's keyboard layout, which macro text is typed through.
+fn layout_cmd(c: &mut Client, host: Option<&str>, set: Option<&str>) -> Result<()> {
+    use kvm_proto::ctrl::key;
+    let parse_host = |h: &str| {
+        names::parse_host(h)
+            .ok_or_else(|| anyhow::anyhow!(fl!("parse-one-of", value = h, choices = "pc1, pc2, host1…host4")))
+    };
+    let hosts: Vec<Host> = match host {
+        Some(h) => vec![parse_host(h)?],
+        None => Host::ALL.to_vec(),
+    };
+    if let (Some(h), Some(l)) = (hosts.first(), set) {
+        let l = names::parse_layout(l).map_err(anyhow::Error::msg)?;
+        c.set_config(ConfigValue::HostLayout(*h, l as u8))?;
+    }
+    for h in hosts {
+        let l = match c.get_config(key::layout(h))? {
+            ConfigValue::HostLayout(_, l) => kvm_hid::layouts::Layout::from_u8(l).unwrap_or_default(),
+            _ => kvm_hid::layouts::Layout::Us,
+        };
+        println!("{}", fl!("cli-layout-entry", host = names::host_name(h), layout = l.name()));
+    }
+    Ok(())
+}
+
+/// `odkvmctl calibrate <device> …`: a gamepad's axes (hid_mapping.md §8).
+fn calibrate(c: &mut Client, device: &str, action: CalAction) -> Result<()> {
+    use kvm_hid::gamepad::{AXES, axis};
+    use kvm_proto::ctrl::AxisCal;
+    let d = Device::from_name(device).ok_or_else(|| {
+        anyhow::anyhow!(fl!("parse-one-of", value = device, choices = "keyboard, mouse, other, wireless1…wireless4"))
+    })?;
+    let present = c.controls(d)?.pad_axes;
+    let name = |a: usize| keycodes::AXES[kvm_map::axes::RELATIVE + a];
+    match action {
+        CalAction::Show => {
+            for a in (0..AXES).filter(|a| present & (1 << a) != 0) {
+                let cal = c.calibration(d, a as u8)?;
+                println!(
+                    "{}",
+                    fl!(
+                        "cli-calibration",
+                        axis = name(a),
+                        min = i32::from(cal.min),
+                        centre = i32::from(cal.centre),
+                        max = i32::from(cal.max),
+                        deadzone = u32::from(cal.deadzone)
+                    )
+                );
+            }
+        }
+        CalAction::Set { axis, min, centre, max, deadzone } => {
+            let a = keycodes::parse_axis(&axis).map_err(anyhow::Error::msg)?;
+            let a =
+                a.checked_sub(kvm_map::axes::RELATIVE).ok_or_else(|| anyhow::anyhow!(fl!("cli-calibrate-not-pad")))?;
+            c.set_calibration(d, a as u8, AxisCal { min, centre, max, deadzone: deadzone.unwrap_or(0) })?;
+        }
+        CalAction::Reset => {
+            for a in 0..AXES {
+                c.set_calibration(d, a as u8, AxisCal::NONE)?;
+            }
+        }
+        CalAction::Measure { seconds } => {
+            // Raw values: the calibration off while measuring.
+            for a in 0..AXES {
+                c.set_calibration(d, a as u8, AxisCal::NONE)?;
+            }
+            c.watch_controls(1)?;
+            println!("{}", fl!("cli-calibrate-move", seconds = seconds));
+            let mut seen = [(i16::MAX, i16::MIN); AXES];
+            let mut last = [0i16; AXES];
+            let until = Instant::now() + Duration::from_secs(seconds as u64);
+            let mut renew = Instant::now() + WATCH_RENEW;
+            while Instant::now() < until {
+                if Instant::now() >= renew {
+                    c.watch_controls(1)?;
+                    renew = Instant::now() + WATCH_RENEW;
+                }
+                for e in c.events(Duration::from_millis(100))? {
+                    if let Event::Axis(i, v) = e
+                        && let Some(a) = (i as usize).checked_sub(kvm_map::axes::RELATIVE)
+                    {
+                        seen[a] = (seen[a].0.min(v), seen[a].1.max(v));
+                        last[a] = v;
+                    }
+                }
+            }
+            println!("{}", fl!("cli-calibrate-let-go"));
+            let rest = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < rest {
+                for e in c.events(Duration::from_millis(100))? {
+                    if let Event::Axis(i, v) = e
+                        && let Some(a) = (i as usize).checked_sub(kvm_map::axes::RELATIVE)
+                    {
+                        last[a] = v;
+                    }
+                }
+            }
+            c.watch_controls(0)?;
+            for a in (0..AXES).filter(|a| present & (1 << a) != 0 && seen[*a].0 < seen[*a].1) {
+                let centre = if axis::is_trigger(a) { 0 } else { last[a] };
+                let cal = AxisCal { min: seen[a].0, centre, max: seen[a].1, deadzone: 8 };
+                c.set_calibration(d, a as u8, cal)?;
+                println!(
+                    "{}",
+                    fl!(
+                        "cli-calibration",
+                        axis = name(a),
+                        min = i32::from(cal.min),
+                        centre = i32::from(cal.centre),
+                        max = i32::from(cal.max),
+                        deadzone = u32::from(cal.deadzone)
+                    )
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn display(action: Option<DisplayAction>) -> Result<()> {
@@ -943,14 +1803,18 @@ fn board_text(b: &Result<Board, String>) -> String {
         Ok(Board::Kvm { installed: None, slot }) => fl!("boot-kvm-empty", slot = if *slot == 0 { "A" } else { "B" }),
         Ok(Board::New { installed: None }) => fl!("boot-new"),
         Ok(Board::New { installed: Some(v) }) => fl!("boot-new-unpartitioned", version = names::version(*v)),
+        Ok(Board::Previous { installed }) => {
+            fl!("boot-kvm-previous", version = installed.map_or_else(|| "-".to_string(), names::version))
+        }
         Ok(Board::Other) => fl!("boot-other"),
         Err(e) => e.clone(),
     }
 }
 
-/// `odkvmctl update [FILE]`: over a PC port to the KVM that answers there; otherwise onto a board in the boot ROM's
-/// bootloader (PWR/SERVICE port). Without FILE, the firmware shipped with this program.
-fn update(sim: bool, file: Option<PathBuf>) -> Result<()> {
+/// `odkvmctl update [FILE] [--module]`: over a PC port to the KVM that answers there, the RP2354B's firmware and then
+/// its module's (the release's `kvm-module-<chip>.bin`, once the KVM is back); otherwise onto a board in the boot ROM's
+/// bootloader (PWR/SERVICE port). `--module`: only the module's. Without FILE, the firmware shipped with this program.
+fn update(sim: bool, file: Option<PathBuf>, module_only: bool) -> Result<()> {
     let path = match file.or_else(firmware::bundled) {
         Some(p) => p,
         None => bail!(fl!("cli-no-firmware")),
@@ -962,7 +1826,7 @@ fn update(sim: bool, file: Option<PathBuf>) -> Result<()> {
     // A board waiting in its bootloader on PWR/SERVICE comes first: it can do nothing else, and the KVM on a PC port
     // may be that same board, whose AT32F405 stays on the PC's bus while the RP2354B is in the boot ROM and so never
     // answers (first board, 2026-11-12: `update` picked it and timed out every time).
-    let boot = if sim { Vec::new() } else { bootsel::Scanner::default().scan() };
+    let boot = if sim || module_only { Vec::new() } else { bootsel::Scanner::default().scan() };
     if !boot.is_empty() {
         let d = match boot.as_slice() {
             [d] => d,
@@ -984,15 +1848,39 @@ fn update(sim: bool, file: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
     let mut c = Client::connect(sim).map_err(|e| anyhow::Error::new(e).context(fl!("cli-no-kvm-anywhere")))?;
-    let hw = c.info()?.hw;
+    let info = c.info()?;
+    // The image for the module's chip (an ESP32-C3 if the KVM doesn't know it yet: it is looked up again below).
+    let module = firmware::module_for(&path, c.status()?.bt_chip).map_err(anyhow::Error::msg)?;
+    let mismatch = |m: &firmware::Module, v: u32| {
+        anyhow::anyhow!(fl!(
+            "fw-module-mismatch",
+            file = m.file.display().to_string(),
+            module = names::version(m.version),
+            version = names::version(v)
+        ))
+    };
+    if module_only {
+        // The KVM's firmware takes only its own release's.
+        let m = module.ok_or_else(|| anyhow::anyhow!(fl!("fw-no-module", folder = path.display().to_string())))?;
+        if m.version != info.rp_fw {
+            return Err(mismatch(&m, info.rp_fw));
+        }
+        return update_module(&mut c, &m, true);
+    }
     let f = firmware::for_pc(&path).map_err(anyhow::Error::msg)?;
-    image::check_hardware(f.version, f.hw_major, hw).map_err(anyhow::Error::msg)?;
+    image::check_hardware(f.version, f.hw_major, info.hw).map_err(anyhow::Error::msg)?;
+    image::check_layout(info.rp_fw, f.version).map_err(anyhow::Error::msg)?;
+    if let Some(m) = &module
+        && m.version != f.version
+    {
+        return Err(mismatch(m, f.version));
+    }
     println!("{}", f.file.display());
     println!("{}", fl!("cli-firmware-for", version = names::version(f.version), major = u32::from(f.hw_major)));
     let mut last = None;
     c.update_firmware(&f.data, |state, done, total| {
         if state == FwState::Receiving {
-            progress_line(&names::fw_state(FwState::Receiving), done, total);
+            progress_line(&format!("RP2354B: {}", names::fw_state(FwState::Receiving)), done, total);
         } else if last != Some(state) {
             // End the progress line once, then one line per state.
             if last == Some(FwState::Receiving) {
@@ -1003,7 +1891,75 @@ fn update(sim: bool, file: Option<PathBuf>) -> Result<()> {
         last = Some(state);
     })?;
     println!("{}", fl!("installed"));
-    Ok(())
+    let Some(m) = module else { return Ok(()) };
+    // The KVM restarts into the new firmware; then the module's turn.
+    println!("{}", fl!("cli-waiting-for-kvm"));
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut c = loop {
+        if let Ok(mut c) = Client::connect(sim)
+            && c.info().is_ok_and(|i| i.rp_fw == f.version)
+        {
+            break c;
+        }
+        if Instant::now() > deadline {
+            bail!(fl!("cli-kvm-not-back"));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    // The new firmware may know the module's chip now (its `Hello`, or its ROM).
+    let chip = c.status()?.bt_chip;
+    let m = firmware::module_for(&path, chip).map_err(anyhow::Error::msg)?.unwrap_or(m);
+    update_module(&mut c, &m, false)
+}
+
+/// Streams the module's firmware to the module if it needs it (`force`: whatever it runs), then waits until it is up.
+fn update_module(c: &mut Client, m: &firmware::Module, force: bool) -> Result<()> {
+    // After a restart the module first says which firmware it runs.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut st = c.status()?;
+    while st.bt_module == BtModule::Starting && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        st = c.status()?;
+    }
+    match st.bt_module {
+        BtModule::Absent => {
+            println!("{}", fl!("cli-update-no-module"));
+            return Ok(());
+        }
+        BtModule::Up if !force => {
+            println!("{}", fl!("cli-module-current"));
+            return Ok(());
+        }
+        _ => {}
+    }
+    println!("{}", m.file.display());
+    let what = fl!("wireless-module");
+    let mut last = None;
+    c.update_module(&m.data, |state, done, total| {
+        if state == FwState::Receiving {
+            print!("\r{what}: {} {:3}%", names::fw_state(state), done * 100 / total.max(1));
+            let _ = std::io::stdout().flush();
+        } else if last != Some(state) {
+            if last == Some(FwState::Receiving) {
+                println!();
+            }
+            println!("{what}: {}", names::fw_state(state));
+        }
+        last = Some(state);
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let st = c.status()?;
+        if st.bt_module == BtModule::Up {
+            println!("{}", fl!("cli-module-up", version = names::version(c.info()?.bt_fw)));
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!(fl!("cli-module-not-up", state = names::bt_module(st.bt_module)));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 fn main() -> Result<()> {
@@ -1020,7 +1976,10 @@ fn main() -> Result<()> {
             println!("{}", fl!("cli-no-interface"));
         }
         for f in found {
-            println!("{:04x}:{:04x}  {:<24} {}", f.vid, f.pid, f.product, f.path.to_string_lossy());
+            match f.link {
+                Link::Bluetooth => println!("{:<9}  {:<24} {}", fl!("cli-list-wireless"), f.product, f.serial),
+                _ => println!("{:04x}:{:04x}  {:<24} {}", f.vid, f.pid, f.product, f.path.to_string_lossy()),
+            }
         }
         for d in &boot {
             let drive = d.drive.as_ref().map_or_else(|| fl!("cli-boot-no-drive"), |p| p.display().to_string());
@@ -1028,8 +1987,8 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
-    if let Some(Cmd::Update { file }) = &cli.cmd {
-        return update(cli.sim, file.clone());
+    if let Some(Cmd::Update { file, module }) = &cli.cmd {
+        return update(cli.sim, file.clone(), *module);
     }
     let mut c = Client::connect(cli.sim).context(fl!("cli-connecting"))?;
     // Every command but `update` needs firmware that speaks this program's protocol.
@@ -1113,6 +2072,43 @@ fn main() -> Result<()> {
                 println!("{}", fl!("cli-active", target = st.active.name().to_uppercase()));
             }
         }
+        // From a computer that reaches the KVM over its module: before anything else, which it may not ask yet.
+        Cmd::Wireless { action: Some(HostAction::Allow { slot: None }) } => {
+            if c.link() != Link::Bluetooth {
+                bail!(fl!("cli-allow-needs-slot"));
+            }
+            let seconds = kvm_core::engine::UNLOCK_WAIT_MS / 1000;
+            c.ask_control(|| println!("{}", fl!("cli-press-key-within", seconds = seconds)))?;
+            println!("{}", fl!("cli-allowed-here"));
+        }
+        // For a KVM without a module: before the check that it has one.
+        Cmd::Wireless { action: Some(HostAction::Adopt { port, firmware }) } => {
+            let port: Port = port.into();
+            let name = names::port_title(port);
+            match c.adopt_module(port) {
+                Err(odkvmctl::Error::Device(ErrorCode::Busy)) => bail!(fl!("cli-adopt-busy")),
+                Err(odkvmctl::Error::Device(ErrorCode::NoDevice)) => bail!(fl!("cli-adopt-empty", port = name)),
+                r => r?,
+            }
+            println!("{}", fl!("cli-adopting", port = name.clone()));
+            // In its ROM, its chip known: then its firmware.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let st = loop {
+                let st = c.status()?;
+                if st.bt_module == BtModule::NeedsUpdate && st.bt_chip != kvm_proto::link::bt::Chip::Unknown {
+                    break st;
+                }
+                if Instant::now() > deadline {
+                    bail!(fl!("cli-adopt-not-taken", port = name, state = names::bt_module(st.bt_module)));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            };
+            let folder = firmware.or_else(firmware::bundled).context(fl!("fw-no-module", folder = "-"))?;
+            let m = firmware::module_for(&folder, st.bt_chip)
+                .map_err(anyhow::Error::msg)?
+                .ok_or_else(|| anyhow::anyhow!(fl!("fw-no-module", folder = folder.display().to_string())))?;
+            update_module(&mut c, &m, true)?;
+        }
         Cmd::Wireless { action } => {
             let s = c.snapshot()?;
             if !s.has_bluetooth() {
@@ -1157,10 +2153,18 @@ fn main() -> Result<()> {
                     let k = names::config_key(&format!("host{slot}-policy")).context(fl!("cli-slot"))?;
                     c.set_config(names::parse_value(k, &policy).map_err(anyhow::Error::msg)?)?;
                 }
+                HostAction::Allow { slot: Some(slot) } => {
+                    let seconds = kvm_core::engine::UNLOCK_WAIT_MS / 1000;
+                    c.allow_host(slot, true, || println!("{}", fl!("cli-press-key-within", seconds = seconds)))?;
+                    println!("{}", fl!("cli-host-allowed", slot = slot));
+                }
+                HostAction::Allow { slot: None } => unreachable!(),
+                HostAction::Disallow { slot } => c.allow_host(slot, false, || {})?,
                 HostAction::Erase => {
                     c.bt_erase_all()?;
                     println!("{}", fl!("cli-wireless-erased"));
                 }
+                HostAction::Adopt { .. } => unreachable!(),
             }
         }
         Cmd::Port { port, action } => {
@@ -1184,12 +2188,24 @@ fn main() -> Result<()> {
             }
             print_port(&c.snapshot()?, port);
         }
+        Cmd::Keymap { action } => keymap(&mut c, action.unwrap_or(KeymapAction::Show { keymap: None }))?,
+        Cmd::Calibrate { device, action } => calibrate(&mut c, &device, action.unwrap_or(CalAction::Show))?,
+        Cmd::Monitor { device, seconds } => monitor(&mut c, &device, seconds)?,
+        Cmd::Field { device, action } => field(&mut c, &device, action.unwrap_or(FieldAction::List))?,
+        Cmd::Outputs => outputs(&mut c)?,
+        Cmd::Layout { host, layout } => layout_cmd(&mut c, host.as_deref(), layout.as_deref())?,
         Cmd::Device { action } => {
             let s = c.snapshot()?;
-            if !s.has_bluetooth() {
+            let action = action.unwrap_or(DeviceAction::List);
+            // A front-port device's descriptor needs no module, nor the module's log (the KVM keeps it, and adds its own
+            // lines: why programming a module failed, for one).
+            if !s.has_bluetooth()
+                && !matches!(&action, DeviceAction::Log)
+                && !matches!(&action, DeviceAction::Map { device } if parse_device(device)?.port().is_some())
+            {
                 bail!(fl!("cli-no-module-boards"));
             }
-            match action.unwrap_or(DeviceAction::List) {
+            match action {
                 DeviceAction::List => print_devices(&s),
                 DeviceAction::Scan { stop } => match stop.as_deref() {
                     Some("stop") => c.bt_scan(false)?,
@@ -1223,9 +2239,12 @@ fn main() -> Result<()> {
                     }
                     print!("{log}");
                 }
-                DeviceAction::Map { slot } => {
-                    Device::wireless_slot(slot).context(fl!("cli-slot"))?;
-                    print_device_map(&c.bt_device_map(slot)?);
+                DeviceAction::Map { device } => {
+                    let d = parse_device(&device)?;
+                    for (iface, map) in c.device_maps(d)? {
+                        println!("{}", fl!("cli-device-map-iface", iface = u32::from(iface)));
+                        print_device_map(&map);
+                    }
                 }
             }
         }
@@ -1347,6 +2366,11 @@ fn main() -> Result<()> {
                         c.allow_software(v, || println!("{}", fl!("cli-press-key-within", seconds = seconds)))?;
                         v
                     }
+                    ConfigValue::BtControl(i, true) => {
+                        let seconds = kvm_core::engine::UNLOCK_WAIT_MS / 1000;
+                        c.allow_host(i + 1, true, || println!("{}", fl!("cli-press-key-within", seconds = seconds)))?;
+                        v
+                    }
                     ConfigValue::SwSwitchAllowed(false) | ConfigValue::SwConfigAllowed(false) => {
                         if !confirm_lock(matches!(v, ConfigValue::SwSwitchAllowed(_)))? {
                             bail!(fl!("cli-nothing-changed"));
@@ -1374,7 +2398,6 @@ fn main() -> Result<()> {
             RebootArg::At32Dfu1 => RebootTarget::At32Dfu1,
             RebootArg::At32Dfu2 => RebootTarget::At32Dfu2,
             RebootArg::At32Retry => RebootTarget::At32Retry,
-            RebootArg::WirelessRetry => RebootTarget::BtRetry,
         })?,
     }
     Ok(())

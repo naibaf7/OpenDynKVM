@@ -1,8 +1,10 @@
-//! Merges normalized input from every source (device, interface, report ID) into one keyboard, one mouse, one consumer
-//! and one system state. Keyboards that report through several interfaces (boot + NKRO), or several report IDs, end up
-//! as one key set.
+//! Merges normalized input from every source (device, interface, report ID) into one keyboard, one mouse, one consumer,
+//! one system and one gamepad state. Keyboards that report through several interfaces (boot + NKRO), or several report
+//! IDs, end up as one key set. Gamepads (hid_mapping.md §6.2): buttons OR, the hat of the last one pressed, each axis
+//! from the source that last moved it.
 
 use heapless::Vec;
+use kvm_hid::gamepad::{self, GamepadInput, HAT_CENTRE};
 use kvm_hid::translate::{ConsumerState, Translation};
 use kvm_hid::{KeyState, MouseInput};
 use kvm_proto::ctrl::Device;
@@ -26,13 +28,22 @@ pub struct Merged {
     pub mouse: Option<MouseInput>,
     pub consumer: Option<ConsumerState>,
     pub system: Option<u8>,
+    /// The merged gamepad, present on change.
+    pub gamepad: Option<GamepadInput>,
 }
 
 impl Merged {
     pub fn is_empty(&self) -> bool {
-        self.keyboard.is_none() && self.mouse.is_none() && self.consumer.is_none() && self.system.is_none()
+        self.keyboard.is_none()
+            && self.mouse.is_none()
+            && self.consumer.is_none()
+            && self.system.is_none()
+            && self.gamepad.is_none()
     }
 }
+
+/// An axis moved by less than this (of ±32767) is noise, and doesn't take the axis over from another source.
+const AXIS_NOISE: i32 = 1024;
 
 #[derive(Default)]
 pub struct Merger {
@@ -40,6 +51,11 @@ pub struct Merger {
     buttons: Vec<(Source, u16), MAX_SOURCES>,
     consumer: Vec<(Source, ConsumerState), MAX_SOURCES>,
     system: Vec<(Source, u8), MAX_SOURCES>,
+    pads: Vec<(Source, GamepadInput), MAX_SOURCES>,
+    /// The source whose hat was pressed last, and the one that last moved each axis.
+    hat_owner: Option<Source>,
+    axis_owner: [Option<Source>; gamepad::AXES],
+    last_pad: GamepadInput,
     last_keys: KeyState,
     last_buttons: u16,
     last_consumer: ConsumerState,
@@ -62,6 +78,10 @@ impl Merger {
             buttons: Vec::new(),
             consumer: Vec::new(),
             system: Vec::new(),
+            pads: Vec::new(),
+            hat_owner: None,
+            axis_owner: [None; gamepad::AXES],
+            last_pad: GamepadInput { buttons: 0, hat: HAT_CENTRE, axes: [0; gamepad::AXES], present: 0 },
             last_keys: KeyState::EMPTY,
             last_buttons: 0,
             last_consumer: ConsumerState { usages: [0; kvm_hid::normalized::CONSUMER_SLOTS] },
@@ -85,6 +105,10 @@ impl Merger {
         self.last_system
     }
 
+    pub fn gamepad(&self) -> GamepadInput {
+        self.last_pad
+    }
+
     pub fn apply(&mut self, dev: Device, iface: u8, t: &Translation) -> Merged {
         let src = Source { dev, iface, report_id: t.report_id };
         if let Some(k) = t.keyboard {
@@ -98,6 +122,19 @@ impl Merger {
         }
         if let Some(s) = t.system {
             upsert(&mut self.system, src, s);
+        }
+        if let Some(g) = t.gamepad {
+            let before = self.pads.iter().find(|(k, _)| *k == src).map(|(_, p)| *p);
+            if g.hat != HAT_CENTRE && before.is_none_or(|b| b.hat != g.hat) {
+                self.hat_owner = Some(src);
+            }
+            for a in (0..gamepad::AXES).filter(|a| g.present & (1 << a) != 0) {
+                let was = before.map_or(0, |b| b.axes[a]);
+                if self.axis_owner[a].is_none() || (g.axes[a] - was).abs() > AXIS_NOISE {
+                    self.axis_owner[a] = Some(src);
+                }
+            }
+            upsert(&mut self.pads, src, g);
         }
         let mut out = self.recompute();
         if let Some(m) = t.mouse
@@ -115,6 +152,13 @@ impl Merger {
         self.buttons.retain(|(s, _)| s.dev != dev);
         self.consumer.retain(|(s, _)| s.dev != dev);
         self.system.retain(|(s, _)| s.dev != dev);
+        self.pads.retain(|(s, _)| s.dev != dev);
+        if self.hat_owner.is_some_and(|s| s.dev == dev) {
+            self.hat_owner = None;
+        }
+        for o in self.axis_owner.iter_mut().filter(|o| o.is_some_and(|s| s.dev == dev)) {
+            *o = None;
+        }
         self.recompute()
     }
 
@@ -124,6 +168,7 @@ impl Merger {
             || self.buttons.iter().any(|(s, _)| s.dev == dev)
             || self.consumer.iter().any(|(s, _)| s.dev == dev)
             || self.system.iter().any(|(s, _)| s.dev == dev)
+            || self.pads.iter().any(|(s, _)| s.dev == dev)
     }
 
     /// The keys and buttons `dev` holds now.
@@ -162,6 +207,20 @@ impl Merger {
             self.last_system = system;
             out.system = Some(system);
         }
+        let of = |o: Option<Source>| o.and_then(|o| self.pads.iter().find(|(s, _)| *s == o).map(|(_, p)| *p));
+        let mut pad = GamepadInput {
+            buttons: self.pads.iter().fold(0, |acc, (_, p)| acc | p.buttons),
+            hat: of(self.hat_owner).map_or(HAT_CENTRE, |p| p.hat),
+            present: self.pads.iter().fold(0, |acc, (_, p)| acc | p.present),
+            ..GamepadInput::default()
+        };
+        for a in 0..gamepad::AXES {
+            pad.axes[a] = of(self.axis_owner[a]).map_or(0, |p| p.axes[a]);
+        }
+        if pad != self.last_pad {
+            self.last_pad = pad;
+            out.gamepad = Some(pad);
+        }
         out
     }
 }
@@ -188,6 +247,22 @@ mod tests {
         assert!(m.apply(Device::Keyboard, 1, &kb(2, &[0x05])).is_empty(), "unchanged state is not re-sent");
         let gone = m.remove(Device::Keyboard);
         assert!(gone.keyboard.unwrap().is_empty());
+    }
+
+    #[test]
+    fn gamepads_merge_buttons_and_the_last_moved_axis() {
+        let pad = |buttons: u32, hat: u8, x: i32| Translation {
+            gamepad: Some(GamepadInput { buttons, hat, axes: [x, 0, 0, 0, 0, 0, 0, 0, 0, 0], present: 1 }),
+            ..Translation::default()
+        };
+        let mut m = Merger::new();
+        assert_eq!(m.apply(Device::Other, 0, &pad(1, HAT_CENTRE, 20000)).gamepad.unwrap().axes[0], 20000);
+        let both = m.apply(Device::Wireless1, 0, &pad(4, 2, 0)).gamepad.unwrap();
+        assert_eq!((both.buttons, both.hat, both.axes[0]), (5, 2, 20000), "the second one's X rests: no takeover");
+        let moved = m.apply(Device::Wireless1, 0, &pad(4, 2, -9000)).gamepad.unwrap();
+        assert_eq!(moved.axes[0], -9000);
+        let gone = m.remove(Device::Wireless1).gamepad.unwrap();
+        assert_eq!((gone.buttons, gone.hat, gone.axes[0]), (1, HAT_CENTRE, 0));
     }
 
     #[test]

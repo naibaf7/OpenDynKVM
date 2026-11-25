@@ -3,13 +3,15 @@
 //! - [`link`]: the 72-byte SPI frame between the RP2354B and each AT32F405, its go-back-N ARQ and messages.
 //! - [`descset`]: the descriptor set the RP2354B sends to an AT32F405 (what a PC enumerates).
 //! - [`ctrl`]: the control protocol spoken over the vendor HID interface by `odkvmctl`.
-//! - [`rpimage`]: the RP2350 image metadata an RP2354B update image must carry.
+//! - [`rpimage`]: the RP2350 image metadata an RP2354B update image must carry, and the RP2354B's flash layout.
+//! - [`modimage`]: the Bluetooth module's firmware as the RP2354B keeps it.
 #![cfg_attr(not(test), no_std)]
 
 pub mod crc;
 pub mod ctrl;
 pub mod descset;
 pub mod link;
+pub mod modimage;
 pub mod rpimage;
 pub mod wire;
 
@@ -21,7 +23,7 @@ pub const fn version_u32(major: u8, minor: u8, patch: u8) -> u32 {
 /// The firmware's version, the same on the RP2354B and both AT32F405s (DEVELOPMENT.md "Versions"): the host software's version
 /// of the release that last changed the firmware. It is never ahead of the host software and doesn't move with every
 /// host release.
-pub const FIRMWARE_VERSION: (u8, u8, u8) = (0, 1, 50);
+pub const FIRMWARE_VERSION: (u8, u8, u8) = (0, 1, 66);
 
 /// The board the firmware is built for (DEVELOPMENT.md "Versions"). A new major version is a different board with its own
 /// firmware image; minor versions are revisions of one board, which one image serves. The board carries no ID of its

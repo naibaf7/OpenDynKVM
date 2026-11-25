@@ -1,0 +1,4 @@
+# The Xtensa toolchain (espup: `espup install --targets esp32`, then `. ~/export-esp.sh`); upstream Rust has no Xtensa
+# backend.
+[toolchain]
+channel = "esp"

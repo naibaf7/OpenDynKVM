@@ -1,4 +1,5 @@
-//! RP2354B firmware updates into the other A/B partition (software.md §4.9; RP2350 datasheet §5.1.16–5.1.17).
+//! RP2354B firmware updates into the other A/B partition (software.md §4.9; RP2350 datasheet §5.1.16–5.1.17). The
+//! Bluetooth module's firmware goes past this, to `bt.rs` (`FwTarget::Module`).
 //!
 //! - `odkvmctl update` sends a raw image linked at 0x1000_0000 (`cargo xtask dist` → `kvm-rp2354.bin`). Its first
 //!   sector must hold an RP2350 Arm IMAGE_DEF.
@@ -86,7 +87,8 @@ fn boot_partition() -> Option<u8> {
 }
 
 /// Reads the partition table through the boot ROM and checks that it is the one `cargo xtask dist` writes: the A/B
-/// pair and the data partition. Records what it found in [`FOUND`].
+/// pair and the data partition. Records what it found in [`FOUND`], and whether the data partition may be used
+/// ([`flash::set_layout_ours`]: the table is this one, or there is none).
 fn discover(work: &mut Work) -> Option<Layout> {
     let mut buf = [0u32; 16];
     let flags = pt::PT_INFO | pt::PARTITION_LOCATION_AND_FLAGS;
@@ -107,6 +109,7 @@ fn discover(work: &mut Work) -> Option<Layout> {
     if n >= 2 && buf[1] & 0x100 == 0 {
         info!("no partition table: firmware updates over USB are off");
         found(FwUpdates::NoTable, read);
+        flash::set_layout_ours(true);
         return None;
     }
     if n < 10 || buf[0] & flags != flags || buf[1] & 0xFF != 3 {
@@ -125,9 +128,10 @@ fn discover(work: &mut Work) -> Option<Layout> {
         | (!b_links_a as u32) << 3;
     if differs != 0 {
         warn!("unexpected partition table (A {:?}, B {:?}, data {:?}): firmware updates over USB are off", a, b, data);
-        found(FwUpdates::OtherLayout, differs | (a.0 / SECTOR) << 4);
+        found(FwUpdates::OtherLayout, differs | (a.1 / SECTOR) << 4);
         return None;
     }
+    flash::set_layout_ours(true);
     // Which partition runs: the QMI address translation the boot ROM set up. `flash_runtime_to_storage_addr` returns
     // the untranslated address in the XIP window, 0x1000_0000 + the flash offset (measured on the first board,
     // 2026-11-12: comparing it with the bare offset turned updates off). The bare offset and the partition the ROM
@@ -223,7 +227,7 @@ pub async fn run() -> ! {
             continue;
         };
         match op {
-            FwOp::Begin { size, crc32 } => {
+            FwOp::Begin { size, crc32, .. } => {
                 rx = None;
                 if !(SECTOR..=PARTITION_LEN).contains(&size) {
                     fail("image size");

@@ -21,7 +21,7 @@
 //!   not by a developer: a downloaded copy opens with *Open* from its context menu the first time, and after each
 //!   update its Accessibility permission (for placing the cursor) is granted again, as macOS sees a new app.
 //! - Every package carries the licenses of all it was compiled from (`THIRD-PARTY-LICENSES.txt`, from `cargo metadata`),
-//!   RMK's notice for the parts of `kvm-vial` adapted from it, and the license of the window's text font (Adwaita Sans,
+//!   RMK's notice for the parts of `kvm-map` adapted from it, and the license of the window's text font (Adwaita Sans,
 //!   SIL OFL 1.1, embedded in opendyn-kvm).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,9 +77,15 @@ pub struct Options {
 }
 
 /// The firmware files every package carries (`cargo xtask dist` makes them; `odkvmctl::firmware` finds them): the
-/// image for updates over a PC port, and the two UF2s for the boot ROM's drive.
-const FIRMWARE: [&str; 3] =
-    [odkvmctl::firmware::UPDATE_BIN, odkvmctl::firmware::UPDATE_UF2, odkvmctl::firmware::FIRST_UF2];
+/// image for updates over a PC port, the Bluetooth module's that follow it (one per chip), and the two UF2s for the boot ROM's
+/// drive.
+const FIRMWARE: [&str; 5] = [
+    odkvmctl::firmware::UPDATE_BIN,
+    odkvmctl::firmware::MODULE_BINS[0],
+    odkvmctl::firmware::MODULE_BINS[1],
+    odkvmctl::firmware::UPDATE_UF2,
+    odkvmctl::firmware::FIRST_UF2,
+];
 
 /// The release's firmware files from `dist`, by name.
 fn firmware_files(dist: &Path) -> Result<Vec<(&'static str, Vec<u8>)>> {
@@ -361,7 +367,7 @@ fn licenses(root: &Path, target: &str) -> Result<Vec<(&'static str, Vec<u8>)>> {
     Ok(vec![
         ("MIT.txt", fs::read(root.join("LICENSES/MIT.txt"))?),
         ("Apache-2.0.txt", fs::read(root.join("LICENSES/Apache-2.0.txt"))?),
-        ("LICENSE-RMK-MIT.txt", fs::read(root.join("crates/kvm-vial/LICENSE-RMK-MIT"))?),
+        ("LICENSE-RMK-MIT.txt", fs::read(root.join("crates/kvm-map/LICENSE-RMK-MIT"))?),
         ("OFL-1.1-AdwaitaSans.txt", fs::read(root.join("software/odkvmctl/fonts/OFL.txt"))?),
         ("THIRD-PARTY-LICENSES.txt", third_party(root, target)?.into_bytes()),
     ])
@@ -493,7 +499,7 @@ fn linux_tree(
     let copyright = format!(
         "OpenDynKVM host software (odkvmctl, opendyn-kvm) {VERSION}\nCopyright 2026 Fabian Tschopp\n\
          License: MIT OR Apache-2.0 (/usr/share/licenses/{PACKAGE}/MIT.txt, Apache-2.0.txt)\n\n\
-         Parts of kvm-vial are adapted from RMK, Copyright 2024 HaoboGu, MIT (LICENSE-RMK-MIT.txt).\n\
+         Parts of kvm-map are adapted from RMK, Copyright 2024 HaoboGu, MIT (LICENSE-RMK-MIT.txt).\n\
          The window's text font is Adwaita Sans, Copyright The Inter Project Authors and others, SIL OFL 1.1\n\
          (OFL-1.1-AdwaitaSans.txt).\n\
          Third-party crates and their licenses: THIRD-PARTY-LICENSES.txt.\n"

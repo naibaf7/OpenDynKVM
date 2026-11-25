@@ -32,6 +32,7 @@ enum Log {
 static LOG: Mutex<RefCell<Log>> = Mutex::new(RefCell::new(Log::Early(heapless::String::new())));
 
 /// Starts the log on IO3 and prints what was kept.
+#[cfg_attr(target_arch = "xtensa", allow(dead_code))]
 pub fn start(uart: UART1<'static>, pin: GPIO3<'static>) {
     if let Ok(tx) = UartTx::new(uart, Config::default().with_baudrate(115_200)) {
         let mut tx = tx.with_tx(pin);

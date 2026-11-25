@@ -128,6 +128,103 @@ pub const NKRO_DESC: &[u8] = &[
     0xC0,
 ];
 
+/// The virtual gamepad (hid_mapping.md §6.1) as report ID 4 of the NKRO interface: 32 buttons, a hat, 8 axes (X, Y the
+/// left stick, Rx, Ry the right one, Z, Rz the triggers, slider, dial), each −32767…32767.
+pub const GAMEPAD_ID: u8 = 4;
+pub const GAMEPAD_LEN: usize = 1 + 4 + 1 + 16;
+#[rustfmt::skip]
+pub const GAMEPAD_DESC: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, GAMEPAD_ID,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x20, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x20, 0x81, 0x02, // 32 buttons
+    0x05, 0x01, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x35, 0x00, 0x46, 0x3B, 0x01, 0x65, 0x14,     // hat, 0–315°
+    0x75, 0x04, 0x95, 0x01, 0x81, 0x42,                                                               //   null state
+    0x65, 0x00, 0x45, 0x00, 0x81, 0x01,                                                               // 4 bits pad
+    0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x33, 0x09, 0x34, 0x09, 0x35, 0x09, 0x36, 0x09, 0x37,
+    0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x08, 0x81, 0x02,                         // 8 axes
+    0xC0,
+];
+
+const fn concat<const N: usize>(a: &[u8], b: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < a.len() {
+        out[i] = a[i];
+        i += 1;
+    }
+    while i < N {
+        out[i] = b[i - a.len()];
+        i += 1;
+    }
+    out
+}
+
+/// The NKRO interface with the virtual gamepad.
+pub const NKRO_PAD_DESC: [u8; NKRO_DESC.len() + GAMEPAD_DESC.len()] = concat(NKRO_DESC, GAMEPAD_DESC);
+
+/// The virtual gamepad's state: buttons 1–32 (bit n = button n + 1), the d-pad (bits up, right, down, left) and the axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Pad {
+    pub buttons: u32,
+    pub dpad: u8,
+    pub axes: [i16; 8],
+}
+
+pub fn gamepad_report(p: &Pad) -> [u8; GAMEPAD_LEN] {
+    let mut r = [0u8; GAMEPAD_LEN];
+    r[0] = GAMEPAD_ID;
+    r[1..5].copy_from_slice(&p.buttons.to_le_bytes());
+    // The hat's null state is any value past 7.
+    r[5] = crate::gamepad::GamepadInput::hat_of(p.dpad) & 0x0F;
+    for (i, a) in p.axes.iter().enumerate() {
+        r[6 + 2 * i..8 + 2 * i].copy_from_slice(&a.max(&-32767).to_le_bytes());
+    }
+    r
+}
+
+/// The virtual gamepad as an XInput controller (the wired Xbox 360 protocol's 20-byte input report). Its buttons are
+/// numbered as the standard gamepad's (W3C): 1 A, 2 B, 3 X, 4 Y, 5 LB, 6 RB, 7 LT, 8 RT, 9 Back, 10 Start, 11 LS,
+/// 12 RS, 13–16 the d-pad up, down, left, right, 17 Home; the axes X, Y the left stick, Rx, Ry the right one, Z, Rz
+/// the triggers (from 0 up).
+pub const XINPUT_LEN: usize = 20;
+
+pub fn xinput_report(p: &Pad) -> [u8; XINPUT_LEN] {
+    let b = |n: u32| p.buttons >> (n - 1) & 1 != 0;
+    let dpad = p.dpad | u8::from(b(13)) | u8::from(b(16)) << 1 | u8::from(b(14)) << 2 | u8::from(b(15)) << 3;
+    let mut w: u16 = 0;
+    for (bit, on) in [
+        (0, dpad & 1 != 0),
+        (1, dpad & 4 != 0),
+        (2, dpad & 8 != 0),
+        (3, dpad & 2 != 0),
+        (4, b(10)),
+        (5, b(9)),
+        (6, b(11)),
+        (7, b(12)),
+        (8, b(5)),
+        (9, b(6)),
+        (10, b(17)),
+        (12, b(1)),
+        (13, b(2)),
+        (14, b(3)),
+        (15, b(4)),
+    ] {
+        w |= u16::from(on) << bit;
+    }
+    let trigger = |v: i16, button: bool| if button { 255 } else { (v.max(0) >> 7) as u8 };
+    let stick = |v: i16| v.max(-32767);
+    let mut r = [0u8; XINPUT_LEN];
+    r[1] = XINPUT_LEN as u8;
+    r[2..4].copy_from_slice(&w.to_le_bytes());
+    r[4] = trigger(p.axes[2], b(7));
+    r[5] = trigger(p.axes[5], b(8));
+    // XInput's Y axes point up.
+    for (i, v) in [stick(p.axes[0]), -stick(p.axes[1]), stick(p.axes[3]), -stick(p.axes[4])].iter().enumerate() {
+        r[6 + 2 * i..8 + 2 * i].copy_from_slice(&v.to_le_bytes());
+    }
+    r
+}
+
 /// Interface 3: KVM control, vendor page 0xFF4B, 64-byte input and output reports.
 #[rustfmt::skip]
 pub const CONTROL_DESC: &[u8] = &[
@@ -244,6 +341,18 @@ mod tests {
             "the pointer is a collection of its own and of another usage"
         );
 
+        let pad = Layout::parse(&NKRO_PAD_DESC).unwrap();
+        assert_eq!(pad.report_len(crate::ReportType::Input, GAMEPAD_ID), GAMEPAD_LEN - 1);
+        let t = crate::Translator::new(pad);
+        let p = Pad { buttons: 1 << 4 | 1, dpad: 0b0011, axes: [100, -200, 0, 0, 0, 32767, 0, -32768] };
+        let g = t.translate(&gamepad_report(&p)).gamepad.unwrap();
+        assert_eq!(
+            (g.buttons, g.hat, g.axes[0], g.axes[1], g.axes[5], g.axes[7]),
+            (p.buttons, 1, 100, -200, 32767, -32767)
+        );
+        let x = xinput_report(&p);
+        assert_eq!((x[1], u16::from_le_bytes([x[2], x[3]]), x[5]), (20, 1 << 12 | 1 << 8 | 1 | 1 << 3, 255));
+        assert_eq!(i16::from_le_bytes([x[8], x[9]]), 200, "Y points up");
         let nk = Layout::parse(NKRO_DESC).unwrap();
         assert_eq!(nk.report_len(ReportType::Input, NKRO_ID), NKRO_LEN);
         assert_eq!(nk.report_len(ReportType::Input, CONSUMER_ID), 2 * CONSUMER_SLOTS);

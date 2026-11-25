@@ -1,0 +1,65 @@
+[package]
+name = "kvm-esp32"
+description = "OpenDynKVM firmware for the Bluetooth module on an original ESP32: the ESP32-C3's Bluetooth LE hosts and devices, and Bluetooth Classic gamepads (software.md §4.13)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[features]
+# Bluetooth Classic: the controller in dual mode (esp-radio's `btdm`) and the Classic host (`classic.rs`). Without it,
+# LE only, as esp-radio upstream runs the controller (a leave-one-out build, 2026-11-25).
+default = ["classic"]
+classic = ["esp-radio/btdm"]
+
+# The ESP32-C3 firmware's modules are this one's too (`src/main.rs`, `#[path]`): only the chip's own parts are here
+# (`main.rs`, `radio.rs`, `classic.rs`).
+[dependencies]
+kvm-proto = { path = "../../crates/kvm-proto" }
+kvm-classic = { path = "../../crates/kvm-classic" }
+esp-hal = { version = "1.2", features = ["esp32", "unstable"] }
+esp-rtos = { version = "0.4", features = ["esp32", "embassy", "esp-radio"] }
+esp-radio = { version = "1.0.0-beta.1", features = ["esp32", "ble", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.6", features = ["esp32"] }
+esp-storage = { version = "0.10", features = ["esp32"] }
+esp-alloc = "0.11"
+critical-section = "1.2"
+# As the ESP32-C3's (firmware/esp32c3/Cargo.toml says why).
+trouble-host = { version = "0.8", features = [
+    "log",
+    "derive",
+    "security",
+    "legacy-pairing",
+    "scan",
+    "connection-event-queue-size-16",
+    "gatt-client-notification-queue-size-8",
+    "default-packet-pool-size-32",
+] }
+# trouble-host's own, for the Classic commands (`classic.rs`).
+bt-hci = "0.10"
+# Its `cmd!` macro names it (the Classic commands bt-hci lacks, `classic.rs`).
+bt-hci-transport = "0.1"
+embassy-executor = "0.10"
+embassy-time = "0.5.1"
+embassy-sync = "0.8"
+embassy-futures = "0.1.2"
+heapless = "0.9"
+embedded-io = "0.7"
+embedded-io-async = "0.7"
+static_cell = "2.1"
+log = { version = "0.4", features = ["release_max_level_warn"] }
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+opt-level = "s"
+
+[patch.crates-io]
+# The ESP32-C3's copy, with its shared buffer credits (firmware/esp32c3/Cargo.toml).
+trouble-host = { path = "../esp32c3/trouble-host" }
+# esp-radio 1.0.0-beta.1 with the ESP32's controller in dual mode, marked "OpenDynKVM:" (src/ble/btdm.rs,
+# src/ble/os_adapter_esp32.rs): upstream starts it for Bluetooth LE only.
+esp-radio = { path = "esp-radio" }

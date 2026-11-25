@@ -1,5 +1,4 @@
-//! How often the RP2354B tries to program an AT32F405 (software.md §4.9), and the Bluetooth module (§4.13, the same
-//! limits, its own record).
+//! How often the RP2354B tries to program an AT32F405 (software.md §4.9).
 //!
 //! Each attempt is counted in flash before it starts, so a power loss in the middle counts too, and the count goes back
 //! to 0 once the chip answers with the embedded firmware. After [`MAX_FAILS`] attempts in a row it gives up, until the
@@ -9,8 +8,6 @@
 
 /// Store key of the AT32F405s' [`Record`].
 pub const ITEM: u16 = 0x0002;
-/// Store key of the Bluetooth module's [`Record`], for its embedded image; its count is `fails[0]`.
-pub const BT_ITEM: u16 = 0x0003;
 /// Attempts in a row before giving up.
 pub const MAX_FAILS: u8 = 5;
 /// Attempts within one boot, when the transfer fails.

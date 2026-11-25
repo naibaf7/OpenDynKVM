@@ -5,15 +5,23 @@
 /// The boot ROM looks for the first block in this many bytes of an image.
 pub const SEARCH_LEN: usize = 4096;
 
-/// The RP2354B's flash layout in 4 KB sectors (`firmware/rp2354/src/flash.rs`, which a board keeps for good once
-/// flashed; `cargo xtask dist` writes the partition table from these): the partition table, A and B, the data
-/// partition, then the last sector left free (RP2350-E10).
+/// The RP2354B's flash layout in 4 KB sectors (`firmware/rp2354/src/flash.rs`; `cargo xtask dist` writes the
+/// partition table from these): the partition table, A and B, the data partition, then the last sector left free
+/// (RP2350-E10).
 pub mod layout {
     pub const SECTOR: u32 = 4096;
     pub const PARTITION_A_SECTOR: u32 = 2;
-    pub const PARTITION_SECTORS: u32 = 246;
+    pub const PARTITION_SECTORS: u32 = 224;
     pub const PARTITION_B_SECTOR: u32 = PARTITION_A_SECTOR + PARTITION_SECTORS;
-    pub const DATA_SECTORS: u32 = 17;
+    pub const DATA_SECTOR: u32 = PARTITION_B_SECTOR + PARTITION_SECTORS;
+    pub const DATA_SECTORS: u32 = 61;
+    /// The first firmware for this layout. Firmware before it had A and B of [`PREVIOUS_PARTITION_SECTORS`], with the
+    /// Bluetooth module's image inside, and 17 sectors of data; a board with that table takes `kvm-first.uf2` from the
+    /// boot ROM's bootloader, and an update over a PC port never crosses this version (either way).
+    pub const SINCE: u32 = crate::version_u32(0, 1, 51);
+    pub const PREVIOUS_PARTITION_SECTORS: u32 = 246;
+
+    const _: () = assert!(DATA_SECTOR + DATA_SECTORS == 511, "the last sector stays free");
 }
 
 const BLOCK_START: u32 = 0xffff_ded3;

@@ -27,11 +27,11 @@ defmt = "1"
 defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }
 embedded-io-async = "0.7"
+# The Bluetooth module's image is taken only with the SHA-256 this firmware was built with (modstream.rs).
+sha2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
-# The Bluetooth module's image goes in compressed (its ROM inflates it) and is checked by MD5 (software.md §4.13).
-flate2 = "1"
-md-5 = "0.10"
+sha2 = "0.10"
 
 [profile.release]
 debug = 2

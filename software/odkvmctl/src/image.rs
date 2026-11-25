@@ -16,6 +16,8 @@ pub const XIP_BASE: u32 = 0x1000_0000;
 const A_XIP: u32 = XIP_BASE + layout::PARTITION_A_SECTOR * layout::SECTOR;
 /// One A/B partition.
 const MAX_IMAGE: usize = (layout::PARTITION_SECTORS * layout::SECTOR) as usize;
+/// Where partition B starts: `kvm-first.uf2` erases its first sector.
+const B_XIP: u32 = A_XIP + MAX_IMAGE as u32;
 
 fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
@@ -46,6 +48,29 @@ pub fn uf2(regions: &[(u32, &[u8])], family: u32) -> Vec<u8> {
         out.extend_from_slice(&b);
     }
     out
+}
+
+/// Whether an update over a PC port from firmware `kvm` to `image` stays on one flash layout. The layout changed with
+/// `layout::SINCE`: across it, the board goes through the boot ROM's bootloader and `kvm-first.uf2` (either way).
+pub fn check_layout(kvm: u32, image: u32) -> Result<(), String> {
+    if (kvm < layout::SINCE) == (image < layout::SINCE) {
+        return Ok(());
+    }
+    Err(fl!(
+        "img-layout-changed",
+        kvm = names::version(kvm),
+        image = names::version(image),
+        since = names::version(layout::SINCE)
+    ))
+}
+
+/// `kvm-first.uf2`: the partition table (`table`, at the start of flash), `image` in partition A, and B's first sector
+/// erased: on a board that had the partition table from before 0.1.51 it may hold part of an old image, which the boot
+/// ROM must not take for one. The data partition is left as it is. Absolute addresses (the boot ROM writes them only
+/// where no partition table, or one that allows it, is in the way).
+pub fn first_uf2(table: &[u8], image: &[u8]) -> Vec<u8> {
+    let erased = [0xFFu8; layout::SECTOR as usize];
+    uf2(&[(XIP_BASE, table), (A_XIP, image), (B_XIP, &erased)], UF2_FAMILY_ABSOLUTE)
 }
 
 /// The UF2 for the boot ROM's drive that an update image makes (what `kvm-rp2354.uf2` holds).
@@ -113,7 +138,13 @@ pub fn first_image(file: &[u8]) -> Result<Vec<u8>, String> {
     if !blocks.iter().any(|(a, _)| (XIP_BASE..A_XIP).contains(a)) {
         return Err(fl!("img-not-first"));
     }
-    let image: Vec<(u32, &[u8])> = blocks.into_iter().filter(|(a, _)| *a >= A_XIP).collect();
+    // Besides the table and the image, only B's first sector, erased ([`first_uf2`]).
+    let erasing_b =
+        |a: u32, data: &[u8]| (B_XIP..B_XIP + layout::SECTOR).contains(&a) && data.iter().all(|b| *b == 0xFF);
+    if let Some((a, _)) = blocks.iter().find(|(a, d)| *a >= B_XIP && !erasing_b(*a, d)) {
+        return Err(fl!("img-uf2-out-of-range", address = format!("{a:#010x}")));
+    }
+    let image: Vec<(u32, &[u8])> = blocks.into_iter().filter(|(a, _)| (A_XIP..B_XIP).contains(a)).collect();
     assemble(&image, A_XIP, MAX_IMAGE)
 }
 
@@ -172,9 +203,9 @@ pub(crate) mod tests {
         b
     }
 
-    /// `kvm-first.uf2` for `image`: a stand-in partition table, then the image in A.
+    /// `kvm-first.uf2` for `image`, as `cargo xtask dist` writes it, with a stand-in partition table.
     pub(crate) fn first_uf2(image: &[u8]) -> Vec<u8> {
-        uf2(&[(XIP_BASE, &[0x5A; 128]), (A_XIP, image)], UF2_FAMILY_ABSOLUTE)
+        super::first_uf2(&[0x5A; 128], image)
     }
 
     const HW: u32 = 0x00_0C_00;
@@ -206,9 +237,23 @@ pub(crate) mod tests {
         let img = first_image(&first_uf2(&fw)).unwrap();
         assert_eq!(&img[..fw.len()], &fw[..]);
         assert_eq!(check_image(&img), Ok((0x100, 0)));
+        // B's first sector erased is part of it (it begins where A ends); anything else beyond A is not.
+        let f = first_uf2(&fw);
+        assert_eq!(uf2_blocks(&f, UF2_FAMILY_ABSOLUTE).unwrap().last().unwrap().0, B_XIP + layout::SECTOR - 256);
+        let written = uf2(&[(XIP_BASE, &[0x5A; 128]), (A_XIP, &fw), (B_XIP, &[0u8; 256])], UF2_FAMILY_ABSOLUTE);
+        assert!(first_image(&written).unwrap_err().contains("out of range"));
         // An update UF2 is not one; nor is an absolute UF2 without a partition table.
         assert!(first_image(&update_uf2(&fw)).unwrap_err().contains("first"));
         assert!(first_image(&uf2(&[(A_XIP, &fw)], UF2_FAMILY_ABSOLUTE)).unwrap_err().contains("first"));
+    }
+
+    /// The `kvm-first.uf2` of the last `cargo xtask dist`, if there is one, goes through the check boards get.
+    #[test]
+    fn the_built_first_install_uf2_reads_back() {
+        let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/kvm-first.uf2");
+        let Ok(file) = std::fs::read(&dist) else { return };
+        let img = first_image(&file).unwrap();
+        assert_eq!(rpimage::fw_id(&img).map(|(v, _)| v), rpimage::image_version(&img));
     }
 
     #[test]

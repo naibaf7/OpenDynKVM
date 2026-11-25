@@ -2,7 +2,7 @@
 
 use heapless::Vec;
 use kvm_hid::normalized;
-use kvm_proto::ctrl::{INTERFACE_STRING, Polling, Port, VIAL_INTERFACE_STRING};
+use kvm_proto::ctrl::{GamepadOut, INTERFACE_STRING, Polling, Port, VIAL_INTERFACE_STRING};
 use kvm_proto::descset::{self, iface as ifl, tag};
 use kvm_proto::wire::WireError;
 
@@ -21,6 +21,8 @@ const MIRROR_EPS: [u8; 6] = [5, 6, 7, 1, 2, 3];
 const LAST_EP: u8 = 7;
 /// The Vial interface's IN endpoint when present (it has no OUT endpoint: its requests come as SET_REPORT).
 const VIAL_EP: u8 = LAST_EP;
+/// The virtual gamepad's XInput interface, when the config asks for one (hid_mapping.md §6.1): IN and OUT.
+const XINPUT_EP: u8 = 6;
 
 pub mod strings {
     pub const MANUFACTURER: u8 = 1;
@@ -62,6 +64,10 @@ pub struct Presentation {
     pub vial: Option<Function>,
     /// The mouse interface has the absolute pointer ([`normalized::MOUSE_ABS_DESC`]): its reports carry report IDs.
     pub mouse_abs: bool,
+    /// The virtual gamepad: on the NKRO interface (`Hid`), an interface of its own (`XInput`, [`Presentation::xinput`]),
+    /// or none.
+    pub gamepad: GamepadOut,
+    pub xinput: Option<Function>,
     pub mirrors: Vec<MirrorMap, MAX_MIRRORS>,
     pub identity: Option<Port>,
 }
@@ -74,6 +80,7 @@ pub enum Role {
     Nkro,
     Control,
     Vial,
+    XInput,
     Mirror(MirrorMap),
 }
 
@@ -87,6 +94,8 @@ impl Presentation {
             control: none,
             vial: None,
             mouse_abs: false,
+            gamepad: GamepadOut::Off,
+            xinput: None,
             mirrors: Vec::new(),
             identity: None,
         }
@@ -103,6 +112,7 @@ impl Presentation {
         .find(|(f, _)| f.ep_in != 0 && f.iface == iface)
         .map(|(_, r)| r)
         .or_else(|| self.vial.filter(|v| v.iface == iface).map(|_| Role::Vial))
+        .or_else(|| self.xinput.filter(|x| x.iface == iface).map(|_| Role::XInput))
         .or_else(|| self.mirrors.iter().find(|m| m.f.iface == iface).map(|m| Role::Mirror(*m)))
     }
 
@@ -142,6 +152,8 @@ pub struct Params<'a> {
     pub normalized: bool,
     /// The mouse interface with the absolute pointer (screen hop, software.md §4.14).
     pub mouse_abs: bool,
+    /// The virtual gamepad (`Hid` only with the normalized interfaces); `XInput` takes a mirror's endpoints.
+    pub gamepad: GamepadOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,8 +219,11 @@ pub fn build(p: &Params, out: &mut [u8]) -> Result<(usize, Presentation), BuildE
     cfg.put(&[9, dt::CONFIGURATION, 0, 0, 0, 1, 0, 0xA0, 250])?;
     let mut pres = Presentation { identity: p.identity.as_ref().map(|i| i.port), ..Presentation::default() };
     let mut next_iface = 0u8;
-    let mut ins = MIRROR_EPS.into_iter().filter(|&e| !(p.normalized && e <= 3 || p.vial && e == VIAL_EP));
-    let mut outs = MIRROR_EPS.into_iter();
+    let xinput = p.gamepad == GamepadOut::XInput;
+    let mut ins = MIRROR_EPS
+        .into_iter()
+        .filter(|&e| !(p.normalized && e <= 3 || p.vial && e == VIAL_EP || xinput && e == XINPUT_EP));
+    let mut outs = MIRROR_EPS.into_iter().filter(|&e| !(xinput && e == XINPUT_EP));
     let mut xinput_ifaces: Vec<u8, MAX_MIRRORS> = Vec::new();
     let mut report_descs: Vec<(u8, &[u8]), MAX_MIRRORS> = Vec::new();
 
@@ -297,10 +312,16 @@ pub fn build(p: &Params, out: &mut [u8]) -> Result<(usize, Presentation), BuildE
         (normalized::MOUSE_DESC, normalized::MOUSE_LEN)
     };
     pres.mouse_abs = p.mouse_abs && p.normalized;
+    pres.gamepad = match p.gamepad {
+        GamepadOut::Hid if !p.normalized => GamepadOut::Off,
+        g => g,
+    };
+    let nkro_desc: &[u8] =
+        if pres.gamepad == GamepadOut::Hid { &normalized::NKRO_PAD_DESC } else { normalized::NKRO_DESC };
     let kvm = [
         (normalized::BOOT_KEYBOARD_DESC, 1, 1, normalized::BOOT_KEYBOARD_LEN, 0u8, 0u8),
         (mouse_desc, 1, 2, mouse_len, 0, 0),
-        (normalized::NKRO_DESC, 0, 0, 64, 0, 0),
+        (nkro_desc, 0, 0, 64, 0, 0),
         (normalized::CONTROL_DESC, 0, 0, normalized::CONTROL_LEN, 4, strings::CONTROL),
     ];
     // (index into `kvm`, interface number)
@@ -333,9 +354,22 @@ pub fn build(p: &Params, out: &mut [u8]) -> Result<(usize, Presentation), BuildE
         let n = next_iface;
         next_iface += 1;
         cfg.put(&interface(n, 1, 3, 0, 0, strings::VIAL))?;
-        cfg.put(&hid(kvm_vial::REPORT_DESC.len()))?;
-        cfg.put(&endpoint(0x80 | VIAL_EP, kvm_vial::REPORT_LEN as u16, interval))?;
+        cfg.put(&hid(kvm_map::REPORT_DESC.len()))?;
+        cfg.put(&endpoint(0x80 | VIAL_EP, kvm_map::REPORT_LEN as u16, interval))?;
         pres.vial = Some(Function { iface: n, ep_in: 0x80 | VIAL_EP, ep_out: 0 });
+    }
+    if xinput {
+        // As a wired Xbox 360 pad: the interface, its vendor class descriptor (naming its endpoints at offsets 6 and
+        // 13), IN and OUT; Windows takes it by the compat ID "XUSB10" below.
+        let n = next_iface;
+        next_iface += 1;
+        let (ep_in, ep_out) = (0x80 | XINPUT_EP, XINPUT_EP);
+        cfg.put(&interface(n, 2, 0xFF, 0x5D, 0x01, 0))?;
+        cfg.put(&[17, 0x21, 0x00, 0x01, 0x01, 0x25, ep_in, 0x14, 0, 0, 0, 0, 0x13, ep_out, 0x08, 0, 0])?;
+        cfg.put(&endpoint(ep_in, 32, interval))?;
+        cfg.put(&endpoint(ep_out, 32, interval))?;
+        pres.xinput = Some(Function { iface: n, ep_in, ep_out });
+        let _ = xinput_ifaces.push(n);
     }
 
     for m in p.mirrors.iter().filter(|m| p.identity.as_ref().is_none_or(|id| id.port != m.port)) {
@@ -408,7 +442,7 @@ pub fn build(p: &Params, out: &mut [u8]) -> Result<(usize, Presentation), BuildE
         w.record(tag::IFACE, n, &[ifl::LOCAL_HID | extra])?;
     }
     if let Some(v) = pres.vial {
-        w.record(tag::HID_REPORT, v.iface, kvm_vial::REPORT_DESC)?;
+        w.record(tag::HID_REPORT, v.iface, kvm_map::REPORT_DESC)?;
         w.record(tag::IFACE, v.iface, &[ifl::LOCAL_HID])?;
     }
     for (n, rd) in &report_descs {
@@ -468,6 +502,7 @@ mod tests {
                 vial: false,
                 normalized: true,
                 mouse_abs: false,
+                gamepad: GamepadOut::Off,
             },
             &mut out,
         )
@@ -513,6 +548,7 @@ mod tests {
             vial: false,
             normalized: true,
             mouse_abs: false,
+            gamepad: GamepadOut::Off,
         };
         let (n, pres) = build(&params, &mut out).unwrap();
         let set = DescSet::parse(&out[..n]).unwrap();
@@ -550,6 +586,7 @@ mod tests {
             vial: true,
             normalized: true,
             mouse_abs: false,
+            gamepad: GamepadOut::Off,
         };
         let mut out = [0u8; 4096];
         let (n, pres) = build(&params(&two), &mut out).unwrap();
@@ -557,7 +594,7 @@ mod tests {
         assert_eq!(pres.vial, Some(Function { iface: 4, ep_in: 0x87, ep_out: 0 }));
         assert_eq!((pres.mirrors[0].f.ep_in, pres.mirrors[1].f.ep_in), (0x85, 0x86));
         assert_eq!(pres.role_of_iface(4), Some(Role::Vial));
-        assert_eq!(set.find(tag::HID_REPORT, 4), Some(kvm_vial::REPORT_DESC));
+        assert_eq!(set.find(tag::HID_REPORT, 4), Some(kvm_map::REPORT_DESC));
         assert_eq!(set.iface_flags(4), ifl::LOCAL_HID);
         let cfg = parse_config(set.config().unwrap()).unwrap();
         assert_eq!(cfg.interfaces[4].in_ep().unwrap().max_packet, 32);
@@ -584,6 +621,7 @@ mod tests {
             vial,
             normalized: false,
             mouse_abs: true,
+            gamepad: GamepadOut::Off,
         };
         let mut out = [0u8; 4096];
         let (n, pres) = build(&params(false), &mut out).unwrap();
@@ -616,6 +654,7 @@ mod tests {
             vial: false,
             normalized: true,
             mouse_abs,
+            gamepad: GamepadOut::Off,
         };
         let mut plain = [0u8; 4096];
         let (n0, p0) = build(&params(false), &mut plain).unwrap();
@@ -646,6 +685,7 @@ mod tests {
                 vial: false,
                 normalized: true,
                 mouse_abs: false,
+                gamepad: GamepadOut::Off,
             },
             &mut out,
         );

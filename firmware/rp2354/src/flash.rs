@@ -1,34 +1,55 @@
 //! The 2 MB flash, shared by the data store and the update writer (both on core 0).
 //!
-//! Layout (physical offsets; `cargo xtask dist` writes the partition table, software.md §4.8):
+//! Layout (physical offsets, from `kvm_proto::rpimage::layout`; `cargo xtask dist` writes the partition table,
+//! software.md §4.9):
 //!
 //! | Offset | Size | Use |
 //! |---|---|---|
 //! | 0 | 8 KB | partition table (boot ROM) |
-//! | 8 KB | 984 KB | partition A: firmware |
-//! | 992 KB | 984 KB | partition B: firmware (A/B pair with A) |
-//! | 1976 KB | 68 KB | partition "data": config, keymap and macros (`kvm_core::store`, 17 sectors) |
+//! | 8 KB | 896 KB | partition A: firmware |
+//! | 904 KB | 896 KB | partition B: firmware (A/B pair with A) |
+//! | 1800 KB | 244 KB | partition "data": config, keymap and macros (`kvm_core::store`, 61 sectors) |
 //! | 2044 KB | 4 KB | left free (RP2350-E10 workaround block on A2 silicon) |
 //!
 //! Booted from a partition, XIP address 0x1000_0000 maps to that partition's start, but the ROM's erase and program
 //! work on physical offsets. Reads of anything outside the running image therefore go through the untranslated XIP
 //! alias ([`read`]).
+//!
+//! The data partition is used only once the partition table is known to be this one, or there is none (a debug
+//! probe's image at the start of flash): on a board with the table of firmware before 0.1.51 it lies in that table's
+//! partition B ([`set_layout_ours`]). The Bluetooth module's firmware is not kept here: the host software streams it
+//! to the module through the RP2354B (`bt.rs`).
 
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::peripherals::FLASH;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use kvm_proto::rpimage::layout;
 
 pub const SIZE: usize = 2 * 1024 * 1024;
-pub const SECTOR: u32 = 4096;
+pub const SECTOR: u32 = layout::SECTOR;
 /// The partitions the partition table is expected to hold.
-pub const PARTITION_A: u32 = 8 * 1024;
-pub const PARTITION_LEN: u32 = 984 * 1024;
-pub const DATA: u32 = PARTITION_A + 2 * PARTITION_LEN;
-pub const DATA_LEN: u32 = 68 * 1024;
-pub const DATA_SECTORS: usize = (DATA_LEN / SECTOR) as usize;
+pub const PARTITION_A: u32 = layout::PARTITION_A_SECTOR * SECTOR;
+pub const PARTITION_LEN: u32 = layout::PARTITION_SECTORS * SECTOR;
+pub const DATA: u32 = layout::DATA_SECTOR * SECTOR;
+pub const DATA_LEN: u32 = layout::DATA_SECTORS * SECTOR;
+pub const DATA_SECTORS: usize = layout::DATA_SECTORS as usize;
+const _: () = assert!(PARTITION_A + 2 * PARTITION_LEN == DATA);
+
+/// Whether the data partition is where this firmware has it (`update::init`).
+static OURS: AtomicBool = AtomicBool::new(false);
+
+/// The partition table is this firmware's, or there is none: the data partition may be used.
+pub fn set_layout_ours(ours: bool) {
+    OURS.store(ours, Ordering::Relaxed);
+}
+
+pub fn layout_ours() -> bool {
+    OURS.load(Ordering::Relaxed)
+}
 
 /// Uncached, untranslated XIP window (RP2350 datasheet §4.4).
 const XIP_NOCACHE_NOALLOC_NOTRANSLATE_BASE: usize = 0x1C00_0000;
@@ -74,11 +95,13 @@ impl kvm_core::store::Nor for DataFlash {
     }
 
     fn erase(&mut self, at: u32) -> bool {
-        at + SECTOR <= DATA_LEN && with(|f| f.blocking_erase(DATA + at, DATA + at + SECTOR).is_ok())
+        layout_ours() && at + SECTOR <= DATA_LEN && with(|f| f.blocking_erase(DATA + at, DATA + at + SECTOR).is_ok())
     }
 
     fn program(&mut self, at: u32, data: &[u8]) -> bool {
         // embassy-rp pads partial pages with 0xFF, which leaves the bytes around `data` as they are.
-        at as usize + data.len() <= DATA_LEN as usize && with(|f| f.blocking_write(DATA + at, data).is_ok())
+        layout_ours()
+            && at as usize + data.len() <= DATA_LEN as usize
+            && with(|f| f.blocking_write(DATA + at, data).is_ok())
     }
 }

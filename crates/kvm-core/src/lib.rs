@@ -10,6 +10,8 @@ pub mod diag;
 pub mod engine;
 pub mod hop;
 pub mod hotkey;
+pub mod known;
+pub mod pads;
 pub mod leds;
 pub mod merge;
 pub mod output;

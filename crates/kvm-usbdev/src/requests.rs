@@ -417,6 +417,7 @@ mod tests {
             vial: false,
             normalized: true,
             mouse_abs: false,
+            gamepad: kvm_proto::ctrl::GamepadOut::Off,
         };
         let (n, _) = build(&p, &mut out).unwrap();
         out[..n].to_vec()

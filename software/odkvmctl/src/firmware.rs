@@ -1,19 +1,27 @@
 //! The firmware that ships with the host software, and the file each way of installing takes (software.md §9
 //! "Firmware page").
 //!
-//! - **Bundled** ([`bundled`]): the packages carry the release's `kvm-rp2354.bin`, `kvm-rp2354.uf2` and
-//!   `kvm-first.uf2`, in `/usr/share/opendyn-kvm/firmware` (Linux) or in `firmware\` next to the programs (Windows).
+//! - **Bundled** ([`bundled`]): the packages carry the release's `kvm-rp2354.bin`, its module images
+//!   (`kvm-module-esp32c3.bin`, `kvm-module-esp32.bin`), `kvm-rp2354.uf2` and `kvm-first.uf2`, in `/usr/share/opendyn-kvm/firmware` (Linux) or in `firmware\` next to the programs
+//!   (Windows).
 //!   `OPENDYN_FIRMWARE` names another folder; programs run from a build tree (`target/...`) take its `dist/`.
 //! - **A path** is one of those files, or a folder holding them. Over a PC port the KVM gets an image ([`for_pc`]: a
 //!   `.bin` or an update UF2; a folder's `kvm-rp2354.bin`). The boot ROM's drive gets the UF2 its board takes
 //!   ([`for_bootloader`]): a KVM an update UF2 (made from the `.bin` if need be), a new board `kvm-first.uf2`, taken
-//!   from the same folder when the path names another file of the release.
+//!   from the same folder when the path names another file of the release. The Bluetooth module's firmware
+//!   ([`module_for`]) is the release folder's image for the module's chip (`Status.bt_chip`: [`module_bin`]), streamed
+//!   over a PC port after the RP2354B's.
 
 use std::path::{Path, PathBuf};
+
+use kvm_proto::link::bt::Chip;
+use kvm_proto::modimage;
 
 use crate::{fl, image};
 
 pub const UPDATE_BIN: &str = "kvm-rp2354.bin";
+/// The module images, one per chip ([`module_bin`]).
+pub const MODULE_BINS: [&str; 2] = ["kvm-module-esp32c3.bin", "kvm-module-esp32.bin"];
 pub const UPDATE_UF2: &str = "kvm-rp2354.uf2";
 pub const FIRST_UF2: &str = "kvm-first.uf2";
 
@@ -107,6 +115,41 @@ pub fn for_bootloader(path: &Path, first: bool) -> Result<Chosen, String> {
     let (version, hw_major) = image::check_image(&image)?;
     let data = if image::is_uf2(&bytes) { bytes } else { image::update_uf2(&image) };
     Ok(Chosen { file, version, hw_major, data })
+}
+
+/// The file name of `chip`'s module image. A chip not known yet is taken for an ESP32-C3: the module of every KVM
+/// before the ESP32 (a module whose `Hello` says no chip runs the ESP32-C3's firmware).
+pub fn module_bin(chip: Chip) -> String {
+    let chip = if chip == Chip::Unknown { Chip::Esp32C3 } else { chip };
+    format!("kvm-module-{}.bin", chip.name())
+}
+
+/// The Bluetooth module's firmware of a release for one chip (`kvm-module-<chip>.bin`, `kvm_proto::modimage`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Module {
+    pub file: PathBuf,
+    pub version: u32,
+    pub chip: Chip,
+    pub data: Vec<u8>,
+}
+
+/// The Bluetooth module's firmware for `chip` of the release at `path` (any of its files, or its folder; a module
+/// image named is taken as it is), checked to be one; None if the release has none for that chip.
+pub fn module_for(path: &Path, chip: Chip) -> Result<Option<Module>, String> {
+    let name = module_bin(chip);
+    let file = if path.is_dir() {
+        path.join(&name)
+    } else if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| MODULE_BINS.contains(&n)) {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(Path::new(".")).join(&name)
+    };
+    if !file.is_file() {
+        return Ok(None);
+    }
+    let data = read(&file)?;
+    let h = modimage::check(&data).ok_or_else(|| fl!("fw-module-damaged", file = file.display().to_string()))?;
+    Ok(Some(Module { file, version: h.version, chip: Chip::from_u8(h.chip), data }))
 }
 
 /// The version and hardware major version of the firmware at `path` (any of the release's files, or its folder).

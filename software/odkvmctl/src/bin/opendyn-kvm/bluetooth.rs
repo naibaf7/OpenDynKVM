@@ -9,9 +9,10 @@ use eframe::egui::{self, Color32, RichText, Ui};
 use kvm_core::leds::BT_VIOLET;
 use kvm_proto::ctrl::diag::BtModule;
 use kvm_proto::ctrl::{
-    BT_PAIR_SECONDS, BtDeviceInfo, BtPolicy, ConfigValue, DevicePairing, ProfileName, selftest, status_flags,
+    BT_PAIR_SECONDS, BtDeviceInfo, BtPolicy, ConfigValue, DevicePairing, FwState, ProfileName, status_flags,
 };
 use odkvmctl::client::{BtHostView, DeviceSlot, Snapshot};
+use odkvmctl::time::Instant;
 use odkvmctl::{fl, names};
 
 use crate::look::{self, BAD, GOOD, WARN, card, chip, ink, note};
@@ -184,45 +185,50 @@ impl App {
         ui.add_space(8.0);
     }
 
-    /// While the module doesn't run its firmware: what it is doing, and for a failed one what the KVM does about it.
-    /// On the Firmware page, and in place of the Bluetooth page's content. Nothing while it is up or not fitted.
-    pub(crate) fn bt_module_card(&self, ui: &mut Ui, s: &Snapshot) {
+    /// While the module doesn't run this firmware's version: what it is doing, and the update it needs. On the Firmware
+    /// page, and in place of the Bluetooth page's content. Nothing while it is up or not fitted.
+    pub(crate) fn bt_module_card(&mut self, ui: &mut Ui, s: &Snapshot) {
         let m = s.status.bt_module;
         if matches!(m, BtModule::Absent | BtModule::Up) {
             return;
         }
-        // An ESP32-C3 board on a front port (software.md §4.13): it comes back when plugged in again.
-        let board = s.module_port();
+        let (update, result) = {
+            let sh = self.shared.lock().unwrap();
+            (sh.module_update, sh.module_result.clone())
+        };
         ui.add_space(8.0);
-        card(ui, &fl!("wireless-module"), |ui| match m {
-            BtModule::Starting | BtModule::Programming => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new(fl!("module-is", state = names::bt_module(m))).color(ink(ui, WARN)));
-                });
-                note(ui, fl!("module-programming-note"));
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-            }
-            BtModule::Failed => {
-                ui.label(RichText::new(names::selftest(selftest::BT_FW)).color(ink(ui, BAD)));
-                if board.is_some() {
-                    // A board stays off until the KVM restarts, which *Try again* does.
-                    note(ui, fl!("module-failed-note-board"));
-                    if ui.button(fl!("try-again")).clicked() {
-                        self.send(UiCmd::RetryBt);
+        card(ui, &fl!("wireless-module"), |ui| {
+            match m {
+                BtModule::NeedsUpdate => {
+                    ui.label(RichText::new(fl!("module-needs-update")).color(ink(ui, WARN)));
+                    note(ui, fl!("module-needs-update-note"));
+                    let busy = matches!(update, Some((st, ..)) if matches!(st, FwState::Receiving | FwState::Writing));
+                    let module = self.fw.module(s.info.rp_fw, s.status.bt_chip);
+                    if ui.add_enabled(!busy && module.is_ok(), egui::Button::new(fl!("update-module"))).clicked() {
+                        self.send(UiCmd::UpdateModule(self.fw.path()));
                     }
-                } else {
-                    note(ui, fl!("module-failed-note"));
+                    if let Err(e) = module {
+                        ui.label(RichText::new(e).color(ink(ui, WARN)));
+                    }
+                }
+                _ => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(fl!("module-is", state = names::bt_module(m))).color(ink(ui, WARN)));
+                    });
+                    note(ui, fl!("module-programming-note"));
                 }
             }
-            _ => {
-                ui.label(RichText::new(names::selftest(selftest::BT_GAVE_UP)).color(ink(ui, BAD)));
-                note(ui, if board.is_some() { fl!("gave-up-note-board") } else { fl!("gave-up-note-module") });
-                if ui.button(fl!("try-again")).clicked() {
-                    self.send(UiCmd::RetryBt);
-                }
+            if let Some((state, done, total)) = update
+                && matches!(m, BtModule::Programming | BtModule::NeedsUpdate)
+            {
+                ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).text(names::fw_state(state)));
+            }
+            if let Some(Err(e)) = result {
+                ui.label(RichText::new(e).color(ink(ui, BAD)));
             }
         });
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
     }
 
     /// The Bluetooth page: pairing, and each of the four host slots (name, state, policy, forget).
@@ -268,12 +274,13 @@ impl App {
         card(ui, &fl!("hosts"), |ui| {
             note(ui, fl!("hosts-note"));
             ui.add_space(4.0);
-            egui::Grid::new("bt-hosts").num_columns(5).spacing([12.0, 8.0]).show(ui, |ui| {
+            egui::Grid::new("bt-hosts").num_columns(6).spacing([12.0, 8.0]).show(ui, |ui| {
                 for h in &s.bt {
                     let i = h.slot as usize - 1;
                     ui.label(RichText::new(format!("{}", h.slot)).strong().color(ink(ui, violet())));
                     if !h.bonded() {
                         ui.label(RichText::new(fl!("slot-free")).color(look::palette(ui).weak));
+                        ui.label("");
                         ui.label("");
                         ui.label("");
                         ui.label("");
@@ -321,6 +328,24 @@ impl App {
                         optimistic(&self.shared, v);
                         self.set(v);
                     }
+                    // Whether its software may control the KVM over the module: on only with a tap on the KVM's key.
+                    let mut allow = h.may_control;
+                    let mut label = fl!("host-may-control-check");
+                    if h.may_control && h.in_session() {
+                        label += &format!(" · {}", fl!("host-controls-now"));
+                    }
+                    let r = ui
+                        .add_enabled(!locked, egui::Checkbox::new(&mut allow, label))
+                        .on_hover_text(fl!("host-may-control-hover"));
+                    if r.changed() {
+                        let v = ConfigValue::BtControl(i as u8, allow);
+                        if allow {
+                            self.bt_allow_asked = Some((h.slot, Instant::now()));
+                        } else {
+                            optimistic(&self.shared, v);
+                        }
+                        self.set(v);
+                    }
                     let forget = ui
                         .add_enabled(!locked, egui::Button::new(RichText::new(fl!("forget")).color(ink(ui, BAD))))
                         .on_hover_text(fl!("forget-hover"));
@@ -331,6 +356,18 @@ impl App {
                     ui.end_row();
                 }
             });
+            // A host just allowed here: the KVM waits for its key (it shows allowed once tapped).
+            let wait = kvm_core::engine::UNLOCK_WAIT_MS as f32 / 1000.0;
+            if let Some((slot, at)) = self.bt_allow_asked {
+                let done = s.bt.iter().any(|h| h.slot == slot && h.may_control);
+                if done || at.elapsed().as_secs_f32() > wait {
+                    self.bt_allow_asked = None;
+                } else {
+                    ui.add_space(4.0);
+                    let seconds = kvm_core::engine::UNLOCK_WAIT_MS / 1000;
+                    ui.label(RichText::new(fl!("cli-press-key-within", seconds = seconds)).color(ink(ui, WARN)));
+                }
+            }
         });
         // The devices after the hosts: each kind's pairing card above its slots.
         ui.add_space(8.0);

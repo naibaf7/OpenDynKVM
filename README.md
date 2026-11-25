@@ -39,6 +39,7 @@ their bring-up, is designed but not ordered yet. What has been verified on a boa
 | [`DEVELOPMENT.md`](DEVELOPMENT.md) | Building the firmware and the host software, changing the board, bring-up status |
 | [`hardware/jlcpcb.md`](hardware/jlcpcb.md) | Ordering the board from JLCPCB |
 | [`hardware/errata.md`](hardware/errata.md) | Faults of boards already ordered, their workarounds and fixes |
+| [`qualified_hardware.md`](qualified_hardware.md) | Mice, keyboards, gamepads and hosts that have been tried, by hardware type |
 
 ## Getting a board
 
@@ -190,10 +191,10 @@ Windows needs no drivers.
 The LED colours are described in [design.md §7](design.md).
 
 **Key blinking red:** a part of the KVM doesn't work. The PC LEDs show which side; `odkvmctl status` (or the GUI)
-says what, and `odkvmctl diag` shows the readings behind it. If it says the KVM gave up programming a PC-side chip or
-the Bluetooth module (it stops after 5 failed attempts in a row, so as not to reprogram it at every power-up), try
-again with `odkvmctl reboot at32-retry` (or `wireless-retry`), the GUI's "Try again" on the Firmware page, or by holding the
-key while plugging the KVM in.
+says what, and `odkvmctl diag` shows the readings behind it. If it says the KVM gave up programming a PC-side chip (it
+stops after 5 failed attempts in a row, so as not to reprogram it at every power-up), try again with `odkvmctl reboot
+at32-retry`, the GUI's "Try again" on the Firmware page, or by holding the key while plugging the KVM in. A Bluetooth
+module that needs an update gets it from the app (Firmware or Wireless page) or `odkvmctl update --module`.
 
 ### Monitors follow the KVM (DDC/CI)
 
@@ -311,8 +312,8 @@ monitor inputs over DDC/CI, and the AT32F405 recovery paths; the full list is in
   crates, odkvmctl, xtask, the logo (`branding/`) and their documentation. The general-purpose hardware tools (router,
   checks, fabrication, solvers) are [MIT](LICENSES/MIT.txt).
 - **Third party:** the HRO USB-C footprint comes from the KiCad library ([CC-BY-SA-4.0](LICENSES/CC-BY-SA-4.0.txt) with
-  the [KiCad libraries exception](LICENSES/KiCad-libraries-exception.txt)); parts of `crates/kvm-vial` are adapted from
-  [RMK](https://github.com/HaoboGu/rmk) ([notice](crates/kvm-vial/LICENSE-RMK-MIT)). The wordmark is set in
+  the [KiCad libraries exception](LICENSES/KiCad-libraries-exception.txt)); parts of `crates/kvm-map` are adapted from
+  [RMK](https://github.com/HaoboGu/rmk) ([notice](crates/kvm-map/LICENSE-RMK-MIT)). The wordmark is set in
   [Montserrat](https://github.com/JulietaUla/Montserrat) (SIL OFL 1.1) and converted to outlines; no font file is
   distributed. The window's text font is [Adwaita Sans](https://gitlab.gnome.org/GNOME/adwaita-fonts) (derived from
   [Inter](https://github.com/rsms/inter); [SIL OFL 1.1](LICENSES/OFL-1.1.txt),

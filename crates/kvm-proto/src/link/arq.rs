@@ -47,6 +47,9 @@ impl Stats {
     }
 }
 
+/// High-priority messages sent in a row before a low one that waits gets its turn.
+pub const HI_RUN: u8 = 3;
+
 pub struct Arq<const Q: usize> {
     // Transmit side.
     next_seq: u8,
@@ -58,6 +61,8 @@ pub struct Arq<const Q: usize> {
     tick: u32,
     hi: Deque<Msg, Q>,
     lo: Deque<Msg, Q>,
+    /// High-priority messages sent in a row: after [`HI_RUN`] a low one that waits goes first.
+    hi_run: u8,
     // Receive side.
     expected: Option<u8>,
     peer_syn: bool,
@@ -83,6 +88,7 @@ impl<const Q: usize> Arq<Q> {
             tick: 0,
             hi: Deque::new(),
             lo: Deque::new(),
+            hi_run: 0,
             expected: None,
             peer_syn: false,
             stats: Stats {
@@ -147,7 +153,13 @@ impl<const Q: usize> Arq<Q> {
             self.stats.retransmits += 1;
             Some(self.send_ptr)
         } else if self.outstanding() < WINDOW {
-            match self.hi.pop_front().or_else(|| self.lo.pop_front()) {
+            // High priority first, but not all the time: a pad's reports filled every exchange over a USB bridge (some
+            // 250 a second each way), and a device's "connected" state, the events and the log waited behind them for
+            // as long as it stayed connected (2026-11-25).
+            let low_turn = self.hi_run >= HI_RUN && !self.lo.is_empty();
+            let next = if low_turn { None } else { self.hi.pop_front() };
+            self.hi_run = if next.is_some() { self.hi_run.saturating_add(1) } else { 0 };
+            match next.or_else(|| self.lo.pop_front()) {
                 Some(m) => {
                     let s = self.next_seq;
                     self.window[(s % WINDOW) as usize] = m;
@@ -329,6 +341,32 @@ mod tests {
             let (a, b) = run(loss, seed, 400);
             assert!(a.errors() + b.errors() > 0 || loss == 0);
         }
+    }
+
+    #[test]
+    fn low_priority_gets_a_share_of_a_high_stream() {
+        let mut a = Ep::new(0);
+        let mut b = Ep::new(0);
+        let mut rng = XorShift(9);
+        let mut got = StdVec::new();
+        let mut low_sent = 0u8;
+        for n in 0..200u32 {
+            // A report every exchange, and a state change now and then.
+            if a.free(Prio::High) > 0 {
+                a.push(&[0x31, n as u8], Prio::High).unwrap();
+            }
+            if n % 20 == 0 && a.free(Prio::Low) > 0 {
+                a.push(&[0x05, low_sent], Prio::Low).unwrap();
+                low_sent += 1;
+            }
+            got.extend(exchange(&mut a, &mut b, &mut rng, 0).1);
+        }
+        let lows: StdVec<u8> = got.iter().filter(|m| m[0] == 0x05).map(|m| m[1]).collect();
+        assert_eq!(lows.len(), low_sent as usize, "every state change through, in a stream of reports");
+        assert!(lows.windows(2).all(|w| w[0] < w[1]), "in order");
+        // And at most one low message per HI_RUN + 1 frames: the reports keep most of the link.
+        let highs = got.iter().filter(|m| m[0] == 0x31).count();
+        assert!(highs >= got.len() * HI_RUN as usize / (HI_RUN as usize + 1) - 1, "{highs} of {}", got.len());
     }
 
     #[test]

@@ -31,6 +31,8 @@ pub mod class {
 
 /// XInput (Xbox 360 wired protocol) interface triple.
 pub const XINPUT: (u8, u8, u8) = (0xFF, 0x5D, 0x01);
+/// One pad's interface of an XInput wireless receiver (`kvm_hid::xinput`); its headset interfaces are protocol 0x82.
+pub const XINPUT_WIRELESS: (u8, u8, u8) = (0xFF, 0x5D, 0x81);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -172,6 +174,21 @@ impl InterfaceInfo<'_> {
         (self.class, self.subclass, self.protocol) == XINPUT
     }
 
+    pub fn is_xinput_wireless(&self) -> bool {
+        (self.class, self.subclass, self.protocol) == XINPUT_WIRELESS
+    }
+
+    /// The XInput protocol the interface speaks, if any.
+    pub fn xinput(&self) -> Option<kvm_hid::xinput::Kind> {
+        if self.is_xinput() {
+            Some(kvm_hid::xinput::Kind::Wired)
+        } else if self.is_xinput_wireless() {
+            Some(kvm_hid::xinput::Kind::Wireless)
+        } else {
+            None
+        }
+    }
+
     pub fn in_ep(&self) -> Option<&EndpointDesc> {
         self.endpoints.iter().find(|e| e.is_in() && e.is_interrupt())
     }
@@ -188,6 +205,15 @@ pub struct ConfigInfo<'a> {
     pub attributes: u8,
     pub max_power_ma: u16,
     pub interfaces: Vec<InterfaceInfo<'a>, MAX_INTERFACES>,
+}
+
+impl ConfigInfo<'_> {
+    /// The interfaces whose interrupt endpoints the KVM polls while it hosts the device: HID, wired XInput, and the
+    /// first pad interface of a wireless receiver (one pad; the receiver in passthrough gives a PC all four).
+    pub fn polled(&self) -> impl Iterator<Item = &InterfaceInfo<'_>> {
+        let first_wireless = self.interfaces.iter().find(|i| i.is_xinput_wireless()).map(|i| i.number);
+        self.interfaces.iter().filter(move |i| i.is_hid() || i.is_xinput() || Some(i.number) == first_wireless)
+    }
 }
 
 /// Iterates `(type, descriptor)` over a configuration descriptor's contents.
@@ -368,12 +394,39 @@ pub(crate) mod fixtures {
         7, 5, 0x81, 3, 32, 0, 4,
         7, 5, 0x01, 3, 32, 0, 8,
     ];
+
+    /// An XInput wireless receiver as it describes itself: four pads' interfaces (0x81) and their headsets' (0x82, four
+    /// endpoints), interleaved, each with a vendor descriptor of type 0x22 the parser skips.
+    #[rustfmt::skip]
+    pub const RECEIVER_CONFIG: &[u8] = &[
+        9, 2, 121, 1, 8, 1, 0, 0xA0, 130,
+        9, 4, 0, 0, 2, 0xFF, 0x5D, 0x81, 0, 20, 0x22, 0x00, 0x01, 0x13, 0x81, 0x1D, 0x00, 0x17, 0x01, 0x02, 0x08, 0x13, 0x01, 0x0C, 0x00, 0x0C, 0x01, 0x02, 0x08, 7, 5, 0x81, 3, 32, 0, 1, 7, 5, 0x01, 3, 32, 0, 8,
+        9, 4, 1, 0, 4, 0xFF, 0x5D, 0x82, 0, 12, 0x22, 0x00, 0x01, 0x13, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, 5, 0x82, 3, 32, 0, 2, 7, 5, 0x02, 3, 32, 0, 4, 7, 5, 0x83, 3, 32, 0, 64, 7, 5, 0x03, 3, 32, 0, 16,
+        9, 4, 2, 0, 2, 0xFF, 0x5D, 0x81, 0, 20, 0x22, 0x00, 0x01, 0x13, 0x81, 0x1D, 0x00, 0x17, 0x01, 0x02, 0x08, 0x13, 0x01, 0x0C, 0x00, 0x0C, 0x01, 0x02, 0x08, 7, 5, 0x85, 3, 32, 0, 1, 7, 5, 0x05, 3, 32, 0, 8,
+        9, 4, 3, 0, 4, 0xFF, 0x5D, 0x82, 0, 12, 0x22, 0x00, 0x01, 0x13, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, 5, 0x86, 3, 32, 0, 2, 7, 5, 0x06, 3, 32, 0, 4, 7, 5, 0x87, 3, 32, 0, 64, 7, 5, 0x07, 3, 32, 0, 16,
+        9, 4, 4, 0, 2, 0xFF, 0x5D, 0x81, 0, 20, 0x22, 0x00, 0x01, 0x13, 0x81, 0x1D, 0x00, 0x17, 0x01, 0x02, 0x08, 0x13, 0x01, 0x0C, 0x00, 0x0C, 0x01, 0x02, 0x08, 7, 5, 0x89, 3, 32, 0, 1, 7, 5, 0x09, 3, 32, 0, 8,
+        9, 4, 5, 0, 4, 0xFF, 0x5D, 0x82, 0, 12, 0x22, 0x00, 0x01, 0x13, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, 5, 0x8A, 3, 32, 0, 2, 7, 5, 0x0A, 3, 32, 0, 4, 7, 5, 0x8B, 3, 32, 0, 64, 7, 5, 0x0B, 3, 32, 0, 16,
+        9, 4, 6, 0, 2, 0xFF, 0x5D, 0x81, 0, 20, 0x22, 0x00, 0x01, 0x13, 0x81, 0x1D, 0x00, 0x17, 0x01, 0x02, 0x08, 0x13, 0x01, 0x0C, 0x00, 0x0C, 0x01, 0x02, 0x08, 7, 5, 0x8D, 3, 32, 0, 1, 7, 5, 0x0D, 3, 32, 0, 8,
+        9, 4, 7, 0, 4, 0xFF, 0x5D, 0x82, 0, 12, 0x22, 0x00, 0x01, 0x13, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, 5, 0x8E, 3, 32, 0, 2, 7, 5, 0x0E, 3, 32, 0, 4, 7, 5, 0x8F, 3, 32, 0, 64, 7, 5, 0x0F, 3, 32, 0, 16,
+    ];
 }
 
 #[cfg(test)]
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    #[test]
+    fn a_receiver_is_polled_for_its_first_pad_only() {
+        let cfg = parse_config(RECEIVER_CONFIG).unwrap();
+        assert_eq!(cfg.interfaces.len(), 8);
+        let polled: std::vec::Vec<u8> = cfg.polled().map(|i| i.number).collect();
+        assert_eq!(polled, [0]);
+        assert_eq!(cfg.interfaces[0].xinput(), Some(kvm_hid::xinput::Kind::Wireless));
+        assert_eq!(cfg.interfaces[1].xinput(), None, "a headset");
+        let pad = parse_config(XINPUT_CONFIG).unwrap();
+        assert_eq!(pad.interfaces[0].xinput(), Some(kvm_hid::xinput::Kind::Wired));
+    }
 
     #[test]
     fn device_roundtrip() {

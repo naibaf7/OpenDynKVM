@@ -6,8 +6,10 @@
 //! reports ([`kvm_proto::link::bt::report`]), never a mirrored device's descriptor, and the front ports in passthrough
 //! stay with the PC that was active before (the *home* PC, `Engine::active`).
 //!
-//! The module can also be an ESP32-C3 board on a front port (a *dongle*, for a KVM without the module on board): the
-//! same firmware, reached over the chip's built-in USB serial port instead of the board's UART ([`dongle_endpoints`]).
+//! The module can also be an ESP32 board on a front port (a *dongle*, for a KVM without the module on board): an
+//! ESP32-C3 with the same firmware, reached over the chip's built-in USB serial port instead of the board's UART, or
+//! an original ESP32 (dual mode: Bluetooth Classic too, `firmware/esp32`) behind its board's CP210x bridge
+//! ([`dongle_endpoints`]). The link and its messages are the same; the module says its chip in its `Hello`.
 //!
 //! The module is also the central of up to four Bluetooth devices (keyboards, mice), in device slots of their own
 //! ([`Devices`]): their reports come to the engine with their report map, and it treats them as it does a normalized
@@ -31,7 +33,7 @@ pub enum BtOut {
     Input {
         host: u8,
         id: u8,
-        data: Vec<u8, { report::MOUSE_LEN }>,
+        data: Vec<u8, { report::INPUT_MAX }>,
     },
     /// The host that is the active target (0: a PC is), and the hosts devices are pinned to (bit n−1 for host n).
     Select {
@@ -67,38 +69,76 @@ pub enum BtOut {
         id: u8,
         data: Vec<u8, 8>,
     },
+    /// A control-protocol report for host `host`'s session over the control service (software.md §8.1): the answer to
+    /// its request, or an event.
+    Control {
+        host: u8,
+        data: [u8; kvm_proto::ctrl::REPORT_LEN],
+    },
 }
 
 /// Espressif's USB serial port in silicon (USB-Serial-JTAG: ESP32-C3 and later chips), which a dongle shows: a CDC-ACM
 /// port whose descriptors the chip fixes, the same in its ROM bootloader as in any firmware.
 pub const DONGLE_VID: u16 = 0x303A;
 pub const DONGLE_PID: u16 = 0x1001;
+/// Silicon Labs' CP210x USB-to-UART bridge, an ESP32 board's (an ESP32 has no USB of its own).
+pub const CP210X_VID: u16 = 0x10C4;
+pub const CP210X_PID: u16 = 0xEA60;
 
-/// Where a dongle's serial port is: its CDC interfaces and the data interface's bulk endpoints (numbers without the
-/// direction bit).
+/// Whether a device with these USB IDs may be an ESP32 board the module can be (an ESP32-C3's own USB serial port,
+/// or a CP210x bridge): what a KVM without a module offers to adopt (`Request::AdoptModule`).
+pub fn dongle_ids(vid: u16, pid: u16) -> bool {
+    matches!((vid, pid), (DONGLE_VID, DONGLE_PID) | (CP210X_VID, CP210X_PID))
+}
+
+/// The USB serial port a dongle shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum DongleKind {
+    /// The chip's own (ESP32-C3): CDC-ACM; DTR/RTS reach its reset logic, and it leaves USB when it restarts.
+    UsbJtag,
+    /// A CP210x bridge (an ESP32 board): vendor requests set its speed and its DTR/RTS, which drive the board's EN
+    /// and GPIO0 through the usual two transistors; it stays on USB while the chip restarts.
+    Cp210x,
+}
+
+/// Where a dongle's serial port is: the interface its line requests go to (CDC communication, or the bridge's), and
+/// the data endpoints (numbers without the direction bit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DongleEps {
-    /// The CDC communication interface, which SET_CONTROL_LINE_STATE (DTR, RTS: the chip's reset and boot) goes to.
+    pub kind: DongleKind,
     pub comm: u8,
     pub ep_in: u8,
     pub ep_out: u8,
     pub mps: u16,
 }
 
-/// A USB-Serial-JTAG port on `device`: VID/PID, a CDC communication interface and a CDC data interface with a bulk
-/// endpoint each way. Any chip and any firmware look like this; whether it is the module is for the link to find out
-/// (`Hello`), and only an ESP32-C3 with a blank flash is ever programmed without being one.
+/// The serial port on `device`, if it is one a dongle has: the ESP32-C3's own (VID/PID, a CDC communication interface
+/// and a CDC data interface with a bulk endpoint each way), or a CP210x bridge (VID/PID, its vendor interface's bulk
+/// endpoints). Any firmware looks like this, and a CP210x is on many boards: whether it is the module is for the link
+/// to find out (`Hello`), and only an ESP32 with a blank flash is ever programmed without being one.
 pub fn dongle_endpoints(device: &DeviceDesc, config: &[u8]) -> Option<DongleEps> {
-    if (device.vid, device.pid) != (DONGLE_VID, DONGLE_PID) {
-        return None;
-    }
+    let kind = match (device.vid, device.pid) {
+        (DONGLE_VID, DONGLE_PID) => DongleKind::UsbJtag,
+        (CP210X_VID, CP210X_PID) => DongleKind::Cp210x,
+        _ => return None,
+    };
     let cfg = parse_config(config)?;
-    let comm = cfg.interfaces.iter().find(|i| i.class == class::CDC)?.number;
-    let data = cfg.interfaces.iter().find(|i| i.class == class::CDC_DATA)?;
+    let (comm, data) = match kind {
+        DongleKind::UsbJtag => (
+            cfg.interfaces.iter().find(|i| i.class == class::CDC)?.number,
+            cfg.interfaces.iter().find(|i| i.class == class::CDC_DATA)?,
+        ),
+        DongleKind::Cp210x => {
+            let i = cfg.interfaces.iter().find(|i| i.class == 0xFF)?;
+            (i.number, i)
+        }
+    };
     let ep_in = data.endpoints.iter().find(|e| e.is_bulk() && e.is_in())?;
     let ep_out = data.endpoints.iter().find(|e| e.is_bulk() && !e.is_in())?;
     Some(DongleEps {
+        kind,
         comm,
         ep_in: ep_in.number(),
         ep_out: ep_out.number(),
@@ -205,7 +245,7 @@ impl BtState {
     pub const EMPTY: BtState = BtState {
         present: false,
         fw: 0,
-        hosts: [HostState { host: 0, flags: 0, interval: 0, latency: 0, addr: [0; 7], rssi: 0 }; BT_HOSTS],
+        hosts: [HostState { host: 0, flags: 0, interval: 0, latency: 0, addr: [0; 7], rssi: 0, reports: 0 }; BT_HOSTS],
         active: None,
         pairing_until: None,
         passkey: None,
@@ -283,8 +323,9 @@ impl BtState {
 /// Devices found while looking for devices to pair, at most.
 pub const MAX_FOUND: usize = 8;
 
-/// Bytes of the module's log the engine keeps (`ModuleLog`): some 40 lines.
-pub const MODULE_LOG_LEN: usize = 2048;
+/// Bytes of the module's log the engine keeps (`ModuleLog`): some 160 lines (40 were too few to hold a pairing that
+/// failed and the restart after it, 2026-11-25).
+pub const MODULE_LOG_LEN: usize = 8192;
 
 /// The wireless module's recent log, as its lines come over the link (`BtMsg::Log`), each with the engine time it came
 /// at, and lines of the engine's own about the module: on a dongle the module's log pin goes nowhere. Kept across
@@ -370,6 +411,11 @@ pub struct Wireless {
 }
 
 impl Wireless {
+    /// Its gamepad's profile, by the USB IDs the module says (a Classic pad's reports come in their USB form).
+    pub fn profile(&self) -> crate::pads::Profile {
+        crate::pads::profile(self.state.vid, self.state.pid, false)
+    }
+
     pub const EMPTY: Wireless = Wireless {
         state: DeviceState {
             dev: 0,
@@ -380,6 +426,8 @@ impl Wireless {
             addr: [0; 7],
             map_len: 0,
             map_crc: 0,
+            vid: 0,
+            pid: 0,
         },
         name: BtDeviceName::new(),
         map: Vec::new(),
@@ -600,6 +648,18 @@ pub fn keyboard(keys: &KeyState) -> [u8; report::KEYBOARD_LEN] {
     keys.to_boot()
 }
 
+/// The virtual gamepad's report for a Bluetooth host ([`report::GAMEPAD`]): its 32 buttons, the hat of its d-pad, and
+/// its first six axes (X, Y, Z, Rx, Ry, Rz).
+pub fn gamepad(p: &kvm_hid::normalized::Pad) -> [u8; report::GAMEPAD_LEN] {
+    let mut r = [0u8; report::GAMEPAD_LEN];
+    r[..4].copy_from_slice(&p.buttons.to_le_bytes());
+    r[4] = kvm_hid::GamepadInput::hat_of(p.dpad);
+    for (i, a) in p.axes[..6].iter().enumerate() {
+        r[5 + 2 * i..7 + 2 * i].copy_from_slice(&a.max(&-32767).to_le_bytes());
+    }
+    r
+}
+
 /// The one consumer usage a Bluetooth host gets: the first held.
 pub fn consumer(c: &ConsumerState) -> u16 {
     c.usages.iter().copied().find(|u| *u != 0).unwrap_or(0)
@@ -618,17 +678,41 @@ mod tests {
     }
 
     #[test]
+    fn the_gamepad_report_reads_back_through_the_report_map() {
+        let t = kvm_hid::Translator::new(kvm_hid::Layout::parse(report::MAP).unwrap());
+        let pad =
+            kvm_hid::normalized::Pad { buttons: 1 << 16 | 1, dpad: 0b0010, axes: [-32767, 100, 0, 0, 0, 32767, 0, 0] };
+        let mut raw = std::vec![report::GAMEPAD];
+        raw.extend(gamepad(&pad));
+        assert_eq!(report::input_len(report::GAMEPAD), Some(raw.len() - 1));
+        let g = t.translate(&raw).gamepad.unwrap();
+        assert_eq!((g.buttons, g.hat, g.axes[0], g.axes[1], g.axes[5]), (1 << 16 | 1, 2, -32767, 100, 32767));
+    }
+
+    #[test]
     fn dongle_found_by_ids_and_cdc_endpoints() {
         use crate::usbdesc::fixtures::{GAMING_MOUSE_CONFIG, USB_SERIAL_JTAG_CONFIG, USB_SERIAL_JTAG_DEVICE};
         let dev = DeviceDesc::parse(&USB_SERIAL_JTAG_DEVICE).unwrap();
         assert_eq!(
             dongle_endpoints(&dev, USB_SERIAL_JTAG_CONFIG),
-            Some(DongleEps { comm: 0, ep_in: 1, ep_out: 1, mps: 64 })
+            Some(DongleEps { kind: DongleKind::UsbJtag, comm: 0, ep_in: 1, ep_out: 1, mps: 64 })
         );
         // Other IDs, or the IDs without a CDC data interface: not a dongle.
         let other = DeviceDesc { pid: 0x1002, ..dev };
         assert_eq!(dongle_endpoints(&other, USB_SERIAL_JTAG_CONFIG), None);
         assert_eq!(dongle_endpoints(&dev, GAMING_MOUSE_CONFIG), None);
+        // An ESP32 board's CP210x bridge: one vendor interface, a bulk endpoint each way.
+        let bridge = DeviceDesc { vid: CP210X_VID, pid: CP210X_PID, ..dev };
+        let config = [
+            9, 2, 32, 0, 1, 1, 0, 0x80, 50, // configuration
+            9, 4, 0, 0, 2, 0xFF, 0, 0, 2, // interface 0, vendor
+            7, 5, 0x82, 2, 64, 0, 0, // bulk IN 2
+            7, 5, 0x01, 2, 64, 0, 0, // bulk OUT 1
+        ];
+        assert_eq!(
+            dongle_endpoints(&bridge, &config),
+            Some(DongleEps { kind: DongleKind::Cp210x, comm: 0, ep_in: 2, ep_out: 1, mps: 64 })
+        );
     }
 
     #[test]
@@ -754,7 +838,9 @@ mod tests {
         assert_eq!((first, at), (0, 0));
         assert_eq!(core::str::from_utf8(&data).unwrap(), "[    1.234] device 1: connected\n");
         assert_eq!(end as usize, data.len());
-        for i in 0..200u32 {
+        // About 20 bytes a line: twice what the log holds.
+        let lines = (MODULE_LOG_LEN / 10) as u32;
+        for i in 0..lines {
             let mut t: heapless::String<32> = heapless::String::new();
             let _ = core::fmt::Write::write_fmt(&mut t, format_args!("line {i}"));
             log.push(2000 + i, &t);
@@ -764,7 +850,9 @@ mod tests {
         assert!(first > 0 && at == first && end - first <= MODULE_LOG_LEN as u32);
         assert!(data.starts_with(b"[    2."));
         let (_, _, _, tail) = log.read(end - 20, 64);
-        assert!(core::str::from_utf8(&tail).unwrap().ends_with("line 199\n"));
+        let mut last: heapless::String<32> = heapless::String::new();
+        let _ = core::fmt::Write::write_fmt(&mut last, format_args!("line {}\n", lines - 1));
+        assert!(core::str::from_utf8(&tail).unwrap().ends_with(last.as_str()));
         // Control characters don't break lines; a long line is cut, not wrapped.
         log.push(5000, &"x\ny".repeat(100));
         let (_, end, _, last) = log.read(u32::MAX, 64);

@@ -1,6 +1,7 @@
-//! Programs the Bluetooth module (ESP32-C3) through its ROM serial bootloader (software.md §4.13), as `at32isp.rs`
-//! does the AT32F405s: the RP2354B carries the module's image and writes it whenever the module runs another version
-//! or none. The module is on the board's UART, or an ESP32-C3 board on a front port (its USB serial port,
+//! Programs the Bluetooth module (an ESP32-C3, or an original ESP32) through its ROM serial bootloader (software.md
+//! §4.13), as `at32isp.rs`
+//! does the AT32F405s, with the module's image as the host software streams it (`kvm_proto::modimage`,
+//! `modstream.rs`): the RP2354B passes it on as it arrives, and keeps none of it. The module is on the board's UART, or an ESP32-C3 board on a front port (its USB serial port,
 //! `dongle.rs`): the protocol is the same over both ([`Line`]), only the way in and out of the ROM differs.
 //!
 //! The protocol is Espressif's serial bootloader protocol (esptool's "serial protocol" page; the framing and sizes
@@ -13,9 +14,19 @@
 //! - SPI_FLASH_MD5 then reads back the written region: the ROM answers 32 hex digits, which must match the image's
 //!   MD5 computed at build time. Only that counts as success.
 //!
-//! The first flash sector is erased first and written last ([`Image`]): a module whose programming broke off (power,
-//! unplugged) has it erased, which is what [`blank_c3`] looks for before it lets a dongle that doesn't answer as the
-//! module be programmed. Any other firmware has its bootloader there.
+//! The image's flash is erased first, all of it (FLASH_DEFL_BEGIN erases only the sectors the inflated data goes to:
+//! the image's blank gaps kept another firmware's data), and its first sector is written last ([`Source`]): a module
+//! whose programming broke off (power,
+//! unplugged, a stream that stopped or wasn't the right image) has it erased, which is what [`blank`] looks for
+//! before it lets a dongle that doesn't answer as the module be programmed. Any other firmware has its bootloader
+//! there.
+//!
+//! **The chips** ([`Chip`], told apart by `GET_SECURITY_INFO`'s chip ID or the magic value at
+//! [`CHIP_DETECT_MAGIC_REG`]): an image is for one chip (`Header::chip`), and only goes on that one. The ESP32's ROM
+//! takes four words to begin a flash region (the ESP32-C3's five, the last for encryption), its image starts at
+//! 0x1000 (its second-stage bootloader's place; [`base`]), and it has no FORCE_DOWNLOAD_BOOT and its RTC watchdog
+//! elsewhere: it leaves its ROM by a reset with its BOOT strap high (EN on the board, RTS on a bridge), which the
+//! caller makes ([`Done::ResetIt`]).
 //!
 //! On the board, the module's UART: entry is IO9 (BOOT) low at a reset (the module's strapping, datasheet section 4;
 //! IO2 and IO8 are pulled up on the board). The board has two wires to the module, and IO9 is on the RP2354B's TX
@@ -29,15 +40,19 @@
 //! which `EnterRom` sets, and a dongle restarted by RTS from its ROM came back in it (first dongle, 2026-11-14). The
 //! same gets a module out of the ROM that landed there by chance (TX low at an unplanned reset).
 
-use defmt::{debug, warn};
+use defmt::warn;
 use embassy_rp::uart::BufferedUart;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::{Read, Write};
+use kvm_proto::link::bt::Chip;
+use kvm_proto::modimage::Header;
 
 /// The ROM's own speed; the transfer runs at [`FAST_BAUD`] once the ROM agreed to change.
 pub const ROM_BAUD: u32 = 115_200;
 const FAST_BAUD: u32 = 921_600;
-const BLOCK: usize = 0x400;
+pub const BLOCK: usize = 0x400;
+/// A flash sector, what an erase takes at least.
+const SECTOR: u32 = 0x1000;
 const FLASH_SIZE: u32 = 4 * 1024 * 1024;
 /// `GET_SECURITY_INFO`'s chip ID of the ESP32-C3; ROMs without one there (ECO2 and older) are told by the magic value
 /// at [`CHIP_DETECT_MAGIC_REG`] (espflash 4.7, `target/mod.rs`).
@@ -58,6 +73,25 @@ mod rtc {
     pub const WDT_RESET: u32 = 1 << 31 | 5 << 28 | 1 << 8 | 1 << 2;
 }
 const ESP32C3_MAGIC: [u32; 4] = [0x6921_506f, 0x1b31_506f, 0x4881_606f, 0x4361_606f];
+/// The ESP32's (espflash 4.7, `target/esp32.rs`).
+const ESP32_MAGIC: u32 = 0x00f0_1d83;
+
+/// The flash offset `chip`'s image starts at: its second-stage bootloader's.
+pub fn base(chip: Chip) -> u32 {
+    match chip {
+        Chip::Esp32 => 0x1000,
+        _ => 0,
+    }
+}
+
+/// How a programmed module gets out of its ROM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum Done {
+    /// It restarted into its firmware (the ESP32-C3's RTC watchdog).
+    Restarted,
+    /// The caller restarts it with its BOOT strap high: EN on the board, RTS on a bridge (the ESP32).
+    ResetIt,
+}
 
 mod op {
     pub const SPI_SET_PARAMS: u8 = 0x0B;
@@ -68,10 +102,10 @@ mod op {
     pub const CHANGE_BAUDRATE: u8 = 0x0F;
     pub const FLASH_DEFL_BEGIN: u8 = 0x10;
     pub const FLASH_DEFL_DATA: u8 = 0x11;
-    pub const FLASH_DEFL_END: u8 = 0x12;
     pub const SPI_FLASH_MD5: u8 = 0x13;
     pub const GET_SECURITY_INFO: u8 = 0x14;
     pub const FLASH_BEGIN: u8 = 0x02;
+    pub const FLASH_DATA: u8 = 0x03;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -84,7 +118,9 @@ pub enum Error {
     Failed(u8, u8, u8),
     /// The flash read back differs from the image.
     Verify,
-    /// Not an ESP32-C3 (its chip ID), so the image is not for it.
+    /// The image stopped coming, or isn't the one it must be (`modstream.rs`).
+    Stream,
+    /// Not a chip the module can be (its chip ID or magic), or not the one the image is for.
     Chip(u32),
     Line,
 }
@@ -93,7 +129,7 @@ pub enum Error {
 pub static LAST_ERROR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// An error as one number: 1 no SYNC, 0x1_00oo timeout of op oo, 0x2_ooee op oo failed with ROM error ee, 3 verify,
-/// 0x4_iiii another chip (its ID or magic, low 16 bits), 5 the line.
+/// 0x4_iiii another chip (its ID or magic, low 16 bits), 5 the line, 6 the stream.
 pub fn code(e: Error) -> u32 {
     match e {
         Error::NoSync => 1,
@@ -102,7 +138,24 @@ pub fn code(e: Error) -> u32 {
         Error::Verify => 3,
         Error::Chip(id) => 0x4_0000 | (id & 0xFFFF),
         Error::Line => 5,
+        Error::Stream => 6,
     }
+}
+
+/// `e` in words, for the module's log (`odkvmctl device log`).
+pub fn describe(e: Error) -> heapless::String<80> {
+    use core::fmt::Write as _;
+    let mut s = heapless::String::new();
+    let _ = match e {
+        Error::NoSync => write!(s, "its ROM doesn't answer"),
+        Error::Timeout(op) => write!(s, "ROM command {op:#04x} not answered in time"),
+        Error::Failed(op, status, err) => write!(s, "ROM command {op:#04x} failed (status {status}, error {err:#04x})"),
+        Error::Verify => write!(s, "the flash differs from the image after writing"),
+        Error::Stream => write!(s, "the image didn't come whole, or isn't one this firmware takes"),
+        Error::Chip(id) => write!(s, "another chip than the image's ({id:#x})"),
+        Error::Line => write!(s, "the line to it failed"),
+    };
+    s
 }
 
 fn noted(e: Error) -> Error {
@@ -113,10 +166,14 @@ fn noted(e: Error) -> Error {
 /// The line to the module's ROM: the board's UART, or a dongle's USB serial port.
 #[allow(async_fn_in_trait)]
 pub trait Line: Read + Write {
-    /// A UART: the ROM is asked for a faster speed for the transfer, and restarts the module itself at the end (IO9
-    /// on the idle TX line boots its firmware). A USB serial port has no speed, and its DTR/RTS restart the chip.
+    /// The board's UART (rather than a USB serial port).
     const UART: bool;
-    fn set_baud(&mut self, baud: u32);
+    /// It has a speed (a UART, or a USB-to-UART bridge): the ROM is asked for a faster one for the transfer. The
+    /// ESP32-C3's own USB serial port has none.
+    fn has_baud(&self) -> bool {
+        Self::UART
+    }
+    async fn set_baud(&mut self, baud: u32);
     /// Whatever arrives within `timeout`, up to `buf.len()` bytes; `Ok(0)` if nothing did. The USB serial port waits
     /// between whole USB transactions, so giving up never loses part of one.
     async fn read_within(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize, ()>;
@@ -125,7 +182,7 @@ pub trait Line: Read + Write {
 impl Line for BufferedUart {
     const UART: bool = true;
 
-    fn set_baud(&mut self, baud: u32) {
+    async fn set_baud(&mut self, baud: u32) {
         self.set_baudrate(baud);
     }
 
@@ -138,25 +195,25 @@ impl Line for BufferedUart {
     }
 }
 
-/// What the RP2354B holds of the module's image (`build.rs`): zlib (deflate) data of the whole flash image from
-/// offset 0 (bootloader, partition table, application), split after its first sector.
-pub struct Image {
-    /// The first `head_len` bytes, written last.
-    pub head: &'static [u8],
-    pub head_len: u32,
-    /// The rest, from `head_len` on, written first.
-    pub tail: &'static [u8],
-    /// The size uncompressed.
-    pub len: u32,
-    /// MD5 of the uncompressed image, as the ROM reports it (lowercase hex).
-    pub md5: &'static [u8; 32],
-    /// MD5 of the first sector erased.
-    pub blank_md5: &'static [u8; 32],
+/// Where [`program`] takes the module's image from (`kvm_proto::modimage`): zlib (deflate) data of the whole flash
+/// image from offset 0 (bootloader, partition table, application), split after its first sector, in the order it is
+/// written.
+#[allow(async_fn_in_trait)]
+pub trait Source {
+    /// The next block of the compressed data after the first sector: fills `out` but for the last block; its length.
+    async fn tail(&mut self, out: &mut [u8; BLOCK]) -> Result<usize, Error>;
+    /// The first sector as it is (`modimage`: not compressed), once all of the image has arrived and checks out.
+    async fn head(&mut self) -> Result<&[u8], Error>;
 }
+
+/// MD5 of the module's first flash sector erased (4096 bytes of 0xFF), as the ROM reports it.
+const BLANK_HEAD_MD5: &[u8; 32] = b"6ae59e64850377ee5470c854761551ea";
 
 struct Rom<'a, L: Line> {
     line: &'a mut L,
     rx: [u8; 96],
+    /// What [`Rom::detect`] found (until then the ESP32-C3's ways).
+    chip: Chip,
 }
 
 fn checksum(data: &[u8]) -> u32 {
@@ -299,9 +356,13 @@ impl<L: Line> Rom<'_, L> {
         self.command(op::WRITE_REG, &[&d], 0, Duration::from_millis(500)).await.map(|_| ())
     }
 
-    /// Turns the RTC watchdog off: the ROM leaves it running in USB download mode, where it would restart the chip in
-    /// the middle of a long write (espflash does the same without its flasher stub).
+    /// Turns the RTC watchdog off: the ESP32-C3's ROM leaves it running in USB download mode, where it would restart
+    /// the chip in the middle of a long write (espflash does the same without its flasher stub). The ESP32's UART
+    /// download mode leaves it off.
     async fn watchdog_off(&mut self) -> Result<(), Error> {
+        if self.chip != Chip::Esp32C3 {
+            return Ok(());
+        }
         self.write_reg(rtc::WDT_WPROTECT, rtc::WDT_WKEY, u32::MAX).await?;
         self.write_reg(rtc::WDT_CONFIG0, 0, u32::MAX).await?;
         self.write_reg(rtc::WDT_WPROTECT, 0, u32::MAX).await
@@ -311,6 +372,10 @@ impl<L: Line> Rom<'_, L> {
     /// ESP32-C3 on its USB serial port: a reset by RTS from the ROM brought a board back in the ROM (first dongle,
     /// 2026-11-14), until it was powered off. FORCE_DOWNLOAD_BOOT is cleared first.
     async fn watchdog_restart(&mut self) -> Result<(), Error> {
+        // The ESP32-C3's registers: the ESP32's are elsewhere, and it leaves by a reset (`Done::ResetIt`).
+        if self.chip != Chip::Esp32C3 {
+            return Err(noted(Error::Chip(self.chip as u32)));
+        }
         self.write_reg(rtc::OPTION1, 0, rtc::FORCE_DOWNLOAD_BOOT).await?;
         self.write_reg(rtc::WDT_WPROTECT, rtc::WDT_WKEY, u32::MAX).await?;
         self.write_reg(rtc::WDT_CONFIG1, 2000, u32::MAX).await?;
@@ -320,20 +385,47 @@ impl<L: Line> Rom<'_, L> {
         Ok(())
     }
 
-    /// The chip must be an ESP32-C3: the image is for it alone.
-    async fn check_chip(&mut self) -> Result<(), Error> {
+    /// Which chip this is: an ESP32-C3 or an ESP32, else an error. Remembered for the rest of the session.
+    async fn detect(&mut self) -> Result<Chip, Error> {
         // Data: flags u32, flash_crypt_cnt u8, key_purposes [u8; 7], chip_id u32, eco_version u32 (12 bytes without the
-        // chip ID).
+        // chip ID). The ESP32's ROM doesn't know the command and doesn't answer it: that isn't the last error.
+        let before = LAST_ERROR.load(core::sync::atomic::Ordering::Relaxed);
         let info = self.command(op::GET_SECURITY_INFO, &[], 0, Duration::from_millis(500)).await;
-        if let Ok((_, end)) = info
+        if info.is_err() {
+            LAST_ERROR.store(before, core::sync::atomic::Ordering::Relaxed);
+        }
+        let chip = if let Ok((_, end)) = info
             && end >= 8 + 16
         {
             let id = u32::from_le_bytes([self.rx[20], self.rx[21], self.rx[22], self.rx[23]]);
-            return if id == ESP32C3_CHIP_ID { Ok(()) } else { Err(noted(Error::Chip(id))) };
+            if id != ESP32C3_CHIP_ID {
+                return Err(noted(Error::Chip(id)));
+            }
+            Chip::Esp32C3
+        } else {
+            let (magic, _) = self
+                .command(op::READ_REG, &[&CHIP_DETECT_MAGIC_REG.to_le_bytes()], 0, Duration::from_millis(500))
+                .await?;
+            if ESP32C3_MAGIC.contains(&magic) {
+                Chip::Esp32C3
+            } else if magic == ESP32_MAGIC {
+                Chip::Esp32
+            } else {
+                return Err(noted(Error::Chip(magic)));
+            }
+        };
+        self.chip = chip;
+        Ok(chip)
+    }
+
+    /// The words that begin a flash region (FLASH_BEGIN, FLASH_DEFL_BEGIN): size, blocks, block size, offset, and on
+    /// the ESP32-C3 a fifth (0: not encrypted).
+    fn begin_words(&self, w: [u32; 4], out: &mut [u8; 20]) -> usize {
+        for (k, v) in w.iter().enumerate() {
+            out[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
         }
-        let (magic, _) =
-            self.command(op::READ_REG, &[&CHIP_DETECT_MAGIC_REG.to_le_bytes()], 0, Duration::from_millis(500)).await?;
-        if ESP32C3_MAGIC.contains(&magic) { Ok(()) } else { Err(noted(Error::Chip(magic))) }
+        out[16..].fill(0);
+        if self.chip == Chip::Esp32 { 16 } else { 20 }
     }
 
     /// The in-package flash attached (default pins: 0, ROM form with the extra word), and its geometry.
@@ -349,32 +441,49 @@ impl<L: Line> Rom<'_, L> {
 
     /// MD5 of `len` bytes of flash from `offset`, compared with `want` (32 lowercase hex digits).
     async fn md5_is(&mut self, offset: u32, len: u32, want: &[u8; 32]) -> Result<bool, Error> {
+        Ok(self.md5(offset, len).await?.is_some_and(|m| m.eq_ignore_ascii_case(want)))
+    }
+
+    /// MD5 of `len` bytes of flash from `offset`, as the ROM gives it (32 hex digits); None if it gives no such thing.
+    async fn md5(&mut self, offset: u32, len: u32) -> Result<Option<[u8; 32]>, Error> {
         let mut md5 = [0u8; 16];
         md5[..4].copy_from_slice(&offset.to_le_bytes());
         md5[4..8].copy_from_slice(&len.to_le_bytes());
         let (_, n) = self.command(op::SPI_FLASH_MD5, &[&md5], 0, Duration::from_secs(10)).await?;
-        Ok(n >= 8 + 32 && self.rx[8..8 + 32].eq_ignore_ascii_case(want))
+        Ok((n >= 8 + 32).then(|| self.rx[8..8 + 32].try_into().unwrap_or([b'?'; 32])))
     }
 
-    /// One region, compressed, from `offset`: FLASH_DEFL_BEGIN (the ROM erases it first), then the data blocks.
-    async fn write_region(&mut self, zlib: &[u8], len: u32, offset: u32) -> Result<(), Error> {
-        let blocks = zlib.len().div_ceil(BLOCK) as u32;
+    /// Starts a region of `len` bytes from `offset`, coming as `zlib_len` compressed bytes: FLASH_DEFL_BEGIN (the
+    /// ROM erases the region first, its size rounded up to whole blocks as the ROM loaders expect it: esptool's
+    /// `flash_defl_begin`).
+    async fn begin_region(&mut self, len: u32, zlib_len: u32, offset: u32) -> Result<(), Error> {
+        let blocks = zlib_len.div_ceil(BLOCK as u32);
+        let erase = len.div_ceil(BLOCK as u32) * BLOCK as u32;
         let mut begin = [0u8; 20];
-        for (k, v) in [len, blocks, BLOCK as u32, offset, 0].iter().enumerate() {
-            begin[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
-        }
+        let n = self.begin_words([erase, blocks, BLOCK as u32, offset], &mut begin);
         // The ROM erases the whole region first: about 30 s per MB at worst (espflash's ERASE_REGION_TIMEOUT_PER_MB).
         let erase = Duration::from_millis(3000 + len as u64 * 30 / 1024);
-        self.command(op::FLASH_DEFL_BEGIN, &[&begin], 0, erase).await?;
-        for (seq, chunk) in zlib.chunks(BLOCK).enumerate() {
-            let mut head = [0u8; 16];
-            head[..4].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
-            head[4..8].copy_from_slice(&(seq as u32).to_le_bytes());
-            self.command(op::FLASH_DEFL_DATA, &[&head, chunk], checksum(chunk), Duration::from_secs(5)).await?;
-            if seq % 64 == 0 {
-                debug!("module: block {} of {} at {=u32:#x}", seq, blocks, offset);
-            }
-        }
+        self.command(op::FLASH_DEFL_BEGIN, &[&begin[..n]], 0, erase).await?;
+        Ok(())
+    }
+
+    /// Block `seq` of the plain region begun last (FLASH_DATA), padded to a whole block with 0xFF as the ROM wants it.
+    async fn data(&mut self, seq: u32, chunk: &[u8]) -> Result<(), Error> {
+        let mut block = [0xFFu8; BLOCK];
+        block[..chunk.len()].copy_from_slice(chunk);
+        let mut head = [0u8; 16];
+        head[..4].copy_from_slice(&(BLOCK as u32).to_le_bytes());
+        head[4..8].copy_from_slice(&seq.to_le_bytes());
+        self.command(op::FLASH_DATA, &[&head, &block], checksum(&block), Duration::from_secs(5)).await?;
+        Ok(())
+    }
+
+    /// Block `seq` of the compressed region begun last.
+    async fn block(&mut self, seq: u32, chunk: &[u8]) -> Result<(), Error> {
+        let mut head = [0u8; 16];
+        head[..4].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+        head[4..8].copy_from_slice(&seq.to_le_bytes());
+        self.command(op::FLASH_DEFL_DATA, &[&head, chunk], checksum(chunk), Duration::from_secs(5)).await?;
         Ok(())
     }
 }
@@ -399,9 +508,9 @@ pub async fn break_into_rom(uart: &mut BufferedUart, ms: u32) {
 
 /// Connects to a module whose ROM bootloader listens (after [`break_into_rom`], `EnterRom` or a dongle's DTR/RTS).
 async fn connect<L: Line>(line: &mut L, tries: u8) -> Result<Rom<'_, L>, Error> {
-    line.set_baud(ROM_BAUD);
+    line.set_baud(ROM_BAUD).await;
     drain(line).await;
-    let mut rom = Rom { line, rx: [0; 96] };
+    let mut rom = Rom { line, rx: [0; 96], chip: Chip::Esp32C3 };
     rom.sync(tries).await?;
     Ok(rom)
 }
@@ -413,76 +522,131 @@ pub async fn listening<L: Line>(line: &mut L) -> bool {
 }
 
 /// A module that sits in its ROM bootloader (it answers SYNC) is restarted into its firmware by the RTC watchdog;
-/// false if no ROM answers. The ROM's own reboot (FLASH_END) keeps FORCE_DOWNLOAD_BOOT, which `EnterRom` sets: the
-/// module would come back in its ROM.
+/// false if no ROM answers, or it is an ESP32 (whose caller resets it instead). The ROM's own reboot (FLASH_END) keeps
+/// FORCE_DOWNLOAD_BOOT, which `EnterRom` sets: the module would come back in its ROM.
 pub async fn leave_rom<L: Line>(line: &mut L) -> bool {
     let left = match connect(line, 10).await {
-        Ok(mut rom) => rom.watchdog_restart().await.is_ok(),
+        Ok(mut rom) => rom.detect().await.is_ok() && rom.watchdog_restart().await.is_ok(),
         Err(_) => false,
     };
-    line.set_baud(ROM_BAUD);
+    line.set_baud(ROM_BAUD).await;
     left
 }
 
-/// A chip whose ROM bootloader listens is restarted into its firmware by the RTC watchdog (a dongle; the board's UART
-/// module restarts with [`leave_rom`]).
+/// A chip whose ROM bootloader listens is restarted into its firmware by the RTC watchdog (an ESP32-C3 dongle; the
+/// board's UART module restarts with [`leave_rom`]); an error for an ESP32, which its caller resets.
 pub async fn watchdog_restart<L: Line>(line: &mut L) -> Result<(), Error> {
     let mut rom = connect(line, 3).await?;
+    rom.detect().await?;
     rom.watchdog_restart().await
 }
 
-/// Whether the chip in its ROM bootloader is an ESP32-C3 with an erased first flash sector: blank, or the module whose
-/// programming broke off ([`program`] writes that sector last). Leaves the ROM listening.
-pub async fn blank_c3<L: Line>(line: &mut L, image: &Image) -> Result<bool, Error> {
-    let mut rom = connect(line, 10).await?;
-    rom.check_chip().await?;
-    rom.attach_flash().await?;
-    rom.md5_is(0, image.head_len, image.blank_md5).await
+/// The chip whose ROM bootloader listens. Leaves the ROM listening.
+pub async fn chip<L: Line>(line: &mut L) -> Result<Chip, Error> {
+    connect(line, 10).await?.detect().await
 }
 
-/// Writes `image` to the module's flash from offset 0, verifies it and restarts the module into it (by its RTC
-/// watchdog). The module's ROM bootloader must be listening
-/// (`EnterRom`, [`break_into_rom`], or a dongle's DTR/RTS). Leaves the UART at [`ROM_BAUD`]; the caller restores the
-/// link's speed.
-pub async fn program<L: Line>(line: &mut L, image: &Image) -> Result<(), Error> {
-    if image.tail.is_empty() && image.head.is_empty() {
-        return Err(Error::Verify);
-    }
+/// The chip in its ROM bootloader, if its image's first flash sector is erased: blank, or the module whose
+/// programming broke off ([`program`] writes that sector last). Leaves the ROM listening.
+pub async fn blank<L: Line>(line: &mut L) -> Result<Option<Chip>, Error> {
     let mut rom = connect(line, 10).await?;
-    rom.check_chip().await?;
-    if L::UART {
+    let chip = rom.detect().await?;
+    rom.attach_flash().await?;
+    Ok(rom.md5_is(base(chip), kvm_proto::modimage::HEAD, BLANK_HEAD_MD5).await?.then_some(chip))
+}
+
+/// Writes the image `h` describes, from `src`, to the module's flash from the image's base, and verifies it; the
+/// module must be the chip the image is for. The ESP32-C3 then restarts into it by its RTC watchdog
+/// ([`Done::Restarted`]); the ESP32 is left in its ROM for the caller to reset ([`Done::ResetIt`]). The module's ROM
+/// bootloader must be listening (`EnterRom`, [`break_into_rom`], or a dongle's DTR/RTS). Leaves the line at
+/// [`ROM_BAUD`]; the caller restores the link's speed. `progress(done, total)`: the compressed bytes written so far, of
+/// all.
+pub async fn program<L: Line>(
+    line: &mut L,
+    h: &Header,
+    src: &mut impl Source,
+    mut progress: impl FnMut(usize, usize),
+    mut differs: impl FnMut(u32, u32, &[u8; 32]),
+) -> Result<Done, Error> {
+    let has_baud = line.has_baud();
+    let mut rom = connect(line, 10).await?;
+    let chip = rom.detect().await?;
+    if chip as u8 != h.chip || h.base != base(chip) {
+        warn!("module: the image is for another chip");
+        return Err(noted(Error::Chip(h.chip as u32)));
+    }
+    if has_baud {
         // Faster, if the ROM agrees (new baud, old baud: 0 for the ROM loader).
         let mut args = [0u8; 8];
         args[..4].copy_from_slice(&FAST_BAUD.to_le_bytes());
         if rom.command(op::CHANGE_BAUDRATE, &[&args], 0, Duration::from_millis(300)).await.is_ok() {
             Timer::after_millis(20).await;
-            rom.line.set_baud(FAST_BAUD);
+            rom.line.set_baud(FAST_BAUD).await;
             Timer::after_millis(20).await;
             drain(rom.line).await;
         }
     }
     rom.attach_flash().await?;
     rom.watchdog_off().await?;
-    // The first sector goes first (erased, nothing written) and comes back last.
+    // All of the image's flash erased first, its first sector with it (written last). FLASH_DEFL_BEGIN erases only
+    // the sectors the inflated data writes to: those the image leaves blank (the gaps before its partition table and
+    // its application) kept what was there, and the first ESP32 board, which had run a sketch, read back other than
+    // written there (2026-11-24). FLASH_BEGIN erases its whole region at once.
     let mut erase = [0u8; 20];
-    for (k, v) in [image.head_len, 0, BLOCK as u32, 0, 0].iter().enumerate() {
-        erase[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+    let all = h.len.div_ceil(SECTOR) * SECTOR;
+    let n = rom.begin_words([all, 0, BLOCK as u32, h.base], &mut erase);
+    let wait = Duration::from_millis(3000 + all as u64 * 30 / 1024);
+    rom.command(op::FLASH_BEGIN, &[&erase[..n]], 0, wait).await?;
+    let total = h.data_len();
+    let mut done = 0;
+    if h.tail_z > 0 {
+        rom.begin_region(h.len - h.head_len, h.tail_z, h.base + h.head_len).await?;
+        let mut buf = [0u8; BLOCK];
+        let mut seq = 0;
+        while done < h.tail_z as usize {
+            let n = src.tail(&mut buf).await?;
+            rom.block(seq, &buf[..n]).await?;
+            seq += 1;
+            done += n;
+            progress(done, total);
+        }
     }
-    rom.command(op::FLASH_BEGIN, &[&erase], 0, Duration::from_secs(3)).await?;
-    if !image.tail.is_empty() {
-        rom.write_region(image.tail, image.len - image.head_len, image.head_len).await?;
+    // The first sector as it is (FLASH_BEGIN, FLASH_DATA): the ESP32's ROM wrote a second compressed region wrong, 32 KB
+    // from its offset with the first region's leftovers (2026-11-24, replayed on the board with esptool's ROM calls:
+    // as it is, the image read back whole). No FLASH_*_END: it would start the firmware, and the check below needs
+    // the loader (esptool leaves it out with the ROM too).
+    let head = src.head().await?;
+    let mut begin = [0u8; 20];
+    let blocks = head.len().div_ceil(BLOCK) as u32;
+    let n = rom
+        .begin_words([head.len().div_ceil(SECTOR as usize) as u32 * SECTOR, blocks, BLOCK as u32, h.base], &mut begin);
+    rom.command(op::FLASH_BEGIN, &[&begin[..n]], 0, Duration::from_secs(3)).await?;
+    for (seq, chunk) in head.chunks(BLOCK).enumerate() {
+        rom.data(seq as u32, chunk).await?;
     }
-    rom.write_region(image.head, image.head_len, 0).await?;
-    // Stay in the loader (1) for the check below.
-    rom.command(op::FLASH_DEFL_END, &[&1u32.to_le_bytes()], 0, Duration::from_secs(2)).await?;
-    if !rom.md5_is(0, image.len, image.md5).await? {
-        rom.line.set_baud(ROM_BAUD);
+    progress(total, total);
+    if !rom.md5_is(h.base, h.len, &h.md5).await? {
         warn!("module: flash differs from the image after writing it");
-        return Err(Error::Verify);
+        // Where: the MD5 of the image's first sector, then of its rest in 64 KB pieces, for `differs` to report (and
+        // someone to compare with the image's).
+        let mut at = 0;
+        while at < h.len {
+            let n = if at == 0 { h.head_len } else { (h.len - at).min(0x1_0000) };
+            if let Ok(Some(m)) = rom.md5(h.base + at, n).await {
+                differs(h.base + at, n, &m);
+            }
+            at += n;
+        }
+        rom.line.set_baud(ROM_BAUD).await;
+        return Err(noted(Error::Verify));
+    }
+    if chip == Chip::Esp32 {
+        rom.line.set_baud(ROM_BAUD).await;
+        return Ok(Done::ResetIt);
     }
     // Out through the RTC watchdog, FORCE_DOWNLOAD_BOOT cleared: the ROM's own reboot keeps that flag, which
     // `EnterRom` sets, and a reset by RTS from the ROM brought a dongle back in its ROM (first dongle, 2026-11-14).
     let restarted = rom.watchdog_restart().await;
-    rom.line.set_baud(ROM_BAUD);
-    restarted
+    rom.line.set_baud(ROM_BAUD).await;
+    restarted.map(|()| Done::Restarted)
 }

@@ -16,6 +16,7 @@ mod flash;
 mod host;
 mod kvm;
 mod link;
+mod modstream;
 mod power;
 mod selftest;
 mod storage;
@@ -182,8 +183,9 @@ async fn main(spawner: Spawner) {
     let board = Board { ports, hub0_rst, _hub0_vbus: hub0_vbus, svc_sel };
 
     flash::init(Flash::new_blocking(p.FLASH));
-    let (store, config) = storage::open();
+    // The partition table first: it says whether the data and module partitions are this firmware's.
     let updates = update::init().is_some();
+    let (store, config) = storage::open();
     let info = Info {
         proto: kvm_proto::ctrl::PROTOCOL_VERSION,
         rp_fw: FW_VERSION,
@@ -194,16 +196,17 @@ async fn main(spawner: Spawner) {
             | caps::IDENTITY
             | caps::PASSTHROUGH
             | caps::VIAL
-            | if updates { caps::FW_UPDATE } else { 0 },
+            | if updates { caps::FW_UPDATE } else { 0 }
+            | if modstream::available() { caps::BT_UPDATE } else { 0 },
         bt_fw: 0,
     };
     let serial_str = core::str::from_utf8(&info.serial).unwrap_or("");
     kvm::init(config, info, serial_str, board);
     storage::restore(&store);
 
-    // The KVM's key held at power-up: the AT32F405s and the Bluetooth module get up to 5 more programming attempts
-    // (software.md §4.9, §4.13), and switching and configuration from software are allowed again (§4.6). Read before
-    // the links start, which decide about programming.
+    // The KVM's key held at power-up: the AT32F405s get up to 5 more programming attempts (software.md §4.9), and
+    // switching and configuration from software are allowed again (§4.6). Read before the links start, which decide
+    // about programming.
     let key = Input::new(p.PIN_11, Pull::Up);
     let held = ui::held_at_power_up(&key).await;
     if held {
@@ -254,9 +257,6 @@ async fn main(spawner: Spawner) {
         high
     };
     kvm::with(|e| e.set_bt_fitted(bt_fitted));
-    if bt_fitted {
-        storage::load_bt_record(&store, bt::image_crc(), held);
-    }
     let mut bt_cfg = uart::Config::default();
     bt_cfg.baudrate = kvm_proto::link::bt::BAUD;
     // The UART's TX idles high where `esp_boot` held the line (its drop leaves the pad to its reset value for the moment

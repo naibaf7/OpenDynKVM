@@ -10,7 +10,7 @@
 //!
 //! # How
 //!
-//! The data partition (17 sectors in the firmware) is a ring, used as a log:
+//! The data partition (61 sectors in the firmware) is a ring, used as a log:
 //!
 //! - **A save appends.** The new value goes, as an item, after the last item of the newest sector (the *head*). The
 //!   old value stays where it is and simply stops counting: the newest copy of a key wins. Nothing in flash is ever
@@ -28,11 +28,11 @@
 //!   and kept in RAM. The sector header is written once per erase, together with the sector's first use.
 //! - **Unchanged values cost nothing:** writing the value already stored programs nothing ([`Store::write`]).
 //!
-//! The cost of a save is its item's size: at most 0.7 KB for the config (eight profiles of seven devices). With
-//! everything the firmware stores at its largest (7.8 KB of keymap, macros, Vial's dynamic entries, records and the
-//! four screen-hop arrangements, carried around the ring), each sector is erased once per about 75 config saves, which
-//! makes about 7.5 million saves before the first sector reaches its rated cycles
-//! (`endurance_with_the_firmware_items`). How often saves come is the engine's business: it saves 5 s after the last
+//! The cost of a save is its item's size: at most 0.8 KB for the config (eight profiles of seven devices). With
+//! everything the firmware stores at its largest (29.3 KB of keymaps, axis rules, known devices' calibrations and field
+//! overrides, macros, Vial's dynamic entries, records and the four screen-hop arrangements, carried around the ring),
+//! each of the data partition's 61 sectors is erased once per about 266 config saves, which makes about 26.7 million
+//! saves before the first sector reaches its rated cycles (`endurance_with_the_firmware_items`). How often saves come is the engine's business: it saves 5 s after the last
 //! change and caps the rate of saves (`kvm_core::engine`, `SAVE_BURST`), so even a host script that changes a setting
 //! every few seconds for years cannot wear the flash out.
 //!
@@ -52,8 +52,8 @@ use heapless::Vec;
 use kvm_proto::crc::Crc32;
 
 pub const SECTOR: u32 = 4096;
-pub const MAX_SECTORS: usize = 32;
-pub const MAX_KEYS: usize = 32;
+pub const MAX_SECTORS: usize = 64;
+pub const MAX_KEYS: usize = 80;
 const MAGIC: &[u8; 4] = b"KST1";
 const HEADER: u32 = 16;
 const ITEM_HEADER: u32 = 8;
@@ -524,21 +524,28 @@ mod tests {
         assert_eq!(s.write(&mut f, 3, &[3; 4000]), Err(StoreError::Full));
     }
 
-    /// The firmware's data partition, in sectors (`firmware/rp2354/src/flash.rs`, `DATA_SECTORS`).
-    const FIRMWARE_SECTORS: usize = 17;
+    /// The firmware's data partition, in sectors.
+    const FIRMWARE_SECTORS: usize = kvm_proto::rpimage::layout::DATA_SECTORS as usize;
     /// Rated erase cycles per sector of the W25Q16JV.
     const RATED_ERASES: u64 = 100_000;
 
-    /// Stores everything the firmware keeps, at its largest: 8 keymap layers, a full macro buffer, the keymap
-    /// settings, Vial's tap dances, combos, key overrides and alternate repeat keys, both programming records, the
-    /// four screen-hop arrangements. Returns the bytes it takes in flash.
+    /// Stores everything the firmware keeps, at its largest: the four keymaps' 8 layers and axis rules each, a full
+    /// macro buffer, the keymap settings, Vial's tap dances, combos, key overrides and alternate repeat keys, the
+    /// AT32F405s' programming record, the four screen-hop arrangements, sixteen devices' calibrations. Returns the bytes
+    /// it takes in flash.
     fn firmware_items(s: &mut Store, f: &mut Ram) -> usize {
-        use kvm_vial::keymap::{Dynamic, LAYER_ITEM_LEN, MACRO_BUFFER, SETTINGS_LEN};
+        use kvm_map::keymap::{Dynamic, LAYER_ITEM_LEN, MACRO_BUFFER, SETTINGS_LEN, item};
         for a in 0..kvm_proto::ctrl::MAX_ARRANGEMENTS as u16 {
             s.write(f, crate::config::ARRANGEMENT_ITEM + a, &[a as u8; crate::config::ARRANGEMENT_ITEM_MAX]).unwrap();
         }
-        for l in 0..kvm_vial::LAYERS as u16 {
-            s.write(f, 0x0110 + l, &[l as u8 + 1; LAYER_ITEM_LEN]).unwrap();
+        for l in 0..(kvm_map::KEYMAPS * kvm_map::LAYERS) as u16 {
+            s.write(f, item::LAYER + l, &[l as u8 + 1; LAYER_ITEM_LEN]).unwrap();
+        }
+        for k in 0..kvm_map::KEYMAPS as u16 {
+            s.write(f, item::AXES + k, &[k as u8; kvm_map::axes::Rules::ITEM_LEN]).unwrap();
+        }
+        for d in 0..crate::known::MAX_DEVICES as u16 {
+            s.write(f, crate::known::ITEM + d, &[d as u8; crate::known::ITEM_LEN]).unwrap();
         }
         s.write(f, 0x0101, &[0x55; MACRO_BUFFER]).unwrap();
         s.write(f, 0x0100, &[1; SETTINGS_LEN]).unwrap();
@@ -547,7 +554,6 @@ mod tests {
             s.write(f, key, &[0x66; 512][..len]).unwrap();
         }
         s.write(f, crate::at32prog::ITEM, &[2; crate::at32prog::Record::LEN]).unwrap();
-        s.write(f, crate::at32prog::BT_ITEM, &[3; crate::at32prog::Record::LEN]).unwrap();
         s.live_bytes()
     }
 
@@ -558,7 +564,7 @@ mod tests {
         let mut f = Ram::new(FIRMWARE_SECTORS);
         let mut s = Store::mount(&mut f, FIRMWARE_SECTORS).unwrap();
         let cold = firmware_items(&mut s, &mut f);
-        assert!((7_500..8_500).contains(&cold), "{cold} bytes besides the config");
+        assert!((27_500..29_500).contains(&cold), "{cold} bytes besides the config");
         let saves = 20_000u32;
         for k in 0..saves {
             // A different config every time, so each one is written.
@@ -568,12 +574,12 @@ mod tests {
         assert!(max - min <= 2, "erases per sector: {:?}", f.erases);
         let per_erase = saves / max;
         let lifetime = u64::from(saves) * RATED_ERASES / u64::from(max);
-        assert!((70..=80).contains(&per_erase), "{per_erase} config saves per erase of a sector");
-        assert!(lifetime >= 7_000_000, "{lifetime} config saves before a sector reaches its rated erases");
+        assert!((262..=278).contains(&per_erase), "{per_erase} config saves per erase of a sector");
+        assert!(lifetime >= 26_000_000, "{lifetime} config saves before a sector reaches its rated erases");
         // The cold items went round the ring with it.
         let s = Store::mount(&mut f, FIRMWARE_SECTORS).unwrap();
-        assert_eq!(get(&s, &mut f, 0x0117).unwrap(), [8; kvm_vial::keymap::LAYER_ITEM_LEN]);
-        assert_eq!(get(&s, &mut f, 0x0101).unwrap(), [0x55; kvm_vial::keymap::MACRO_BUFFER]);
+        assert_eq!(get(&s, &mut f, 0x0117).unwrap(), [8; kvm_map::keymap::LAYER_ITEM_LEN]);
+        assert_eq!(get(&s, &mut f, 0x0101).unwrap(), [0x55; kvm_map::keymap::MACRO_BUFFER]);
     }
 
     /// The erase counts the headers carry stay right across power cycles, though the spare sector has no header.
@@ -582,7 +588,7 @@ mod tests {
         let mut f = Ram::new(FIRMWARE_SECTORS);
         let mut s = Store::mount(&mut f, FIRMWARE_SECTORS).unwrap();
         firmware_items(&mut s, &mut f);
-        for k in 0..6_000u32 {
+        for k in 0..16_000u32 {
             s.write(&mut f, crate::config::ITEM, &[(k % 251) as u8; 300]).unwrap();
             if k % 37 == 0 {
                 s = Store::mount(&mut f, FIRMWARE_SECTORS).unwrap();

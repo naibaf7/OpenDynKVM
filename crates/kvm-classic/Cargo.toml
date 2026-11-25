@@ -1,0 +1,13 @@
+[package]
+name = "kvm-classic"
+description = "Bluetooth Classic (BR/EDR) pieces of the OpenDynKVM ESP32 module's gamepad host: HCI events, L2CAP signaling for HID, and the pads' report forms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+heapless.workspace = true
+kvm-proto.workspace = true
+
+[dev-dependencies]
+kvm-hid.workspace = true

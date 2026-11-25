@@ -13,7 +13,7 @@ pub const PAYLOAD_LEN: usize = REPORT_LEN - 2;
 /// The protocol's version. A host and the firmware talk only when theirs are the same: otherwise the host offers the
 /// firmware it came with, and nothing else (`GetInfo` and the `Fw*` requests are all it uses then). Raised with every
 /// change of a message, a config key or a value.
-pub const PROTOCOL_VERSION: u8 = 12;
+pub const PROTOCOL_VERSION: u8 = 15;
 
 /// Vendor usage page and usage of the control interface; hosts discover it by these, not by VID/PID.
 pub const USAGE_PAGE: u16 = 0xFF4B;
@@ -549,13 +549,123 @@ wire_enum! {
         /// Forget the failed attempts at programming the AT32F405s, then restart, so that both get up to 5 more
         /// (software.md §4.9).
         At32Retry = 4,
-        /// The same for the Bluetooth module (software.md §4.13).
-        BtRetry = 5,
     }
 }
 
 wire_enum! {
-    pub enum FwTarget { Rp2354 = 0 }
+    /// What an update writes: the RP2354B's firmware (into the A/B partition it doesn't run from; it waits for the
+    /// key), or the Bluetooth module's ([`crate::modimage`]), which the RP2354B passes on to the module as it arrives.
+    /// That needs no key: the RP2354B takes only the module image its own firmware was built with (`caps::BT_UPDATE`).
+    pub enum FwTarget { Rp2354 = 0, Module = 1 }
+}
+
+wire_enum! {
+    /// The virtual gamepad the PCs get, for what the keymaps send it (hid_mapping.md §6.1): none (a phantom controller
+    /// confuses games), a HID gamepad (a report ID on the NKRO interface: 32 buttons, a hat, 8 axes), or an XInput
+    /// controller (an interface of its own, one mirror fewer).
+    pub enum GamepadOut { Off = 0, Hid = 1, XInput = 2 }
+}
+
+// `wire_enum!` takes no derives beyond its own.
+#[allow(clippy::derivable_impls)]
+impl Default for GamepadOut {
+    fn default() -> Self {
+        GamepadOut::Off
+    }
+}
+
+/// Keymaps (each profile uses one or none), layers per keymap, and the controls a keymap maps (`kvm_map::pos`):
+/// keyboard usages 0–231, mouse buttons, gamepad buttons, the hat, axis directions.
+pub const KEYMAPS: usize = 4;
+pub const KEYMAP_LAYERS: usize = 8;
+/// Keycodes per `GetKeycodes` / `SetKeycodes`.
+pub const KEYCODES_PER: usize = 28;
+/// Axis rules (6 bytes each, `kvm_map::axes::Rule`) per `Response::AxisRules`.
+pub const RULES_PER: usize = 8;
+pub const RULE_LEN: usize = 6;
+
+/// Bytes per entry of the keymaps' shared entries (`Request::GetMapEntry`): Vial's layout, 10 at most.
+pub const MAP_ENTRY_MAX: usize = 10;
+/// Macro buffer bytes per `Request::SetMacros` and `Response::Macros`.
+pub const MACRO_PIECE: usize = 56;
+/// Keyboard layouts a host can be set to (`kvm_hid::layouts::Layout::ALL`).
+pub const LAYOUTS: u8 = 13;
+/// Field overrides a device can have (`Request::SetOverride`).
+pub const MAX_OVERRIDES: usize = 8;
+/// Raw report bytes per `Event::Report`.
+pub const REPORT_PIECE: usize = 56;
+
+/// A field of a device's reports made a control (hid_mapping.md §9): bits its descriptor doesn't declare, or
+/// declares as something else, read as a gamepad button or axis. Kept with the device's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct FieldOverride {
+    /// The interface (a Bluetooth device's is 0) and report ID (0: the interface has none) whose reports carry it.
+    pub iface: u8,
+    pub report_id: u8,
+    /// Its first bit, counted from the report's first byte after the report ID, and how many (1–16).
+    pub bit: u16,
+    pub bits: u8,
+    /// [`field`] flags.
+    pub flags: u8,
+    /// What it becomes: gamepad button 1–32 as 0–31, or [`field::AXIS`] + gamepad axis 0–9 (`kvm_hid::gamepad::axis`).
+    pub target: u8,
+}
+
+pub mod field {
+    /// The value is signed (two's complement); otherwise it runs from 0.
+    pub const SIGNED: u8 = 1 << 0;
+    /// Read backwards: a button pressed while the bit is 0, an axis turned round.
+    pub const INVERT: u8 = 1 << 1;
+    pub const AXIS: u8 = 0x40;
+}
+
+/// What a host is offered and what it took (`Response::Outputs`): bit per output.
+pub mod outputs {
+    pub const KEYBOARD: u8 = 1 << 0;
+    pub const MOUSE: u8 = 1 << 1;
+    pub const MEDIA: u8 = 1 << 2;
+    /// The absolute pointer (screen hop).
+    pub const POINTER: u8 = 1 << 3;
+    pub const GAMEPAD: u8 = 1 << 4;
+    /// The virtual gamepad as an XInput controller.
+    pub const XINPUT: u8 = 1 << 5;
+    pub const VIAL: u8 = 1 << 6;
+    /// Mirrored devices.
+    pub const MIRRORS: u8 = 1 << 7;
+}
+
+/// What a device has, for the host software's picture of it (`Response::Controls`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Controls {
+    pub keyboard: bool,
+    /// Mouse buttons 1–16, gamepad buttons 1–32 (bit n = button n + 1).
+    pub mouse_buttons: u16,
+    pub pad_buttons: u32,
+    /// Mouse X/Y, wheel, pan.
+    pub mouse_axes: u8,
+    /// Gamepad axes X, Y, Z, Rx, Ry, Rz, slider, dial, brake, accelerator.
+    pub pad_axes: u16,
+    pub hat: bool,
+    /// Identifies the device for its calibration (and the host software's names for its controls): VID/PID and
+    /// interface, or the Bluetooth address, hashed; 0 = none.
+    pub identity: u32,
+}
+
+/// One gamepad axis's calibration, in normalized units (−32767…32767; a trigger 0…32767).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct AxisCal {
+    pub min: i16,
+    pub centre: i16,
+    pub max: i16,
+    /// Around the centre, in 256ths of the half range, read as the centre.
+    pub deadzone: u8,
+}
+
+impl AxisCal {
+    pub const NONE: AxisCal = AxisCal { min: -32767, centre: 0, max: 32767, deadzone: 0 };
 }
 
 wire_enum! {
@@ -589,6 +699,9 @@ wire_enum! {
         NoDevice = 8,
         /// Only the active PC may ask for this (learning a hotkey).
         NotActive = 9,
+        /// A Bluetooth host that may not control the KVM asked (software.md §8.1, "Over Bluetooth"): it asks for that
+        /// with `AskControl`, confirmed by a tap on the KVM's key.
+        NotAllowed = 10,
     }
 }
 
@@ -1009,14 +1122,11 @@ pub mod selftest {
     pub const AT32_XTAL2: u32 = 1 << 14;
     /// Still running; the other bits are provisional.
     pub const RUNNING: u32 = 1 << 15;
-    /// The Bluetooth module (boards 0.16.0 on, when fitted) doesn't run the embedded firmware: programming it failed
-    /// this boot, or it doesn't answer; tried again at the next power-up. Bits 16 and up travel after the Bluetooth
-    /// fields of `Status`.
+    /// The Bluetooth module (boards 0.16.0 on, when fitted, or a dongle) doesn't run this firmware's version, or none:
+    /// Bluetooth is off until the host software sends it (`FwTarget::Module`). Bits 16 and up travel after the
+    /// Bluetooth fields of `Status`.
     pub const BT_FW: u32 = 1 << 16;
-    /// Programming the Bluetooth module failed 5 times in a row: no more attempts until the embedded image changes, the
-    /// KVM's key is held at power-up, or `RebootTarget::BtRetry`.
-    pub const BT_GAVE_UP: u32 = 1 << 17;
-    pub const BT: u32 = BT_FW | BT_GAVE_UP;
+    pub const BT: u32 = BT_FW;
     pub const PORTS: [u32; 3] = [PORT_KB, PORT_MS, PORT_OT];
     /// Everything that concerns PC `k`'s side (its link, hub and AT32F405 firmware).
     pub const PCS: [u32; 2] =
@@ -1121,19 +1231,17 @@ pub mod diag {
     wire_enum! {
         /// The Bluetooth module, as the RP2354B sees it (boards 0.16.0 on, when fitted).
         pub enum BtModule {
-            /// Not fitted, or a board before 0.16.0: the Bluetooth items are left out.
+            /// Not fitted, or a board before 0.16.0, and no dongle: the Bluetooth items are left out.
             Absent = 0,
-            /// The link is up and the module runs the firmware the RP2354B carries.
+            /// The link is up and the module runs the RP2354B's version.
             Up = 1,
-            /// Being programmed with the RP2354B's copy of its firmware.
+            /// Being programmed with the firmware the host software streams (`FwTarget::Module`).
             Programming = 2,
-            /// Fitted, but it doesn't answer or couldn't be programmed: Bluetooth is off until the next power-up.
-            Failed = 3,
-            /// Programming failed 5 times in a row: not tried again until the image changes, the key is held at
-            /// power-up, or `RebootTarget::BtRetry`.
-            GaveUp = 4,
-            /// Fitted, waiting for its `Hello`: just reset, or just programmed.
-            Starting = 5,
+            /// Waiting for its `Hello`: just reset, or just programmed.
+            Starting = 3,
+            /// It runs another version than the RP2354B's, or none (blank, or a programming cut short): Bluetooth is
+            /// off until the host software sends this version's (`FwTarget::Module`).
+            NeedsUpdate = 4,
         }
     }
 
@@ -1413,6 +1521,8 @@ pub mod caps {
     pub const VIAL: u16 = 1 << 4;
     /// The Bluetooth module (boards 0.16.0 on) is fitted and answers: Bluetooth hosts are targets.
     pub const BLUETOOTH: u16 = 1 << 5;
+    /// The firmware was built with the module's (it knows its SHA-256): `FwTarget::Module` is taken.
+    pub const BT_UPDATE: u16 = 1 << 6;
     pub const SIMULATED: u16 = 1 << 15;
 }
 
@@ -1622,8 +1732,9 @@ pub struct Info {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Status {
     pub active: Pc,
-    /// The PC this response is sent to (None in the simulator or over the service port).
-    pub asking: Option<Pc>,
+    /// The host this response is sent to: a PC, or a Bluetooth host over the module's control service (None in the
+    /// simulator or over the service port).
+    pub asking: Option<Host>,
     pub links: [LinkState; 2],
     pub power: PowerSource,
     pub adv_pwr: Advertised,
@@ -1675,6 +1786,23 @@ pub struct Status {
     /// Pairing a device: how far it got, and the passkey to type on a keyboard that asks for one.
     pub bt_device_pairing: DevicePairing,
     pub bt_device_passkey: Option<u32>,
+    /// How far programming the module has got, in percent (while `bt_module` is `Programming`).
+    pub bt_progress: u8,
+    /// The module's chip, which picks its firmware image (`kvm-module-<chip>.bin`): from its `Hello`, or from its ROM
+    /// while it runs no firmware of the KVM's (`Unknown` until either).
+    pub bt_chip: crate::link::bt::Chip,
+}
+
+impl Status {
+    /// The PC this response is sent to, if a PC asked.
+    pub fn asking_pc(&self) -> Option<Pc> {
+        self.asking.and_then(Host::as_pc)
+    }
+
+    /// The Bluetooth host slot (1–4) this response is sent to, if one asked over the module's control service.
+    pub fn asking_bt(&self) -> Option<u8> {
+        self.asking.and_then(Host::bt_slot)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1741,8 +1869,8 @@ pub mod key {
     pub const SW_SWITCH_ALLOWED: u16 = 0x0040;
     pub const SW_CONFIG_ALLOWED: u16 = 0x0041;
     pub const VIAL: u16 = 0x0050;
-    /// Apply the stored keymap to normalized keyboards.
-    pub const KEYMAP: u16 = 0x0051;
+    /// The virtual gamepad the PCs get ([`GamepadOut`](super::GamepadOut)).
+    pub const GAMEPAD: u16 = 0x0052;
     /// Make the running PC active when the active one is switched off (software.md §4.12).
     pub const AUTO_SELECT: u16 = 0x0060;
     /// In standby, keep the keyboard and mouse powered so that a key press wakes a sleeping PC.
@@ -1762,6 +1890,9 @@ pub mod key {
     pub const BT_NAME_BASE: u16 = 0x0090;
     /// What the module does with host slot 1–4 while another target is active ([`Policy`](super::BtPolicy)).
     pub const BT_POLICY_BASE: u16 = 0x0098;
+    /// Host slot 1–4 may control the KVM over Bluetooth (bool, off by default). Turning it on takes a tap on the key;
+    /// it goes off by itself when the slot's bond goes.
+    pub const BT_CONTROL_BASE: u16 = 0x009C;
     /// Screen hop: the absolute pointer on the KVM's mouse, the acceleration, speed, edge resistance and
     /// corner, PC1's and PC2's mapping.
     pub const ABS_POINTER: u16 = 0x00A0;
@@ -1787,6 +1918,18 @@ pub mod key {
     pub const PROFILE_ROUTES_BASE: u16 = 0x0100;
     /// Profile 0–7's arrangement (0: none, n + 1: arrangement n).
     pub const PROFILE_ARRANGEMENT_BASE: u16 = 0x0108;
+    /// Profile 0–7's keymap (0: none, n + 1: keymap n; hid_mapping.md).
+    pub const PROFILE_KEYMAP_BASE: u16 = 0x0110;
+    /// Profile 0–7's keymap for a host that can't take the virtual gamepad (0: none, the profile's own; n + 1: keymap
+    /// n): its gamepad mapped to the mouse and keys instead.
+    pub const PROFILE_FALLBACK_BASE: u16 = 0x0118;
+    /// The keyboard layout of each host ([`Host::index`] order: PC1, PC2, Bluetooth hosts 1–4), `kvm_hid::layouts`:
+    /// macro text is typed through it.
+    pub const LAYOUT_BASE: u16 = 0x00E8;
+
+    pub const fn layout(h: Host) -> u16 {
+        LAYOUT_BASE + h.index() as u16
+    }
 
     use super::{DEVICES, Host, MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, MAX_SCREENS};
 
@@ -1862,7 +2005,7 @@ pub mod key {
         SW_SWITCH_ALLOWED,
         SW_CONFIG_ALLOWED,
         VIAL,
-        KEYMAP,
+        GAMEPAD,
         AUTO_SELECT,
         STANDBY_WAKE,
         STANDBY_GLOW,
@@ -1878,6 +2021,10 @@ pub mod key {
         BT_POLICY_BASE + 1,
         BT_POLICY_BASE + 2,
         BT_POLICY_BASE + 3,
+        BT_CONTROL_BASE,
+        BT_CONTROL_BASE + 1,
+        BT_CONTROL_BASE + 2,
+        BT_CONTROL_BASE + 3,
         ABS_POINTER,
         HOP_ACCEL,
         HOP_SPEED,
@@ -1899,10 +2046,22 @@ pub mod key {
         BT_POINTER_BASE + 1,
         BT_POINTER_BASE + 2,
         BT_POINTER_BASE + 3,
+        LAYOUT_BASE,
+        LAYOUT_BASE + 1,
+        LAYOUT_BASE + 2,
+        LAYOUT_BASE + 3,
+        LAYOUT_BASE + 4,
+        LAYOUT_BASE + 5,
     ];
     /// Each profile's keys, after the profile count and the active profile.
-    const PROFILE_BASES: [u16; 4] =
-        [PROFILE_NAME_BASE, PROFILE_MODES_BASE, PROFILE_ROUTES_BASE, PROFILE_ARRANGEMENT_BASE];
+    const PROFILE_BASES: [u16; 6] = [
+        PROFILE_NAME_BASE,
+        PROFILE_MODES_BASE,
+        PROFILE_ROUTES_BASE,
+        PROFILE_ARRANGEMENT_BASE,
+        PROFILE_KEYMAP_BASE,
+        PROFILE_FALLBACK_BASE,
+    ];
     const ALL_LEN: usize = MAX_HOTKEYS
         + BASE.len()
         + 2 * DEVICES
@@ -1972,7 +2131,7 @@ pub enum ConfigValue {
     SwSwitchAllowed(bool),
     SwConfigAllowed(bool),
     Vial(VialMode),
-    Keymap(bool),
+    Gamepad(GamepadOut),
     AutoSelect(bool),
     StandbyWake(bool),
     StandbyGlow(bool),
@@ -1990,6 +2149,9 @@ pub enum ConfigValue {
     BtName(u8, ProfileName),
     /// Bluetooth host slot 0–3 and what the module does with it while another target is active.
     BtPolicy(u8, BtPolicy),
+    /// Bluetooth host slot 0–3 may control the KVM over Bluetooth. On only by the key (`Request::AskControl`, or this
+    /// set from a PC, confirmed with a tap); off at once.
+    BtControl(u8, bool),
     /// The KVM's mouse also has an absolute pointer (screen hop needs it). Changing it reconnects the PCs' KVM devices.
     AbsPointer(bool),
     HopAccel(Accel),
@@ -2006,6 +2168,13 @@ pub enum ConfigValue {
     HopUnits(Host, Units),
     /// Profile index, and the arrangement screen hop uses in it (None: screen hop is off there).
     ProfileArrangement(u8, Option<u8>),
+    /// Profile index, and the keymap its normalized devices go through (None: none, as without the mapping engine).
+    ProfileKeymap(u8, Option<u8>),
+    /// Profile index, and the keymap used instead while the input's host can't take the virtual gamepad (None: the
+    /// profile's own).
+    ProfileFallback(u8, Option<u8>),
+    /// A host's keyboard layout (`kvm_hid::layouts::Layout` as its number, below [`LAYOUTS`]).
+    HostLayout(Host, u8),
     /// Arrangement 0–3, screen slot 0–7.
     Screen(u8, u8, Screen),
     /// Arrangement 0–3 and its name.
@@ -2031,7 +2200,7 @@ impl ConfigValue {
             ConfigValue::SwSwitchAllowed(_) => key::SW_SWITCH_ALLOWED,
             ConfigValue::SwConfigAllowed(_) => key::SW_CONFIG_ALLOWED,
             ConfigValue::Vial(_) => key::VIAL,
-            ConfigValue::Keymap(_) => key::KEYMAP,
+            ConfigValue::Gamepad(_) => key::GAMEPAD,
             ConfigValue::AutoSelect(_) => key::AUTO_SELECT,
             ConfigValue::StandbyWake(_) => key::STANDBY_WAKE,
             ConfigValue::StandbyGlow(_) => key::STANDBY_GLOW,
@@ -2046,6 +2215,7 @@ impl ConfigValue {
             ConfigValue::ProfileName(i, _) => key::PROFILE_NAME_BASE + *i as u16,
             ConfigValue::BtName(i, _) => key::BT_NAME_BASE + *i as u16,
             ConfigValue::BtPolicy(i, _) => key::BT_POLICY_BASE + *i as u16,
+            ConfigValue::BtControl(i, _) => key::BT_CONTROL_BASE + *i as u16,
             ConfigValue::AbsPointer(_) => key::ABS_POINTER,
             ConfigValue::HopAccel(_) => key::HOP_ACCEL,
             ConfigValue::HopSpeed(_) => key::HOP_SPEED,
@@ -2054,6 +2224,9 @@ impl ConfigValue {
             ConfigValue::HopMapping(h, _) => key::hop_mapping(*h),
             ConfigValue::HopUnits(h, _) => key::hop_units(*h),
             ConfigValue::ProfileArrangement(i, _) => key::PROFILE_ARRANGEMENT_BASE + *i as u16,
+            ConfigValue::ProfileKeymap(i, _) => key::PROFILE_KEYMAP_BASE + *i as u16,
+            ConfigValue::ProfileFallback(i, _) => key::PROFILE_FALLBACK_BASE + *i as u16,
+            ConfigValue::HostLayout(h, _) => key::layout(*h),
             ConfigValue::Screen(a, i, _) => key::screen(*a, *i),
             ConfigValue::ArrangementName(a, _) => key::ARRANGEMENT_NAME_BASE + *a as u16,
             ConfigValue::BtPointer(i, _) => key::BT_POINTER_BASE + *i as u16,
@@ -2085,7 +2258,11 @@ impl ConfigValue {
             ConfigValue::ProfileName(_, n) | ConfigValue::BtName(_, n) | ConfigValue::ArrangementName(_, n) => {
                 w.lv(n.as_str().as_bytes())
             }
-            ConfigValue::ProfileArrangement(_, a) => w.u8(a.map_or(0, |a| a + 1)),
+            ConfigValue::ProfileArrangement(_, a)
+            | ConfigValue::ProfileKeymap(_, a)
+            | ConfigValue::ProfileFallback(_, a) => w.u8(a.map_or(0, |a| a + 1)),
+            ConfigValue::HostLayout(_, l) => w.u8(l),
+            ConfigValue::Gamepad(g) => w.u8(g as u8),
             ConfigValue::BtPointer(_, p) => w.u8(p as u8),
             ConfigValue::BtPolicy(_, p) => w.u8(p as u8),
             ConfigValue::HopAccel(a) => w.u8(a as u8),
@@ -2105,9 +2282,9 @@ impl ConfigValue {
                 Ok(())
             }
             ConfigValue::PowerCycleOnSwitch(b)
+            | ConfigValue::BtControl(_, b)
             | ConfigValue::SwSwitchAllowed(b)
             | ConfigValue::SwConfigAllowed(b)
-            | ConfigValue::Keymap(b)
             | ConfigValue::AutoSelect(b)
             | ConfigValue::StandbyWake(b)
             | ConfigValue::StandbyGlow(b)
@@ -2148,7 +2325,7 @@ impl ConfigValue {
             key::SW_SWITCH_ALLOWED => ConfigValue::SwSwitchAllowed(r.bool()?),
             key::SW_CONFIG_ALLOWED => ConfigValue::SwConfigAllowed(r.bool()?),
             key::VIAL => ConfigValue::Vial(r.u8()?.try_into()?),
-            key::KEYMAP => ConfigValue::Keymap(r.bool()?),
+            key::GAMEPAD => ConfigValue::Gamepad(r.u8()?.try_into()?),
             key::AUTO_SELECT => ConfigValue::AutoSelect(r.bool()?),
             key::STANDBY_WAKE => ConfigValue::StandbyWake(r.bool()?),
             key::STANDBY_GLOW => ConfigValue::StandbyGlow(r.bool()?),
@@ -2192,6 +2369,9 @@ impl ConfigValue {
             k if bt_slots(key::BT_POLICY_BASE).contains(&k) => {
                 ConfigValue::BtPolicy((k - key::BT_POLICY_BASE) as u8, r.u8()?.try_into()?)
             }
+            k if bt_slots(key::BT_CONTROL_BASE).contains(&k) => {
+                ConfigValue::BtControl((k - key::BT_CONTROL_BASE) as u8, r.bool()?)
+            }
             key::ABS_POINTER => ConfigValue::AbsPointer(r.bool()?),
             key::HOP_ACCEL => ConfigValue::HopAccel(r.u8()?.try_into()?),
             key::HOP_SPEED => ConfigValue::HopSpeed(r.u8()? as i8),
@@ -2208,6 +2388,22 @@ impl ConfigValue {
             k if profiles(key::PROFILE_ARRANGEMENT_BASE).contains(&k) => {
                 let i = (k - key::PROFILE_ARRANGEMENT_BASE) as u8;
                 ConfigValue::ProfileArrangement(i, r.u8()?.checked_sub(1))
+            }
+            k if profiles(key::PROFILE_KEYMAP_BASE).contains(&k) => {
+                let i = (k - key::PROFILE_KEYMAP_BASE) as u8;
+                ConfigValue::ProfileKeymap(i, r.u8()?.checked_sub(1).filter(|k| (*k as usize) < KEYMAPS))
+            }
+            k if profiles(key::PROFILE_FALLBACK_BASE).contains(&k) => {
+                let i = (k - key::PROFILE_FALLBACK_BASE) as u8;
+                ConfigValue::ProfileFallback(i, r.u8()?.checked_sub(1).filter(|k| (*k as usize) < KEYMAPS))
+            }
+            k if (key::LAYOUT_BASE..key::LAYOUT_BASE + HOSTS as u16).contains(&k) => {
+                let h = Host::from_index((k - key::LAYOUT_BASE) as usize).ok_or(WireError::Invalid)?;
+                let l = r.u8()?;
+                if l >= LAYOUTS {
+                    return Err(WireError::Invalid);
+                }
+                ConfigValue::HostLayout(h, l)
             }
             k if (key::HOP_UNITS_BASE..key::HOP_UNITS_BASE + 2).contains(&k) => ConfigValue::HopUnits(
                 Host::from_index((k - key::HOP_UNITS_BASE) as usize).ok_or(WireError::Invalid)?,
@@ -2293,10 +2489,12 @@ pub enum Request {
     BtPairDevice([u8; 7]),
     /// Forget the bond in Bluetooth device slot 1–4 (0xFF = all) and drop its connection.
     BtForgetDevice(u8),
-    /// The report map the KVM holds for Bluetooth device slot 1–4, from byte `offset`: `Response::BtDeviceMap`, for
-    /// diagnosing a device the KVM can't read (`odkvmctl device map`).
-    GetBtDeviceMap {
-        slot: u8,
+    /// The report descriptor the KVM holds for a device's `index`-th HID interface (a Bluetooth device's report map,
+    /// index 0), from byte `offset`: `Response::DeviceMap`, for the monitor and for diagnosing a device the KVM can't
+    /// read (`odkvmctl device map`).
+    GetDeviceMap {
+        device: Device,
+        index: u8,
         offset: u16,
     },
     /// The wireless module's recent log, which the KVM keeps, from byte `at` (counted since it started keeping it):
@@ -2305,6 +2503,77 @@ pub enum Request {
     /// Forget every host and device the wireless module has paired, clear every key it holds, and restart it: for
     /// pairings that keep failing on state the module shouldn't hold. The hosts keep the KVM in their own lists.
     BtEraseAll,
+    /// Make the ESP32 board on this front port the wireless module, replacing its firmware: one the KVM left alone,
+    /// because it runs other firmware (only a blank board, or one running the module's, is taken without asking). The
+    /// port is probed again, and the board is taken whatever it runs (even with the port set to passthrough); it then
+    /// waits for the module's firmware (`BtModule::NeedsUpdate`). `Busy` on a KVM with a module already.
+    AdoptModule(Port),
+    /// From a Bluetooth host over the module's control service: let this host control the KVM
+    /// (`ConfigValue::BtControl`). `NeedsKeyPress` while the KVM waits for a tap on its key, `Ok` once it may; from
+    /// anything but a Bluetooth host `Unsupported`.
+    AskControl,
+    /// Keycodes of keymap 0–3, layer 0–7, from position `first`: `Response::Keycodes`.
+    GetKeycodes {
+        keymap: u8,
+        layer: u8,
+        first: u16,
+    },
+    /// Sets keycodes of keymap 0–3, layer 0–7, from position `first`.
+    SetKeycodes {
+        keymap: u8,
+        layer: u8,
+        first: u16,
+        codes: Vec<u16, KEYCODES_PER>,
+    },
+    /// Axis rules of keymap 0–3, layer 0–7, from input `first`: `Response::AxisRules`.
+    GetAxisRules {
+        keymap: u8,
+        layer: u8,
+        first: u8,
+    },
+    SetAxisRule {
+        keymap: u8,
+        layer: u8,
+        input: u8,
+        rule: [u8; RULE_LEN],
+    },
+    /// Stream the controls of the normalized devices to the asking PC (`Event::Control`, `Event::Axis`): 0 stop, 1
+    /// watch, 2 watch and keep them from doing anything else meanwhile (learning a control in the editor). Only from
+    /// the active PC, a configuration change, and for `WATCH_MS` (10 s): the host software asks again to go on.
+    WatchControls(u8),
+    /// What a device has: `Response::Controls`.
+    GetControls(Device),
+    /// The calibration of a device's gamepad axis 0–9: `Response::Calibration`.
+    GetCalibration(Device, u8),
+    SetCalibration(Device, u8, AxisCal),
+    /// Entry `index` of one kind of the keymaps' shared entries (0 tap dance, 1 combo, 2 key override, 3 alternate
+    /// repeat key: `kvm_map::keymap::Dynamic`), in Vial's layout: `Response::MapEntry`.
+    GetMapEntry {
+        kind: u8,
+        index: u8,
+    },
+    SetMapEntry {
+        kind: u8,
+        index: u8,
+        data: Vec<u8, MAP_ENTRY_MAX>,
+    },
+    /// Bytes `offset`.. of the macro buffer: `Response::Macros`.
+    GetMacros(u16),
+    SetMacros {
+        offset: u16,
+        data: Vec<u8, MACRO_PIECE>,
+    },
+    /// A QMK setting of the keymaps by Vial's id (qsid): `Response::MapSetting`.
+    GetMapSetting(u16),
+    SetMapSetting(u16, u32),
+    /// Stream a device's raw input reports to the asking PC (`Event::Report`): changed ones, at most about 60 a second
+    /// per interface and report ID. As `WatchControls`: from the active PC, a configuration change, for `WATCH_MS`.
+    MonitorDevice(Device, bool),
+    /// Field override 0–7 of a device: `Response::Override`.
+    GetOverride(Device, u8),
+    SetOverride(Device, u8, Option<FieldOverride>),
+    /// What a host is offered and took: `Response::Outputs`.
+    GetOutputs(Host),
     /// Where the asking PC's own cursor is, in its display arrangement's pixels. With screen hop, the KVM
     /// takes it over while it isn't moving the pointer itself: a touchpad or a program moved it.
     PointerAt([i16; 2]),
@@ -2357,10 +2626,10 @@ pub struct BtDeviceInfo {
 }
 
 /// Bytes of a device's report map per `Response::BtDeviceMap` (header, slot, total, offset and length come first).
-pub const BT_MAP_PIECE: usize = 48;
-const _: () = assert!(2 + 1 + 2 + 2 + 1 + BT_MAP_PIECE <= REPORT_LEN);
+pub const MAP_PIECE: usize = 48;
+const _: () = assert!(2 + 1 + 2 + 2 + 1 + MAP_PIECE <= REPORT_LEN);
 // `Response::ModuleLog` carries as many: header, first, end, at and length come first.
-const _: () = assert!(2 + 4 + 4 + 4 + 1 + BT_MAP_PIECE <= REPORT_LEN);
+const _: () = assert!(2 + 4 + 4 + 4 + 1 + MAP_PIECE <= REPORT_LEN);
 
 /// A device found while looking for devices to pair (`Response::BtFound`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2435,9 +2704,29 @@ pub mod req {
     pub const GET_BT_FOUND: u8 = 0x1C;
     pub const BT_PAIR_DEVICE: u8 = 0x1D;
     pub const BT_FORGET_DEVICE: u8 = 0x1E;
-    pub const GET_BT_DEVICE_MAP: u8 = 0x1F;
+    pub const GET_DEVICE_MAP: u8 = 0x1F;
     pub const GET_MODULE_LOG: u8 = 0x20;
     pub const BT_ERASE_ALL: u8 = 0x21;
+    pub const GET_KEYCODES: u8 = 0x22;
+    pub const SET_KEYCODES: u8 = 0x23;
+    pub const GET_AXIS_RULES: u8 = 0x24;
+    pub const SET_AXIS_RULE: u8 = 0x25;
+    pub const WATCH_CONTROLS: u8 = 0x26;
+    pub const GET_CONTROLS: u8 = 0x27;
+    pub const GET_CALIBRATION: u8 = 0x28;
+    pub const SET_CALIBRATION: u8 = 0x29;
+    pub const GET_MAP_ENTRY: u8 = 0x2A;
+    pub const SET_MAP_ENTRY: u8 = 0x2B;
+    pub const GET_MACROS: u8 = 0x2C;
+    pub const SET_MACROS: u8 = 0x2D;
+    pub const GET_MAP_SETTING: u8 = 0x2E;
+    pub const SET_MAP_SETTING: u8 = 0x2F;
+    pub const MONITOR_DEVICE: u8 = 0x30;
+    pub const GET_OVERRIDE: u8 = 0x31;
+    pub const SET_OVERRIDE: u8 = 0x32;
+    pub const GET_OUTPUTS: u8 = 0x33;
+    pub const ASK_CONTROL: u8 = 0x34;
+    pub const ADOPT_MODULE: u8 = 0x35;
     pub const ERROR: u8 = 0xFF;
 }
 
@@ -2451,6 +2740,9 @@ pub mod ev {
     pub const BT_ACTIVE: u8 = 0xC6;
     pub const PLACE_CURSOR: u8 = 0xC7;
     pub const BT_DEVICE_CHANGED: u8 = 0xC8;
+    pub const CONTROL: u8 = 0xC9;
+    pub const AXIS: u8 = 0xCA;
+    pub const REPORT: u8 = 0xCB;
 }
 
 impl Request {
@@ -2483,9 +2775,29 @@ impl Request {
             Request::GetBtDevice(_) => req::GET_BT_DEVICE,
             Request::BtScan(_) => req::BT_SCAN,
             Request::GetBtFound(_) => req::GET_BT_FOUND,
-            Request::GetBtDeviceMap { .. } => req::GET_BT_DEVICE_MAP,
+            Request::GetDeviceMap { .. } => req::GET_DEVICE_MAP,
             Request::GetModuleLog(_) => req::GET_MODULE_LOG,
             Request::BtEraseAll => req::BT_ERASE_ALL,
+            Request::AdoptModule(_) => req::ADOPT_MODULE,
+            Request::AskControl => req::ASK_CONTROL,
+            Request::GetKeycodes { .. } => req::GET_KEYCODES,
+            Request::SetKeycodes { .. } => req::SET_KEYCODES,
+            Request::GetAxisRules { .. } => req::GET_AXIS_RULES,
+            Request::SetAxisRule { .. } => req::SET_AXIS_RULE,
+            Request::WatchControls(_) => req::WATCH_CONTROLS,
+            Request::GetControls(_) => req::GET_CONTROLS,
+            Request::GetCalibration(..) => req::GET_CALIBRATION,
+            Request::SetCalibration(..) => req::SET_CALIBRATION,
+            Request::GetMapEntry { .. } => req::GET_MAP_ENTRY,
+            Request::SetMapEntry { .. } => req::SET_MAP_ENTRY,
+            Request::GetMacros(_) => req::GET_MACROS,
+            Request::SetMacros { .. } => req::SET_MACROS,
+            Request::GetMapSetting(_) => req::GET_MAP_SETTING,
+            Request::SetMapSetting(..) => req::SET_MAP_SETTING,
+            Request::MonitorDevice(..) => req::MONITOR_DEVICE,
+            Request::GetOverride(..) => req::GET_OVERRIDE,
+            Request::SetOverride(..) => req::SET_OVERRIDE,
+            Request::GetOutputs(_) => req::GET_OUTPUTS,
             Request::BtPairDevice(_) => req::BT_PAIR_DEVICE,
             Request::BtForgetDevice(_) => req::BT_FORGET_DEVICE,
         }
@@ -2510,6 +2822,16 @@ impl Request {
                 | Request::BtPairDevice(_)
                 | Request::BtForgetDevice(_)
                 | Request::BtEraseAll
+                | Request::AdoptModule(_)
+                | Request::SetKeycodes { .. }
+                | Request::SetAxisRule { .. }
+                | Request::SetCalibration(..)
+                | Request::WatchControls(1..=u8::MAX)
+                | Request::SetMapEntry { .. }
+                | Request::SetMacros { .. }
+                | Request::SetMapSetting(..)
+                | Request::MonitorDevice(_, true)
+                | Request::SetOverride(..)
         )
     }
 
@@ -2525,8 +2847,9 @@ impl Request {
             | Request::FactoryReset
             | Request::FwCommit
             | Request::FwStatus
-            | Request::BtEraseAll => {}
-            Request::GetPort(p) | Request::Redetect(p) => w.u8(*p as u8)?,
+            | Request::BtEraseAll
+            | Request::AskControl => {}
+            Request::GetPort(p) | Request::Redetect(p) | Request::AdoptModule(p) => w.u8(*p as u8)?,
             Request::GetPortString(p, k) => {
                 w.u8(*p as u8)?;
                 w.u8(*k as u8)?;
@@ -2544,11 +2867,81 @@ impl Request {
             | Request::BtForgetDevice(s) => w.u8(*s)?,
             Request::BtPair(on) | Request::BtScan(on) => w.bool(*on)?,
             Request::BtPairDevice(a) => w.bytes(a)?,
-            Request::GetBtDeviceMap { slot, offset } => {
-                w.u8(*slot)?;
+            Request::GetDeviceMap { device, index, offset } => {
+                w.u8(*device as u8)?;
+                w.u8(*index)?;
                 w.u16(*offset)?;
             }
             Request::GetModuleLog(at) => w.u32(*at)?,
+            Request::GetKeycodes { keymap, layer, first } => {
+                w.u8(*keymap)?;
+                w.u8(*layer)?;
+                w.u16(*first)?;
+            }
+            Request::SetKeycodes { keymap, layer, first, codes } => {
+                w.u8(*keymap)?;
+                w.u8(*layer)?;
+                w.u16(*first)?;
+                w.u8(codes.len() as u8)?;
+                for c in codes {
+                    w.u16(*c)?;
+                }
+            }
+            Request::GetAxisRules { keymap, layer, first } => {
+                w.u8(*keymap)?;
+                w.u8(*layer)?;
+                w.u8(*first)?;
+            }
+            Request::SetAxisRule { keymap, layer, input, rule } => {
+                w.u8(*keymap)?;
+                w.u8(*layer)?;
+                w.u8(*input)?;
+                w.bytes(rule)?;
+            }
+            Request::WatchControls(m) => w.u8(*m)?,
+            Request::GetControls(d) => w.u8(*d as u8)?,
+            Request::GetCalibration(d, a) => {
+                w.u8(*d as u8)?;
+                w.u8(*a)?;
+            }
+            Request::SetCalibration(d, a, c) => {
+                w.u8(*d as u8)?;
+                w.u8(*a)?;
+                axis_cal(&mut w, c)?;
+            }
+            Request::GetMapEntry { kind, index } => {
+                w.u8(*kind)?;
+                w.u8(*index)?;
+            }
+            Request::SetMapEntry { kind, index, data } => {
+                w.u8(*kind)?;
+                w.u8(*index)?;
+                w.lv(data)?;
+            }
+            Request::GetMacros(offset) => w.u16(*offset)?,
+            Request::SetMacros { offset, data } => {
+                w.u16(*offset)?;
+                w.lv(data)?;
+            }
+            Request::GetMapSetting(q) => w.u16(*q)?,
+            Request::SetMapSetting(q, v) => {
+                w.u16(*q)?;
+                w.u32(*v)?;
+            }
+            Request::MonitorDevice(d, on) => {
+                w.u8(*d as u8)?;
+                w.bool(*on)?;
+            }
+            Request::GetOverride(d, n) => {
+                w.u8(*d as u8)?;
+                w.u8(*n)?;
+            }
+            Request::SetOverride(d, n, o) => {
+                w.u8(*d as u8)?;
+                w.u8(*n)?;
+                field_override(&mut w, o)?;
+            }
+            Request::GetOutputs(h) => w.u8(*h as u8)?,
             Request::BtPasskey(v) => w.u32(*v)?,
             Request::PointerAt([x, y]) => {
                 w.u16(*x as u16)?;
@@ -2604,9 +2997,45 @@ impl Request {
             req::GET_BT_DEVICE => Request::GetBtDevice(r.u8()?),
             req::BT_SCAN => Request::BtScan(r.bool()?),
             req::GET_BT_FOUND => Request::GetBtFound(r.u8()?),
-            req::GET_BT_DEVICE_MAP => Request::GetBtDeviceMap { slot: r.u8()?, offset: r.u16()? },
+            req::GET_DEVICE_MAP => Request::GetDeviceMap { device: device(&mut r)?, index: r.u8()?, offset: r.u16()? },
             req::GET_MODULE_LOG => Request::GetModuleLog(r.u32()?),
             req::BT_ERASE_ALL => Request::BtEraseAll,
+            req::ADOPT_MODULE => Request::AdoptModule(r.u8()?.try_into()?),
+            req::ASK_CONTROL => Request::AskControl,
+            req::GET_KEYCODES => Request::GetKeycodes { keymap: r.u8()?, layer: r.u8()?, first: r.u16()? },
+            req::SET_KEYCODES => {
+                let (keymap, layer, first, n) = (r.u8()?, r.u8()?, r.u16()?, r.u8()? as usize);
+                let mut codes = Vec::new();
+                for _ in 0..n {
+                    codes.push(r.u16()?).map_err(|_| WireError::Overflow)?;
+                }
+                Request::SetKeycodes { keymap, layer, first, codes }
+            }
+            req::GET_AXIS_RULES => Request::GetAxisRules { keymap: r.u8()?, layer: r.u8()?, first: r.u8()? },
+            req::SET_AXIS_RULE => {
+                Request::SetAxisRule { keymap: r.u8()?, layer: r.u8()?, input: r.u8()?, rule: r.array()? }
+            }
+            req::WATCH_CONTROLS => Request::WatchControls(r.u8()?),
+            req::GET_CONTROLS => Request::GetControls(device(&mut r)?),
+            req::GET_CALIBRATION => Request::GetCalibration(device(&mut r)?, r.u8()?),
+            req::SET_CALIBRATION => Request::SetCalibration(device(&mut r)?, r.u8()?, read_axis_cal(&mut r)?),
+            req::GET_MAP_ENTRY => Request::GetMapEntry { kind: r.u8()?, index: r.u8()? },
+            req::SET_MAP_ENTRY => Request::SetMapEntry {
+                kind: r.u8()?,
+                index: r.u8()?,
+                data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
+            },
+            req::GET_MACROS => Request::GetMacros(r.u16()?),
+            req::SET_MACROS => Request::SetMacros {
+                offset: r.u16()?,
+                data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
+            },
+            req::GET_MAP_SETTING => Request::GetMapSetting(r.u16()?),
+            req::SET_MAP_SETTING => Request::SetMapSetting(r.u16()?, r.u32()?),
+            req::MONITOR_DEVICE => Request::MonitorDevice(device(&mut r)?, r.bool()?),
+            req::GET_OVERRIDE => Request::GetOverride(device(&mut r)?, r.u8()?),
+            req::SET_OVERRIDE => Request::SetOverride(device(&mut r)?, r.u8()?, read_field_override(&mut r)?),
+            req::GET_OUTPUTS => Request::GetOutputs(r.u8()?.try_into()?),
             req::BT_PAIR_DEVICE => Request::BtPairDevice(r.array()?),
             req::BT_FORGET_DEVICE => Request::BtForgetDevice(r.u8()?),
             _ => return Err(WireError::Invalid),
@@ -2637,13 +3066,16 @@ pub enum Response {
     BtDevice(BtDeviceInfo),
     /// Entry n of the devices found, None past the last.
     BtFound(Option<BtFound>),
-    /// Bytes `offset`.. of the report map the KVM holds for a device slot, `total` long (0: it holds none: no bond,
-    /// or not read yet).
-    BtDeviceMap {
-        slot: u8,
+    /// Bytes `offset`.. of the report descriptor of a device's `index`-th HID interface (number `iface`, of
+    /// `interfaces`), `total` long (0: none: no device, no bond, or not read yet).
+    DeviceMap {
+        device: Device,
+        index: u8,
+        iface: u8,
+        interfaces: u8,
         total: u16,
         offset: u16,
-        data: Vec<u8, BT_MAP_PIECE>,
+        data: Vec<u8, MAP_PIECE>,
     },
     /// Bytes `at`.. of the module's log, which the KVM holds from byte `first` to `end` (counted since it started
     /// keeping it; older lines made room for newer ones).
@@ -2651,7 +3083,41 @@ pub enum Response {
         first: u32,
         end: u32,
         at: u32,
-        data: Vec<u8, BT_MAP_PIECE>,
+        data: Vec<u8, MAP_PIECE>,
+    },
+    Keycodes {
+        keymap: u8,
+        layer: u8,
+        first: u16,
+        codes: Vec<u16, KEYCODES_PER>,
+    },
+    AxisRules {
+        keymap: u8,
+        layer: u8,
+        first: u8,
+        rules: Vec<[u8; RULE_LEN], RULES_PER>,
+    },
+    Controls(Device, Controls),
+    Calibration(Device, u8, AxisCal),
+    MapEntry {
+        kind: u8,
+        index: u8,
+        data: Vec<u8, MAP_ENTRY_MAX>,
+    },
+    /// Bytes `offset`.. of the macro buffer, `total` long.
+    Macros {
+        offset: u16,
+        total: u16,
+        data: Vec<u8, MACRO_PIECE>,
+    },
+    MapSetting(u16, u32),
+    Override(Device, u8, Option<FieldOverride>),
+    /// [`outputs`] bits: what the host is offered, and what it took (a Bluetooth host: the reports it subscribed to;
+    /// a PC: everything offered while its link is up).
+    Outputs {
+        host: Host,
+        offered: u8,
+        taken: u8,
     },
     Ok,
     Error(ErrorCode),
@@ -2676,6 +3142,21 @@ pub enum Event {
     /// Put the cursor here, in this PC's own pixels: only to a PC whose host software asked for it
     /// (`Request::PlaceCursor`), at most once a millisecond, the latest position.
     PlaceCursor([i16; 2]),
+    /// A control of a normalized device went down or up (`Request::WatchControls`): its position (`kvm_map::pos`).
+    Control(u16, bool),
+    /// An axis input (`kvm_map::axes::input`) moved: its value (absolute), or the motion since the last (relative).
+    Axis(u8, i16),
+    /// Bytes `offset`.. of a raw input report of the monitored device's interface `iface`, `total` long, its report ID
+    /// first when the interface has them (`Request::MonitorDevice`).
+    Report {
+        device: Device,
+        iface: u8,
+        offset: u8,
+        total: u8,
+        /// The first `len` bytes count.
+        len: u8,
+        data: [u8; REPORT_PIECE],
+    },
 }
 
 /// Anything the device sends.
@@ -2688,6 +3169,53 @@ pub enum DeviceMsg {
 
 fn advertised(r: &mut Reader) -> Result<Advertised, WireError> {
     r.u8()?.try_into()
+}
+
+fn device(r: &mut Reader) -> Result<Device, WireError> {
+    Device::from_index(r.u8()? as usize).ok_or(WireError::Invalid)
+}
+
+fn field_override(w: &mut Writer, o: &Option<FieldOverride>) -> Result<(), WireError> {
+    w.bool(o.is_some())?;
+    if let Some(o) = o {
+        w.u8(o.iface)?;
+        w.u8(o.report_id)?;
+        w.u16(o.bit)?;
+        w.u8(o.bits)?;
+        w.u8(o.flags)?;
+        w.u8(o.target)?;
+    }
+    Ok(())
+}
+
+fn read_field_override(r: &mut Reader) -> Result<Option<FieldOverride>, WireError> {
+    if !r.bool()? {
+        return Ok(None);
+    }
+    let o = FieldOverride {
+        iface: r.u8()?,
+        report_id: r.u8()?,
+        bit: r.u16()?,
+        bits: r.u8()?,
+        flags: r.u8()?,
+        target: r.u8()?,
+    };
+    let target_ok = (o.target as usize) < 32 || (field::AXIS..field::AXIS + 10).contains(&o.target);
+    if !(1..=16).contains(&o.bits) || !target_ok {
+        return Err(WireError::Invalid);
+    }
+    Ok(Some(o))
+}
+
+fn axis_cal(w: &mut Writer, c: &AxisCal) -> Result<(), WireError> {
+    w.u16(c.min as u16)?;
+    w.u16(c.centre as u16)?;
+    w.u16(c.max as u16)?;
+    w.u8(c.deadzone)
+}
+
+fn read_axis_cal(r: &mut Reader) -> Result<AxisCal, WireError> {
+    Ok(AxisCal { min: r.u16()? as i16, centre: r.u16()? as i16, max: r.u16()? as i16, deadzone: r.u8()? })
 }
 
 fn device_name(r: &mut Reader) -> Result<BtDeviceName, WireError> {
@@ -2719,7 +3247,7 @@ impl Response {
             }
             Response::Status(s) => {
                 w.u8(s.active as u8)?;
-                w.u8(s.asking.map_or(0, |p| p as u8))?;
+                w.u8(s.asking.map_or(0, |h| h as u8))?;
                 w.u8(s.links[0] as u8)?;
                 w.u8(s.links[1] as u8)?;
                 w.u8(s.power as u8)?;
@@ -2740,7 +3268,8 @@ impl Response {
                 w.u8(s.bt_bonded)?;
                 w.u8(s.bt_pairing)?;
                 w.u8(s.bt_passkey)?;
-                w.u8(s.bt_module as u8)?;
+                // The chip in the high nibble: the report has no byte left.
+                w.u8(s.bt_module as u8 | (s.bt_chip as u8) << 4)?;
                 w.u16((s.selftest >> 16) as u16)?;
                 w.u8(s.hop as u8)?;
                 w.u16(s.pointer[0] as u16)?;
@@ -2757,6 +3286,7 @@ impl Response {
                 w.u8(s.bt_found)?;
                 w.u8(s.bt_device_pairing as u8)?;
                 w.u32(s.bt_device_passkey.unwrap_or(u32::MAX))?;
+                w.u8(s.bt_progress)?;
             }
             Response::Port(p) => {
                 w.u8(p.port as u8)?;
@@ -2811,17 +3341,77 @@ impl Response {
                 w.bytes(&d.addr)?;
                 w.lv(d.name.as_bytes())?;
             }
-            Response::BtDeviceMap { slot, total, offset, data } => {
-                w.u8(*slot)?;
+            Response::DeviceMap { device, index, iface, interfaces, total, offset, data } => {
+                w.u8(*device as u8)?;
+                w.u8(*index)?;
+                w.u8(*iface)?;
+                w.u8(*interfaces)?;
                 w.u16(*total)?;
                 w.u16(*offset)?;
                 w.lv(data)?;
+            }
+            Response::MapEntry { kind, index, data } => {
+                w.u8(*kind)?;
+                w.u8(*index)?;
+                w.lv(data)?;
+            }
+            Response::Macros { offset, total, data } => {
+                w.u16(*offset)?;
+                w.u16(*total)?;
+                w.lv(data)?;
+            }
+            Response::MapSetting(q, v) => {
+                w.u16(*q)?;
+                w.u32(*v)?;
+            }
+            Response::Override(d, n, o) => {
+                w.u8(*d as u8)?;
+                w.u8(*n)?;
+                field_override(&mut w, o)?;
+            }
+            Response::Outputs { host, offered, taken } => {
+                w.u8(*host as u8)?;
+                w.u8(*offered)?;
+                w.u8(*taken)?;
             }
             Response::ModuleLog { first, end, at, data } => {
                 w.u32(*first)?;
                 w.u32(*end)?;
                 w.u32(*at)?;
                 w.lv(data)?;
+            }
+            Response::Keycodes { keymap, layer, first, codes } => {
+                w.u8(*keymap)?;
+                w.u8(*layer)?;
+                w.u16(*first)?;
+                w.u8(codes.len() as u8)?;
+                for c in codes {
+                    w.u16(*c)?;
+                }
+            }
+            Response::AxisRules { keymap, layer, first, rules } => {
+                w.u8(*keymap)?;
+                w.u8(*layer)?;
+                w.u8(*first)?;
+                w.u8(rules.len() as u8)?;
+                for r in rules {
+                    w.bytes(r)?;
+                }
+            }
+            Response::Controls(d, c) => {
+                w.u8(*d as u8)?;
+                w.bool(c.keyboard)?;
+                w.u16(c.mouse_buttons)?;
+                w.u32(c.pad_buttons)?;
+                w.u8(c.mouse_axes)?;
+                w.u16(c.pad_axes)?;
+                w.bool(c.hat)?;
+                w.u32(c.identity)?;
+            }
+            Response::Calibration(d, a, c) => {
+                w.u8(*d as u8)?;
+                w.u8(*a)?;
+                axis_cal(&mut w, c)?;
             }
             Response::BtFound(f) => {
                 w.bool(f.is_some())?;
@@ -2893,6 +3483,27 @@ impl Event {
                 w.u16(x as u16)?;
                 w.u16(y as u16)?;
             }
+            Event::Control(p, down) => {
+                w.u8(ev::CONTROL)?;
+                w.u8(0)?;
+                w.u16(p)?;
+                w.bool(down)?;
+            }
+            Event::Axis(i, v) => {
+                w.u8(ev::AXIS)?;
+                w.u8(0)?;
+                w.u8(i)?;
+                w.u16(v as u16)?;
+            }
+            Event::Report { device, iface, offset, total, len, ref data } => {
+                w.u8(ev::REPORT)?;
+                w.u8(0)?;
+                w.u8(device as u8)?;
+                w.u8(iface)?;
+                w.u8(offset)?;
+                w.u8(total)?;
+                w.lv(&data[..(len as usize).min(REPORT_PIECE)])?;
+            }
         }
         Ok(out)
     }
@@ -2921,6 +3532,15 @@ impl DeviceMsg {
             ev::PLACE_CURSOR => {
                 return Ok(DeviceMsg::Event(Event::PlaceCursor([r.u16()? as i16, r.u16()? as i16])));
             }
+            ev::CONTROL => return Ok(DeviceMsg::Event(Event::Control(r.u16()?, r.bool()?))),
+            ev::AXIS => return Ok(DeviceMsg::Event(Event::Axis(r.u8()?, r.u16()? as i16))),
+            ev::REPORT => {
+                let (device, iface, offset, total) = (device(&mut r)?, r.u8()?, r.u8()?, r.u8()?);
+                let b = r.lv()?;
+                let mut data = [0u8; REPORT_PIECE];
+                data.get_mut(..b.len()).ok_or(WireError::Overflow)?.copy_from_slice(b);
+                return Ok(DeviceMsg::Event(Event::Report { device, iface, offset, total, len: b.len() as u8, data }));
+            }
             ev::HOTKEY_LEARNED => {
                 let end = r.u8()?.try_into()?;
                 let h = Hotkey { kind: r.u8()?.try_into()?, modifiers: r.u8()?, key: r.u8()?, swallow: r.bool()? };
@@ -2948,11 +3568,12 @@ impl DeviceMsg {
                 bt_fw: r.u32()?,
             }),
             req::GET_STATUS => {
+                let module: u8;
                 let mut st = Status {
                     active: r.u8()?.try_into()?,
                     asking: match r.u8()? {
                         0 => None,
-                        p => Some(p.try_into()?),
+                        h => Some(h.try_into()?),
                     },
                     links: [r.u8()?.try_into()?, r.u8()?.try_into()?],
                     power: r.u8()?.try_into()?,
@@ -2969,7 +3590,10 @@ impl DeviceMsg {
                     bt_bonded: r.u8()?,
                     bt_pairing: r.u8()?,
                     bt_passkey: r.u8()?,
-                    bt_module: diag::BtModule::from_u8(r.u8()?).ok_or(WireError::Invalid)?,
+                    bt_module: {
+                        module = r.u8()?;
+                        diag::BtModule::from_u8(module & 0x0F).ok_or(WireError::Invalid)?
+                    },
                     hop: HopState::Off,
                     pointer: [0, 0],
                     bt_passkey_digits: 0,
@@ -2984,6 +3608,8 @@ impl DeviceMsg {
                     bt_found: 0,
                     bt_device_pairing: DevicePairing::Idle,
                     bt_device_passkey: None,
+                    bt_progress: 0,
+                    bt_chip: crate::link::bt::Chip::from_u8(module >> 4),
                 };
                 // The self-test's bits 16–31, then screen hop, the passkey typed and the supply.
                 st.selftest |= (r.u16()? as u32) << 16;
@@ -3001,6 +3627,7 @@ impl DeviceMsg {
                 st.bt_found = r.u8()?;
                 st.bt_device_pairing = r.u8()?.try_into()?;
                 st.bt_device_passkey = Some(r.u32()?).filter(|v| *v != u32::MAX);
+                st.bt_progress = r.u8()?;
                 Response::Status(st)
             }
             req::GET_PORT => Response::Port(PortInfo {
@@ -3060,18 +3687,63 @@ impl DeviceMsg {
                 addr: r.array()?,
                 name: device_name(&mut r)?,
             }),
-            req::GET_BT_DEVICE_MAP => Response::BtDeviceMap {
-                slot: r.u8()?,
+            req::GET_DEVICE_MAP => Response::DeviceMap {
+                device: device(&mut r)?,
+                index: r.u8()?,
+                iface: r.u8()?,
+                interfaces: r.u8()?,
                 total: r.u16()?,
                 offset: r.u16()?,
                 data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
             },
+            req::GET_MAP_ENTRY => Response::MapEntry {
+                kind: r.u8()?,
+                index: r.u8()?,
+                data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
+            },
+            req::GET_MACROS => Response::Macros {
+                offset: r.u16()?,
+                total: r.u16()?,
+                data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
+            },
+            req::GET_MAP_SETTING => Response::MapSetting(r.u16()?, r.u32()?),
+            req::GET_OVERRIDE => Response::Override(device(&mut r)?, r.u8()?, read_field_override(&mut r)?),
+            req::GET_OUTPUTS => Response::Outputs { host: r.u8()?.try_into()?, offered: r.u8()?, taken: r.u8()? },
             req::GET_MODULE_LOG => Response::ModuleLog {
                 first: r.u32()?,
                 end: r.u32()?,
                 at: r.u32()?,
                 data: Vec::from_slice(r.lv()?).map_err(|_| WireError::Overflow)?,
             },
+            req::GET_KEYCODES => {
+                let (keymap, layer, first, n) = (r.u8()?, r.u8()?, r.u16()?, r.u8()? as usize);
+                let mut codes = Vec::new();
+                for _ in 0..n {
+                    codes.push(r.u16()?).map_err(|_| WireError::Overflow)?;
+                }
+                Response::Keycodes { keymap, layer, first, codes }
+            }
+            req::GET_AXIS_RULES => {
+                let (keymap, layer, first, n) = (r.u8()?, r.u8()?, r.u8()?, r.u8()? as usize);
+                let mut rules = Vec::new();
+                for _ in 0..n {
+                    rules.push(r.array()?).map_err(|_| WireError::Overflow)?;
+                }
+                Response::AxisRules { keymap, layer, first, rules }
+            }
+            req::GET_CONTROLS => Response::Controls(
+                device(&mut r)?,
+                Controls {
+                    keyboard: r.bool()?,
+                    mouse_buttons: r.u16()?,
+                    pad_buttons: r.u32()?,
+                    mouse_axes: r.u8()?,
+                    pad_axes: r.u16()?,
+                    hat: r.bool()?,
+                    identity: r.u32()?,
+                },
+            ),
+            req::GET_CALIBRATION => Response::Calibration(device(&mut r)?, r.u8()?, read_axis_cal(&mut r)?),
             req::GET_BT_FOUND => Response::BtFound(match r.bool()? {
                 false => None,
                 true => Some(BtFound {
@@ -3225,6 +3897,7 @@ mod tests {
             Request::Identify(5),
             Request::Redetect(Port::Keyboard),
             Request::FwBegin { target: FwTarget::Rp2354, size: 123_456, crc32: 0xAABBCCDD },
+            Request::FwBegin { target: FwTarget::Module, size: 370_000, crc32: 1 },
             Request::FwData { offset: 56, data: Vec::from_slice(&[7u8; FW_CHUNK]).unwrap() },
             Request::FwCommit,
             Request::FwStatus,
@@ -3268,9 +3941,46 @@ mod tests {
             Request::BtScan(true),
             Request::BtScan(false),
             Request::GetBtFound(9),
-            Request::GetBtDeviceMap { slot: 2, offset: 96 },
+            Request::GetDeviceMap { device: Device::Wireless2, index: 0, offset: 96 },
+            Request::GetDeviceMap { device: Device::Other, index: 2, offset: 0 },
+            Request::GetMapEntry { kind: 1, index: 31 },
+            Request::SetMapEntry { kind: 3, index: 0, data: Vec::from_slice(&[1, 2, 3, 4, 5, 6]).unwrap() },
+            Request::GetMacros(2000),
+            Request::SetMacros { offset: 56, data: Vec::from_slice(&[b'x'; MACRO_PIECE]).unwrap() },
+            Request::GetMapSetting(21),
+            Request::SetMapSetting(7, 175),
+            Request::MonitorDevice(Device::Other, true),
+            Request::GetOverride(Device::Wireless4, 7),
+            Request::SetOverride(
+                Device::Other,
+                1,
+                Some(FieldOverride { iface: 3, report_id: 1, bit: 270, bits: 12, flags: field::SIGNED, target: 0x46 }),
+            ),
+            Request::SetOverride(Device::Keyboard, 0, None),
+            Request::GetOutputs(Host::Bt3),
+            Request::SetConfig(ConfigValue::ProfileFallback(5, Some(2))),
+            Request::SetConfig(ConfigValue::HostLayout(Host::Bt2, 12)),
             Request::GetModuleLog(70_000),
             Request::BtEraseAll,
+            Request::AdoptModule(Port::Other),
+            Request::AskControl,
+            Request::SetConfig(ConfigValue::BtControl(3, true)),
+            Request::GetKeycodes { keymap: 3, layer: 7, first: 280 },
+            Request::SetKeycodes {
+                keymap: 1,
+                layer: 2,
+                first: 4,
+                codes: Vec::from_slice(&[0x7400; KEYCODES_PER]).unwrap(),
+            },
+            Request::GetAxisRules { keymap: 0, layer: 1, first: 8 },
+            Request::SetAxisRule { keymap: 2, layer: 0, input: 13, rule: [6, 1, 0, 1, 20, 16] },
+            Request::WatchControls(2),
+            Request::GetControls(Device::Wireless2),
+            Request::GetCalibration(Device::Other, 9),
+            Request::SetCalibration(Device::Mouse, 3, AxisCal { min: -30000, centre: 120, max: 31000, deadzone: 12 }),
+            Request::SetConfig(ConfigValue::ProfileKeymap(7, Some(3))),
+            Request::SetConfig(ConfigValue::ProfileKeymap(0, None)),
+            Request::SetConfig(ConfigValue::Gamepad(GamepadOut::XInput)),
             Request::BtPairDevice([1, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xC6]),
             Request::BtForgetDevice(0xFF),
         ];
@@ -3294,7 +4004,7 @@ mod tests {
     fn responses_and_events_roundtrip() {
         let status = Status {
             active: Pc::Pc2,
-            asking: Some(Pc::Pc1),
+            asking: Some(Host::Bt2),
             links: [LinkState::Connected, LinkState::Suspended],
             power: PowerSource::PcBus,
             adv_pwr: Advertised::None,
@@ -3304,13 +4014,13 @@ mod tests {
             flags: status_flags::SW_SWITCH_ALLOWED,
             uptime_s: 99,
             link_errors: [0, 2],
-            selftest: selftest::PORT_MS | selftest::RUNNING | selftest::BT_GAVE_UP,
+            selftest: selftest::PORT_MS | selftest::RUNNING | selftest::BT_FW,
             bt_active: 2,
             bt_ready: 0b0011,
             bt_bonded: 0b0111,
             bt_pairing: 42,
             bt_passkey: 3,
-            bt_module: diag::BtModule::GaveUp,
+            bt_module: diag::BtModule::NeedsUpdate,
             hop: HopState::NotNormalized,
             pointer: [-1920, 1079],
             bt_passkey_digits: 4,
@@ -3325,6 +4035,8 @@ mod tests {
             bt_found: 3,
             bt_device_pairing: DevicePairing::Pairing,
             bt_device_passkey: Some(0),
+            bt_progress: 37,
+            bt_chip: crate::link::bt::Chip::Esp32,
         };
         // The status fits in its report.
         assert!(Response::Status(status).encode(req::GET_STATUS, 1).is_ok());
@@ -3381,17 +4093,79 @@ mod tests {
             ),
             (req::GET_BT_FOUND, Response::BtFound(None)),
             (
-                req::GET_BT_DEVICE_MAP,
-                Response::BtDeviceMap { slot: 2, total: 312, offset: 288, data: Vec::from_slice(&[0xC0; 24]).unwrap() },
+                req::GET_DEVICE_MAP,
+                Response::DeviceMap {
+                    device: Device::Wireless2,
+                    index: 0,
+                    iface: 0,
+                    interfaces: 1,
+                    total: 312,
+                    offset: 288,
+                    data: Vec::from_slice(&[0xC0; 24]).unwrap(),
+                },
             ),
             (
-                req::GET_BT_DEVICE_MAP,
-                Response::BtDeviceMap { slot: 1, total: 512, offset: 0, data: Vec::from_slice(&[0x05; 48]).unwrap() },
+                req::GET_DEVICE_MAP,
+                Response::DeviceMap {
+                    device: Device::Other,
+                    index: 3,
+                    iface: 5,
+                    interfaces: 4,
+                    total: 512,
+                    offset: 0,
+                    data: Vec::from_slice(&[0x05; MAP_PIECE]).unwrap(),
+                },
+            ),
+            (
+                req::GET_MAP_ENTRY,
+                Response::MapEntry { kind: 0, index: 31, data: Vec::from_slice(&[0xAA; MAP_ENTRY_MAX]).unwrap() },
+            ),
+            (
+                req::GET_MACROS,
+                Response::Macros { offset: 1992, total: 2048, data: Vec::from_slice(&[7; MACRO_PIECE]).unwrap() },
+            ),
+            (req::GET_MAP_SETTING, Response::MapSetting(21, 0x07FF)),
+            (
+                req::GET_OVERRIDE,
+                Response::Override(
+                    Device::Wireless1,
+                    7,
+                    Some(FieldOverride { iface: 0, report_id: 0, bit: 7, bits: 1, flags: field::INVERT, target: 31 }),
+                ),
+            ),
+            (req::GET_OVERRIDE, Response::Override(Device::Mouse, 0, None)),
+            (
+                req::GET_OUTPUTS,
+                Response::Outputs { host: Host::Bt1, offered: 0x1F, taken: outputs::KEYBOARD | outputs::MOUSE },
             ),
             (
                 req::GET_MODULE_LOG,
                 Response::ModuleLog { first: 4096, end: 6144, at: 4096, data: Vec::from_slice(&[b'x'; 48]).unwrap() },
             ),
+            (
+                req::GET_KEYCODES,
+                Response::Keycodes { keymap: 2, layer: 5, first: 252, codes: Vec::from_slice(&[0x7E08; 28]).unwrap() },
+            ),
+            (
+                req::GET_AXIS_RULES,
+                Response::AxisRules { keymap: 1, layer: 0, first: 8, rules: Vec::from_slice(&[[9u8; 6]; 6]).unwrap() },
+            ),
+            (
+                req::GET_CONTROLS,
+                Response::Controls(
+                    Device::Other,
+                    Controls {
+                        keyboard: false,
+                        mouse_buttons: 0,
+                        pad_buttons: 0x3FFF,
+                        mouse_axes: 0,
+                        pad_axes: 0x33,
+                        hat: true,
+                        identity: 0xDEAD_BEEF,
+                    },
+                ),
+            ),
+            (req::GET_CALIBRATION, Response::Calibration(Device::Other, 2, AxisCal::NONE)),
             (
                 req::GET_BT_FOUND,
                 Response::BtFound(Some(BtFound {
@@ -3436,6 +4210,20 @@ mod tests {
             Event::HotkeyLearned(LearnEnd::Learned, Hotkey::double_tap(0xE4, true)),
             Event::HotkeyLearned(LearnEnd::TimedOut, Hotkey::NONE),
             Event::PlaceCursor([-2880, 1809]),
+            Event::Control(283, true),
+            Event::Axis(9, -32767),
+            Event::Report {
+                device: Device::Other,
+                iface: 3,
+                offset: 56,
+                total: 64,
+                len: 8,
+                data: {
+                    let mut d = [0u8; REPORT_PIECE];
+                    d[..8].fill(0x80);
+                    d
+                },
+            },
         ] {
             assert_eq!(DeviceMsg::decode(&e.encode().unwrap()).unwrap(), DeviceMsg::Event(e));
         }

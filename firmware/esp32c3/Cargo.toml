@@ -50,3 +50,11 @@ codegen-units = 1
 
 [profile.dev]
 opt-level = "s"
+
+# trouble-host 0.8.0 with one change, marked "OpenDynKVM:" (trouble-host/src/connection_manager.rs; `Stack::link_credits`
+# reads it): the controller's ACL buffers are one pool of credits for every connection. Upstream gives each connection
+# the whole count, so with several hosts connected the module could hand the controller more packets than it holds; a
+# connection whose credits then never came back held up the stack's one send queue, and with it every host (three hosts,
+# 2026-11-24).
+[patch.crates-io]
+trouble-host = { path = "trouble-host" }

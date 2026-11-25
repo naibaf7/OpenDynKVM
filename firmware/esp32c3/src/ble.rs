@@ -17,18 +17,22 @@
 //! - **Pinned hosts:** a host devices are pinned to ([`BtMsg::Select`]'s `pinned`) takes input as the selected one
 //!   does, and stays connected and asked for the short interval whatever its policy.
 //! - **Devices:** the same stack is the central of the Bluetooth devices ([`crate::devices`]).
+//! - **Control:** a service of its own carries the control protocol for a bonded host's software (software.md §8.1,
+//!   "Over Bluetooth"; [`kvm_proto::link::bt::control`]): a request written to it goes to the RP2354B, which decides
+//!   whether that host may ask; the answer, or an event, comes back to be notified. Its attributes need the bond's
+//!   authenticated link, its notifications are never kept with the bond (each session subscribes anew), and while
+//!   requests come the host is asked for the selected host's short interval.
 
 use core::cell::RefCell;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
+use embassy_futures::select::{Either3, Either4, select3, select4};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
-use esp_radio::ble::controller::BleConnector;
-use kvm_proto::link::bt::{BtMsg, EventKind, HostState, MAX_HOSTS, Motion, Policy, host_flags, report};
+use kvm_proto::link::bt::{BtMsg, EventKind, HostState, MAX_HOSTS, Motion, Policy, control, host_flags, report};
 use static_cell::StaticCell;
 use trouble_host::prelude::*;
 
@@ -65,12 +69,13 @@ const HID_INFO: [u8; 4] = [0x11, 0x01, 0x00, 0x02];
 const PNP_ID: [u8; 7] = [0x02, 0x09, 0x12, 0x01, 0x00, 0x00, 0x01];
 const MAKER: [u8; 10] = *b"OpenDynKVM";
 
-#[gatt_server(connections_max = HOST_CONNS, attribute_table_size = 64)]
+#[gatt_server(connections_max = HOST_CONNS, attribute_table_size = 84)]
 #[allow(dead_code)] // the Device Information and Battery services are only read by the hosts
 struct Server {
     hid: HidService,
     dis: DeviceInformation,
     bas: BatteryService,
+    ctl: ControlService,
 }
 
 #[gatt_service(uuid = service::HUMAN_INTERFACE_DEVICE)]
@@ -99,6 +104,10 @@ struct HidService {
     #[descriptor(uuid = descriptors::REPORT_REFERENCE, read, value = [report::POINTER, 1])]
     #[characteristic(uuid = characteristic::REPORT, read, notify, value = [0; report::POINTER_LEN])]
     pointer: [u8; report::POINTER_LEN],
+    /// The virtual gamepad (report 5), for a host that subscribes to it (hid_mapping.md §6.1).
+    #[descriptor(uuid = descriptors::REPORT_REFERENCE, read, value = [report::GAMEPAD, 1])]
+    #[characteristic(uuid = characteristic::REPORT, read, notify, value = [0; report::GAMEPAD_LEN])]
+    gamepad: [u8; report::GAMEPAD_LEN],
 }
 
 #[gatt_service(uuid = service::DEVICE_INFORMATION)]
@@ -113,6 +122,29 @@ struct DeviceInformation {
 struct BatteryService {
     #[characteristic(uuid = characteristic::BATTERY_LEVEL, read, notify, value = 100)]
     level: u8,
+}
+
+/// The control protocol for a bonded host's software ([`control`]: the same UUIDs, which the macro takes only as
+/// literals). Only over the bond's authenticated link.
+#[gatt_service(uuid = "98141409-422d-48a6-aba2-21d691a393cc")]
+struct ControlService {
+    /// Requests, one 64-byte report each ([`control::REQUEST`]).
+    #[characteristic(
+        uuid = "98141410-422d-48a6-aba2-21d691a393cc",
+        write,
+        write_without_response,
+        permissions(authenticated),
+        value = [0; control::REPORT_LEN]
+    )]
+    request: [u8; control::REPORT_LEN],
+    /// Answers and events ([`control::REPLY`]).
+    #[characteristic(
+        uuid = "98141411-422d-48a6-aba2-21d691a393cc",
+        notify,
+        permissions(authenticated),
+        value = [0; control::REPORT_LEN]
+    )]
+    reply: [u8; control::REPORT_LEN],
 }
 
 /// What the Bluetooth side knows, shared by its tasks (one executor: the mutex only guards against interrupts).
@@ -161,9 +193,15 @@ fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     STATE.lock(|s| f(s.borrow_mut().as_mut().expect("Bluetooth state")))
 }
 
-/// Input reports for each slot's connection task: (report id, data, length).
-/// A report on its way: its ID, its bytes, and how many of them count.
-type Queued = (u8, [u8; 8], u8);
+/// A report on its way to a slot's connection task: its ID, its bytes, and how many of them count.
+type Queued = (u8, [u8; report::INPUT_MAX], u8);
+
+fn queued(id: u8, data: &[u8]) -> Queued {
+    let mut d = [0u8; report::INPUT_MAX];
+    let n = data.len().min(report::INPUT_MAX);
+    d[..n].copy_from_slice(&data[..n]);
+    (id, d, n as u8)
+}
 
 static REPORTS: [Channel<CriticalSectionRawMutex, Queued, 16>; MAX_HOSTS] = [const { Channel::new() }; MAX_HOSTS];
 /// Each slot's motion, coalesced until the host takes it at a connection event ([`Motion`]): a mouse reports far more
@@ -173,9 +211,85 @@ static MOTION: [Mutex<CriticalSectionRawMutex, RefCell<Motion>>; MAX_HOSTS] =
     [const { Mutex::new(RefCell::new(Motion::new())) }; MAX_HOSTS];
 static MOTION_READY: [Signal<CriticalSectionRawMutex, ()>; MAX_HOSTS] = [const { Signal::new() }; MAX_HOSTS];
 
-fn take_motion(slot: usize) -> Option<(u8, [u8; 8], u8)> {
-    MOTION[slot].lock(|m| m.borrow_mut().take()).map(|(_, id, d)| (id, d, 8))
+/// How evenly pointer motion flows to a host, for the log every [`FLOW_WINDOW`] while it moves: what comes from the
+/// RP2354B and what goes to the host, each with its longest gap (shorter than [`FLOW_PAUSE`]: longer ones are the
+/// hand at rest), and the most packets the controller held for all connections. A phone host's pointer jittered on
+/// the ESP32 more than on the ESP32-C3 (2026-11-25): late input, late connection events, or a queue that fills.
+#[derive(Clone, Copy)]
+struct Flow {
+    since: Option<Instant>,
+    inputs: u32,
+    last_input: Option<Instant>,
+    input_gap: u64,
+    sent: u32,
+    last_sent: Option<Instant>,
+    sent_gap: u64,
+    queued: usize,
 }
+const FLOW_WINDOW: Duration = Duration::from_secs(5);
+
+/// Packets in the controller from which a host's motion waits (on the ESP32), and how long at most.
+const MOTION_QUEUE: usize = 2;
+const MOTION_WAIT: Duration = Duration::from_millis(30);
+const FLOW_PAUSE: Duration = Duration::from_millis(500);
+static FLOW: Mutex<CriticalSectionRawMutex, RefCell<[Flow; MAX_HOSTS]>> = Mutex::new(RefCell::new(
+    [Flow { since: None, inputs: 0, last_input: None, input_gap: 0, sent: 0, last_sent: None, sent_gap: 0, queued: 0 };
+        MAX_HOSTS],
+));
+
+/// The gap since `last`, if it isn't a pause, into `max`; `last` becomes now.
+fn flow_gap(last: &mut Option<Instant>, max: &mut u64) {
+    let now = Instant::now();
+    if let Some(t) = *last {
+        let gap = now.duration_since(t);
+        if gap < FLOW_PAUSE {
+            *max = (*max).max(gap.as_millis());
+        }
+    }
+    *last = Some(now);
+}
+
+/// Motion for host slot `slot` came from the RP2354B.
+fn flow_input(slot: usize) {
+    FLOW.lock(|f| {
+        let f = &mut f.borrow_mut()[slot];
+        f.since.get_or_insert_with(Instant::now);
+        f.inputs += 1;
+        flow_gap(&mut f.last_input, &mut f.input_gap);
+    });
+}
+
+/// Motion went to host `host` (slot `slot`), `queued` packets in the controller: the window's line, when it's over.
+fn flow_sent(host: u8, slot: usize, queued: usize) {
+    let done = FLOW.lock(|f| {
+        let f = &mut f.borrow_mut()[slot];
+        f.sent += 1;
+        flow_gap(&mut f.last_sent, &mut f.sent_gap);
+        f.queued = f.queued.max(queued);
+        let over = f.since.is_some_and(|t| t.elapsed() >= FLOW_WINDOW);
+        over.then(|| core::mem::replace(f, Flow { since: None, inputs: 0, input_gap: 0, sent: 0, sent_gap: 0, queued: 0, ..*f }))
+    });
+    if let Some(f) = done {
+        log::line(format_args!(
+            "host {host}: motion 5 s: {} in (gap up to {} ms), {} out (gap up to {} ms), up to {} queued",
+            f.inputs, f.input_gap, f.sent, f.sent_gap, f.queued
+        ));
+    }
+}
+
+fn take_motion(slot: usize) -> Option<Queued> {
+    MOTION[slot].lock(|m| m.borrow_mut().take()).map(|(_, id, d)| queued(id, &d))
+}
+/// Each slot's control-protocol reports from the RP2354B, to notify: [`control::WINDOW`] answers, and the events
+/// between them. A switch alone brings a burst of events (the switch, the active host, each port, each host whose
+/// interval changes); until 0.1.53 there was room for 8, the answers to a refresh under way were dropped, and the
+/// host's software took the KVM for gone (a Windows host, 2026-11-24: its window dropped the KVM on every switch).
+static CONTROL_OUT: [Channel<CriticalSectionRawMutex, [u8; control::REPORT_LEN], CONTROL_QUEUE>; MAX_HOSTS] =
+    [const { Channel::new() }; MAX_HOSTS];
+const CONTROL_QUEUE: usize = 24;
+/// How long after a host's last control request it keeps the short connection interval: its software asks in bursts
+/// (a window's refresh), and each burst would wait for the slow interval's events otherwise.
+const CONTROL_FAST: Duration = Duration::from_secs(5);
 /// Each slot's connection task: let the host go (forgotten, or not selected under `ConnectWhenSelected`), or ask it
 /// for other connection parameters (selection changed).
 static CTL: [Signal<CriticalSectionRawMutex, Ctl>; MAX_HOSTS] = [const { Signal::new() }; MAX_HOSTS];
@@ -233,7 +347,8 @@ fn drop_unpaired() {
     }
 }
 
-pub type Controller = ExternalController<BleConnector<'static>, 20>;
+/// The chip's controller as the stack's HCI (`radio.rs` of each firmware: the ESP32's also carries its Classic host).
+pub use crate::radio::Controller;
 pub type St = Stack<'static, Controller, DefaultPacketPool>;
 
 /// Keeps the Bluetooth stack's keys to the slots' bonds and the pairings under way. The stack stores a pairing's keys
@@ -273,7 +388,12 @@ pub fn tidy_keys(stack: &St) {
     log::line(format_args!("Bluetooth: {stray} stray keys dropped"));
 }
 
-static RESOURCES: StaticCell<HostResources<DefaultPacketPool, CONNS, L2CAP, 1, KEYS>> = StaticCell::new();
+/// The stack's resources (23 KB), never built on the stack. On the ESP32 in the DRAM after the ROM's data, next to the
+/// heap (`.dram2_uninit`): with Bluetooth on, its main DRAM is 128 KB, and its stack was 13 KB until they moved
+/// (`firmware/esp32/src/main.rs`).
+#[cfg_attr(target_arch = "xtensa", unsafe(link_section = ".dram2_uninit"))]
+static mut RESOURCES: core::mem::MaybeUninit<HostResources<DefaultPacketPool, CONNS, L2CAP, 1, KEYS>> =
+    core::mem::MaybeUninit::uninit();
 static STACK: StaticCell<St> = StaticCell::new();
 static SERVER: StaticCell<Server<'static>> = StaticCell::new();
 static BONDS: StaticCell<Bonds> = StaticCell::new();
@@ -286,12 +406,10 @@ pub async fn run(
     bonds: Bonds,
     device_bonds: DeviceBonds,
 ) -> ! {
-    let config = esp_radio::ble::Config::default()
-        .with_max_connections(ACTIVITIES)
-        .with_default_tx_power(esp_radio::ble::TxPower::P9);
-    let connector = BleConnector::new(bt, config).expect("Bluetooth controller");
-    let controller: Controller = ExternalController::new(connector);
-    let resources = RESOURCES.init(HostResources::new());
+    let controller: Controller = crate::radio::controller(spawner, bt, ACTIVITIES);
+    // SAFETY: taken once, here (`run` never returns). Every field of `HostResources` is a `MaybeUninit`
+    // (`HostResources::new` leaves them all uninitialized), so its uninitialized memory is a valid value of it.
+    let resources = unsafe { (*core::ptr::addr_of_mut!(RESOURCES)).assume_init_mut() };
     // A static random address from the chip's MAC, so the hosts' bonds stay valid across restarts and updates.
     let m = esp_hal::efuse::base_mac_address();
     let mac = m.as_bytes();
@@ -348,11 +466,25 @@ pub async fn run(
     devices::start(DEVICE_BONDS.init(device_bonds), stack);
     spawner.spawn(control(stack).expect("control task"));
     spawner.spawn(devices::central(spawner, stack).expect("central task"));
+    // The stack's runner and the advertising, tasks of their own: their futures are made in their tasks' storage. As
+    // one `select` here they were made on the stack and copied, which took this function's frame to 33 KB, and with
+    // `main`'s above it more than the ESP32's stack (2026-11-24).
+    spawner.spawn(host_runner(stack).expect("runner task"));
+    spawner.spawn(advertiser(spawner, stack, server).expect("advertising task"));
+    core::future::pending().await
+}
+
+#[embassy_executor::task]
+async fn host_runner(stack: &'static St) {
     let mut runner = stack.runner();
-    let mut peripheral = stack.peripheral();
-    let _ =
-        select(runner.run_with_handler(&devices::Handler), advertise(spawner, &mut peripheral, stack, server)).await;
+    let _ = runner.run_with_handler(&devices::Handler).await;
     panic!("Bluetooth host stopped");
+}
+
+#[embassy_executor::task]
+async fn advertiser(spawner: Spawner, stack: &'static St, server: &'static Server<'static>) {
+    let mut peripheral = stack.peripheral();
+    advertise(spawner, &mut peripheral, stack, server).await
 }
 
 /// Advertises while a host may connect: pairing is open (and a slot is free), or a host that should be connected
@@ -397,7 +529,15 @@ async fn advertise(
         )
         .unwrap_or(0);
         let mut scan = [0u8; 31];
-        let m = AdStructure::encode_slice(&[AdStructure::CompleteLocalName(NAME.as_bytes())], &mut scan).unwrap_or(0);
+        // The control service too (30 of the 31 bytes), so that a host's software can find the KVM by it.
+        let m = AdStructure::encode_slice(
+            &[
+                AdStructure::CompleteLocalName(NAME.as_bytes()),
+                AdStructure::CompleteServiceUuids128(&[control::SERVICE_LE]),
+            ],
+            &mut scan,
+        )
+        .unwrap_or(0);
         let params = AdvertisementParameters {
             interval_min: Duration::from_millis(30),
             interval_max: Duration::from_millis(50),
@@ -485,13 +625,14 @@ fn params(selected: bool) -> RequestedConnParams {
 type Conn = GattConnection<'static, 'static, DefaultPacketPool>;
 
 /// The CCCDs of the characteristics that notify, in the order of [`notify`]'s bits.
-fn cccds(server: &Server<'_>) -> [Option<u16>; 5] {
+fn cccds(server: &Server<'_>) -> [Option<u16>; 6] {
     [
         server.hid.keyboard.cccd_handle,
         server.hid.mouse.cccd_handle,
         server.hid.consumer.cccd_handle,
         server.hid.pointer.cccd_handle,
         server.bas.level.cccd_handle,
+        server.hid.gamepad.cccd_handle,
     ]
 }
 
@@ -515,6 +656,24 @@ fn restore_notifications(server: &Server<'_>, conn: &Conn, bits: u8) {
             let _ = t.write(*h, 0, if bits & (1 << bit) != 0 { &[1, 0] } else { &[0, 0] });
         }
     }
+    server.set_client_att_table(conn.raw(), &t.view());
+}
+
+/// The host's software has the control service's answers switched on: a control session ([`host_flags::CONTROL`]).
+fn control_session(server: &Server<'_>, conn: &Conn) -> bool {
+    let (Some(h), Some(t)) = (server.ctl.reply.cccd_handle, server.get_client_att_table(conn.raw())) else {
+        return false;
+    };
+    t.get(h).is_some_and(|v| v.first().is_some_and(|b| b & 1 != 0))
+}
+
+/// A connection starts without a control session, whatever the stack kept from the last one of a bonded host: the
+/// software that had it may be gone, and each session subscribes anew.
+fn end_control_session(server: &Server<'_>, conn: &Conn) {
+    let (Some(h), Some(mut t)) = (server.ctl.reply.cccd_handle, server.get_client_att_table(conn.raw())) else {
+        return;
+    };
+    let _ = t.write(h, 0, &[0, 0]);
     server.set_client_att_table(conn.raw(), &t.view());
 }
 
@@ -553,6 +712,8 @@ fn store_notifications(slot: usize, bits: u8) {
 
 fn set_subscribed(slot: usize, bits: u8) {
     set_flags(slot, |h| {
+        // The RP2354B sees what the host took (its outputs view, the gamepad's fallback).
+        h.reports = bits;
         if bits & notify::KEYBOARD != 0 {
             h.flags |= host_flags::SUBSCRIBED;
         } else {
@@ -576,10 +737,12 @@ async fn connection(
     let current = || with(|s| s.conn_gen[slot] == mine);
     set_flags(slot, |h| {
         h.flags |= host_flags::CONNECTED;
+        h.flags &= !host_flags::CONTROL;
         h.addr = conn.raw().peer_address().to_bytes();
     });
     with(|s| s.pairing_peer[slot] = new.then(|| conn.raw().peer_identity()));
     while REPORTS[slot].try_receive().is_ok() {}
+    while CONTROL_OUT[slot].try_receive().is_ok() {}
     MOTION[slot].lock(|m| *m.borrow_mut() = Motion::new());
     MOTION_READY[slot].reset();
     CTL[slot].reset();
@@ -595,9 +758,12 @@ async fn connection(
         restore_notifications(server, &conn, bits);
         set_subscribed(slot, bits);
     }
+    end_control_session(server, &conn);
     let mut waiting_passkey = false;
     // Notification settings changed by the host, and when they go to flash.
     let mut unsaved: Option<(u8, Instant)> = None;
+    // The short interval for the host's software, until this long after its last request.
+    let mut fast_until: Option<Instant> = None;
     loop {
         let passkey =
             async { if waiting_passkey { PASSKEY[slot].wait().await } else { core::future::pending().await } };
@@ -607,8 +773,14 @@ async fn connection(
                 None => core::future::pending().await,
             }
         };
-        let input = select(REPORTS[slot].receive(), MOTION_READY[slot].wait());
-        let woke = select4(conn.next(), input, CTL[slot].wait(), select(passkey, save)).await;
+        let slow_down = async {
+            match fast_until {
+                Some(at) => Timer::at(at).await,
+                None => core::future::pending().await,
+            }
+        };
+        let input = select3(REPORTS[slot].receive(), MOTION_READY[slot].wait(), CONTROL_OUT[slot].receive());
+        let woke = select4(conn.next(), input, CTL[slot].wait(), select3(passkey, save, slow_down)).await;
         // Superseded by a newer connection of this slot: nothing of this one counts any more.
         if !current() {
             log::line(format_args!("host {host}: an older connection, superseded"));
@@ -622,6 +794,11 @@ async fn connection(
                     break;
                 }
                 GattConnectionEvent::ConnectionParamsUpdated { conn_interval, peripheral_latency, .. } => {
+                    log::line(format_args!(
+                        "host {host}: interval {}.{:02} ms, latency {peripheral_latency}",
+                        conn_interval.as_micros() / 1000,
+                        conn_interval.as_micros() % 1000 / 10
+                    ));
                     set_flags(slot, |h| {
                         h.interval = (conn_interval.as_micros() / 1250) as u16;
                         h.latency = peripheral_latency;
@@ -709,16 +886,27 @@ async fn connection(
                 }
                 GattConnectionEvent::Gatt { event: e } => {
                     let mut cccd = false;
+                    let mut session = false;
+                    let mut requested = false;
                     if let GattEvent::Write(w) = &e {
                         if cccds(server).contains(&Some(w.handle())) {
                             cccd = true;
+                        } else if Some(w.handle()) == server.ctl.reply.cccd_handle {
+                            session = true;
+                        } else if w.handle() == server.ctl.request.handle {
+                            // Only a bonded host's (the attribute already wants an authenticated link): whether it may
+                            // ask is the RP2354B's to say.
+                            if with(|s| s.hosts[slot].bonded() && s.pairing_peer[slot].is_none()) {
+                                w.with_data(|_, d| link::send(&BtMsg::ControlRequest { host, data: d }));
+                                requested = true;
+                            }
                         } else if w.handle() == server.hid.leds.handle {
                             let leds = w.with_data(|_, d| d.first().copied().unwrap_or(0));
                             link::send(&BtMsg::Output { host, id: report::KEYBOARD, data: &[leds] });
                         }
                     }
                     if let Ok(reply) = e.accept() {
-                        reply.send().await;
+                        crate::stall::watched(stack, host, reply.send()).await;
                     }
                     // Accepted, the write is in the table: what the host has on now, kept with its bond.
                     if cccd {
@@ -726,15 +914,57 @@ async fn connection(
                         set_subscribed(slot, bits);
                         unsaved = Some((bits, Instant::now() + NOTIFY_SAVE_AFTER));
                     }
+                    // A control session starts or ends: only in RAM, never with the bond.
+                    if session {
+                        let on = control_session(server, &conn);
+                        let mtu = conn.raw().att_mtu();
+                        if on && mtu < control::MIN_MTU {
+                            log::line(format_args!("host {host}: ATT MTU {mtu}, too small for the control service"));
+                        }
+                        log::line(format_args!("host {host}: control session {}", if on { "open" } else { "closed" }));
+                        set_flags(slot, |h| {
+                            if on {
+                                h.flags |= host_flags::CONTROL;
+                            } else {
+                                h.flags &= !host_flags::CONTROL;
+                            }
+                        });
+                    }
+                    // The software asks in bursts: the short interval while they come.
+                    if requested {
+                        let was_fast = fast_until.is_some() || with(|s| in_use(s, slot));
+                        fast_until = Some(Instant::now() + CONTROL_FAST);
+                        if !was_fast {
+                            let _ = conn.raw().update_connection_params(stack, &params(true)).await;
+                        }
+                    }
                 }
                 _ => {}
             },
+            Either4::Second(Either3::Third(reply)) => {
+                // The answer to a request of this host's software, or an event for it. A session it ended gets none.
+                let encrypted = conn.raw().security_level().is_ok_and(|l| l.encrypted());
+                if encrypted && with(|s| s.hosts[slot].flags & host_flags::CONTROL != 0) {
+                    let _ = crate::stall::watched(stack, host, server.ctl.reply.notify(&conn, &reply, false)).await;
+                }
+            }
             Either4::Second(input) => {
                 // Queued reports first (motion before them was moved into the queue), then the motion so far: what
                 // comes while it goes out waits for the next one.
+                // On the ESP32, motion waits while the controller still holds [`MOTION_QUEUE`] packets, and adds up
+                // meanwhile: queued as it came, it went out late and in bursts whenever connection events were late
+                // (its controller serves them less evenly than the ESP32-C3's), and the pointer jumped.
+                if matches!(input, Either3::Second(())) && cfg!(target_arch = "xtensa") {
+                    let (free, all) = stack.link_credits();
+                    if all.saturating_sub(free) >= MOTION_QUEUE {
+                        crate::stall::SENT.reset();
+                        let _ = embassy_time::with_timeout(MOTION_WAIT, crate::stall::SENT.wait()).await;
+                    }
+                }
                 let Some((id, data, len)) = (match input {
-                    Either::First(r) => Some(r),
-                    Either::Second(()) => take_motion(slot),
+                    Either3::First(r) => Some(r),
+                    Either3::Second(()) => take_motion(slot),
+                    Either3::Third(_) => None,
                 }) else {
                     continue;
                 };
@@ -751,41 +981,61 @@ async fn connection(
                     set_flags(slot, |h| h.flags |= host_flags::ENCRYPTED);
                 }
                 let d = &data[..len as usize];
-                let _ = match id {
-                    report::KEYBOARD => {
-                        let mut v = [0u8; report::KEYBOARD_LEN];
-                        v[..d.len().min(8)].copy_from_slice(&d[..d.len().min(8)]);
-                        server.hid.keyboard.notify(&conn, &v, false).await
+                let send = async {
+                    match id {
+                        report::KEYBOARD => {
+                            let mut v = [0u8; report::KEYBOARD_LEN];
+                            v[..d.len().min(8)].copy_from_slice(&d[..d.len().min(8)]);
+                            server.hid.keyboard.notify(&conn, &v, false).await
+                        }
+                        report::MOUSE => {
+                            let mut v = [0u8; report::MOUSE_LEN];
+                            v[..d.len().min(8)].copy_from_slice(&d[..d.len().min(8)]);
+                            let r = server.hid.mouse.notify(&conn, &v, false).await;
+                            let (free, all) = stack.link_credits();
+                            flow_sent(host, slot, all.saturating_sub(free));
+                            r
+                        }
+                        report::CONSUMER => {
+                            let mut v = [0u8; report::CONSUMER_LEN];
+                            v[..d.len().min(2)].copy_from_slice(&d[..d.len().min(2)]);
+                            server.hid.consumer.notify(&conn, &v, false).await
+                        }
+                        report::POINTER => {
+                            let mut v = [0u8; report::POINTER_LEN];
+                            v[..d.len().min(8)].copy_from_slice(&d[..d.len().min(8)]);
+                            server.hid.pointer.notify(&conn, &v, false).await
+                        }
+                        report::GAMEPAD => {
+                            let mut v = [0u8; report::GAMEPAD_LEN];
+                            let n = d.len().min(report::GAMEPAD_LEN);
+                            v[..n].copy_from_slice(&d[..n]);
+                            server.hid.gamepad.notify(&conn, &v, false).await
+                        }
+                        _ => Ok(()),
                     }
-                    report::MOUSE => {
-                        let mut v = [0u8; report::MOUSE_LEN];
-                        v[..d.len().min(8)].copy_from_slice(&d[..d.len().min(8)]);
-                        server.hid.mouse.notify(&conn, &v, false).await
-                    }
-                    report::CONSUMER => {
-                        let mut v = [0u8; report::CONSUMER_LEN];
-                        v[..d.len().min(2)].copy_from_slice(&d[..d.len().min(2)]);
-                        server.hid.consumer.notify(&conn, &v, false).await
-                    }
-                    report::POINTER => {
-                        let mut v = [0u8; report::POINTER_LEN];
-                        v[..d.len().min(8)].copy_from_slice(&d[..d.len().min(8)]);
-                        server.hid.pointer.notify(&conn, &v, false).await
-                    }
-                    _ => Ok(()),
                 };
+                // A report that can't go out for long: the stack is stuck (`stall`).
+                let _ = crate::stall::watched(stack, host, send).await;
             }
             Either4::Third(Ctl::Disconnect) => conn.raw().disconnect(),
             Either4::Third(Ctl::Params) => {
                 let selected = with(|s| in_use(s, slot));
-                let _ = conn.raw().update_connection_params(stack, &params(selected)).await;
+                let _ = conn.raw().update_connection_params(stack, &params(selected || fast_until.is_some())).await;
             }
-            Either4::Fourth(Either::Second(())) => {
+            Either4::Fourth(Either3::Second(())) => {
                 if let Some((bits, _)) = unsaved.take() {
                     store_notifications(slot, bits);
                 }
             }
-            Either4::Fourth(Either::First(value)) => {
+            Either4::Fourth(Either3::Third(())) => {
+                // The host's software went quiet: back to the interval its place says.
+                fast_until = None;
+                if !with(|s| in_use(s, slot)) {
+                    let _ = conn.raw().update_connection_params(stack, &params(false)).await;
+                }
+            }
+            Either4::Fourth(Either3::First(value)) => {
                 waiting_passkey = false;
                 let _ = match value {
                     Some(v) => conn.raw().pass_key_input(v),
@@ -808,7 +1058,7 @@ async fn connection(
             s.pairing_now[slot] = false;
         });
         set_flags(slot, |h| {
-            h.flags &= !(host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED);
+            h.flags &= !(host_flags::CONNECTED | host_flags::ENCRYPTED | host_flags::SUBSCRIBED | host_flags::CONTROL);
             h.interval = 0;
             h.latency = 0;
         });
@@ -830,8 +1080,9 @@ async fn control(stack: &'static St) {
                 if (1..=MAX_HOSTS).contains(&slot) && with(|s| in_use(s, slot - 1)) {
                     let i = slot - 1;
                     if Motion::is_motion(id) {
+                        flow_input(i);
                         if let Some((_, id, d)) = MOTION[i].lock(|m| m.borrow_mut().add(host, id, data)) {
-                            let _ = REPORTS[i].try_send((id, d, 8));
+                            let _ = REPORTS[i].try_send(queued(id, &d));
                         }
                         MOTION_READY[i].signal(());
                     } else {
@@ -839,10 +1090,7 @@ async fn control(stack: &'static St) {
                         while let Some(r) = take_motion(i) {
                             let _ = REPORTS[i].try_send(r);
                         }
-                        let mut d = [0u8; 8];
-                        let n = data.len().min(8);
-                        d[..n].copy_from_slice(&data[..n]);
-                        let _ = REPORTS[i].try_send((id, d, n as u8));
+                        let _ = REPORTS[i].try_send(queued(id, data));
                     }
                 }
             }
@@ -897,6 +1145,12 @@ async fn control(stack: &'static St) {
             BtMsg::Passkey { host, value } => {
                 if let Some(slot) = (host as usize).checked_sub(1).filter(|i| *i < MAX_HOSTS) {
                     PASSKEY[slot].signal(value);
+                }
+            }
+            BtMsg::ControlReply { host, data } => {
+                // Dropped if the host's software is that far behind: it times out and asks again.
+                if let Some(slot) = (host as usize).checked_sub(1).filter(|i| *i < MAX_HOSTS) {
+                    let _ = CONTROL_OUT[slot].try_send(control::pad(data));
                 }
             }
             BtMsg::Policy { host, policy } => {

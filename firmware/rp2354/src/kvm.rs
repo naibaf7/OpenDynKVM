@@ -1,15 +1,15 @@
 //! The engine (`kvm_core::Engine`) and where its outputs go. Only core-0 tasks call into it.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use defmt::warn;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
 use embassy_sync::signal::Signal;
 use kvm_core::config::Config;
-use kvm_core::engine::{Engine, Output};
-use kvm_proto::ctrl::{FwState, Info, Pc, Port, RebootTarget};
+use kvm_core::engine::{Engine, FwOp, Output};
+use kvm_proto::ctrl::{FwState, FwTarget, Info, Pc, Port, RebootTarget};
 use kvm_proto::link::LinkMsg;
 use kvm_proto::link::msg::{CTRL_REPLY_CHUNK, Command, CtrlStatus, fragments};
 
@@ -21,6 +21,8 @@ use crate::{link, power};
 /// in, so no stack ever holds a copy.
 static ENGINE: Mutex<ThreadModeRawMutex, RefCell<Engine>> = Mutex::new(RefCell::new(Engine::empty()));
 static BOARD: Mutex<ThreadModeRawMutex, RefCell<Option<Board>>> = Mutex::new(RefCell::new(None));
+/// The update under way is the Bluetooth module's (its operations go to `modstream.rs`).
+static MODULE_UPDATE: AtomicBool = AtomicBool::new(false);
 
 /// Something changed that belongs in flash (the storage task pulls the items from the engine).
 pub static SAVE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -106,7 +108,16 @@ fn route(e: &mut Engine, o: Output) {
         Output::Save => SAVE.signal(()),
         Output::Reboot(t) => REBOOT.signal(t),
         Output::Firmware(op) => {
-            if crate::update::OPS.try_send(op).is_err() {
+            // The module's firmware goes past the update writer, to the module (`modstream.rs`).
+            if let FwOp::Begin { target, .. } = &op {
+                MODULE_UPDATE.store(*target == FwTarget::Module, Ordering::Relaxed);
+            }
+            let sent = if MODULE_UPDATE.load(Ordering::Relaxed) {
+                crate::modstream::pass(op, e)
+            } else {
+                crate::update::OPS.try_send(op).is_ok()
+            };
+            if !sent {
                 warn!("firmware update queue full");
                 e.set_fw_state(FwState::Failed, 0);
             }

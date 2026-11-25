@@ -15,8 +15,8 @@ Using the KVM is in the [README](README.md).
 | [`hardware/errata.md`](hardware/errata.md) | Faults of boards already ordered: which versions, the firmware workaround, the fix for the next board |
 | [`hardware/case/`](hardware/case/) | The 3D-printable case: STEP for CAD, 3MF for the slicer, generated from the board by `gen_case.py` |
 | [`analysis.md`](analysis.md), [`report.md`](report.md) | Design reviews of the schematic and the routed board, and the router's development report |
-| `crates/` | Shared Rust crates: protocols (`kvm-proto`), HID parsing (`kvm-hid`), the KVM logic (`kvm-core`), the USB device core (`kvm-usbdev`), Vial and the keymap engine (`kvm-vial`) |
-| `firmware/rp2354/`, `firmware/at32f405/`, `firmware/esp32c3/` | The firmware images (each its own Cargo workspace); the ESP32-C3 one is for the optional Bluetooth module |
+| `crates/` | Shared Rust crates: protocols (`kvm-proto`), HID parsing (`kvm-hid`), the KVM logic (`kvm-core`), the USB device core (`kvm-usbdev`), Vial and the keymap engine (`kvm-map`) |
+| `firmware/rp2354/`, `firmware/at32f405/`, `firmware/esp32c3/`, `firmware/esp32/` | The firmware images (each its own Cargo workspace); the ESP32-C3 and ESP32 ones are for the optional Bluetooth module (the ESP32's dual mode, with Bluetooth Classic) |
 | `software/odkvmctl/` | `odkvmctl` (command line) and `opendyn-kvm` (window and tray icon) for Windows, Linux and macOS |
 | `xtask/` | `cargo xtask dist`: the firmwares and the files to flash; `cargo xtask package`: the host software's installers; `cargo xtask desktop`: the development build's menu entry and icons (Linux) |
 | [`branding/`](branding/) | The logo, the wordmark and the application icons as SVG, and the script that draws them |
@@ -29,7 +29,11 @@ Using the KVM is in the [README](README.md).
   `rust-toolchain.toml`, so rustup installs `thumbv8m.main-none-eabihf`, `thumbv7em-none-eabihf` and
   `riscv32imc-unknown-none-elf` on first use. A distribution `rustc` without these targets (Fedora's, for example)
   won't build the firmware: put `~/.cargo/bin` first in `PATH`.
-- **espflash** (`cargo install espflash`) for the Bluetooth module's flash image in `cargo xtask dist`.
+- **espflash** (`cargo install espflash`) for the Bluetooth module's flash images in `cargo xtask dist`.
+- **The Xtensa toolchain** for the ESP32 module's firmware (`firmware/esp32`): `cargo install espup`, then
+  `espup install --targets esp32` (with `~/.cargo/bin` in `PATH`). Its `rust-toolchain.toml` picks the `esp` channel;
+  `cargo xtask dist` finds the Xtensa linker by itself, a build by hand needs `. ~/export-esp.sh` first. Without it
+  `dist` makes no ESP32 module image.
 - **Windows build of odkvmctl from Linux** (optional): `rustup target add x86_64-pc-windows-gnu` and MinGW-w64.
 - odkvmctl's USB access is pure Rust on Windows and Linux: no libudev or C compiler is needed. On macOS it is hidapi's
   C backend, built with Xcode's command line tools: the macOS app is built on a Mac
@@ -82,7 +86,10 @@ cargo xtask package --macos                            # on a Mac: the macOS app
 OPENDYN_SHOTS=/tmp/shots cargo test -p odkvmctl --bin opendyn-kvm -- --ignored screenshots   # every GUI page as an image
 OPENDYN_SIM_BT=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim   # the same with the Bluetooth module (0.16.0)
 OPENDYN_SIM_BT=dongle cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the module as an ESP32-C3 board on Other
+OPENDYN_SIM_BT=needs-update cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # a module waiting for its firmware
 OPENDYN_SIM_HOP=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # the same with screen hop set up
+OPENDYN_SIM_PAD=1 cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # a gamepad on Other (the Keymaps page, calibration)
+OPENDYN_SIM_PAD=receiver cargo run -p odkvmctl --bin opendyn-kvm -- --sim  # a pad receiver (symmetric: touch-pad pad)
 OPENDYN_LANG=de cargo run -p odkvmctl --bin odkvmctl -- --sim       # in German (en, fr, de, nb, zh; or Settings → Language)
 # The GUI with the simulator in a browser (software.md §9 "On the web"; needs the wasm32-unknown-unknown target and
 # wasm-bindgen-cli of the wasm-bindgen version in Cargo.lock); serve target/web with a <canvas id="opendyn-kvm"> page:
@@ -90,8 +97,9 @@ cargo build -p odkvmctl --bin opendyn-kvm --release --target wasm32-unknown-unkn
 wasm-bindgen --target web --no-typescript --out-dir target/web target/wasm32-unknown-unknown/release/opendyn-kvm.wasm
 ```
 
-`cargo xtask dist` builds the AT32F405 firmware, then the RP2354B firmware with it embedded, and the Bluetooth
-module's image; the files it writes and what each is for are in [software.md §10](software.md).
+`cargo xtask dist` builds the AT32F405 firmware and the Bluetooth module's images, one per chip
+(`kvm-module-esp32c3.bin`, `kvm-module-esp32.bin`, which the host software streams to the module), then the RP2354B
+firmware with the AT32F405's embedded and the module images' SHA-256 (it takes no other module image); the files it writes and what each is for are in [software.md §10](software.md).
 
 `cargo xtask package` writes the host software's installers:
 
@@ -128,8 +136,8 @@ Hardware, firmware and host software each carry a `major.minor.patch` version.
 | What | Now | Where it is set |
 |---|---|---|
 | Hardware | **0.18.0** in design, not ordered yet (0.13.0 to 0.17.0 were designed and never ordered). **0.12.0** is the board ordered as revision 12 | `HW_VERSION` in `hardware/tools/gen_pcb.py` (printed on the board: the design's version) and `kvm_proto::HARDWARE_VERSION` (what the firmware reports: the newest board that was ordered, still 0.12.0) |
-| Firmware, RP2354B and both AT32F405s alike | **0.1.50** | `kvm_proto::FIRMWARE_VERSION` |
-| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.50** | `version` in the root `Cargo.toml` |
+| Firmware, RP2354B and both AT32F405s alike | **0.1.66** | `kvm_proto::FIRMWARE_VERSION` |
+| Host software (`odkvmctl`, `opendyn-kvm`, the installers) | **0.1.66** | `version` in the root `Cargo.toml` |
 
 - **Hardware:** a new major version is a different board: 1.0.0 will be the mass-production board, 2.0.0 a new design.
   Minor versions are revisions of the same board. When a board is ordered:

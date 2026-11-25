@@ -13,6 +13,8 @@
 //! - [`devices`]: the Bluetooth devices: looking for them, pairing, reconnecting, their reports.
 //! - [`bonds`]: the four host slots in the last two sectors of the flash, the four device slots in the two before,
 //!   which the RP2354B's image never reaches.
+//! - [`radio`]: the controller as the stack's HCI.
+//! - [`stall`]: a report that doesn't go out for long restarts the module.
 //!
 //! IO9 (the BOOT strap) is on the RP2354B's TX line: it is never driven here. IO3 carries a plain-text log (UART1 TX,
 //! 115200) to the board's test pad TP1601.
@@ -27,6 +29,8 @@ mod bonds;
 mod devices;
 mod link;
 mod log;
+mod radio;
+mod stall;
 
 use embassy_executor::Spawner;
 use esp_rtos::embassy::InterruptExecutor;

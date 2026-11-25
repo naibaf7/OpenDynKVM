@@ -57,6 +57,12 @@ pub mod gd {
 }
 
 /// Consumer page.
+/// Simulation controls page.
+pub mod sim {
+    pub const ACCELERATOR: u16 = 0xC4;
+    pub const BRAKE: u16 = 0xC5;
+}
+
 pub mod consumer {
     pub const CONSUMER_CONTROL: u16 = 0x01;
     pub const AC_PAN: u16 = 0x238;

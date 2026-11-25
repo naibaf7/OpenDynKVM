@@ -5,11 +5,12 @@
 
 use heapless::Vec;
 
+use crate::gamepad::{self, GamepadInput, HAT_CENTRE};
 use crate::keyboard::KeyState;
 use crate::mouse::MouseInput;
 use crate::normalized::CONSUMER_SLOTS;
 use crate::parser::{Field, Layout, MAX_FIELDS, ReportType};
-use crate::usage::{consumer, gd, id_of, key, page, page_of, usage};
+use crate::usage::{consumer, gd, id_of, key, page, page_of, sim, usage};
 
 /// What kind of device an interface looks like (for the port summary and the Auto policy).
 pub mod caps {
@@ -52,6 +53,10 @@ enum Kind {
     ConsumerBits,
     SystemArray,
     SystemBits,
+    /// A gamepad's or joystick's buttons, axes and hat ([`GamepadInput`]).
+    PadButtons,
+    PadAxes,
+    PadHat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -100,6 +105,45 @@ pub struct Translation {
     pub consumer: Option<ConsumerState>,
     /// `normalized::system` bits.
     pub system: Option<u8>,
+    pub gamepad: Option<GamepadInput>,
+}
+
+/// What controls a device has, for the host software's picture of it (hid_mapping.md §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Controls {
+    /// Mouse buttons and gamepad buttons, as masks (bit n = button n + 1).
+    pub mouse_buttons: u16,
+    pub pad_buttons: u32,
+    /// Bits: mouse X/Y, wheel, pan.
+    pub mouse_axes: u8,
+    /// Bit per [`gamepad::axis`].
+    pub pad_axes: u16,
+    pub hat: bool,
+    pub keyboard: bool,
+}
+
+/// The gamepad axis a usage is (generic desktop X–Dial, simulation brake and accelerator).
+fn pad_axis(u: u32) -> Option<usize> {
+    match (page_of(u), id_of(u)) {
+        (page::GENERIC_DESKTOP, a @ gd::X..=gd::DIAL) => Some((a - gd::X) as usize),
+        (page::SIMULATION, sim::BRAKE) => Some(gamepad::axis::BRAKE),
+        (page::SIMULATION, sim::ACCELERATOR) => Some(gamepad::axis::ACCELERATOR),
+        _ => None,
+    }
+}
+
+/// How a field of a gamepad or joystick reads.
+fn pad_kind(f: &Field) -> Kind {
+    let first = f.usages.first().map(|r| r.min).unwrap_or(0);
+    match page_of(first) {
+        page::BUTTON if f.is_variable() => Kind::PadButtons,
+        page::GENERIC_DESKTOP if f.all_usages().any(|u| id_of(u) == gd::HAT_SWITCH) => Kind::PadHat,
+        page::GENERIC_DESKTOP | page::SIMULATION if f.is_variable() && !f.is_relative() => {
+            if f.all_usages().any(|u| pad_axis(u).is_some()) { Kind::PadAxes } else { Kind::Ignore }
+        }
+        _ => Kind::Ignore,
+    }
 }
 
 pub struct Translator {
@@ -170,6 +214,43 @@ impl Translator {
 
     pub fn verdict(&self) -> Verdict {
         self.verdict
+    }
+
+    /// The controls the device has.
+    pub fn controls(&self) -> Controls {
+        let mut c = Controls::default();
+        for (f, kind) in self.layout.fields.iter().zip(&self.kinds) {
+            for u in f.all_usages() {
+                match kind {
+                    Kind::KeyBits | Kind::KeyArray => c.keyboard = true,
+                    Kind::Buttons => {
+                        if let b @ 1..=16 = id_of(u) {
+                            c.mouse_buttons |= 1 << (b - 1);
+                        }
+                    }
+                    Kind::Axes => {
+                        c.mouse_axes |= match (page_of(u), id_of(u)) {
+                            (page::GENERIC_DESKTOP, gd::X | gd::Y) => 0b0011,
+                            (page::GENERIC_DESKTOP, gd::WHEEL) => 0b0100,
+                            _ => 0b1000,
+                        }
+                    }
+                    Kind::PadButtons => {
+                        if let b @ 1..=32 = id_of(u) {
+                            c.pad_buttons |= 1 << (b - 1);
+                        }
+                    }
+                    Kind::PadAxes => {
+                        if let Some(a) = pad_axis(u) {
+                            c.pad_axes |= 1 << a;
+                        }
+                    }
+                    Kind::PadHat => c.hat = true,
+                    _ => {}
+                }
+            }
+        }
+        c
     }
 
     pub fn translate(&self, report: &[u8]) -> Translation {
@@ -270,6 +351,32 @@ impl Translator {
                         }
                     }
                 }
+                Kind::PadButtons => {
+                    let g = t.gamepad.get_or_insert_default();
+                    for e in 0..n {
+                        if f.read_raw(payload, e) != 0
+                            && let Some(b @ 1..=32) = f.usage(e).map(id_of)
+                        {
+                            g.buttons |= 1 << (b - 1);
+                        }
+                    }
+                }
+                Kind::PadAxes => {
+                    let g = t.gamepad.get_or_insert_default();
+                    for e in 0..n {
+                        if let Some(a) = f.usage(e).and_then(pad_axis) {
+                            let trigger = gamepad::axis::is_trigger(a);
+                            g.axes[a] = gamepad::normalize(f.read(payload, e), f.logical_min, f.logical_max, trigger);
+                            g.present |= 1 << a;
+                        }
+                    }
+                }
+                Kind::PadHat => {
+                    let g = t.gamepad.get_or_insert_default();
+                    let (v, min, max) = (f.read(payload, 0), f.logical_min, f.logical_max);
+                    // Out of range: the null state, at rest. Four positions read as the main directions.
+                    g.hat = if v < min || v > max { HAT_CENTRE } else { ((v - min) * 8 / (max - min + 1)) as u8 };
+                }
                 Kind::Ignore => {}
             }
         }
@@ -363,7 +470,7 @@ fn classify(f: &Field, channels: &[u32], v: &mut Verdict) -> Kind {
     if is_gamepad_app(f) {
         v.caps |= caps::GAMEPAD;
         v.misfit |= misfit::GAMEPAD;
-        return Kind::Ignore;
+        return pad_kind(f);
     }
 
     match pg {
@@ -399,6 +506,7 @@ fn classify(f: &Field, channels: &[u32], v: &mut Verdict) -> Kind {
             if f.all_usages().any(|u| matches!(id_of(u), gd::Z..=gd::DIAL | gd::HAT_SWITCH)) {
                 v.caps |= caps::GAMEPAD;
                 v.misfit |= misfit::GAMEPAD;
+                return pad_kind(f);
             } else {
                 v.caps |= caps::OTHER;
                 v.misfit |= misfit::UNKNOWN_USAGE;
@@ -507,6 +615,20 @@ mod tests {
     fn gamepad_and_vendor_inputs_do_not_fit() {
         let g = tr(GAMEPAD).verdict();
         assert!(!g.fits() && g.caps & caps::GAMEPAD != 0 && g.misfit & misfit::GAMEPAD != 0);
+        // Mirrored by Auto, but read all the same, for a gamepad set to Normalized.
+        let t = tr(GAMEPAD);
+        let pad = t.translate(&[0x01, 0x20, 0x02, 0, 255, 128, 64]).gamepad.unwrap();
+        assert_eq!((pad.buttons, pad.hat), (1 | 1 << 13, 2));
+        assert_eq!(&pad.axes[..6], &[-32767, 32767, 128, 0, 0, -16320]);
+        use crate::gamepad::axis;
+        assert_eq!(pad.present, 1 << axis::X | 1 << axis::Y | 1 << axis::Z | 1 << axis::RZ);
+        assert_eq!(
+            t.translate(&[0, 0, 0x0F, 0, 0, 0, 0]).gamepad.unwrap().hat,
+            crate::gamepad::HAT_CENTRE,
+            "null state"
+        );
+        let c = t.controls();
+        assert_eq!((c.pad_buttons, c.hat, c.pad_axes, c.mouse_buttons), ((1 << 14) - 1, true, pad.present, 0));
         let v = tr(MOUSE_VENDOR_BUTTONS).verdict();
         assert_eq!(v.misfit, misfit::VENDOR_INPUT);
         assert!(v.caps & caps::MOUSE != 0);

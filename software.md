@@ -10,6 +10,7 @@ C/C++ is the fallback for two specific parts, each with a decision gate (§11).
 | [`firmware/rp2354`](firmware/rp2354) | RP2354B | Rust, `embassy-rp` 0.10, `embassy-usb-host` 0.1 | Own driver for the RP2350's **native** USB host controller (§4.2). |
 | [`firmware/at32f405`](firmware/at32f405) | 2 × AT32F405 | Rust, `at32f4xx-pac` 0.4, `embassy-executor`, `embassy-usb-synopsys-otg` 0.4 | The OTGHS core is a dwc2; the AT32-specific parts are clocks, PHY power-up and the SPI slave. |
 | [`firmware/esp32c3`](firmware/esp32c3) | ESP32-C3-MINI-1 (boards 0.16.0 on, when fitted) | Rust, `esp-hal` 1.2, `esp-rtos` 0.4, `esp-radio` 1.0 (beta), `trouble-host` 0.8 | Bluetooth LE keyboard and mouse towards up to four hosts (§4.13). |
+| [`firmware/esp32`](firmware/esp32) | an original ESP32 (an ESP32 board on a front port; a module on a board to come) | Rust (Xtensa toolchain), the ESP32-C3 firmware's modules, `kvm-classic`, a patched `esp-radio` | The same, dual mode: Bluetooth Classic gamepads too (§4.13, "The ESP32 module"). |
 | [`software/odkvmctl`](software/odkvmctl) | Windows, Linux | Rust, `hidapi`, `clap`, `egui`/`eframe`, `tray-icon` (Windows), `ksni` (Linux) | One crate, two binaries: `odkvmctl` (CLI) and `opendyn-kvm` (window + tray icon). |
 | [`crates/`](crates) | all of the above | Rust, `no_std` | Protocols, HID parsing, switching logic, USB device core. Tested on the PC with `cargo test`. |
 
@@ -46,7 +47,7 @@ crates/
   kvm-hid/                 HID report-descriptor parser, field codec, normalized formats and their descriptors
   kvm-core/                hotkeys, switching, Auto policy, descriptor-set builder, config, control-request handler,
                            the flash store (§4.8)
-  kvm-vial/                Vial protocol, keymap and keymap engine (§4.11); parts adapted from RMK
+  kvm-map/                Vial protocol, keymap and keymap engine (§4.11); parts adapted from RMK
   kvm-usbdev/              USB device core that serves a descriptor set (generic over embassy-usb-driver)
 firmware/
   rp2354/                  RP2354B image (own Cargo workspace, target thumbv8m.main-none-eabihf)
@@ -184,6 +185,20 @@ keyboard's LEDs are its target's.
     such a device, unless that hub's own link to the PC (the AT32F405's) is full speed. Until 0.1.11 it showed
     Hub-0's full speed (first board, 2026-11-12, a USB 2.0 flash drive on Other).
 - **Auto policy** is design.md §4 verbatim, as a pure function with unit tests.
+- **XInput pads** (`kvm_hid::xinput`, no report descriptor): a wired pad (interface 0xFF/0x5D/0x01) is mirrored by
+  Auto, and normalized when set so. A wireless receiver (one interface 0xFF/0x5D/0x81 per pad, each with a headset
+  interface 0x82) passes through by Auto, which gives the PC all four pads, the headsets and the receiver's own
+  driver; set to Normalized, the KVM polls its first pad interface (`ConfigInfo::polled`: one pad, two interrupt
+  pipes), asks the receiver whether a pad is linked when it starts hosting it (`INQUIRY`), lights the pad's player
+  LED when it links, and decodes its input (the wired report from the packet's fifth byte); a pad that leaves lets
+  go of everything. Both are decoded in the standard gamepad order, with the d-pad as the hat and the triggers as the
+  brake and accelerator. Rumble from the PCs doesn't reach them.
+- **Pad profiles** (`kvm-core::pads`, by VID/PID): the symmetric-stick pads of vendor 0x054C (the 4 and 5 series)
+  number their face buttons left, bottom, right, top and put the right stick on Z/Rz and the triggers on Rx/Ry; the
+  profile reorders them into the standard order before the field overrides and the calibration, and reads the 5
+  series' touch pad from its vendor data (the first finger's contact as button 20, its position as the slider and the
+  dial). Any other HID pad keeps its own numbering. The profile's style (generic, offset sticks, symmetric sticks)
+  tells the host software how to draw the pad.
 - **Profiles** (`kvm-core::config::Profile`, design.md §4): up to eight, each a name, every device's mode and routing,
   and a screen-hop arrangement. The settings in force are the active profile's, and the `Mode` and `Route` settings
   change that profile. Any change of the settings in force (a device's mode or routing, the active profile, its
@@ -318,8 +333,10 @@ hotkeys also work on a mirrored keyboard.
 
 ### 4.8 Config and keymap storage
 
-The config, the keymap layers, the macros and the keymap settings are items in a **log-structured key-value store**
-(`kvm-core::store`) on the **data partition** (68 KB = 17 sectors at 1976 KB, §4.9).
+The config, the keymaps (layers and axis rules), the macros, the keymap settings and the gamepads' calibrations are
+items in a **log-structured key-value store**
+(`kvm-core::store`) on the **data partition** (244 KB = 61 sectors at 1800 KB, §4.9; 68 KB = 17 sectors before
+0.1.51).
 
 - **Why a log:** NOR flash programs bits only from 1 to 0, a 1 comes back only by erasing a whole 4 KB sector, and
   each sector is rated for 100 000 erases. Erasing and rewriting one sector per value would put every save's erase on
@@ -335,24 +352,26 @@ The config, the keymap layers, the macros and the keymap settings are items in a
   short leaves an item whose CRC fails; reading stops there and the value before it stays in force. A cut garbage
   collection leaves two copies, and the newer wins. A host test cuts the power after every byte and erase of a run of
   writes and checks that no committed value is lost (`power_cuts_never_lose_a_committed_value`).
-- **What is written, when:** the engine marks what changed (config, each screen-hop arrangement, each of the 8 layers,
-  macros, keymap settings) and
-  emits `Save` 5 s after the last change, or at once on `odkvmctl config save`. The storage task then writes only the
-  changed items (`Engine::take_save_item`). Switching PCs, Bluetooth hosts or screens never writes flash; changing
-  profile does only with "power up in the profile last active". A change made while the storage task writes keeps its
-  own autosave (`Engine::config_saved`).
+- **What is written, when:** the engine marks what changed (config, each screen-hop arrangement, each of the 32 layers,
+  each keymap's axis rules, each known device's calibration and field overrides, macros, keymap settings) and emits
+  `Save` 5 s after the last change, or at once on `odkvmctl config save`. The storage task then writes only the changed
+  items (`Engine::take_save_item`). Switching PCs, Bluetooth hosts or screens never writes flash; changing profile does
+  only with "power up in the profile last active". A change made while the storage task writes keeps its own autosave
+  (`Engine::config_saved`).
 - **Save pacing:** up to 30 saves go ahead as they come; after that at most one a minute, which is also how fast the
   allowance comes back (`SAVE_BURST`, `SAVE_PACE_MS`). Setting the KVM up never meets it. It holds a host script that
   changes a setting every few seconds, or saves in a loop, to 1 440 saves a day; a `SaveConfig` held back leaves
   `CONFIG_DIRTY` set until it is written.
 - **Endurance** (W25Q16JV in the RP2354: 100 000 erase cycles per sector), measured by
-  `endurance_with_the_firmware_items` with everything the firmware stores at its largest (8 layers, a full macro buffer,
-  Vial's tap dances, combos, key overrides and alternate repeat keys, the records and the four arrangements with every
-  screen slot used, 7.8 KB carried around the ring) and the config at its largest (704 bytes, `config::ITEM_MAX`: 664
-  with everything set, 632 with the defaults, as all eight profiles' names, modes and routings are written; the
-  arrangements have items of their own): each sector is erased once per 74 config saves, the 17 within one cycle of
-  each other, so 7.5 million saves before the first sector reaches its rated cycles. Paced, that is about 14 years of
-  a script saving once a minute day and night; set up by hand, it doesn't wear out.
+  `endurance_with_the_firmware_items` with everything the firmware stores at its largest (the 4 keymaps' 32 layers and
+  axis rules, 16 known devices' calibrations and field overrides, a full macro buffer, Vial's tap dances, combos, key
+  overrides and alternate repeat keys, the records and the four arrangements with every screen slot used: 29.3 KB
+  carried around the ring) and the config at its largest (800 bytes, `config::ITEM_MAX`: 752 with everything set, 720
+  with the defaults, as all eight profiles' names, modes, routings, keymaps and fallback keymaps and the six hosts'
+  keyboard layouts are written; the arrangements have items of their own): each sector is erased once per 266 config
+  saves, the 61 within one cycle of each other, so 26.7 million saves before the first sector reaches its rated cycles
+  (17 sectors before 0.1.51, with one keymap: 74 saves, 7.5 million). Paced, that is about 50 years of a script
+  saving once a minute day and night; set up by hand, it doesn't wear out.
   The two alternating 4 KB slots used before erased a sector on every save: 200 000 saves.
 - **Erase counts** are in each sector's header, for the boot log (`at most N erases per sector`). The spare sector has
   no header, so at mount it takes the highest count of the others (`erase_counts_survive_remounts`).
@@ -369,19 +388,22 @@ The config, the keymap layers, the macros and the keymap settings are items in a
 | Offset | Size | Use |
 |---|---|---|
 | 0 | 8 KB | partition table (boot ROM block, encoded as `picotool partition create` does) |
-| 8 KB | 984 KB | partition A |
-| 992 KB | 984 KB | partition B, the A/B partner of A |
-| 1976 KB | 68 KB | partition "data" (id 2): config and keymap store (§4.8). Not bootable, accepts no UF2 family |
+| 8 KB | 896 KB | partition A |
+| 904 KB | 896 KB | partition B, the A/B partner of A |
+| 1800 KB | 244 KB | partition "data" (id 2): config and keymap store (§4.8). Not bootable, accepts no UF2 family |
 | 2044 KB | 4 KB | free: the RP2350-E10 workaround block (picotool `--abs-block`, at 0x10FF_FF00) lands in the last sector |
 
-- **The partition geometry is fixed once a board is flashed.** At boot `update.rs` checks the table against the
-  constants in `flash.rs`. A firmware built with another geometry switches USB updates off on a board with the old
-  table, and every board would need the pinhole + PWR/SERVICE + `kvm-first.uf2` procedure. What lives *inside* the
-  data partition is the firmware's own and may change with any update (items carry versions).
-- The image is 922 KB of the 984 KB (2026-11-19, with the AT32F405 and ESP32-C3 images it carries, Vial and the
-  Bluetooth devices: the module's image grew 66 KB compressed with its central role, and the engine 44 KB with the
-  pinned devices' ways and the device slots' translators; the engine's static is initialised data, so its size is
-  taken from flash too).
+- **The geometry changed once, with 0.1.51** (`kvm_proto::rpimage::layout::SINCE`): A and B went from 984 to
+  896 KB and the data partition from 68 to 244 KB, as the Bluetooth module's firmware left the RP2354B image (the host
+  software streams it to the module, §4.13). At boot `update.rs` checks the table against `flash.rs`; on any other
+  table USB updates are off and the data partition is left alone too (`flash::layout_ours`: on the table from before
+  0.1.51 it would lie in that table's partition B), so the config lives in RAM only. A board with the old table goes
+  over once through the service port (below): the app and `odkvmctl update` recognise its table and give it
+  `kvm-first.uf2`, and an update over a PC port never crosses 0.1.51 (`image::check_layout`). The old data partition's
+  17 sectors are the last 17 of the new one, so its store is meant to mount there (not tried on a board yet). What
+  lives *inside* the data partition is the firmware's own and may change with any update (items carry versions).
+- The image is 597 KB of the 896 KB (2026-11-21, 0.1.51: with the AT32F405's 42 KB, without the module's; until 0.1.50
+  it carried the module's too, compressed, and took 946 KB of 984 KB).
 
 **RP2354B update** (`update.rs`; RP2350 datasheet §5.1.16–5.1.17):
 1. `odkvmctl update kvm-rp2354.bin` (or the `.uf2`, or the app's Firmware page) checks that the file is an RP2350 Arm
@@ -397,6 +419,8 @@ The config, the keymap layers, the macros and the keymap settings are items in a
 5. The boot ROM starts the new image under its 16.7 s watchdog. The image calls `explicit_buy` as soon as Hub-0 is
    enumerated and one link has answered (§4.10). The ROM then clears the TBYB flag and erases the old image's first
    sector. If the image hangs or fails that check, the watchdog reboots into the old image.
+6. The host software then streams the release's module firmware for its chip (`kvm-module-<chip>.bin`) once the KVM is back and its module
+   says it runs another version (§4.13), with no key: the new firmware takes only that image.
 - The same image without the TBYB flag (UF2 drag-and-drop, picotool, a debug probe) boots normally and needs no buy.
 - Without the expected partition table (a board flashed by a debug probe), `Info.caps` leaves out `FW_UPDATE` and the
   engine refuses `FwBegin`.
@@ -407,13 +431,15 @@ doesn't come up on the PC ports, from a computer on PWR/SERVICE. The firmware ro
 held while plugging in, or `odkvmctl reboot bootloader`. The ROM then shows its `RP2350` drive and its PICOBOOT
 interface (2e8a:000f; RP2350 datasheet §5.5–5.6).
 - **Which board:** PICOBOOT's GET_INFO `UF2_TARGET_PARTITION` (rp2350-arm-s) says where an image would go. The KVM's
-  A (sectors 2–247) or B (248–493), from `kvm_proto::rpimage::layout`: a KVM, whose other partition holds the firmware
-  in use (its IMAGE_DEF's `VERSION` item, read from the first 4 KB with READ). 0xFF (no partition table) and erased
+  A (sectors 2–225) or B (226–449), from `kvm_proto::rpimage::layout`: a KVM, whose other partition holds the firmware
+  in use (its IMAGE_DEF's `VERSION` item, read from the first 4 KB with READ). The table from before 0.1.51 (A 2–247,
+  B 248–493): a KVM that takes `kvm-first.uf2`, which writes the new table. 0xFF (no partition table) and erased
   flash: a new board; no partition table but the KVM's `FwId` in the image at the start of flash: a board flashed by a
   debug probe, set up like a new one. Anything else (another table, other firmware) is not a KVM and isn't touched.
 - **Installing:** the UF2 the board takes, copied onto the drive as dragging it would (`OPENDYN.UF2`, flushed in
   64 KB steps): a KVM gets the update UF2 (`kvm-rp2354.uf2`, or one made from the `.bin`), which the ROM writes into
-  the partition not booted; a new board gets `kvm-first.uf2` (partition table and A). The ROM then does a flash update
+  the partition not booted; a new board, or one with the table from before 0.1.51, gets `kvm-first.uf2` (partition
+  table and A, B's first sector erased, the data partition left as it is). The ROM then does a flash update
   boot: the new image is chosen whatever its version and the other partition's start is erased (§5.1.16), so this
   also installs an older version. PICOBOOT's `UF2_STATUS` counts the blocks the ROM has written (the progress bar, and
   its abort reasons as errors); the device leaving the bus means it restarted. Nothing is sent over PICOBOOT while the
@@ -480,8 +506,7 @@ The self-test (`selftest.rs`, design.md §10 step 1.5) runs at every boot and re
 | `AT32_FW1`, `AT32_FW2` | reprogramming an AT32F405 (§4.9) failed this boot; tried again at the next power-up |
 | `AT32_GAVE_UP1`, `AT32_GAVE_UP2` | 5 attempts in a row failed: no more until the image changes, the key is held at power-up, or `at32-retry` |
 | `AT32_XTAL1`, `AT32_XTAL2` | the AT32F405's 12 MHz crystal doesn't run: it works on its internal oscillator, without USB to its PC |
-| `BT_FW` | the Bluetooth module (when fitted, §4.13) doesn't run the embedded firmware this boot; tried again at the next power-up |
-| `BT_GAVE_UP` | 5 attempts in a row at programming the Bluetooth module failed: no more until the image changes, the key is held at power-up, or `wireless-retry` |
+| `BT_FW` | the Bluetooth module (when fitted, or a dongle, §4.13) doesn't run this firmware's version and waits for the host software to send it; not shown on the key |
 | `HUB1`, `HUB2` | a PC supplies VBUS, but its hub never resets the AT32F405 (judged 8 s after boot, cleared when it does) |
 | `PORT_KB/MS/OT` | a TPS2553 FAULT is low while switched off, or within 100 ms of the first switch-on |
 | `POWER` | 1 s after boot: PWR-port VBUS outside 4.4–5.6 V while `PWR_ST` says it powers the board (or above 4.8 V while it doesn't), or CC above 2.3 V |
@@ -504,17 +529,99 @@ The self-test (`selftest.rs`, design.md §10 step 1.5) runs at every boot and re
   plain-text log of the events that matter at bring-up without a probe: boot, self-test, AT32F405 programming, updates.
   Everything else goes to defmt over RTT.
 
-### 4.11 Keymap and Vial (`kvm-vial`)
+### 4.11 Mapping engine and Vial (`kvm-map`)
 
-A QMK-style keymap for keyboards without Vial of their own, edited with the Vial app (design.md §4). It runs on the
-RP2354B, which already parses the keyboard and owns the config storage; the AT32F405s only serve one more interface.
+What every control of a normalized device does: a QMK-style keymap engine for keyboards, mice and gamepads alike,
+rules for their axes, a virtual gamepad for the PCs, and the Vial app as a way into the keyboard part (design.md §4,
+hid_mapping.md). It runs on the RP2354B, which already parses the devices and owns the config storage; the AT32F405s
+only serve the interfaces. Since 0.1.51; before, the keymap was the keyboard's only.
+
+- **Pipeline** (`kvm-core::engine`): each device's reports are decoded (`kvm-hid::translate`: keyboard, mouse,
+  consumer and system controls, and a gamepad's buttons 1–32, its hat and its axes: X–Dial of the generic desktop
+  page, brake and accelerator of the simulation page), a gamepad's axes go through its calibration, and the devices
+  routed to the active host are merged (keys and buttons ORed, the hat last pressed, an axis the one moved last). The
+  hotkeys come next, so no keymap can take the PC switch away. Then, if the active profile uses a keymap, the axis
+  rules and after them the keymap engine over every control held, and the output builders; without one, the short
+  path of before: keyboard and mouse as they are, a gamepad 1:1 onto the virtual gamepad.
+- **Positions** (`kvm_map::pos`, 312): the KVM only learns which controls are down, so the "matrix" is the controls
+  themselves: keyboard usages 0–231 (Vial's matrix, below), mouse buttons 1–16 at 232–247, gamepad buttons 1–32 at
+  248–279, the hat's up, right, down and left at 280–283, and the two directions of each of the 14 axis inputs at
+  284–311 (an axis whose rule makes it buttons).
+- **Keymaps:** 4, of 8 layers each (`KEYMAPS`, `LAYERS`); each profile uses one or none (`profileN-keymap`, like its
+  screen-hop arrangement; default none). Macros, tap dances, combos, key overrides and the QMK settings are shared by
+  all four. A fresh keymap's layer 0 has every control do what it says, the other layers are transparent. Changing to
+  a profile with another keymap lets go of everything held.
+- **Keycodes** are QMK's, plus: mouse buttons 1–8 as `KC_BTN1`–`KC_BTN8` (0xD1–0xD8) and 9–16 as `KVM_BTN9` on
+  (0x7E00–0x7E07), gamepad buttons as QMK's `JS_0`–`JS_31` (0x7400–0x741F), and the virtual gamepad's d-pad
+  (0x7E08–0x7E0B: up, right, down, left). So a key can press a gamepad button and a gamepad button a key.
+- **Axis rules** (`axes.rs`): per keymap and layer, one rule for each of 14 inputs (mouse X, Y, wheel, pan; gamepad X,
+  Y, Z, Rx, Ry, Rz, slider, dial, brake, accelerator), 6 bytes: target (transparent, none, mouse X / Y / wheel / pan,
+  virtual gamepad axis 0–7, buttons), scale (8.8 fixed point), invert and curve (linear, quadratic, cubic), deadzone
+  and a parameter. The highest active layer whose rule isn't transparent decides; on layer 0 a transparent rule is the
+  default (the mouse to the mouse, a gamepad axis to the same axis). Relative to relative is scaled with the
+  remainder kept; absolute to absolute has deadzone, curve and scale; absolute to relative (stick → mouse) reads the
+  deflection as a speed, moved every 8 ms (`TICK_MS`; the parameter is the counts per tick at full deflection);
+  relative to absolute (mouse → stick) deflects the axis, which springs back at the parameter's rate (0: it stays);
+  to buttons holds a direction past the threshold (absolute) or taps it for each report that moves it (relative).
+  Several inputs on one gamepad axis: the last one moved wins.
+- **Virtual gamepad** (setting `gamepad`: `off` (default; a controller nobody uses confuses games), `hid`, `xinput`;
+  changing it re-enumerates both PCs): what the keymaps send to a gamepad, and the gamepads of the short path, reach
+  the active PC as one gamepad. `hid`: report ID 4 on the NKRO interface (§7.1): 32 buttons, a hat and 8 axes of
+  16 bits, so no endpoint leaves the mirrors. `xinput`: a vendor interface of its own on EP6 IN and OUT with the
+  compatible ID `XUSB10`, its buttons in the standard gamepad's order (W3C: 1 A, 2 B, 3 X, 4 Y, 5 LB, 6 RB, 7 LT, 8 RT,
+  9 Back, 10 Start, 11 LS, 12 RS, 13 Home), Z and Rz as the triggers; the PC's rumble and LED reports are dropped.
+  Both came with milestone 3 (hid_mapping.md §14); one at a time, as two controllers would be two players.
+- **Calibration** (`kvm-core::calibration`): kept with the device, not the profile: by its identity (FNV-1a of VID,
+  PID and serial number on a front port, of the address of a Bluetooth device), 16 devices, one taking the place of
+  the one set longest ago. Per axis: minimum, centre and maximum (the measured range onto the full one) and a deadzone
+  around the centre, in 256ths; a trigger has no centre. Applied to the device's reports before they are merged.
+- **The KVM's actions** (0x7E0C–0x7E1F, `KVM_ACTION`, milestone 4): the hotkey list's actions as keycodes, in its
+  order (the other PC, next and previous host, PC1, PC2, Bluetooth hosts 1–4, next and previous profile, profiles 0–7,
+  the Other port's mode), so a mouse or gamepad button switches the PC as a hotkey does. They fill QMK's keyboard
+  range after mouse buttons 9–16 and the d-pad (0x7E00–0x7E0B), which the Vial definition names as Vial's custom
+  keycodes (`build.rs`: BTN9…, DPAD_U…, PC_TOG, PC1, HOST1, PROF0, …), so Vial offers them too. The engine does an
+  action once the steps before it reached the host (`Step::Kvm`).
+- **Every Vial feature on every device:** mouse and gamepad controls are positions of the same engine, so layer-tap,
+  mod-tap, tap dances, combos (by keycode: `pad1,pad2`), key overrides and macros work on them as on keys. A tap-hold
+  keycode's tap may be any basic keycode, a mouse button or a media key too (`lt(1,mouse1)`). A macro holds and taps
+  keys, media keys, mouse and gamepad buttons and the d-pad, and a mouse key in a macro moves the pointer or the wheel
+  one step. Tested per device kind in `remap/tests.rs`.
+- **Macro text per host** (milestone 6): every host has a keyboard layout (`layout-pc1`, `layout-pc2`,
+  `layout-host1`–`4`: `kvm_hid::layouts`, 13 of them: US, UK, German, Swiss German, French, Spanish, Italian,
+  Portuguese, Norwegian, Swedish/Finnish, Danish, Japanese, Brazilian), and a macro's text is typed through the layout
+  of the host it goes to: a German PC gets `z` from the key where a US one has `y`, `@` with AltGr+Q, and a dead key
+  such as `^` followed by Space. The same tables give the app's keyboard picture its legends.
+- **Monitor and field overrides** (milestone 5, hid_mapping.md §9): `MonitorDevice` streams one device's raw reports
+  to the host software (`Event::Report`, in pieces of 56 bytes: a report that changed, at most one per 16 ms per
+  interface and report ID; guarded and renewed as a watch), and `GetDeviceMap` gives its descriptors, every HID
+  interface's. A field override (`kvm-core::known`, up to 8 per device, kept with its calibration) reads bits the
+  descriptor doesn't declare, or declares as something else, as a gamepad button or axis of the device: interface,
+  report ID, first bit after the ID, 1–16 bits, signed or not, inverted or not. It applies to the device's reports
+  before calibration and merging (a report ID of its own merges as a source of its own, so its fields add to the
+  gamepad's), and `GetControls` reports the buttons and axes it gives. An axis rule with the `DELTA` flag reads an
+  absolute input by how far it moved, so a touch pad's coordinates move the mouse; a jump larger than its parameter
+  is a finger put down elsewhere and moves nothing.
+- **The gamepad for Bluetooth hosts, and the fallback** (milestone 6): the module's report map has a gamepad (ID 5,
+  §4.13), and a Bluetooth host that subscribed to it gets the virtual gamepad as the PCs do. A host that can't take
+  one (a PC while `gamepad` is off, a Bluetooth host that didn't subscribe) runs the profile's fallback keymap
+  instead of its own (`profileN-fallback`, none by default): the keymap that maps the sticks to the mouse and the
+  buttons to keys. The engine picks the keymap again when the input's host changes or what it takes changes
+  (`Engine::host_changed`). `GetOutputs` tells the host software what each host is offered and took: a PC everything
+  its interfaces carry while its link is up, a Bluetooth host the reports it subscribed to (`HostState::reports`).
+- **Watching controls** (`WatchControls`, §8.2): the host software asks for `Control` and `Axis` events from the
+  normalized devices, as merged for the active host (an axis at most every 50 ms, and an absolute one on a change of
+  1024 or more), to show what is held and to learn a control; "watch and swallow" keeps the controls from the hosts
+  meanwhile, and a control still held when it ends stays away until it is let go. The events go to the PC that asked
+  (either PC, or the service port); one watch at a time, a new one replaces it.
+
+The keyboard part, and the Vial app's view of it:
 
 - **Matrix:** position = HID keyboard usage 0x00–0xE7, row = usage / 8, column = usage % 8 (29 × 8). One byte per
   row keeps Vial's matrix tester inside one 32-byte report. Usages outside the layout (keypad extras 0xA5–0xDF, and
   0xE8–0xFF) pass through unmapped.
 - **Layout** (`build.rs`): full-size ANSI with ISO Enter and ISO left Shift as layout options, plus F13–F24, the
-  international and language keys, Power, Mute and Volume. The JSON is xz-compressed as vial-qmk does it (616 bytes)
-  and served in 32-byte blocks.
+  international and language keys, Power, Mute and Volume. The JSON, with the KVM's own keycodes as Vial's custom
+  keycodes, is xz-compressed as vial-qmk does it (964 bytes) and served in 32-byte blocks.
 - **Engine** (`remap.rs`): runs on the merged keyboard state of Normalized ports, after the hotkeys (so no keymap can
   take the PC switch away) and before the output builders. Events pass three stages, in QMK's order:
   - **combos** (32, up to 4 keys each, by keycode): a key of a combo waits until the combo is complete and no larger
@@ -542,17 +649,22 @@ RP2354B, which already parses the keyboard and owns the config storage; the AT32
   qsids per query reply; the dynamic entries: 32 tap dances, combos, key overrides and alternate repeat keys, with
   caps word and layer lock flagged). Keycodes are stored exactly as written, so every keycode reads back unchanged;
   QK_BOOT in a key or an entry is stored as KC_NO unless unlocked. Command decoding and the keycode ranges are adapted
-  from RMK (MIT, `crates/kvm-vial/LICENSE-RMK-MIT`); RMK's keymap engine is async and tied to its runtime, so it is
+  from RMK (MIT, `crates/kvm-map/LICENSE-RMK-MIT`); RMK's keymap engine is async and tied to its runtime, so it is
   not reused. The dynamic entries, the QMK settings and the engine follow vial-qmk and QMK's documentation.
-- **Storage** (`keymap.rs`, `kvm_core::store`): the layers (0x0110–0x0117), the macros (0x0101), the settings
-  (0x0100, 47 bytes; the 13 of before read with the new settings at their defaults) and one item per kind of dynamic
-  entry in Vial's own layout (0x0102–0x0105, 321 bytes each, 193 for the alternate repeat keys).
+- **Storage** (`keymap.rs`, `kvm_core::store`): keymap k's layer n at 0x0110 + 8k + n (version 2: the keycode of
+  every position, 625 bytes; the keyboard-only layers of before 0.1.51 are not read), keymap k's axis rules at 0x0130 +
+  k (673 bytes), the macros (0x0101), the settings (0x0100, 47 bytes), one item per kind of dynamic entry in Vial's own
+  layout (0x0102–0x0105, 321 bytes each, 193 for the alternate repeat keys), and each device's calibration at 0x0200 +
+  slot (`kvm-core::calibration`, 75 bytes).
 - **Interface:** usage page 0xFF60 / usage 0x61, 32-byte reports, IN endpoint only (EP7): the requests arrive as
   SET_REPORT on a `LOCAL_HID` interface, which the AT32F405 already forwards, so its firmware is unchanged. The serial
   number gets Vial's marker `vial:f64c2b3c` (also in identity mode, appended to the cloned serial).
 - **Setting** `vial` (§8.3): `off` (default), `on` (it keeps EP7 IN, so mirrors get one IN endpoint less), `auto`
   (shown only while an IN endpoint is spare, so mirrors always come first). Changing it re-enumerates both PCs once, as a
-  mirror attaching does anyway. `keymap` (default on) applies the keymap; a fresh keymap changes nothing.
+  mirror attaching does anyway. Vial edits the keyboard part (positions 0–231) of the active profile's keymap, or of
+  keymap 0 while the profile uses none; the other positions and the axis rules only the host software sets
+  (`odkvmctl keymap`, the Keymaps page, §9). The setting `keymap` of before 0.1.51 (apply the one keymap) is gone:
+  whether a profile's devices go through a keymap is its `profileN-keymap`.
 - **Rules:** every write needs "configuration from software" (0x0041). Macros, the matrix tester and QK_BOOT also need
   Vial's unlock: both Shift keys held for 3 s, per PC. The matrix tester answers only the active PC. The bootloader
   jump is ignored.
@@ -602,7 +714,7 @@ saved: after a power loss the KVM finds the running PC again from the PCs' state
 - `Output::Power(PowerPlan)` carries the plan to the firmware (`firmware/rp2354/src/power.rs`); the LEDs read it through
   `led_inputs`. Tested in `standby.rs` and the engine tests (auto-select, standby and the key, wakeup).
 
-### 4.13 Bluetooth hosts and devices (boards 0.16.0 on, `bt.rs`, `espisp.rs`, `kvm-core::bt`, `firmware/esp32c3`)
+### 4.13 Bluetooth hosts and devices (boards 0.16.0 on, `bt.rs`, `espisp.rs`, `kvm-core::bt`, `firmware/esp32c3`, `firmware/esp32`)
 
 Up to four extra hosts (PCs, tablets, phones) connect over Bluetooth LE to an ESP32-C3-MINI-1 on the board, which the
 RP2354B treats as a third, lesser target: the hosts get the KVM's own keyboard, mouse and media reports (and screen
@@ -660,19 +772,24 @@ The RP2354B side runs on core 0 (`bt::run`); core 1 keeps to the AT32F405 links.
 | 0x75 | BT → RP | `DeviceMap`: a piece of a device's report map (offset, total, ≤ 59 bytes) |
 | 0x76 | BT → RP | `Found`: a device that may be paired, found while looking: address, RSSI, appearance, name (at most once a second each) |
 | 0x77 | BT → RP | `Log`: a line of the module's log (≤ 63 bytes; a longer line in several), which the RP2354B keeps in RAM (2 KB, the latest whole lines, with the time it came; `GetModuleLog`) |
+| 0x78–0x7B | BT → RP | `ControlRequest`: a control-protocol report host 1–4 wrote to the control service (the host in the type, so the 64 bytes fit; trailing zeros left out, `link::bt::control::trim`) |
+| 0x50–0x53 | RP → BT | `ControlReply`: the answer to one of host 1–4's requests, or an event for it, to notify |
 
-**Reports.** One HID service with a fixed report map (`kvm_proto::link::bt::report::MAP`, 229 bytes): keyboard (boot
+**Reports.** One HID service with a fixed report map (`kvm_proto::link::bt::report::MAP`, 305 bytes): keyboard (boot
 layout, ID 1, with the LED output report), mouse (16 buttons, 16-bit X/Y, wheel, AC pan, ID 2), consumer (one 16-bit
-usage, ID 3), and screen hop's absolute pointer (16 buttons, X/Y 0–32767, wheel, AC pan, ID 4). The
-pointer is a top-level collection of usage Pointer of its own, as on the PCs' USB interface, so a host that takes no
-absolute pointer leaves it alone; the engine sends it nothing unless screen hop puts that host's pointer there
-(§4.14). Desktop and mobile systems take it without a driver: HID over GATT is built into them. Motion is coalesced
-on its way (`link::bt::Motion`, on the RP2354B before the link and in the module before each notification): a mouse
-reports up to 1000 times a second, the link to a module on a front port carries about 200 messages a second, and a
-host takes notifications at its connection events (7.5–15 ms for the selected one). So one motion report waits at a
-time, relative moves adding up and an absolute position replacing the one before; a report with other buttons sends
-the waiting one first, so no click is lost. Queued one by one, as at first, the reports came late, and those that
-didn't fit were dropped with their motion: on the first dongle (2026-11-14) the pointer crawled.
+usage, ID 3), screen hop's absolute pointer (16 buttons, X/Y 0–32767, wheel, AC pan, ID 4), and the virtual gamepad (32
+buttons, a hat, X, Y, Z, Rx, Ry, Rz of 16 bits, ID 5, since 0.1.51). The pointer and the gamepad are top-level
+collections of their own, as on the PCs' USB interface, so a host that takes no absolute pointer or no gamepad leaves it
+alone; the engine sends the pointer nothing unless screen hop puts that host's pointer there (§4.14). Which input
+reports a host subscribed to goes to the RP2354B with its state (`HostState::reports`, the module's notification bits):
+the gamepad's tells whether the host took it (§4.11). A host bonded before 0.1.51 knows the old map and gets the gamepad
+only after pairing again. Desktop and mobile systems take it without a driver: HID over GATT is built into them. Motion
+is coalesced on its way (`link::bt::Motion`, on the RP2354B before the link and in the module before each notification):
+a mouse reports up to 1000 times a second, the link to a module on a front port carries about 200 messages a second, and
+a host takes notifications at its connection events (7.5–15 ms for the selected one). So one motion report waits at a
+time, relative moves adding up and an absolute position replacing the one before; a report with other buttons sends the
+waiting one first, so no click is lost. Queued one by one, as at first, the reports came late, and those that didn't fit
+were dropped with their motion: on the first dongle (2026-11-14) the pointer crawled.
 
 **Engine** (`kvm-core::bt`, `Engine::switch`):
 - **Targets:** PC1, PC2 and the bonded hosts 1–4. `Target::Bt1`–`Bt4` select a host; `Toggle` from a host goes back
@@ -745,6 +862,17 @@ dropped. Each connection has a task of its own and holds its slot from the momen
   PC "connected" for a moment and then never again, and the KVM didn't show it). A new pairing also asks for its
   connection parameters only once it is complete, so the connection's task keeps taking events while the keys go
   across.
+- **The controller's buffers are one pool.** trouble-host sends every connection's packets through one queue, in
+  order, each once its connection has a credit for a controller buffer. Upstream 0.8 gives every connection the
+  controller's whole buffer count, so with several hosts the module could hand the controller more packets than it
+  holds; a connection whose credits then never came back held up the queue for every host. Each host's task waited in
+  its next report, stopped taking its host's requests, and the stack logged `OutOfMemory` for each one that came: no
+  input anywhere until the module was unplugged (three hosts, 2026-11-24). The firmware builds a copy of trouble-host
+  0.8.0 (`firmware/esp32c3/trouble-host`, its changes marked "OpenDynKVM:") whose credits are one pool, freed by the
+  controller's completions or a connection's end. **For any other way into that**, a report or reply that has waited
+  10 s while the controller reported nothing sent restarts the module (`stall.rs`; longer than the 4 and 6 s
+  supervision timeouts it asks hosts for, by which a host gone silent has freed its buffers): the hosts come back with
+  their bonds, and the module's log says why.
 - **A forgotten host** still lists the KVM as paired: Bluetooth LE has no way to make a host let go of a bond, so it is
   removed on the host too (the app's *Forget* says so). Until then it tries to reconnect with its old keys while the
   module advertises, and the stack turns it away (no key for it).
@@ -761,36 +889,51 @@ first dongle (2026-11-14) they did, the RP2354B took the link for lost and resta
 RP2354B takes the link for lost after 3 s without a good exchange. IO3 carries a plain-text log (UART1, 115200) to test pad TP1601, once the link has come over the
 UART (on a dev board IO3 may be wired to anything); the first 1 KB from before is kept and printed then.
 
-**Programming** (`espisp.rs`, like `at32isp.rs` for the AT32F405s). `cargo xtask dist` builds the module's firmware and
-its flash image from offset 0 (bootloader, partition table, application, with espflash), and the RP2354B firmware
-embeds it zlib-compressed (`build.rs`: 349 KB of the 615 KB image; its version from a `KVMESP32` marker, its MD5),
-in two parts: the first 4 KB sector, and the rest. The ROM erases that sector first and writes it last, so a module
-whose programming broke off (power, unplugged) is left with it erased, which is how a blank chip looks (below).
-When the module's `Hello` carries another version, the RP2354B sends `EnterRom` and the module restarts into its ROM
-bootloader (it sets FORCE_DOWNLOAD_BOOT, which every restart but a power-up keeps). When it says nothing within 4 s
-(blank, or a firmware that doesn't come up), the RP2354B holds TX, the module's BOOT strap, low (a UART break) across
-a reset: from 0.18.0 one it makes on the module's EN (GPIO9 through 1 kΩ: 20 ms low under a 300 ms break, as BOOT held
-at power-up), else, or if no ROM answers then, a 6 s break across one of the resets such a module makes by itself (a
-ROM that finds no firmware restarts about every 3 s, by its TG0 watchdog). Then SYNC, the chip checked (an ESP32-C3:
-`GET_SECURITY_INFO`'s chip ID, or the magic value at 0x4000_1000 on older ROMs), 921 600 baud, the RTC watchdog off,
-the first sector erased, FLASH_DEFL_* in 1 KB blocks for the rest and then for that sector, SPI_FLASH_MD5 against the
-image's, and a restart through the RTC watchdog with FORCE_DOWNLOAD_BOOT cleared: the ROM's own reboot (FLASH_END)
-keeps that flag, so a module sent `EnterRom` would come back in its ROM. A module found in its ROM after an unplanned
-reset (TX low at that moment) is restarted the same way; one hung in its firmware is restarted by EN (0.18.0 on), and
-in any case by its own watchdog (TIMG0, 5 s, fed by the main executor, where the Bluetooth side runs: esp-hal's start
-leaves every watchdog off).
-- **Limits:** as for the AT32F405s (§4.9, `kvm-core::at32prog`), with the module's own record in the store (item
-  0x0003: CRC-32 of the embedded image's MD5, one count). Each attempt is counted in flash before it starts, and the
-  count goes back to 0 when the module says `Hello` with the embedded version. Within one boot it tries again at once
-  only if the transfer failed; a module that took its image but doesn't answer waits for the next power-up
-  (`selftest::BT_FW`, Bluetooth off until then). After 5 failed attempts in a row it gives up (`BT_GAVE_UP`), until
-  the image changes, the key is held at power-up, or `odkvmctl reboot wireless-retry` / the GUI's *Try again*.
+**Programming** (`espisp.rs`, like `at32isp.rs` for the AT32F405s, from the host software's stream: `modstream.rs`).
+Since 0.1.51 the RP2354B keeps none of the module's firmware. `cargo xtask dist` builds it and its flash image from
+offset 0 (bootloader, partition table, application, with espflash) and writes `kvm-module-esp32c3.bin`
+(`kvm_proto::modimage`: a header with the version from the `KVMESP32` marker, the chip, the image's flash offset,
+lengths, CRC-32 and MD5; then the image zlib-compressed in two parts, everything after its first 4 KB sector, then that
+sector: 365 KB of 661 KB), and the same for the ESP32 (`kvm-module-esp32.bin`, below). The RP2354B firmware is built
+with both files' SHA-256 (`build.rs`, `caps::BT_UPDATE`) and takes no other: the key that installed the firmware
+vouches for its module, so the stream needs no key of its own, and other host software can't put another firmware on
+the module. The host software sends the image for the module's chip (`Status.bt_chip`, which the module's `Hello` or
+its ROM gave), and the RP2354B checks the header's chip against the module's ROM.
+- **When:** a module whose `Hello` carries another version is sent `EnterRom` and restarts into its ROM bootloader (it
+  sets FORCE_DOWNLOAD_BOOT, which every restart but a power-up keeps), and waits there, Bluetooth off
+  (`BtModule::NeedsUpdate`, `selftest::BT_FW`). One that says nothing within 4 s (blank, or a firmware that doesn't
+  come up) waits as well. A stream that comes while the module is up (`odkvmctl update --module`) sends it
+  `EnterRom` first. The app and `odkvmctl update` stream the release's module image after the RP2354B's update,
+  once the KVM is back; the Wireless and Firmware pages offer *Update the wireless module* while it waits.
+- **Into the ROM:** a module that isn't listening there is caught: the RP2354B holds TX, the module's BOOT strap, low
+  (a UART break) across a reset: from 0.18.0 one it makes on the module's EN (GPIO9 through 1 kΩ: 20 ms low under a
+  300 ms break, as BOOT held at power-up), else, or if no ROM answers then, a 6 s break across one of the resets such
+  a module makes by itself (a ROM that finds no firmware restarts about every 3 s, by its TG0 watchdog).
+- **Writing:** SYNC, the chip checked (an ESP32-C3: `GET_SECURITY_INFO`'s chip ID, or the magic value at 0x4000_1000
+  on older ROMs), 921 600 baud, the RTC watchdog off, all of the image's flash erased (FLASH_BEGIN: FLASH_DEFL_BEGIN
+  erases only the sectors the inflated data goes to, so the image's blank gaps kept another firmware's data, and the
+  first ESP32 board, which had run a sketch, read back other than written there: 2026-11-24), FLASH_DEFL_* in 1 KB
+  blocks as the
+  stream brings them, then the first sector, SPI_FLASH_MD5 against the header's, and a restart through the RTC
+  watchdog with FORCE_DOWNLOAD_BOOT cleared: the ROM's own reboot (FLASH_END) keeps that flag, so a module sent
+  `EnterRom` would come back in its ROM. The first sector is held in RAM until the whole file has arrived with the
+  CRC-32 its `FwBegin` named and the SHA-256 the firmware was built with: a stream that stops (10 s), is cut short or
+  is another image leaves it erased, so the module boots nothing of it and is found blank again (below).
+- **Flow:** the engine passes `FwTarget::Module` operations to the module's task past the update writer (`kvm.rs`);
+  with 40 of them waiting it answers `FwData` with Busy and the host retries (up to 30 s, which covers catching a
+  silent module). `FwState` is `Receiving` (bytes so far, which are the bytes written) and then `Writing`, `Done` or
+  `Failed`; `Status.bt_progress` is the percentage.
+- A module found in its ROM after an unplanned reset (TX low at that moment) is restarted the same way; one hung in its
+  firmware is restarted by EN (0.18.0 on), and in any case by its own watchdog (TIMG0, 5 s, fed by the main executor,
+  where the Bluetooth side runs: esp-hal's start leaves every watchdog off).
+- **No attempt counting:** the RP2354B never programs the module by itself any more, so there is no record in the
+  store and nothing to give up on (until 0.1.50: 5 attempts in a row, item 0x0003, `BT_GAVE_UP`, `wireless-retry`).
 - **State** (`bt::State`, `Status.bt_module`): not fitted, starting (waiting for its `Hello`), up, being programmed,
-  failed this boot, gave up. `Info.bt_fw` is its firmware while it is up. Hosts hear of a change at once
-  (`BtChanged(0)`).
-- **Self-test and LEDs** (§4.10): `BT_FW` and `BT_GAVE_UP` show on the key in the self-test's LED code and keep it
-  blinking red afterwards (`selftest::ON_KEY`). A module that is still starting or being programmed isn't a failure;
-  the self-test's verdict waits for it until its 12 s deadline, and the bits follow the module after that.
+  needs an update. `Info.bt_fw` is its firmware while it is up. Hosts hear of a change at once (`BtChanged(0)`).
+- **Self-test and LEDs** (§4.10): `BT_FW` while the module needs an update. It doesn't turn the key red: after an
+  update it is the expected state until the host software sends the module's firmware. A module that is still
+  starting or being programmed isn't a failure; the self-test's verdict waits for it until its 12 s deadline, and the
+  bit follows the module after that.
 - **Power:** the budget counts `BT_CURRENT_MA` whenever the module is fitted, also while it doesn't answer.
 
 **On a front port** (a *dongle*, for a KVM without the module on its board: 0.12–0.15, or 0.16+ built without it).
@@ -806,7 +949,7 @@ small C3 boards) runs the same module firmware, and the RP2354B reaches it on a 
   - it says `Hello` as the module (any version) within 4 s: it is the module (`PortState::Module`);
   - it doesn't, and its ROM bootloader (it may be in it already, else DTR/RTS put it there) says it is an ESP32-C3
     whose first flash sector is erased: new, erased (`espflash erase-flash`), or the module after a programming that
-    broke off. It is the module, and is programmed;
+    broke off. It is the module, and waits in its ROM for the host software's stream;
   - else it is someone's own ESP32 board, restarted into its own firmware if the RP2354B put it into its ROM, and then
     an ordinary device (`dongle_declined`: a non-HID device goes to the active PC in Auto). Its firmware is never
     touched. A port set to a passthrough mode leaves such a board alone from the start, and setting the dongle's port
@@ -816,7 +959,8 @@ small C3 boards) runs the same module firmware, and the RP2354B reaches it on a 
   watchdog goes off before the write (the ROM leaves it running in USB download mode), and the chip leaves the ROM by
   a restart through it, FORCE_DOWNLOAD_BOOT cleared first (espflash's `WatchdogReset` for this chip and port): a
   restart by RTS from the ROM brought the first dongle back in its ROM (2026-11-14), the new firmware written and
-  verified but not started until the board was powered off. Attempts are counted per board, the same 5 in a row.
+  verified but not started until the board was powered off. A dongle that needs the module's firmware waits in its
+  ROM for the stream, as the module on the board does.
 - **Into the ROM:** a dongle that runs another version is sent `EnterRom`, as the module on the board is; DTR/RTS
   is the way in when it doesn't answer, or doesn't go (DTR/RTS didn't get the first dongle into its ROM reliably while
   its firmware ran; from its ROM it did).
@@ -828,8 +972,13 @@ small C3 boards) runs the same module firmware, and the RP2354B reaches it on a 
   board restarted into its ROM on purpose goes straight there. A restart that Hub-0 doesn't see within 1.5 s is
   followed by a replug of the port (`REPLUG`: data lines off and on, VBUS stays). A board is only declined while it is
   attached and has answered (its ROM: not a blank ESP32-C3), or when 5 restarts into its ROM in a row missed; then it
-  is restarted into its own firmware and declined again at once when it comes back (for 10 s). A board that doesn't
-  run the firmware after its attempts stays off until the KVM restarts (*Try again* restarts it).
+  is restarted into its own firmware and declined again at once when it comes back (for 10 s). One of ours that won't
+  go into its ROM can't be updated and is left alone until the KVM restarts.
+- **Adopting a board** that runs other firmware (`Request::AdoptModule`: `odkvmctl wireless adopt <port>`, or the
+  Devices page's *Make it the wireless module*, two presses): only on a KVM without a module. The port is probed again
+  and the board taken whatever it runs (its port set back from passthrough to Auto, so that it stays taken across its
+  restarts): restarted into its ROM, its chip read, and it waits there for the module's firmware, which
+  `odkvmctl wireless adopt` streams at once (the window offers *Update the wireless module*).
 - **The port:** `PortState::Module`: the LED glows violet, the window and `odkvmctl` say the port holds
   the wireless module and is attached to no PC, and how to get the port back (unplug the board, or a passthrough
   mode). Its current comes from the port, so the budget doesn't count `BT_CURRENT_MA` for it. Unplugged, Bluetooth goes
@@ -914,6 +1063,37 @@ front ports' and sent wherever its routing says, keymap and hotkeys included.
 - **The window and `odkvmctl`** show a device slot only while it holds a bond: a free slot is nothing to set. A
   device pinned to a Bluetooth host makes the module keep that host connected (`Select`'s mask) whatever its policy.
 
+**Control over Bluetooth** (0.1.52, protocol 15; `kvm_proto::link::bt::control`, `ble.rs`, `Engine::bt_control`). A
+computer paired as one of the hosts reaches the control protocol through the module, so a laptop or tablet that is
+only a Bluetooth host can be configured without a cable (§8.1 "Over Bluetooth" for what it may ask).
+- **Service:** a GATT service of its own, UUID `98141409-422d-48a6-aba2-21d691a393cc`: a characteristic the host writes
+  64-byte requests to (`…1410…`, write and write without response) and one that notifies 64-byte answers and events
+  (`…1411…`). Both need the bond's authenticated link (`permissions(authenticated)`: hosts pair with a passkey), and
+  the module forwards a request only from a bonded slot that isn't pairing. The service's UUID is also in the scan
+  response (30 of its 31 bytes with the name), for a host's software that looks for the KVM by it.
+- **Session:** the reply characteristic's notifications on are a session (`host_flags::CONTROL`, in `HostState` to the
+  RP2354B): the engine's events go there too, as to the PCs. They are never kept with the bond, nor counted by the
+  wear guard; each connection starts without (`end_control_session`), and each session subscribes anew.
+- **Size:** a report needs an ATT MTU of 67 (`control::MIN_MTU`): desktop and mobile systems negotiate 185 or more; a
+  smaller one is logged.
+- **Speed:** each request takes about two connection events. While requests come the host is asked for the selected
+  host's 7.5–15 ms interval, back to its own 5 s after the last (`CONTROL_FAST`), and the RP2354B polls the link every
+  millisecond for 0.5 s after each (`CONTROL_BUSY`). The host software keeps up to 6 requests under way
+  (`control::WINDOW`, `Client::request_all`): a window's refresh is about 200 requests, which one at a time would take
+  several seconds.
+- **Queues:** the module holds 24 reports per host on their way to be notified (`CONTROL_OUT`): the 6 answers under
+  way and the events between them, of which a switch alone brings several (the switch, the active host, each port,
+  each host whose interval changes). One that doesn't fit is dropped. Until 0.1.53 there was room for 8, and a switch
+  made a Windows host's window drop the KVM (2026-11-24).
+- **A missed answer** is no lost KVM over this link, unlike over USB (`Client::lost`): a read whose answer doesn't
+  come within the second is asked again once (`Client::request`, `request_all`; a change is not, it may have been
+  made), and only 3 answers missed in a row (`MISSED_LOST`), or the link itself failing, make the window let go and
+  connect again.
+- **Connecting again** (Windows, macOS): a link that goes stops its notifications' thread and waits for it to let go
+  of its GATT objects (`ble::sys::Link`'s `Drop`). Windows refuses a program's new link ("access denied") while it
+  still holds the objects of an earlier one, and until 0.1.53 that thread held them until the next notification came:
+  the window then couldn't reach the KVM again until it was restarted, or until another switch notified it.
+
 **Diagnostics** (§8.4): a *Bluetooth* group, only with the module fitted: its state (as `Status.bt_module`),
 the version from its `Hello`, the UART exchanges that failed (`bt::LINK_ERRORS`) and the hosts connected; while there
 are any, the hosts whose notification settings the module holds in RAM (`BT_SETTINGS_HELD`, orange).
@@ -926,6 +1106,62 @@ yet): the UART link at 3 Mbaud, the UART break as a way into the ROM of a blank 
 and several hosts at once. Host side and engine are tested on the PC
 (`kvm-core` engine tests, the simulator with `OPENDYN_SIM_BT=1`, or `OPENDYN_SIM_BT=dongle` for a board on the Other
 port).
+
+**The ESP32 module** (`firmware/esp32`, `kvm-classic`, 0.1.53). An original ESP32 is dual mode, so it is a Bluetooth
+Classic host as well: for gamepads that pair only over Classic (the 5 series of the symmetric-stick pads). The module
+can be either chip, and the RP2354B's side is the same for both: the link, its messages, the device slots.
+- **Firmware:** `firmware/esp32` builds the ESP32-C3 firmware's modules (`#[path]`: the hosts, the LE devices, the
+  bonds, the link, the log, the stall watchdog), their few chip-specific parts chosen by `target_arch`, plus its own
+  `main.rs`, `radio.rs` and `classic.rs`. It needs the Xtensa toolchain (espup) and a copy of esp-radio
+  (`firmware/esp32/esp-radio`, its changes marked "OpenDynKVM:"): upstream starts the ESP32's controller for LE only,
+  the copy in dual mode (four Classic ACL links, no audio ones, whose memory esp-hal's linker script already keeps out
+  of the firmware's), and it gives four ROM routines the controller library calls and esp-rom-sys's ROM script lacks
+  (their addresses from ESP-IDF's). With Bluetooth on, the ESP32's main DRAM is 128 KB: a 72 KB heap (the
+  controller's memory) and the LE stack's 23 KB of resources live in the DRAM after the ROM's data, 12 KB more heap
+  and the other statics in the main DRAM, and the stack gets some 38 KB. Every device slot takes an LE device or a
+  Classic pad, and is free for either once forgotten: four of either at once, an LE device's connection state on the
+  heap while it lasts. Built without frame pointers: with them the Xtensa backend moved the stack pointer 4 bytes to
+  pass a call's arguments, and 16-aligned values (the LE stack's keys) were copied to the wrong place.
+- **The link, either place:** the ESP32 has no USB of its own, so on a front port it is a board whose USB-to-UART
+  bridge (a CP210x: 10C4:EA60) is on its UART0, and on a board (to come) its UART0 is wired to the RP2354B. It listens
+  at 3 Mbaud (the board's) and at 1 Mbaud (`BRIDGE_BAUD`: the CP2104 goes to 2 Mbaud) in turn, a quarter second each,
+  and keeps the speed the first valid frame came at. Its `Hello` says its chip, and that it is a Classic host
+  (`hello_flags`); a module whose `Hello` says no chip runs the ESP32-C3's firmware from before.
+- **A bridge dongle** (`dongle.rs`, `DongleKind::Cp210x`): vendor requests set the bridge's UART on, 8N1, its speed
+  (the link's, the ROM's 115 200, the transfer's 921 600) and DTR/RTS, which drive the board's EN and GPIO0 through
+  the usual two transistors: esptool's classic reset into the ROM, RTS alone out of it. The bridge stays on USB while
+  the ESP32 restarts, so a session goes on over the same line (`Outcome::Again`), where an ESP32-C3's ends and waits
+  for the chip to come back on USB. As for an ESP32-C3 board, a CP210x board is only taken on a port not set to
+  passthrough, and only if it says `Hello` as the module or its image's first sector is erased, or when adopted (above:
+  the first HUZZAH32, 2026-11-24, ran a sketch and was declined until then).
+- **The ROM** (`espisp.rs`): the chip comes from `GET_SECURITY_INFO` (the ESP32's ROM doesn't know it) or the magic
+  value (0x00F0_1D83). The ESP32's ROM begins a flash region with four words (the ESP32-C3's five), its image starts at
+  0x1000 (`Header::base`: espflash's merged image pads the sector before), its UART download mode leaves the RTC
+  watchdog off, and it has no FORCE_DOWNLOAD_BOOT: `EnterRom` can't send it into its ROM (it logs that), the RP2354B
+  does (DTR/RTS on a bridge, the break with EN on the board), and it leaves by a reset with its BOOT strap high
+  (`Done::ResetIt`: RTS, or EN). **On a board** its GPIO0 must be on the RP2354B's TX line as the ESP32-C3's IO9 is,
+  and its EN on GPIO9.
+- **Classic** (`classic.rs`, with `kvm-classic`'s tested pieces): it shares the controller with trouble-host through
+  `radio::Split`, which takes Classic's events, its links' ACL data and its share of Number of Completed Packets out of
+  what the LE stack reads (`kvm_classic::hci::route_event`; a link's handle is Classic's from its Connection Complete to
+  its Disconnection Complete), and sends its commands through the same controller. Once the LE stack has set the
+  controller up it adds Classic's events to the event mask, turns on Secure Simple Pairing, extended inquiry results,
+  role switches and page scan, and names itself (class: a computer). Looking for devices runs inquiries next to the
+  LE scan; HID peripherals that answer go to the RP2354B as `Found` with a Classic address (type `ADDR_CLASSIC`).
+  Pairing one: connect, authenticate (Secure Simple Pairing, Just Works: a pad has no input and no output), its link
+  key into a free device slot (`bonds::Device`, the key where an LE device has its LTK), encryption, then L2CAP's HID
+  control and interrupt channels (`kvm_classic::l2cap`). A bonded pad reconnects by paging the module (its home
+  button): accepted, its key given, and it opens the channels itself (else the module does, after 2 s).
+- **The pad's reports:** it sends a short report until its feature report 5 is read, then its full report 0x31 with a
+  CRC-32; the module reads that feature report, lights its middle player light, and passes the full report on in the
+  USB form of its report 1 (`kvm_classic::pad`: the USB report's body but its last, reserved, byte, which is what one
+  link message holds), with that form's report map and the USB IDs (`DeviceState::vid`, `pid`). The engine applies the
+  pad's profile to a Bluetooth device as to one on a port (`kvm_core::pads`): the buttons in the standard order, the
+  right stick and the triggers moved, the touch pad.
+
+**On hardware:** not yet (2026-11-24): the ESP32 firmware, the RP2354B's bridge dongle and both chips' ROM handling
+are built and their logic tested on the PC (`kvm-classic`: HCI events, L2CAP signaling, the pad's reports and
+descriptor through the KVM's HID parser; `kvm-core`: a bridge found as a dongle, the pad's reports through the engine).
 
 ### 4.14 Screen hop (`kvm-core::hop`)
 
@@ -1212,10 +1448,11 @@ The first byte is the type.
 |---|---|---|---|
 | 0 | Boot keyboard (6KRO, boot subclass) | EP1 IN, 8 bytes | unless left out for mirrors (below) |
 | 1 | Mouse (boot subclass): 16 buttons, 16-bit X/Y, wheel + pan with resolution multiplier; with `abs-pointer`, report ID 1 and an absolute pointer as ID 2 (§4.14) | EP2 IN | unless left out |
-| 2 | NKRO keyboard (ID 1), consumer control (ID 2), system control (ID 3) | EP3 IN | unless left out |
+| 2 | NKRO keyboard (ID 1), consumer control (ID 2), system control (ID 3); with `gamepad hid` the virtual gamepad (ID 4: 32 buttons, a hat, 8 axes; §4.11) | EP3 IN | unless left out |
 | 3 | KVM control (vendor page 0xFF4B, 64-byte in/out) | EP4 IN + EP4 OUT | always |
 | 4 | Vial (raw HID, page 0xFF60, 32-byte reports; requests as SET_REPORT) | EP7 IN | `vial` on, or auto while an IN endpoint is spare (§4.11) |
-| 4/5… | Mirrored interfaces of the front-port devices | EP5–EP7 IN (EP5–EP6 with Vial), then EP1–EP3 IN while 0–2 are left out; EP5–EP7, then EP1–EP3 OUT | Mirrored / identity |
+| 4/5… | The virtual gamepad as an XInput controller (class 0xFF/0x5D/0x01, compatible ID `XUSB10`, §4.11) | EP6 IN + EP6 OUT | `gamepad xinput` |
+| 4/5… | Mirrored interfaces of the front-port devices | EP5–EP7 IN (less Vial's EP7 and XInput's EP6), then EP1–EP3 IN while 0–2 are left out; EP5–EP7 (less XInput's EP6), then EP1–EP3 OUT | Mirrored / identity |
 
 - Keys go out through **either** interface 0 or interface 2, never both: interface 0 when the PC has selected the boot
   protocol (BIOS), interface 2 otherwise. The OS merges both into one keyboard, so nothing doubles.
@@ -1266,15 +1503,35 @@ Limit 4 KB. The AT32F405 keeps the active set and a staging buffer, and checks t
   first (`Client::info_checked`); with another version it reads nothing else, every page of the window says so and
   leads to the Firmware page, whose update works (`GetInfo` and the `Fw*` requests are all it needs), and `odkvmctl`
   refuses every command but `update`. Messages decode strictly: there is no support for older or newer firmware.
+- **Over Bluetooth** (protocol 15, §4.13 "Control over Bluetooth"): the same reports through the module's control
+  service, for a computer paired as one of its hosts (`odkvmctl::ble`: BlueZ over D-Bus in pure Rust on Linux,
+  WinRT's GATT client on Windows and CoreBluetooth on macOS through bluest; Web Bluetooth in a browser, §9 "On the
+  web"). The system already holds the link (the KVM is its keyboard and mouse), so the host software finds the KVM among
+  the connected devices with the service, and prefers USB where it has both (`transport::open_first`).
+  - **Allowed by the key:** a host may control the KVM only once a tap on the KVM's key allowed it
+    (`ConfigValue::BtControl`, off by default). Until then it gets `GetInfo` (to see that it speaks this protocol) and
+    `AskControl`, and `NotAllowed` for everything else. `AskControl` from the host itself, or `BtControl` set on from a
+    PC, arms the key as allowing software control again does (§8 Safety, 30 s, the key LED pulsing white); a tap
+    grants exactly that host, never the locks a PC waits for at the same time or another host (`Busy`). Off is at once.
+    A slot whose bond goes (forgotten, paired with something else, every pairing erased) loses it: any state without
+    a bond clears it, so one lost on the way doesn't stay for the next host to pair into the slot. A factory reset
+    clears it too.
+  - **Not over Bluetooth:** firmware updates (`Fw*` but `FwStatus`: the module that carries the stream is what an
+    update replaces, and a module that needs one is off the air), restarts into a bootloader (only USB brings the
+    board back), and what streams to a PC or needs its cursor (`WatchControls`, `MonitorDevice`, `LearnHotkey`,
+    `PointerAt`, `PlaceCursor`: `NotActive`; stopping them is no error). The software locks apply as from a PC.
+  - **Who asks:** `Status.asking` names the host, a PC or the Bluetooth slot (`Host`, one byte as before: 0x11–0x14
+    for the slots).
 
 ### 8.2 Messages
 
 Report layout: `type u8 | request id u8 | payload (62 bytes)`. The response type is the request type | 0x80; errors
-are type 0xFF with the request type and an error code; events use request id 0.
+are type 0xFF with the request type and an error code (10 `NotAllowed`: a Bluetooth host that may not control the KVM
+yet); events use request id 0.
 
 | Request | Response |
 |---|---|
-| 0x01 `GetInfo` | protocol version (12), firmware versions (RP2354B, AT32F405 ×2), hardware version (u32, packed like the firmware's), serial, capability bits (`BLUETOOTH` when the module answers); then the Bluetooth module's firmware version |
+| 0x01 `GetInfo` | protocol version (15), firmware versions (RP2354B, AT32F405 ×2), hardware version (u32, packed like the firmware's), serial, capability bits (`BLUETOOTH` when the module answers); then the Bluetooth module's firmware version |
 | 0x02 `GetStatus` | active PC, **which PC is asking**, link state of each PC, power source, advertised current, budget, lock bits, uptime, link errors, self-test bits 0–15 (§4.10); then the Bluetooth host that gets input, the hosts ready and bonded (bit masks), seconds of pairing left, the host waiting for a passkey, the module's state, and self-test bits 16–31; then screen hop's state (off, on, or what it needs) and the pointer's place in the arrangement (two i16); then the supply judged from its measured 5 V (unknown, good, sags, low), its voltage now and lowest in the last minute, and what the front devices declare (§4.7); then the Bluetooth devices bonded and ready (bit masks), seconds of looking for devices left, how many found, how far pairing a device got, and the passkey to type on it |
 | 0x03 `GetPort` | state, mode setting and effective mode, where its input goes now (a host, or none), Auto reason, VID:PID, speed, interface classes, report rate, faults |
 | 0x04 `GetPortString` | manufacturer or product string of a port's device (UTF-8, ≤ 58 bytes) |
@@ -1291,9 +1548,21 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x1A `GetBtDevice` | a Bluetooth device slot (1–4): flags, RSSI, battery, appearance, address, name (§4.13) |
 | 0x1B `BtScan` / 0x1C `GetBtFound` | look for devices to pair for 60 s, or stop (host pairing closes); entry n of the devices found (address, RSSI, appearance, name), none past the last |
 | 0x1D `BtPairDevice` / 0x1E `BtForgetDevice` | pair the device found at an address into a free slot (`Busy` while one pairs); forget a slot (0xFF = all) |
-| 0x1F `GetBtDeviceMap` | slot, offset: up to 48 bytes of the report map the KVM holds for a device slot, and its length (0: none) |
+| 0x1F `GetDeviceMap` | a device, the index of its HID interface, an offset: up to 48 bytes of that interface's report descriptor (a Bluetooth device's report map, index 0), the interface's number, how many HID interfaces it has, and the length (0: none) |
 | 0x21 `BtEraseAll` | every pairing the module holds, hosts and devices, erased, and the module restarted (`EraseAll`); a configuration change |
 | 0x20 `GetModuleLog` | position: up to 48 bytes of the module's log the KVM keeps, from there, and the positions of the first byte kept and past the last (counted since the RP2354B started) |
+| 0x22 `GetKeycodes` / 0x23 `SetKeycodes` | keymap 0–3, layer 0–7, first position (u16): up to 28 keycodes from there (§4.11); `Set` is a configuration change |
+| 0x24 `GetAxisRules` / 0x25 `SetAxisRule` | keymap, layer, first input: up to 8 axis rules of 6 bytes; `Set`: one input's rule |
+| 0x26 `WatchControls` | 0 stop, 1 watch, 2 watch and keep the controls from the hosts: `Control` and `Axis` events to the asking PC (§4.11) |
+| 0x27 `GetControls` | a device (`Device` order): whether it has keys, its mouse buttons (u16), gamepad buttons (u32), mouse axes, gamepad axes and hat, and its identity (u32; 0 none) |
+| 0x2A `GetMapEntry` / 0x2B `SetMapEntry` | kind (0 tap dance, 1 combo, 2 key override, 3 alternate repeat key), index: the entry in Vial's layout (10 bytes, 6 for a repeat key), shared by all keymaps |
+| 0x2C `GetMacros` / 0x2D `SetMacros` | offset: up to 56 bytes of the macro buffer (2 KB, Vial's format) and its length |
+| 0x2E `GetMapSetting` / 0x2F `SetMapSetting` | a QMK setting by Vial's id (qsid) and its value (u32) |
+| 0x30 `MonitorDevice` | a device, on or off: its raw reports as `Report` events to the asking PC; as `WatchControls`: from the active PC, a configuration change, for 10 s unless asked again |
+| 0x31 `GetOverride` / 0x32 `SetOverride` | a device and field override 0–7: interface, report ID, first bit, bits, flags (signed, inverted), target (gamepad button 0–31, or 0x40 + axis), or none; kept with the device's identity |
+| 0x33 `GetOutputs` | a host: what it is offered and what it took, as bits (keyboard, mouse, media, pointer, gamepad, XInput, Vial, mirrors) |
+| 0x34 `AskControl` | from a Bluetooth host over the module: may it control the KVM (§8.1 "Over Bluetooth")? `Ok` if it may, `NeedsKeyPress` while the KVM waits for its key; from anyone else `Unsupported` |
+| 0x28 `GetCalibration` / 0x29 `SetCalibration` | a device and its gamepad axis 0–9: minimum, centre, maximum (i16) and deadzone (256ths); kept with the device's identity, `Set` is a configuration change |
 
 | Event | Body |
 |---|---|
@@ -1306,6 +1575,9 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0xC6 `BtActive` | input goes to Bluetooth host 1–4, or 0: back on a PC (`Switched` follows) |
 | 0xC7 `PlaceCursor` | where to put the cursor, in the PC's own pixels (two i16); only to a PC holding a `PlaceCursor` lease, at most one a millisecond |
 | 0xC8 `BtDeviceChanged` | a Bluetooth device slot changed, or 0: looking for devices started, found one, stopped, or a pairing moved on |
+| 0xC9 `Control` | a control's position (u16, `kvm_map::pos`) and whether it went down; only while watching |
+| 0xCA `Axis` | an axis input (0–13) and its value (absolute) or the motion since the last event (relative); only while watching |
+| 0xCB `Report` | a piece of the monitored device's raw report: device, interface, offset, total length, up to 56 bytes (the report ID first when the interface has them); only while monitoring |
 
 ### 8.3 Config keys
 
@@ -1323,7 +1595,7 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x0040 | software switching allowed; from software only **off**: turning it on answers `NeedsKeyPress` and waits 30 s for a tap on the key (§4.6) |
 | 0x0041 | software configuration allowed (likewise; asking for it back works while it is off) |
 | 0x0050 | Vial interface: off / on / auto (§4.11) |
-| 0x0051 | apply the keymap to normalized keyboards |
+| 0x0052 | the virtual gamepad: off (default), HID, XInput (§4.11; changing it re-enumerates both PCs) |
 | 0x0060 | auto-select: make the running PC active when the active one is switched off (default on, §4.12) |
 | 0x0061 | standby-wake: in standby, keep keyboard and mouse powered so a key press wakes a sleeping PC (default on) |
 | 0x0062 | standby-glow: in standby, the key LED glows instead of all LEDs going dark (default off) |
@@ -1334,6 +1606,7 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x0088–0x008F | name of profile 0–7, UTF-8, at most 12 bytes; defaults: work, gaming, profile 2 … profile 7 |
 | 0x0090–0x0093 | name of Bluetooth host slot 1–4 (empty: "BT n") |
 | 0x0098–0x009B | policy of Bluetooth host slot 1–4: stay connected (default), or connect only while selected |
+| 0x009C–0x009F | Bluetooth host slot 1–4 may control the KVM over the module (default off; on only with a tap on the key, §8.1) |
 | 0x00A0 | absolute pointer on the KVM's mouse interface (default off; changing it re-enumerates both PCs, §4.14) |
 | 0x00A1 | screen hop's acceleration: flat, precision (default), adaptive |
 | 0x00A2 | pointer speed, −10–10 (default 0) |
@@ -1346,9 +1619,12 @@ are type 0xFF with the request type and an error code; events use request id 0.
 | 0x00D8–0x00DB | how Bluetooth host 1–4 maps the absolute pointer, as 0x00A6 |
 | 0x00DC–0x00DF | what Bluetooth host 1–4's desktop coordinates count, as 0x00AC |
 | 0x00E0–0x00E3 | how screen hop moves Bluetooth host 1–4's pointer: its absolute pointer (default) or relative motion only |
+| 0x00E8–0x00ED | the keyboard layout of PC1, PC2, Bluetooth hosts 1–4 (`kvm_hid::layouts::Layout`, 0 US by default): macro text is typed through it (§4.11) |
 | 0x00F0–0x00FF | entry 0–15 of the hotkey list (§4.5): action (kind, argument: a host for select-host, a profile for select-profile; kind 0 = unused entry), then the hotkey: kind (none, double-tap, combo), modifiers, key usage, swallow |
 | 0x0100–0x0107 | every device's routing in profile 0–7 (7 bytes, as 0x0038–0x003E; default all follow) |
 | 0x0108–0x010F | the arrangement profile 0–7 uses: 0 none (default, screen hop off), n + 1 arrangement n |
+| 0x0110–0x0117 | the keymap profile 0–7 uses: 0 none (default, the short path), n + 1 keymap n (§4.11) |
+| 0x0118–0x011F | profile 0–7's fallback keymap, for a host that can't take the gamepad: 0 none (default, the profile's own), n + 1 keymap n |
 
 0x0030–0x003E are the active profile's modes and routings: the config item (§4.8) doesn't keep them, the profiles'
 are there.
@@ -1380,8 +1656,7 @@ The main limits:
 - **3.3 V:** good within ±5 %, against a reference that is itself ±3.3 %.
 - **PC USB speed:** orange at full speed, since 125 µs polling needs high speed.
 - **Hub-0:** red as low speed (errata E1), or when missing outside deep standby.
-- **Bluetooth module:** orange while it is programmed, red when it doesn't run its firmware this boot or programming
-  gave up (as the self-test's `BT_FW` / `BT_GAVE_UP`).
+- **Bluetooth module:** orange while it is programmed, and while it needs an update (as the self-test's `BT_FW`).
 
 The firmware measures every 2 s, and the engine builds the list when asked. Readings not taken yet (before the first
 measurement, a PC whose chip doesn't answer) are left out, so a host merges the pages by id.
@@ -1396,15 +1671,20 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
   - `odkvmctl switch pc1|pc2|toggle|next|host1…host4`;
   - `odkvmctl wireless` (the four host slots), `wireless pair [stop]`, `wireless passkey <digits>`,
     `wireless forget <slot|all>`, `wireless name <slot> [<name>]`, `wireless policy <slot> stay|on-select`,
-    `wireless erase` (every pairing the module holds, hosts and devices, and a restart of the module) (a KVM with
-    the Bluetooth module, §4.13). The user-facing name is neutral until the product is listed with the Bluetooth SIG
+    `wireless erase` (every pairing the module holds, hosts and devices, and a restart of the module), `wireless
+    allow <slot>` (from a PC: that host may control the KVM over the module, once the key is tapped), `wireless
+    disallow <slot>`, and on a host that reaches the KVM over the module `wireless allow` alone (asks for itself;
+    every other command answers `NotAllowed` until then, saying so) (a KVM with the Bluetooth module, §4.13). The
+    host list marks the hosts that may control the KVM, and those whose software is connected now. `odkvmctl list`
+    shows the KVMs reached over the module too. The user-facing name is neutral until the product is listed with the Bluetooth SIG
     (design.md §16);
   - `odkvmctl device` (the four device slots, and while looking the devices found, numbered), `device scan [stop]`
     (look for 60 s and list the devices as they show up; Ctrl-C leaves the KVM looking), `device pair <number|address>`
     (follows the pairing to its end, with the passkey to type on a keyboard that asks), `device forget <slot|all>`,
-    `device mode <slot> auto|normalized|off`, `device route <slot> follow|pc1|pc2|host1…host4`, `device map <slot>`
-    (the report map the KVM holds, as hex, and what the parser makes of it, run on the PC: to send along when a device
-    shows as not supported), `device log` (the module's recent log as the KVM keeps it: connections, pairing, why a
+    `device mode <slot> auto|normalized|off`, `device route <slot> follow|pc1|pc2|host1…host4`, `device map <device>`
+    (a device by name, `keyboard` … `wireless4`, or a Bluetooth device's slot: every HID interface's descriptor the
+    KVM holds, as hex, and what the parser makes of it, run on the PC: to send along when a device shows as not
+    supported), `device log` (the module's recent log as the KVM keeps it: connections, pairing, why a
     device was let go) (§4.13);
   - `odkvmctl port <keyboard|mouse|other> [mode <…>|route <…>|redetect]`;
   - `odkvmctl profile` (list: each device's mode, and its pin where it has one), `odkvmctl profile
@@ -1418,15 +1698,40 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     `next-profile`, …), hotkeys as `double:scrolllock`, `ctrl+alt+1`, `f13` or `none`; `learn` instead has the KVM learn
     it from the keyboard, warns of a plain key or one another entry has, and on a terminal asks before using it. As
     settings: `hotkey1`–`hotkey16`, `<action> <hotkey>` or `none`;
+  - `odkvmctl keymap [show [<keymap>]]` (what each keymap, 0–3, does differently from a fresh one, layer by layer,
+    and the profiles using it), `keymap set <keymap> <layer> <control> <keycode>`, `keymap axis <keymap> <layer>
+    <input> <target> [--scale <x>] [--invert] [--deadzone <%>] [--curve linear|quadratic|cubic] [--param <n>]`,
+    `keymap learn [<seconds>]` (the controls of the normalized devices as they are used, by the names `set` takes;
+    from the active PC), `keymap use <profile> <keymap|none>` (§4.11). Controls are key names (`a`, `f13`,
+    `lctrl`), `mouse1`–`mouse16`, `pad1`–`pad32`, `hat-up` / `-right` / `-down` / `-left`, and axis directions
+    (`x-`, `wheel+`); keycodes are a key or `ctrl+c`, `mouse1`, `pad5`, `dpad-up`, `mo(1)`, `tg(2)`, `lt(1,space)`,
+    `mt(shift,a)`, `none`, `trans`, or a number (`odkvmctl::keycodes`). As settings: `profileN-keymap` (`none`, 0–3)
+    and `gamepad` (`off`, `hid`, `xinput`);
+  - `odkvmctl keymap macro [<n> [<step>…]]` (steps as `text:hello`, `tap:ctrl+c`, `down:shift`, `up:shift`,
+    `delay:100`, or `none`), `keymap dance [<n> <tap> [<hold> [<double> [<tap-hold>]]] [--term <ms>]]`, `keymap combo
+    [<n> <keycodes,…> <output>]`, `keymap override [<n> <trigger> <replacement> [--mods …] [--negative …]
+    [--suppress …] [--layers 0,1] [--off]]`, `keymap repeat [<n> <keycode> <alternate> [--mods …] [--off]]`, `keymap
+    setting [<name> [<value>]]` (the QMK settings by name: `tapping-term`, `permissive-hold`, …), `keymap fallback
+    <profile> <keymap|none>`: without arguments each lists what is set (§4.11);
+  - `odkvmctl monitor <device> [<seconds>]` (the fields its descriptors declare, then its reports as they change, the
+    changed bytes marked), `odkvmctl field <device> [list|set <n> <interface> <report ID> <bit> <bits> <target>
+    [--signed] [--invert]|remove <n>]` (targets `pad1`–`pad32` or an axis: `x` … `accelerator`), `odkvmctl outputs`
+    (what each host is offered and took), `odkvmctl layout [<host> [<layout>]]` (each host's keyboard layout: `us`,
+    `gb`, `de`, …);
+  - `odkvmctl calibrate <device> [show]`, `calibrate <device> measure [<seconds>]` (move every stick and trigger to
+    its limits, then let go: the range seen and where it rests become the calibration), `calibrate <device> set
+    <axis> <min> <centre> <max> [<deadzone>]`, `calibrate <device> reset`; a device is `keyboard`, `mouse`, `other` or
+    `wireless1`–`4`, the calibration is kept with the device that is there (§4.11);
   - `odkvmctl config get [<name>]`, `config set <name> <value>`, `config save`, `config reset`. Turning
     `software-switching` or `software-config` off prints what stops working and, on a terminal, asks y/N; turning one
     on asks the KVM and waits for its key (`Client::allow_software`);
   - `odkvmctl diag`: the diagnostics, graded (§8.4);
-  - `odkvmctl identify [<seconds>]`, `odkvmctl update [<file or folder>]` (default: the firmware shipped with the
-    program; over a PC port to the KVM that answers there, otherwise onto a board in its bootloader on PWR/SERVICE,
-    §4.9 "Service port"; `odkvmctl list` shows those boards too),
-    `odkvmctl reboot [normal|bootloader|at32-dfu1|at32-dfu2|at32-retry|wireless-retry]` (`at32-retry`: up to 5 more
-    programming attempts for the AT32F405s, §4.9; `wireless-retry`: the same for the Bluetooth module, §4.13).
+  - `odkvmctl identify [<seconds>]`, `odkvmctl update [<file or folder>] [--module]` (default: the firmware shipped
+    with the program; over a PC port to the KVM that answers there, the RP2354B's and then, once the KVM is back and
+    its module asks for it, the module's; otherwise onto a board in its bootloader on PWR/SERVICE, §4.9 "Service
+    port"; `odkvmctl list` shows those boards too; `--module`: only the module's, whatever it runs, §4.13),
+    `odkvmctl reboot [normal|bootloader|at32-dfu1|at32-dfu2|at32-retry]` (`at32-retry`: up to 5 more programming
+    attempts for the AT32F405s, §4.9).
     `odkvmctl status` names the Bluetooth module's firmware, or what it is doing instead, where one is fitted.
   - `odkvmctl display [list]`, `odkvmctl display input <id> <value>`: the monitors' inputs over DDC/CI (no KVM needed).
   - `odkvmctl screens [--arrangement <n|name>] [list]`: screen hop's state, the arrangements (those with screens or a
@@ -1444,7 +1749,9 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     `no-hop` for a screen off for hop, `fixed` for a place on its computer that dragging doesn't change) or `off`.
     `odkvmctl status` has a screen-hop line.
   - `--sim` runs any command against a built-in simulated device (`OPENDYN_SIM_HOP=1`: with screen hop set up, two
-    arrangements and, with `OPENDYN_SIM_BT=1`, the tablet of host 1 in both).
+    arrangements and, with `OPENDYN_SIM_BT=1`, the tablet of host 1 in both; `OPENDYN_SIM_PAD=1`, `receiver` or
+    `symmetric`: a generic gamepad, a wireless receiver with a pad linked, or a symmetric-stick pad with a touch pad on
+    the Other port instead of the webcam, Normalized, with the virtual gamepad on).
 - **GUI** (`opendyn-kvm`), laid out after Creative's Sound Blaster app: a sidebar with the logo, coloured page icons
   and, at its foot, the quick controls (profile, PC1 / PC2 in the KVM's LED colours, LED brightness, dark / light), and
   the pages as rounded cards. The accent colour is the active PC's. Pages:
@@ -1492,13 +1799,39 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     active PC with a keyboard the KVM reads), and × to remove it; **Add hotkey** puts a new entry after the last one,
     doing something no entry does yet. Then the double-tap window; what a tap and a long press on the KVM's key do, and the long
     press's duration: a slider whose handle sits on a bar from 0 to 3 s that shows the tap window and where the long
-    press begins; the Vial interface and keymap, shown when `Info.caps` has `VIAL`;
+    press begins; the Vial interface, shown when `Info.caps` has `VIAL`;
+  - *Keymaps* (`keymaps.rs`, with a KVM): the four keymaps and their eight layers, what a layer does as a picture of
+    a full-size keyboard (and a row of the keys it doesn't draw), of a mouse with its side buttons (buttons 6–16 in a
+    row) or of a gamepad (the standard one's 17 buttons, or the gamepad on the page's device with its own, its extra
+    buttons named as the user likes, kept on this computer in `odkvmctl::local`), each control's legend coloured
+    where it does something other than it says. While the page shows, the controls held light up live (from the
+    active PC, renewed every 4 s: `WatchControls`). A control is chosen by clicking it, or with *Learn* by pressing it
+    on the device (meanwhile the controls reach no host); then its action from a list grouped by kind (mouse,
+    gamepad, layers, media and system), typed as on the CLI, or *Press what it should do*: the next control pressed
+    gives its own keycode. The axis rules of the layer in a table, each axis's live value beside it. The profiles
+    using the keymap (checkboxes), the virtual gamepad (off, HID, XInput), the gamepad drawn in its device's style
+    (offset sticks and lettered buttons for an XInput pad, sticks side by side with shapes, Share, Options, Mute and
+    a touch pad for a symmetric one, buttons by number for any other; *Drawn as* changes it, kept on this computer by
+    the device's identity), and for a gamepad its calibration: a
+    wizard (move every stick and trigger to its limits, then *Done*; it waits until all is let go to take the
+    centre) and *Reset*. The keyboard picture in the shape of this computer's keyboard (ANSI, ISO, JIS, ABNT2; the
+    layout's own unless chosen, kept on this computer) with the legends of the host this computer is (its keyboard
+    layout). The action list has the KVM's actions too. The page's other sections (`keymaps/parts.rs`): *Macros* (one
+    step per line, as on the CLI), *Tap dances*, *Combos*, *Key overrides*, *Repeat keys* (rows of keycode fields that
+    turn red while they don't read as a keycode and go to the KVM when left; the entries in use and one more), *Timing
+    and options* (the QMK settings), *Monitor* (a device's reports as grids of bits, the declared ones tinted and the
+    changing ones lighting up; bits selected with a click and a Shift-click become a field override, the device's
+    overrides listed with ×) and *Hosts* (each host's keyboard layout and its outputs, what it took in colour; each
+    profile's fallback keymap);
   - *Settings*: this computer (start at login, appearance: system / dark / light, language), LEDs, PC side, software control,
     save and factory reset. Software control stays usable while configuration is locked: turning a lock off goes
     through an "are you sure" dialog with the warning, turning it on shows a countdown until the key is pressed;
-  - *Firmware*: versions (the Bluetooth module's too, or what it is doing instead), the firmware file, update,
-    identify, a card for a PC-side chip or a Bluetooth module the KVM gave up programming (with *Try again*) or a
-    module being programmed, and the diagnostics (§8.4) with a coloured dot per reading. The file starts as the
+  - *Firmware*: versions (the Bluetooth module's too, or what it is doing instead), the firmware file, update (a bar
+    for the RP2354B, then one for the module once the KVM is back; once the KVM answers with the new firmware and its
+    module is through, the page starts afresh: bars and results go, the diagnostics and the file are read anew, and
+    one line says what it runs), identify, a card for a PC-side chip the KVM gave up
+    programming (with *Try again*) or a module being programmed or needing an update (with *Update the wireless
+    module*), and the diagnostics (§8.4) with a coloured dot per reading. The file starts as the
     firmware shipped with the app (`odkvmctl::firmware::bundled`: `firmware\` beside the programs, the packages'
     `/usr/share/opendyn-kvm/firmware`, `OPENDYN_FIRMWARE`, or a build tree's `dist/`); *Browse…* opens the desktop's
     file dialog (`rfd`: the XDG portal on Linux, no GTK; on a thread of its own). The page says the file's version and
@@ -1510,10 +1843,14 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     §4.13): pairing a host (with a countdown, and a passkey field while a host waits for one); pairing a device (*Look
     for devices* with a countdown, the devices found with their kind, signal and *Pair*, how far the pairing got, and
     the six digits to type on a keyboard that asks for them); the four device slots (name, kind, state, battery,
-    forget; their modes and routings are on *Ports*); the four host slots: name, state, policy, forget; and, last,
-    *Erase all pairings* (two presses: every host and device the module holds, its keys, and a restart). While the
-    module is starting, being programmed or failed, the page says so instead (with *Try again* after 5 failed
-    attempts).
+    forget; their modes and routings are on *Ports*); the four host slots: name, state, policy, *May control the KVM*
+    (on only with a tap on the KVM's key, which the card then asks for; "its software is connected" while it has a
+    session, §8.1 "Over Bluetooth"), forget; and, last, *Erase all pairings* (two presses: every host and device the module holds, its keys, and a restart). While the
+    module is starting, being programmed or needs an update, the page says so instead (with *Update the wireless
+    module* when it needs one).
+  - *Allow this computer* instead of every KVM page, on a computer that reaches the KVM over the module and may not
+    control it yet (`NotAllowed`): *Ask the KVM*, then the 30 s to tap its key. The Firmware page says that updates go
+    over USB while the KVM is reached over the module.
 
   Bluetooth hosts are lesser targets and the window stays the two-PC window: without the module nothing changes. With
   it:
@@ -1649,12 +1986,27 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     once one is plugged in the banner says so and offers *Use it*. Leaving puts the monitors that follow back on this
     computer's input. Nothing of it is saved: the next start looks for the KVM again. The window's title says
     "simulated" while it lasts. A window test clicks through it against a scripted no-KVM and the simulator.
-- **On the web** (the simulator in a browser): `opendyn-kvm` also builds for `wasm32-unknown-unknown`, the window in a
-  page's `<canvas id="opendyn-kvm">` (`web.rs`: eframe's web runner, WebGL through glow). It has only the simulator: no
-  USB, files, tray, single copy or DDC/CI. The worker's rounds run once per frame (`worker::Web`) instead of on a thread
-  of their own, waits spin on the browser's clock (`odkvmctl::time`), the local settings live in the page's storage,
-  and the page's address stands in for the environment (`?OPENDYN_SIM_BT=1&OPENDYN_SIM_HOP=1`, `OPENDYN_LANG=de`).
-  The product page (repository opendynkvm-web) builds it from here; nothing here depends on that repository.
+- **On the web** (0.1.52): `opendyn-kvm` also builds for `wasm32-unknown-unknown`, the window in a page's
+  `<canvas id="opendyn-kvm">` (`web.rs`: eframe's web runner, WebGL through glow). It starts with the simulator and,
+  in a Chromium-based browser, reaches a real KVM: its control interface over **WebHID** from a PC connected to it, or
+  its module's control service over **Web Bluetooth** from a computer paired as one of its hosts (`odkvmctl::webio`; a
+  small JS snippet keeps each link's reports until they are read and sends one write at a time, which Web Bluetooth
+  needs). A banner offers *Connect over USB…* and *Connect over the wireless link…* (the browser's chooser, which needs
+  the click), and *Back to the simulator*; a KVM the page was given before is taken again at the start, without
+  asking. A KVM that goes away leaves the simulator in its place, with a line saying so. No files (so no firmware
+  update: the Firmware page says to use the app), tray, single copy or DDC/CI.
+  - **Async:** WebHID and Web Bluetooth answer only once the page's event loop has run, so a request can't wait in a
+    loop as on a computer. The client (`Client`), the transports and the worker's rounds (`run`, `command`, `refresh`,
+    `take_events`) are written once with `maybe-async`: blocking on a computer (its `is_sync`), async in a browser,
+    where the worker is a task on the page's event loop (`worker::spawn_web`) and waits are the browser's timers
+    (`time::pause`). No lock on the shared state is held across a request.
+  - **Stack:** the simulator's engine (about 220 KB) is on the heap (`SimTransport::engine`), and the browser's
+    simulator is made once, outside the task, and parked while a real KVM is in use: copies of it on the 1 MB stack
+    overflowed it.
+  - The local settings live in the page's storage, and the page's address stands in for the environment
+    (`?OPENDYN_SIM_BT=1&OPENDYN_SIM_HOP=1`, `OPENDYN_LANG=de`; `OPENDYN_SIM_BT=wireless` plays a Bluetooth host that
+    must ask first, here and in the app). The product page (repository opendynkvm-web) builds it from here; nothing
+    here depends on that repository.
 - **macOS** (11 and later, 0.1.27 on; built and checked from Linux with `cargo clippy --target aarch64-apple-darwin`
   and a stand-in C compiler for hidapi's C, not yet run on a Mac): the control interface through hidapi's IOHIDManager
   backend; the screens from Quartz's display list in points (`Units::Logical`), each display's scaling from its mode's
@@ -1687,7 +2039,7 @@ measurement, a PC whose chip doesn't answer) are left out, so a host merges the 
     `cargo xtask desktop [--remove]` installs the entry (for `target/debug/opendyn-kvm`) and the icons into
     `~/.local/share` for a development build.
   - Each package carries `THIRD-PARTY-LICENSES.txt`: the license texts of every crate compiled in (from
-    `cargo metadata`, each distinct text once), and RMK's notice for `kvm-vial`.
+    `cargo metadata`, each distinct text once), and RMK's notice for `kvm-map`.
   - Each package carries the release's firmware: `cargo xtask package` runs `dist` into the same folder first, and
     puts `kvm-rp2354.bin`, `kvm-rp2354.uf2` and `kvm-first.uf2` into `/usr/share/opendyn-kvm/firmware` (Linux) or
     `firmware\` beside the programs (Windows). The window and `odkvmctl update` install it by default.
@@ -1722,15 +2074,17 @@ cargo xtask package --macos                            # on a Mac: OpenDynKVM-<v
 (cd firmware/at32f405 && cargo build --release)        # flash: probe-rs over SWD, or DFU (§4.9)
 ```
 
-`cargo xtask dist` builds the AT32F405 firmware, then the RP2354B firmware with it embedded, and writes to `dist/`:
+`cargo xtask dist` builds the AT32F405 firmware and the Bluetooth module's, then the RP2354B firmware with the
+AT32F405's embedded and the module image's SHA-256, and writes to `dist/`:
 
 | File | Use |
 |---|---|
-| `kvm-first.uf2` | blank board: copy onto the `RP2350` drive (PWR/SERVICE port); partition table + firmware in partition A |
+| `kvm-first.uf2` | blank board, or one with the partition table from before 0.1.51: copy onto the `RP2350` drive (PWR/SERVICE port); partition table + firmware in partition A, B's start erased |
 | `kvm-rp2354.uf2` | board with the partition table: the ROM writes it into the partition that is not running |
 | `kvm-rp2354.bin` | `odkvmctl update` |
+| `kvm-module-esp32c3.bin`, `kvm-module-esp32.bin` | the Bluetooth module's firmware for each chip as the host software streams it (`kvm_proto::modimage`); `odkvmctl update` sends the module's after `kvm-rp2354.bin` |
 | `kvm-at32f405.bin` | AT32F405 flash image for DFU or SWD (normally the RP2354B programs the AT32F405s itself) |
-| `kvm-esp32c3.bin` | the Bluetooth module's flash from offset 0, as the RP2354B writes it (on the bench: `espflash write-bin 0x0`) |
+| `kvm-esp32c3.bin`, `kvm-esp32.bin` | the Bluetooth module's flash from offset 0 (on the bench: `espflash write-bin 0x0`) |
 | `pt.json` | the same partition table for `picotool partition create` |
 
 The partition-table encoder is tested against a block made by `picotool partition create` (embassy-rp's test vector,
@@ -1771,10 +2125,14 @@ hash included).
 
 Not built yet:
 - **Vial:** every feature of vial-qmk is in (§4.11) but RGB, encoders and the pre-0.19 tapping flags. Macro text is
-  typed with a US layout: on a PC set to another layout, letters and symbols can come out wrong. The whole path is
-  tested against vial-gui's request sequences, not yet against the app on hardware (M2).
+  typed through the host's keyboard layout (13 of them, ASCII only, as Vial's text is). The whole path is tested
+  against vial-gui's request sequences, not yet against the app on hardware (M2); the custom keycodes' names are
+  QMK's keyboard range as vial-gui reads it, not yet seen in the app.
 - **Source hi-res wheels:** the normalized mouse offers a resolution multiplier, but source mice are read in detent
   mode for now.
+- **Mapping on hardware** (hid_mapping.md, milestones 1–6): everything is tested in the engine and the simulator, not
+  yet with real devices and games: the virtual gamepad (HID, XInput, over Bluetooth), calibration, a touch pad made a
+  control with field overrides, which hosts subscribe to the Bluetooth gamepad.
 
 Needed from outside:
 

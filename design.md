@@ -553,11 +553,10 @@ Alternatives searched:
   the active PC's colour.
   - **Blinking red** (alternating with the active PC's colour, and in standby too): a part of the KVM doesn't work.
     This covers Hub-0, the PWR-port readings, for either PC its link, its hub, its chip's firmware or its chip's
-    crystal, and the Bluetooth module's firmware (0.16.0, when fitted). The PC LEDs show which side, `odkvmctl status` says what. A front port's power-switch fault stays on that
+    crystal. The PC LEDs show which side, `odkvmctl status` says what. A front port's power-switch fault stays on that
     port's LED.
-  - **Held while the KVM powers up:** the AT32F405s, and the Bluetooth module where fitted, get up to 5 more
-    programming attempts. The RP2354B stops after 5 failed attempts in a row, so it doesn't reprogram a chip at every
-    power-up (software.md §4.9, §4.13). Switching and
+  - **Held while the KVM powers up:** the AT32F405s get up to 5 more programming attempts. The RP2354B stops after 5
+    failed attempts in a row, so it doesn't reprogram a chip at every power-up (software.md §4.9). Switching and
     configuration from software are allowed again too (§8). That press is neither a tap nor a long press.
   - **Pulsing white:** a firmware update, or software asking to be allowed again, waits for a tap (§8).
 - **Status LEDs** on the front edge:
@@ -586,12 +585,17 @@ Alternatives searched:
 - It is available on **both** PCs at all times, including the inactive one.
 - The RP2354B holds the only copy of the state. A change made from either PC is pushed as an event to the app on both
   PCs.
+- **Over Bluetooth** (with the module, §16; 0.1.52): a computer paired as one of the Bluetooth hosts reaches the same
+  protocol through a GATT service of the module's, so a laptop or tablet that is only a Bluetooth host can be set up
+  without a cable. Only bonded, authenticated hosts reach it, and each only once a tap on the KVM's key allowed it
+  (from the host itself, or from a PC); firmware updates stay on USB (software.md §8.1).
 
 **Front ends.** Both use the same protocol:
 - **`odkvmctl`**: a cross-platform tray app plus CLI (proposed: Rust + hidapi, one static binary per OS).
   - The tray icon shows the active PC, with notifications on switch and on faults.
   - The CLI allows scripting, e.g. `odkvmctl switch pc2`, `odkvmctl port mouse mode mirrored-identity`.
-- **WebHID page** (Chromium-based browsers): zero-install configuration, for machines where you don't want to install anything.
+- **Browser** (Chromium-based browsers): the same window, built for the web, with zero install: over WebHID from a PC,
+  or over Web Bluetooth from a Bluetooth host; the simulator otherwise (software.md §9 "On the web").
 
 **What it reports**
 
@@ -658,20 +662,23 @@ A USB-C cable and a paper clip are the only tools needed.
       - each port power switch toggles without a fault;
       - VBUS/CC readings are plausible;
       - Hub-1/2 are seen by their AT32F405 (via VBUS_DET);
-      - the Bluetooth module, where fitted, runs the embedded firmware.
+      - the Bluetooth module, where fitted, runs the RP2354B's version (else it waits for the host software to send it).
 
       The result is shown as an LED colour code and in the host software.
-2. **Normal updates:** from `odkvmctl` or the WebHID page on either PC, through the control interface to the RP2354B.
+2. **Normal updates:** from `odkvmctl` or the app on either PC, through the control interface to the RP2354B (not over
+   Bluetooth, nor from the browser, which has no firmware files).
    - It writes into its inactive A/B flash partition, asks for a key press to confirm, and reboots in
      *try-before-you-buy* mode. A bad image rolls back automatically.
-   - It reprograms the AT32F405s, and the Bluetooth module where fitted, if their image changed.
+   - It reprograms the AT32F405s if their image changed. The host software then streams the Bluetooth module's
+     firmware through it to the module, where fitted, if the module runs another version.
    - Alternatively, reboot into service mode and drop a UF2 on the drive.
 3. **Recovery:**
    - **RP2354B:** hold the pinhole button (on `QSPI_SS`) while powering via PWR/SERVICE, and the ROM bootloader comes
      up whatever is in flash.
    - **AT32F405s:** the RP2354B can always force them into their ROM bootloader.
    - **Bluetooth module:** its BOOT strap is on the RP2354B's TX line, so the RP2354B can always get it into its ROM
-     bootloader (a UART break across one of its resets) and program it again.
+     bootloader (a UART break across one of its resets) and program it again with the firmware the host software
+     sends.
    - All bootloaders live in ROM, so the device cannot be bricked by a bad flash.
 
 During firmware *development*, a debug probe still helps for stepping through code (a $5 Pico 2 running Raspberry Pi's
@@ -978,8 +985,9 @@ Up to four extra hosts (PCs, tablets, phones) take the KVM's keyboard and mouse 
 USB PCs. They are lesser targets: the KVM's own keyboard, mouse and media reports only (no mirroring, identity or
 passthrough), and the window and the LEDs stay the two-PC KVM until a host is paired. At the same time the module
 takes up to four Bluetooth LE keyboards, mice and other input devices (firmware 0.1.50): each is one of the KVM's
-devices as a front port's is, normalized or off, following the active host or pinned to one (§4). Firmware and
-control protocol: software.md §4.13.
+devices as a front port's is, normalized or off, following the active host or pinned to one (§4). A host's software
+may also control the KVM through the module, once the KVM's key allowed that host (§8, 0.1.52). Firmware and control
+protocol: software.md §4.13.
 
 - **Module:** ESP32-C3-MINI-1-H4X (LCSC C41349510), pre-certified, with its PCB antenna. Chosen over a bare nRF54L or
   ESP32-C3 for the certification it carries (the board's radio tests reuse the module's) and over an nRF54L15 module
@@ -995,12 +1003,13 @@ control protocol: software.md §4.13.
 - **Interface:** UART0 on GPIO28/29, and from 0.18.0 GPIO9 to the module's EN through 1 kΩ (R1605, beside the EN
   pad). The module's BOOT strap shares the RP2354B's TX line, so the RP2354B gets the module into its ROM bootloader
   with a link command, or with a UART break across a reset. From 0.18.0 it makes that reset itself on EN. Before, it
-  waits for one the module makes by itself. It then programs the module from its own image, as it does the AT32F405s.
+  waits for one the module makes by itself. It then programs the module with the firmware the host software streams
+  through it (the RP2354B keeps none of it, and takes only the image its own firmware was built with).
   On 0.16.0 and 0.17.0 EN has only its RC. The line could not leave GPIO30, beside the UART, in a seeded route
   (hardware/debug/v18-esp-en/).
 - **Without it on the board:** an ESP32-C3 board with the chip's own USB port, on a front port, can be the module
-  instead (0.12–0.15 boards, the `_nobt` variant): the same firmware over its USB serial port, programmed and kept up
-  to date by the RP2354B as the fitted module is. It takes that port; an ESP32 board with other firmware is never
+  instead (0.12–0.15 boards, the `_nobt` variant): the same firmware over its USB serial port, programmed through the
+  RP2354B as the fitted module is. It takes that port; an ESP32 board with other firmware is never
   touched (software.md §4.13).
 - **Assembly variants:** the module and its eight parts carry `Fit = BT`. `tools/make_fab.py` writes the BOM and CPL with
   them (`jlcpcb_*.csv`) and without them (`jlcpcb_*_nobt.csv`). The same firmware runs both, and boards 0.12–0.15: it

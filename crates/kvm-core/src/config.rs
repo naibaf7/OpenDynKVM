@@ -9,10 +9,10 @@
 use core::ops::RangeInclusive;
 
 use kvm_proto::ctrl::{
-    Accel, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, DEVICES, Device, ErrorCode, HOP_CORNER_MAX, HOP_RESISTANCE_MAX,
-    HOP_SPEED, HOSTS, Host, Hotkey, HotkeyAction, HotkeyBinding, KeyAction, MAX_ARRANGEMENTS, MAX_HOTKEYS,
-    MAX_PROFILES, MAX_SCREENS, Mapping, PROFILE_NAME_MAX, Polling, PortMode, ProfileName, Rgb, Routing, Screen, Units,
-    VialMode, key,
+    Accel, BT_HOSTS, BtPointer, BtPolicy, ConfigValue, DEVICES, Device, ErrorCode, GamepadOut, HOP_CORNER_MAX,
+    HOP_RESISTANCE_MAX, HOP_SPEED, HOSTS, Host, Hotkey, HotkeyAction, HotkeyBinding, KEYMAPS, KeyAction,
+    MAX_ARRANGEMENTS, MAX_HOTKEYS, MAX_PROFILES, MAX_SCREENS, Mapping, PROFILE_NAME_MAX, Polling, PortMode,
+    ProfileName, Rgb, Routing, Screen, Units, VialMode, key,
 };
 use kvm_proto::wire::{Reader, Writer};
 
@@ -21,7 +21,7 @@ pub use crate::hop::Layout;
 /// Store key of the config.
 pub const ITEM: u16 = 0x0001;
 /// Room for every key with margin (`item_roundtrip` keeps the item at its longest 32 bytes short of it).
-pub const ITEM_MAX: usize = 704;
+pub const ITEM_MAX: usize = 800;
 /// Store key of arrangement 0's item; arrangement n's is this + n.
 pub const ARRANGEMENT_ITEM: u16 = 0x0010;
 /// An arrangement's item at its longest: its name (key, length, then the name with its own length) and every screen
@@ -48,7 +48,11 @@ pub struct Config {
     pub sw_switch_allowed: bool,
     pub sw_config_allowed: bool,
     pub vial: VialMode,
-    pub keymap: bool,
+    /// The virtual gamepad the PCs get (hid_mapping.md §6.1).
+    pub gamepad: GamepadOut,
+    /// Each host's keyboard layout (`Host::index`; `kvm_hid::layouts::Layout` as its number): macro text is typed
+    /// through it.
+    pub layouts: [u8; HOSTS],
     pub auto_select: bool,
     pub standby_wake: bool,
     pub standby_glow: bool,
@@ -67,6 +71,8 @@ pub struct Config {
     pub bt_names: [ProfileName; BT_HOSTS],
     /// What the Bluetooth module does with each host slot while another target is active.
     pub bt_policies: [BtPolicy; BT_HOSTS],
+    /// Each Bluetooth host slot may control the KVM over the module's control service (software.md §8.1).
+    pub bt_control: [bool; BT_HOSTS],
     /// The KVM's mouse interface also has an absolute pointer (screen hop needs it).
     pub abs_pointer: bool,
     pub hop: HopConfig,
@@ -112,6 +118,10 @@ pub struct Profile {
     pub routes: [Routing; DEVICES],
     /// The arrangement screen hop moves the pointer across in this profile; None: screen hop is off.
     pub arrangement: Option<u8>,
+    /// The keymap (`kvm_map`) the profile's normalized devices go through; None: none, the short path.
+    pub keymap: Option<u8>,
+    /// The keymap used instead while the input's host can't take the virtual gamepad; None: the profile's own.
+    pub fallback: Option<u8>,
 }
 
 impl Profile {
@@ -123,7 +133,14 @@ impl Profile {
             modes[i] = ports;
             i += 1;
         }
-        Profile { name: ProfileName::new(name), modes, routes: [Routing::Follow; DEVICES], arrangement: None }
+        Profile {
+            name: ProfileName::new(name),
+            modes,
+            routes: [Routing::Follow; DEVICES],
+            arrangement: None,
+            keymap: None,
+            fallback: None,
+        }
     }
 }
 
@@ -153,8 +170,8 @@ impl Config {
         sw_config_allowed: true,
         // Opt-in: the interface costs a mirror endpoint and changes the serial number.
         vial: VialMode::Off,
-        // A fresh keymap changes nothing, so it can always apply.
-        keymap: true,
+        gamepad: GamepadOut::Off,
+        layouts: [0; HOSTS],
         // Standby (software.md §4.12): the keyboard follows the PC that is on, can wake a sleeping one, and the LEDs
         // go dark.
         auto_select: true,
@@ -179,6 +196,7 @@ impl Config {
         ],
         bt_names: [ProfileName::new(""); BT_HOSTS],
         bt_policies: [BtPolicy::StayConnected; BT_HOSTS],
+        bt_control: [false; BT_HOSTS],
         // Opt-in: it changes the KVM's mouse interface, so both PCs reconnect it once.
         abs_pointer: false,
         hop: HopConfig {
@@ -212,6 +230,18 @@ impl Config {
     /// The profile after the active one, among those in use.
     pub fn next_profile(&self) -> u8 {
         (self.profile + 1) % self.profile_count
+    }
+
+    /// The keymap of the active profile (None: no keymap, the short path), for a host that takes the virtual gamepad
+    /// or not (then its fallback, if it has one).
+    pub fn keymap(&self, takes_gamepad: bool) -> Option<u8> {
+        let p = &self.profiles[self.profile as usize];
+        if takes_gamepad { p.keymap } else { p.fallback.or(p.keymap) }
+    }
+
+    /// The keyboard layout of host `h`.
+    pub fn keyboard_layout(&self, h: Host) -> kvm_hid::layouts::Layout {
+        kvm_hid::layouts::Layout::from_u8(self.layouts[h.index()]).unwrap_or_default()
     }
 
     /// The arrangement of the active profile (None: screen hop is off in it).
@@ -276,7 +306,7 @@ impl Config {
             key::SW_SWITCH_ALLOWED => ConfigValue::SwSwitchAllowed(self.sw_switch_allowed),
             key::SW_CONFIG_ALLOWED => ConfigValue::SwConfigAllowed(self.sw_config_allowed),
             key::VIAL => ConfigValue::Vial(self.vial),
-            key::KEYMAP => ConfigValue::Keymap(self.keymap),
+            key::GAMEPAD => ConfigValue::Gamepad(self.gamepad),
             key::AUTO_SELECT => ConfigValue::AutoSelect(self.auto_select),
             key::STANDBY_WAKE => ConfigValue::StandbyWake(self.standby_wake),
             key::STANDBY_GLOW => ConfigValue::StandbyGlow(self.standby_glow),
@@ -304,6 +334,10 @@ impl Config {
                 let i = k - key::BT_POLICY_BASE;
                 ConfigValue::BtPolicy(i as u8, self.bt_policies[i as usize])
             }
+            k if (key::BT_CONTROL_BASE..key::BT_CONTROL_BASE + BT_HOSTS as u16).contains(&k) => {
+                let i = k - key::BT_CONTROL_BASE;
+                ConfigValue::BtControl(i as u8, self.bt_control[i as usize])
+            }
             key::ABS_POINTER => ConfigValue::AbsPointer(self.abs_pointer),
             key::HOP_ACCEL => ConfigValue::HopAccel(self.hop.accel),
             key::HOP_SPEED => ConfigValue::HopSpeed(self.hop.speed),
@@ -322,6 +356,17 @@ impl Config {
             k if (key::PROFILE_ARRANGEMENT_BASE..key::PROFILE_ARRANGEMENT_BASE + MAX_PROFILES as u16).contains(&k) => {
                 let i = k - key::PROFILE_ARRANGEMENT_BASE;
                 ConfigValue::ProfileArrangement(i as u8, self.profiles[i as usize].arrangement)
+            }
+            k if (key::PROFILE_KEYMAP_BASE..key::PROFILE_KEYMAP_BASE + MAX_PROFILES as u16).contains(&k) => {
+                let i = k - key::PROFILE_KEYMAP_BASE;
+                ConfigValue::ProfileKeymap(i as u8, self.profiles[i as usize].keymap)
+            }
+            k if (key::PROFILE_FALLBACK_BASE..key::PROFILE_FALLBACK_BASE + MAX_PROFILES as u16).contains(&k) => {
+                let i = k - key::PROFILE_FALLBACK_BASE;
+                ConfigValue::ProfileFallback(i as u8, self.profiles[i as usize].fallback)
+            }
+            k if let Some(h) = Host::ALL.iter().copied().find(|h| key::layout(*h) == k) => {
+                ConfigValue::HostLayout(h, self.layouts[h.index()])
             }
             k if (key::ARRANGEMENT_NAME_BASE..key::ARRANGEMENT_NAME_BASE + MAX_ARRANGEMENTS as u16).contains(&k) => {
                 let a = k - key::ARRANGEMENT_NAME_BASE;
@@ -367,7 +412,9 @@ impl Config {
             {
                 return Err(ErrorCode::InvalidValue);
             }
-            ConfigValue::BtName(i, _) | ConfigValue::BtPolicy(i, _) if i as usize >= BT_HOSTS => {
+            ConfigValue::BtName(i, _) | ConfigValue::BtPolicy(i, _) | ConfigValue::BtControl(i, _)
+                if i as usize >= BT_HOSTS =>
+            {
                 return Err(ErrorCode::InvalidValue);
             }
             ConfigValue::ProfileArrangement(i, a)
@@ -378,6 +425,12 @@ impl Config {
             ConfigValue::ArrangementName(a, _) if a as usize >= MAX_ARRANGEMENTS => {
                 return Err(ErrorCode::InvalidValue);
             }
+            ConfigValue::ProfileKeymap(i, k) | ConfigValue::ProfileFallback(i, k)
+                if i as usize >= MAX_PROFILES || k.is_some_and(|k| k as usize >= KEYMAPS) =>
+            {
+                return Err(ErrorCode::InvalidValue);
+            }
+            ConfigValue::HostLayout(_, l) if l >= kvm_proto::ctrl::LAYOUTS => return Err(ErrorCode::InvalidValue),
             ConfigValue::BtPointer(i, _) if i as usize >= BT_HOSTS => return Err(ErrorCode::InvalidValue),
             ConfigValue::HopSpeed(v) if !HOP_SPEED.contains(&v) => return Err(ErrorCode::InvalidValue),
             ConfigValue::HopResistance(v) if v > HOP_RESISTANCE_MAX => return Err(ErrorCode::InvalidValue),
@@ -387,7 +440,10 @@ impl Config {
             {
                 return Err(ErrorCode::InvalidValue);
             }
-            ConfigValue::SwSwitchAllowed(true) | ConfigValue::SwConfigAllowed(true) if origin == Origin::Software => {
+            // On only at the device: the key confirming a request (`Engine::request_lock`).
+            ConfigValue::SwSwitchAllowed(true) | ConfigValue::SwConfigAllowed(true) | ConfigValue::BtControl(_, true)
+                if origin == Origin::Software =>
+            {
                 return Err(ErrorCode::Locked);
             }
             _ => {}
@@ -411,7 +467,7 @@ impl Config {
             ConfigValue::SwSwitchAllowed(b) => self.sw_switch_allowed = b,
             ConfigValue::SwConfigAllowed(b) => self.sw_config_allowed = b,
             ConfigValue::Vial(m) => self.vial = m,
-            ConfigValue::Keymap(b) => self.keymap = b,
+            ConfigValue::Gamepad(g) => self.gamepad = g,
             ConfigValue::AutoSelect(b) => self.auto_select = b,
             ConfigValue::StandbyWake(b) => self.standby_wake = b,
             ConfigValue::StandbyGlow(b) => self.standby_glow = b,
@@ -431,6 +487,7 @@ impl Config {
             ConfigValue::ProfileName(i, n) => self.profiles[i as usize].name = n,
             ConfigValue::BtName(i, n) => self.bt_names[i as usize] = n,
             ConfigValue::BtPolicy(i, p) => self.bt_policies[i as usize] = p,
+            ConfigValue::BtControl(i, on) => self.bt_control[i as usize] = on,
             ConfigValue::AbsPointer(b) => self.abs_pointer = b,
             ConfigValue::HopAccel(a) => self.hop.accel = a,
             ConfigValue::HopSpeed(v) => self.hop.speed = v,
@@ -440,6 +497,9 @@ impl Config {
             ConfigValue::HopUnits(h, u) => self.hop.units[h.index()] = u,
             ConfigValue::BtPointer(i, p) => self.hop.bt_pointer[i as usize] = p,
             ConfigValue::ProfileArrangement(i, a) => self.profiles[i as usize].arrangement = a,
+            ConfigValue::ProfileKeymap(i, k) => self.profiles[i as usize].keymap = k,
+            ConfigValue::ProfileFallback(i, k) => self.profiles[i as usize].fallback = k,
+            ConfigValue::HostLayout(h, l) => self.layouts[h.index()] = l,
             ConfigValue::ArrangementName(a, n) => self.arrangements[a as usize].name = n,
             ConfigValue::Screen(a, i, s) => {
                 // A free slot is stored as such, whatever else came with it.
@@ -553,6 +613,8 @@ mod tests {
             c.set(ConfigValue::ProfileName(i, ProfileName::new("twelve bytes")), Origin::Software).unwrap();
             let a = (i % 2 == 0).then_some(i / 2 % MAX_ARRANGEMENTS as u8);
             c.set(ConfigValue::ProfileArrangement(i, a), Origin::Software).unwrap();
+            c.set(ConfigValue::ProfileKeymap(i, a), Origin::Software).unwrap();
+            c.set(ConfigValue::ProfileFallback(i, a), Origin::Software).unwrap();
             if i < 7 {
                 let routes = core::array::from_fn(|d| Routing::ALL[(d + i as usize) % Routing::ALL.len()]);
                 c.set(ConfigValue::ProfileRoutes(i, routes), Origin::Software).unwrap();
@@ -567,6 +629,7 @@ mod tests {
         for h in Host::ALL.iter().copied() {
             c.set(ConfigValue::HopMapping(h, Mapping::MainScreen), Origin::Software).unwrap();
             c.set(ConfigValue::HopUnits(h, Units::Logical), Origin::Software).unwrap();
+            c.set(ConfigValue::HostLayout(h, 12), Origin::Software).unwrap();
         }
         for i in 0..BT_HOSTS as u8 {
             c.set(ConfigValue::BtPointer(i, BtPointer::Relative), Origin::Software).unwrap();

@@ -11,6 +11,8 @@ use crate::usbdesc::{ConfigInfo, DeviceDesc, MAX_INTERFACES, class};
 pub enum IfaceKind {
     Hid(Verdict),
     XInput,
+    /// A pad's interface of an XInput wireless receiver: normalized (one pad), never mirrored.
+    XInputWireless,
     Audio,
     Video,
     Storage,
@@ -54,6 +56,8 @@ impl DeviceSummary {
                 IfaceKind::Hid(verdict(i.number).unwrap_or(Verdict { caps: caps::OTHER, misfit: u16::MAX }))
             } else if i.is_xinput() {
                 IfaceKind::XInput
+            } else if i.is_xinput_wireless() {
+                IfaceKind::XInputWireless
             } else {
                 match i.class {
                     class::AUDIO => IfaceKind::Audio,
@@ -97,6 +101,12 @@ impl DeviceSummary {
         self.interfaces.iter().any(|i| i.kind == IfaceKind::XInput)
     }
 
+    /// A wireless receiver's pad interface: normalizable, though the receiver's headset interfaces keep it from
+    /// being mirrored (Auto passes it through, which gives a PC every pad and the headsets).
+    pub fn has_xinput_wireless(&self) -> bool {
+        self.interfaces.iter().any(|i| i.kind == IfaceKind::XInputWireless)
+    }
+
     pub fn all_hid_fit(&self) -> bool {
         self.has_hid() && self.hid().all(Verdict::fits)
     }
@@ -131,7 +141,7 @@ impl DeviceSummary {
                     }
                     b
                 }
-                IfaceKind::XInput => cls::XINPUT | cls::GAMEPAD,
+                IfaceKind::XInput | IfaceKind::XInputWireless => cls::XINPUT | cls::GAMEPAD,
                 IfaceKind::Audio => cls::AUDIO | cls::NON_HID,
                 IfaceKind::Video => cls::VIDEO | cls::NON_HID,
                 IfaceKind::Storage => cls::STORAGE | cls::NON_HID,
@@ -217,7 +227,12 @@ pub fn decide_all(candidates: &[Candidate], wireless: bool, vial: bool) -> [Opti
 pub fn decide(setting: PortMode, port: Port, d: &DeviceSummary, b: &Budget) -> (PortMode, AutoReason) {
     let (need_in, need_out) = d.mirror_cost();
     let mirror_fits = need_in > 0 && need_in <= b.free_in && need_out <= b.free_out;
-    let normalizable = d.hid().any(|v| v.caps & (caps::KEYBOARD | caps::MOUSE | caps::CONSUMER | caps::SYSTEM) != 0);
+    // Gamepads too, since the mapping engine reads them (hid_mapping.md): to the virtual gamepad, or as the keymap says.
+    // XInput pads, wired or behind a wireless receiver, are decoded without a descriptor (`kvm_hid::xinput`).
+    let normalizable =
+        d.hid().any(|v| v.caps & (caps::KEYBOARD | caps::MOUSE | caps::CONSUMER | caps::SYSTEM | caps::GAMEPAD) != 0)
+            || d.has_xinput()
+            || d.has_xinput_wireless();
     match setting {
         PortMode::Auto => {
             if d.has_non_hid() || (!d.has_hid() && !d.has_xinput()) {
@@ -319,6 +334,19 @@ mod tests {
             decide(PortMode::Auto, Port::Other, &pad, &none),
             (PortMode::Passthrough, AutoReason::EndpointBudget)
         );
+    }
+
+    #[test]
+    fn a_wireless_receiver_passes_through_unless_normalized() {
+        let rx = summary(RECEIVER_CONFIG, |_| None);
+        assert!(rx.has_xinput_wireless() && rx.classes() & cls::GAMEPAD != 0);
+        // Auto and mirrored: the PC gets it all (four pads, the headsets); Normalized: the KVM reads one pad.
+        assert_eq!(decide(PortMode::Auto, Port::Other, &rx, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
+        assert_eq!(decide(PortMode::Mirrored, Port::Other, &rx, &ROOM), (PortMode::Passthrough, AutoReason::NonHid));
+        assert_eq!(decide(PortMode::Normalized, Port::Other, &rx, &ROOM), (PortMode::Normalized, AutoReason::NotAuto));
+        // A wired pad: mirrored by Auto as before, and now normalizable too.
+        let pad = summary(XINPUT_CONFIG, |_| None);
+        assert_eq!(decide(PortMode::Normalized, Port::Other, &pad, &ROOM), (PortMode::Normalized, AutoReason::NotAuto));
     }
 
     #[test]

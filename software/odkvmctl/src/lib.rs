@@ -1,6 +1,8 @@
 //! Host side of the OpenDynKVM control protocol (software.md §8–§9), shared by the `odkvmctl` CLI and `opendyn-kvm`.
 
 pub mod autostart;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ble;
 pub mod bootsel;
 pub mod client;
 pub mod ddc;
@@ -8,12 +10,15 @@ pub mod firmware;
 pub mod i18n;
 pub mod icon;
 pub mod image;
+pub mod keycodes;
 pub mod local;
 pub mod names;
 pub mod placer;
 pub mod screens;
 pub mod sim;
 pub mod transport;
+#[cfg(target_arch = "wasm32")]
+pub mod webio;
 
 pub use client::{Client, Error};
 
@@ -25,6 +30,19 @@ pub mod time {
     pub use std::time::{Instant, SystemTime, UNIX_EPOCH};
     #[cfg(target_arch = "wasm32")]
     pub use web_time::{Instant, SystemTime, UNIX_EPOCH};
+
+    /// Waits `d` between a client's requests: the thread sleeps.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn pause(d: Duration) {
+        std::thread::sleep(d);
+    }
+
+    /// Waits `d` between a client's requests: in a browser the page's event loop runs meanwhile (WebHID and Web
+    /// Bluetooth answer only then).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn pause(d: Duration) {
+        crate::webio::sleep(d).await;
+    }
 
     /// Waits `d`. In a browser there is one thread: it spins, so only for the few milliseconds the simulator takes.
     pub fn sleep(d: Duration) {

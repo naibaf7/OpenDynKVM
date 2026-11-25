@@ -53,11 +53,13 @@ LOGO_SVG = HERE.parent.parent / 'branding' / 'opendynkvm-logo-on-light.svg'
 # ── Stack, bottom to top (mm; z = 0 is the underside of the floor) ──────────────────────────────────────────────────
 FLOOR = 2.0             # floor thickness
 UNDER = 5.0             # floor to board: the bottom side's tallest parts are 3.5 mm (UNDER_PARTS)
-OVER = 9.0              # board to lid: the top side's tallest parts are the 6.3 x 7.7 mm electrolytics (8.0 max)
+OVER = 10.0             # board to lid: a standard 10 mm spacer; the top side's tallest parts are the 6.3 x 7.7 mm electrolytics (8.0 max)
 LID = 2.5               # lid thickness: room for a countersunk M3 head (1.7 mm) over the spacer
 WALL = 2.0              # wall thickness
-GAP_SIDE = 0.5          # board edge to wall, left and right
-GAP_PORTS = 0.8         # board edge to wall, front and rear: the connectors overhang the edge by up to 0.55 mm
+GAP_SIDE = 1.5          # board edge to wall, left and right
+GAP_PORTS = 1.3         # board edge to wall, front and rear: the connectors overhang the edge by up to 0.55 mm
+WALL_PORTS = 1.5        # front and rear wall: GAP_PORTS + WALL_PORTS = 2.8 mm keeps the plugs' reach to the receptacles
+                        # as it was with a 0.8 mm gap and a 2.0 mm wall
 CORNER_R = 3.0          # outer corners, seen from above
 INNER_R = 1.0           # inner corners
 BOTTOM_CHAMFER = 0.6    # the tray's bottom edge (keeps the first layer's squish off the outside)
@@ -66,7 +68,7 @@ LID_FILLET = 1.0        # the lid's top edge
 # ── Fasteners: M3 countersunk screws (ISO 10642 / DIN 7991) from the top, one per corner ────────────────────────────
 SCREW_D = 3.4           # clearance hole in the lid and the spacers
 CSK_D = 6.8             # countersink diameter at the top of the lid (90°): head 6.0-6.72 mm
-FASTENER = 'insert'     # 'insert': M3 heat-set insert in each post; 'tap': self-tapping M3 straight into the post
+FASTENER = 'tap'        # 'insert': M3 heat-set insert in each post; 'tap': self-tapping M3 straight into the post
 INSERT_D = 4.0          # hole for the insert (M3 x 5.7 x 4.6 mm inserts; check yours)
 INSERT_L = 5.7          # insert length
 TAP_D = 2.5             # pilot hole for 'tap'
@@ -75,7 +77,7 @@ SPACER_OD = 6.4         # spacers between board and lid: the top side keeps 3.5 
 SCREW_LENGTHS = (16, 18, 20)
 
 # ── Openings ────────────────────────────────────────────────────────────────────────────────────────────────────────
-USB_C_WIN = (13.0, 7.5, 2.0)    # rear windows (w, h, corner r): room for a USB-C plug's body
+USB_C_WIN = (14.5, 8.5, 2.0)    # rear windows (w, h, corner r): room for a USB-C plug's body
 USB_C_Z = 1.6                   # opening centre above the board (HRO TYPE-C-31-M-12, 3.3 mm tall)
 USB_A_W = 16.0                  # front notches, open at the top: a USB-A plug's body is up to 16 x 8 mm
 USB_A_Z = 3.6                   # opening centre above the board (Molex 67643, 7.2 mm tall)
@@ -132,7 +134,7 @@ class Case:
         self.in_x = f['w'] / 2 + GAP_SIDE
         self.in_y = f['h'] / 2 + GAP_PORTS
         self.out_x = self.in_x + WALL
-        self.out_y = self.in_y + WALL
+        self.out_y = self.in_y + WALL_PORTS
 
     def xy(self, x, y):
         """KiCad (x right, y down) to case coordinates."""
@@ -317,20 +319,20 @@ def tray(c):
             depth = UNDER + FLOOR - 0.8
             body -= Pos(hx, hy, c.z_board - depth / 2) * Cylinder(TAP_D / 2, depth + 0.01)
 
-    depth = WALL + 2 * max(GAP_PORTS, GAP_SIDE) + 2
+    depth = max(WALL, WALL_PORTS) + 2 * max(GAP_PORTS, GAP_SIDE) + 2
     w, h, r = USB_C_WIN
     for p in f['usb_c']:
         x, _ = c.centre(p)
-        body -= wall_cut(RectangleRounded(w, h, r), x, c.in_y + WALL / 2, c.z_top + USB_C_Z, depth)
+        body -= wall_cut(RectangleRounded(w, h, r), x, c.in_y + WALL_PORTS / 2, c.z_top + USB_C_Z, depth)
     bottom = c.z_top + USB_A_Z - USB_A_HALF
     tall = c.z_lid - bottom + 2 * USB_A_R + 1            # past the top: only the bottom corners are rounded
     for p in f['usb_a']:
         x, _ = c.centre(p)
-        body -= wall_cut(RectangleRounded(USB_A_W, tall, USB_A_R), x, -c.in_y - WALL / 2, bottom + tall / 2, depth)
+        body -= wall_cut(RectangleRounded(USB_A_W, tall, USB_A_R), x, -c.in_y - WALL_PORTS / 2, bottom + tall / 2, depth)
     w, h, r = LED_WIN
     for p in f['leds']:
         x, _ = c.xy(p['x'], p['y'])
-        body -= wall_cut(RectangleRounded(w, h, r), x, -c.in_y - WALL / 2, c.z_top + LED_Z + h / 2, depth)
+        body -= wall_cut(RectangleRounded(w, h, r), x, -c.in_y - WALL_PORTS / 2, c.z_top + LED_Z + h / 2, depth)
     return body
 
 

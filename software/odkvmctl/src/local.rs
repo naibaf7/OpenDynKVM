@@ -107,11 +107,31 @@ pub struct Local {
     /// Screen hop: the window places this computer's cursor where the KVM's pointer is, on the screens the system
     /// lets it (`crate::placer`, Windows and macOS). On unless turned off: running the window is the choice.
     pub place_cursor: bool,
+    /// The user's names for a device's controls (the mapping editor: a gamepad's extra buttons), by the device's
+    /// identity (`Controls::identity`, hexadecimal) and the control's position (`kvm_map::pos`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub control_names: BTreeMap<String, BTreeMap<u16, String>>,
+    /// How the mapping editor draws a gamepad, where the user chose (`kvm_core::pads::Style::name`), by the device's
+    /// identity as for `control_names` (`none`: the picture without a device).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub pad_styles: BTreeMap<String, String>,
+    /// The mapping editor's keyboard picture: its physical shape (`kvm_hid::layouts::Physical::name`); None: the one
+    /// this computer's keyboard layout comes with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<String>,
 }
 
 impl Default for Local {
     fn default() -> Self {
-        Local { theme: Theme::default(), displays: Vec::new(), language: None, place_cursor: true }
+        Local {
+            theme: Theme::default(),
+            displays: Vec::new(),
+            language: None,
+            place_cursor: true,
+            control_names: BTreeMap::new(),
+            pad_styles: BTreeMap::new(),
+            keyboard: None,
+        }
     }
 }
 

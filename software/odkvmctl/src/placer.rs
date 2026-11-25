@@ -139,12 +139,15 @@ fn run(shared: &Shared, wake: &dyn Fn()) {
     }
 }
 
+// The KVM's control interface on this computer's USB: a placer has nothing to do in a browser.
+#[cfg(not(target_arch = "wasm32"))]
 fn send(t: &mut dyn Transport, p: Placement) -> Result<(), End> {
     let raw = Request::PlaceCursor(p).encode(0).map_err(|_| End::Lost)?;
     t.write(&raw).map_err(|_| End::Lost)
 }
 
 /// Whether the KVM's firmware speaks this program's protocol (it places the cursor only then).
+#[cfg(not(target_arch = "wasm32"))]
 fn check_protocol(t: &mut dyn Transport) -> Result<(), End> {
     let raw = Request::GetInfo.encode(0).map_err(|_| End::Lost)?;
     t.write(&raw).map_err(|_| End::Lost)?;
@@ -162,6 +165,7 @@ fn check_protocol(t: &mut dyn Transport) -> Result<(), End> {
 
 /// One connection: the lease while placing may and is allowed, the placements, until it is turned off or the KVM
 /// goes away.
+#[cfg(not(target_arch = "wasm32"))]
 fn session(
     t: &mut dyn Transport,
     shared: &Shared,

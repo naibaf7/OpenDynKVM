@@ -42,11 +42,10 @@ fn fw_bits(k: usize) -> u32 {
     bits
 }
 
-/// The Bluetooth module (when fitted): it doesn't run the embedded firmware this boot, or programming gave up.
+/// The Bluetooth module (when fitted, or a dongle): it doesn't run this firmware's version, and waits for an update.
 fn bt_bits() -> u32 {
     match bt::state() {
-        bt::State::Failed => selftest::BT_FW,
-        bt::State::GaveUp => selftest::BT_GAVE_UP,
+        bt::State::NeedsUpdate => selftest::BT_FW,
         _ => 0,
     }
 }
@@ -135,9 +134,10 @@ pub async fn run() -> ! {
             } else if !matches!(check, FwCheck::Skipped | FwCheck::Pending) {
                 bits |= link_bit;
             }
-            let fw = [selftest::AT32_FW1 | selftest::AT32_GAVE_UP1 | selftest::AT32_XTAL1, selftest::AT32_FW2
-                | selftest::AT32_GAVE_UP2
-                | selftest::AT32_XTAL2][k];
+            let fw = [
+                selftest::AT32_FW1 | selftest::AT32_GAVE_UP1 | selftest::AT32_XTAL1,
+                selftest::AT32_FW2 | selftest::AT32_GAVE_UP2 | selftest::AT32_XTAL2,
+            ][k];
             bits = (bits & !fw) | fw_bits(k);
         }
         bits = (bits & !selftest::BT) | bt_bits();

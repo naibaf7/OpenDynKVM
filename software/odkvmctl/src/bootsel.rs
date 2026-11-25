@@ -8,8 +8,9 @@
 //! - **Which board** ([`Scanner`]): PICOBOOT's GET_INFO tells where an RP2350 Arm image would go. One of the KVM's two
 //!   firmware partitions: a KVM, whose other partition holds the firmware installed (its `VERSION` item, in the first
 //!   4 KB). No partition table and erased flash: a new board. No partition table but the KVM's firmware (a board
-//!   flashed by a debug probe): a board to set up as a new one. Anything else (another partition table, other firmware)
-//!   is not a KVM, and is left alone.
+//!   flashed by a debug probe): a board to set up as a new one. The KVM's partition table of firmware before 0.1.51
+//!   (`layout::SINCE`): a KVM that takes the first-install UF2, which writes the new table. Anything else (another
+//!   partition table, other firmware) is not a KVM, and is left alone.
 //! - **Installing** ([`install`]): the UF2 the board takes (`firmware::for_bootloader`), copied onto the ROM's drive,
 //!   as dragging it there would: the ROM picks the partition, writes it, and boots it whatever its version, erasing the
 //!   other one's start (§5.1.16). PICOBOOT's UF2_STATUS counts the blocks the ROM has written; the device leaves the
@@ -70,6 +71,9 @@ pub enum Board {
     /// No partition table. `installed`: the KVM's firmware at the start of flash (a board flashed without its
     /// partition table), or None: erased. Either way it takes `kvm-first.uf2`.
     New { installed: Option<u32> },
+    /// The KVM's partition table of firmware before 0.1.51, with `installed` in the partition it boots: it takes
+    /// `kvm-first.uf2`, which writes the new table (the data partition's settings stay where they were).
+    Previous { installed: Option<u32> },
     /// Not a KVM: another partition table, or firmware that isn't the KVM's. Left alone.
     Other,
 }
@@ -77,7 +81,7 @@ pub enum Board {
 impl Board {
     /// Whether it takes the first-install UF2 (partition table and partition A) rather than an update's.
     pub fn takes_first(&self) -> bool {
-        matches!(self, Board::New { .. })
+        matches!(self, Board::New { .. } | Board::Previous { .. })
     }
 }
 
@@ -242,7 +246,9 @@ fn info_words(data: &[u8]) -> Vec<u32> {
 /// The board, from where an RP2350 Arm image would go (GET_INFO UF2_TARGET_PARTITION: a partition, 0xFF for "no
 /// partition table: at the start of flash", or -1 for nowhere) and the partition's place.
 fn classify(target: &[u32]) -> Target {
-    use layout::{PARTITION_A_SECTOR as A, PARTITION_B_SECTOR as B, PARTITION_SECTORS as N};
+    use layout::{
+        PARTITION_A_SECTOR as A, PARTITION_B_SECTOR as B, PARTITION_SECTORS as N, PREVIOUS_PARTITION_SECTORS as P,
+    };
     match target.first().copied() {
         Some(0xFF) => Target::Unpartitioned,
         Some(p) if p < 16 => {
@@ -250,6 +256,8 @@ fn classify(target: &[u32]) -> Target {
             match (loc & 0x1FFF, (loc >> 13) & 0x1FFF) {
                 (first, last) if (first, last) == (A, A + N - 1) => Target::Kvm { slot: 0, booted: B },
                 (first, last) if (first, last) == (B, B + N - 1) => Target::Kvm { slot: 1, booted: A },
+                (first, last) if (first, last) == (A, A + P - 1) => Target::Previous { booted: A + P },
+                (first, last) if (first, last) == (A + P, A + 2 * P - 1) => Target::Previous { booted: A },
                 _ => Target::Other,
             }
         }
@@ -262,6 +270,10 @@ enum Target {
     /// A KVM: an update goes to `slot`; the firmware in use starts at sector `booted`.
     Kvm {
         slot: u8,
+        booted: u32,
+    },
+    /// The KVM's table of firmware before 0.1.51; the firmware in use starts at sector `booted`.
+    Previous {
         booted: u32,
     },
     Unpartitioned,
@@ -282,6 +294,10 @@ fn identify(pb: &mut Picoboot) -> Result<Board, String> {
         Target::Kvm { slot, booted } => {
             let head = pb.read(XIP_BASE + booted * layout::SECTOR, 4096)?;
             Ok(Board::Kvm { installed: rpimage::image_version(&head), slot })
+        }
+        Target::Previous { booted } => {
+            let head = pb.read(XIP_BASE + booted * layout::SECTOR, 4096)?;
+            Ok(Board::Previous { installed: rpimage::image_version(&head) })
         }
         Target::Unpartitioned => {
             let head = pb.read(XIP_BASE, 4096)?;
@@ -522,6 +538,7 @@ pub fn simulated(kind: &str) -> Option<BootDevice> {
     let board = match kind {
         "kvm" => Ok(Board::Kvm { installed: Some(0x00_01_00), slot: 0 }),
         "new" => Ok(Board::New { installed: None }),
+        "previous" => Ok(Board::Previous { installed: Some(kvm_proto::version_u32(0, 1, 50)) }),
         "other" => Ok(Board::Other),
         "unknown" => Err(fl!("boot-no-permission")),
         _ => return None,
@@ -642,6 +659,9 @@ mod tests {
         let loc = |first: u32, last: u32| 0xFC00_0000 | last << 13 | first;
         assert_eq!(classify(&[0, loc(A, A + N - 1), 0]), Target::Kvm { slot: 0, booted: B });
         assert_eq!(classify(&[1, loc(B, B + N - 1), 0]), Target::Kvm { slot: 1, booted: A });
+        // The KVM's table before 0.1.51: A and B of 984 KB.
+        assert_eq!(classify(&[1, loc(248, 493), 0]), Target::Previous { booted: 2 });
+        assert_eq!(classify(&[0, loc(2, 247), 0]), Target::Previous { booted: 248 });
         // A Pico 2 with picotool's default A/B table, 1 MB each.
         assert_eq!(classify(&[0, loc(2, 257), 0]), Target::Other);
         assert_eq!(classify(&[0xFF]), Target::Unpartitioned);

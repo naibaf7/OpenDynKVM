@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui::{self, RichText, Ui};
 use kvm_proto::ctrl::{FwState, Info};
+use kvm_proto::link::bt::Chip;
 use odkvmctl::bootsel::{self, Board, BootDevice};
 use odkvmctl::client::Snapshot;
 use odkvmctl::{firmware, fl, image, names};
@@ -27,17 +28,50 @@ pub struct Files {
     bundled: Option<PathBuf>,
     described: Option<(String, Described)>,
     for_boot: Vec<((String, bool), ForBoot)>,
+    /// The release's module firmware: its version (None: the release has none).
+    module: Option<(String, Result<Option<u32>, String>)>,
+    /// The completed update ([`Shared::finished`](crate::worker::Shared)) after which the files were last read anew.
+    finished: Option<odkvmctl::time::Instant>,
 }
 
 impl Files {
     pub fn new() -> Files {
         let bundled = firmware::bundled();
         let path = bundled.as_ref().map(|b| b.display().to_string()).unwrap_or_default();
-        Files { path, bundled, described: None, for_boot: Vec::new() }
+        Files { path, bundled, described: None, for_boot: Vec::new(), module: None, finished: None }
     }
 
-    fn path(&self) -> PathBuf {
+    /// Reads the files anew when next asked (a release folder may have been rebuilt meanwhile).
+    fn forget(&mut self) {
+        self.described = None;
+        self.for_boot.clear();
+        self.module = None;
+    }
+
+    pub(crate) fn path(&self) -> PathBuf {
         PathBuf::from(self.path.trim())
+    }
+
+    /// Whether the release has the module firmware a KVM with firmware `rp_fw` takes (its own release's), for the
+    /// module's `chip`.
+    pub(crate) fn module(&mut self, rp_fw: u32, chip: Chip) -> Result<(), String> {
+        let key = self.path.trim().to_string();
+        let cached = format!("{key}\n{}", chip.name());
+        if self.module.as_ref().is_none_or(|(p, _)| *p != cached) {
+            let m = firmware::module_for(Path::new(&key), chip).map(|m| m.map(|m| m.version));
+            self.module = Some((cached, m));
+        }
+        match &self.module.as_ref().unwrap().1 {
+            Ok(Some(v)) if *v == rp_fw => Ok(()),
+            Ok(Some(v)) => Err(fl!(
+                "fw-module-mismatch",
+                file = firmware::module_bin(chip),
+                module = names::version(*v),
+                version = names::version(rp_fw)
+            )),
+            Ok(None) => Err(fl!("fw-no-module", folder = key)),
+            Err(e) => Err(e.clone()),
+        }
     }
 
     fn described(&mut self) -> Described {
@@ -75,6 +109,15 @@ impl App {
     pub(crate) fn install_cards(&mut self, ui: &mut Ui, s: Option<&Snapshot>) {
         if let Some(p) = self.shared.lock().unwrap().picked.take() {
             self.fw.path = p.display().to_string();
+        }
+        // An update is completely done: the page starts afresh (the worker cleared its progress and results).
+        let finished = self.shared.lock().unwrap().finished;
+        if let Some(f) = finished
+            && self.fw.finished != Some(f.at)
+        {
+            self.fw.finished = Some(f.at);
+            self.fw.forget();
+            self.diag_asked = None;
         }
         // The KVM on this PC's port: read whole, or only its identity when its firmware speaks another protocol.
         let info = s.map(|s| s.info).or(self.shared.lock().unwrap().mismatch);
@@ -163,31 +206,77 @@ impl App {
 
     /// Over this computer's PC port, to the KVM that answers there.
     fn update_card(&mut self, ui: &mut Ui, info: &Info) {
-        let (update, result) = {
+        let (update, result, module, module_result, pending) = {
             let sh = self.shared.lock().unwrap();
-            (sh.update, sh.update_result.clone())
+            (
+                sh.update,
+                sh.update_result.clone(),
+                sh.module_update,
+                sh.module_result.clone(),
+                sh.module_pending.is_some(),
+            )
         };
-        let fits = self.fw.described().is_ok_and(|(v, m)| image::check_hardware(v, m, info.hw).is_ok());
+        let described = self.fw.described();
+        let fits = described.as_ref().is_ok_and(|(v, m)| image::check_hardware(*v, *m, info.hw).is_ok());
+        let layout = described.as_ref().map_or(Ok(()), |(v, _)| image::check_layout(info.rp_fw, *v));
         card(ui, &fl!("update"), |ui| {
             note(ui, fl!("update-over-pc-note"));
+            if let Err(e) = &layout {
+                ui.label(RichText::new(e).color(ink(ui, BAD)));
+            }
+            let fits = fits && layout.is_ok();
             let busy =
                 matches!(update, Some((st, ..)) if !matches!(st, FwState::Done | FwState::Failed | FwState::Idle));
             if ui.add_enabled(!busy && fits, egui::Button::new(fl!("install"))).clicked() {
                 let mut sh = self.shared.lock().unwrap();
                 sh.update = None;
                 sh.update_result = None;
+                sh.finished = None;
                 drop(sh);
+                self.fw.forget();
                 self.send(UiCmd::Update(self.fw.path()));
             }
+            if let Some(f) = self.shared.lock().unwrap().finished {
+                let v = names::version(f.version);
+                let text = if f.module {
+                    fl!("update-complete-module", version = v)
+                } else {
+                    fl!("update-complete", version = v)
+                };
+                ui.label(RichText::new(text).color(ink(ui, GOOD)));
+            }
             if let Some((state, done, total)) = update {
-                ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).text(names::fw_state(state)));
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                        .text(format!("RP2354B: {}", names::fw_state(state))),
+                );
                 if state == FwState::AwaitingKey {
                     ui.label(RichText::new(fl!("press-key-to-install")).strong());
                 }
             }
             match result {
+                Some(Ok(())) if pending => {
+                    ui.label(RichText::new(fl!("installed-module-next")).color(ink(ui, GOOD)));
+                }
                 Some(Ok(())) => {
                     ui.label(RichText::new(fl!("installed")).color(ink(ui, GOOD)));
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(e).color(ink(ui, BAD)));
+                }
+                None => {}
+            }
+            // The module's turn, once the KVM is back.
+            if let Some((state, done, total)) = module {
+                let what = fl!("wireless-module");
+                ui.add(
+                    egui::ProgressBar::new(done as f32 / total.max(1) as f32)
+                        .text(format!("{what}: {}", names::fw_state(state))),
+                );
+            }
+            match module_result {
+                Some(Ok(())) => {
+                    ui.label(RichText::new(fl!("installed-module")).color(ink(ui, GOOD)));
                 }
                 Some(Err(e)) => {
                     ui.label(RichText::new(e).color(ink(ui, BAD)));
@@ -215,6 +304,10 @@ impl App {
                 Ok(Board::New { installed: Some(v) }) => {
                     ui.label(fl!("boot-new-unpartitioned", version = names::version(*v)));
                 }
+                Ok(Board::Previous { installed }) => {
+                    let version = installed.map_or_else(|| "-".to_string(), names::version);
+                    ui.label(fl!("boot-kvm-previous", version = version));
+                }
                 Ok(Board::Other) => {
                     ui.label(RichText::new(fl!("boot-other")).color(ink(ui, BAD)));
                 }
@@ -229,7 +322,7 @@ impl App {
             }
             // What it can get: the UF2 its board takes, or (state unknown) the user's choice of the two.
             let choices: &[bool] = match &d.board {
-                Ok(b @ (Board::Kvm { .. } | Board::New { .. })) => {
+                Ok(b @ (Board::Kvm { .. } | Board::New { .. } | Board::Previous { .. })) => {
                     if b.takes_first() {
                         &[true]
                     } else {
@@ -312,9 +405,12 @@ impl App {
             let mut sh = shared.lock().unwrap();
             sh.boot_install = Some((d.location.clone(), 0, 1));
             sh.boot_result = None;
+            sh.finished = None;
         }
         crate::background(move || {
+            let mut version = None;
             let r = firmware::for_bootloader(&path, first).and_then(|c| {
+                version = Some(c.version);
                 bootsel::install(&d, &c.data, |done, total| {
                     shared.lock().unwrap().boot_install = Some((d.location.clone(), done, total));
                     wake();
@@ -322,6 +418,12 @@ impl App {
             });
             let mut sh = shared.lock().unwrap();
             sh.boot_install = None;
+            // Done once the KVM answers on this computer's PC port with it (and its module is through).
+            if r.is_ok()
+                && let Some(version) = version
+            {
+                sh.expected = Some(crate::worker::Expected { version, restart: false });
+            }
             sh.boot_result = Some((d.location.clone(), r));
             drop(sh);
             wake();

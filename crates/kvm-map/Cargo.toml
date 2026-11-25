@@ -1,0 +1,20 @@
+[package]
+name = "kvm-map"
+description = "The OpenDynKVM's mapping engine: keymaps and axis rules for every input device, with the Vial protocol as a way to edit the keyboard part (sans I/O); parts adapted from RMK"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kvm-hid.workspace = true
+heapless.workspace = true
+defmt = { workspace = true, optional = true }
+
+[build-dependencies]
+xz2 = "0.1"
+
+[dev-dependencies]
+xz2 = "0.1"
+
+[features]
+defmt = ["dep:defmt", "heapless/defmt", "kvm-hid/defmt"]

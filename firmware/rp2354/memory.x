@@ -1,8 +1,8 @@
 /* RP2354B: 2 MB in-package flash, 512 KB striped SRAM + two 4 KB banks.
-   The image must fit one A/B partition (984 KB); the partition the ROM boots appears at 0x10000000. The data
-   partition and the partition table live outside the image (src/flash.rs). */
+   The image must fit one A/B partition (896 KB, rpimage::layout); the partition the ROM boots appears at 0x10000000.
+   The data partition and the partition table live outside the image (src/flash.rs). */
 MEMORY {
-    FLASH : ORIGIN = 0x10000000, LENGTH = 984K
+    FLASH : ORIGIN = 0x10000000, LENGTH = 896K
     RAM : ORIGIN = 0x20000000, LENGTH = 512K
     SRAM8 : ORIGIN = 0x20080000, LENGTH = 4K
     SRAM9 : ORIGIN = 0x20081000, LENGTH = 4K

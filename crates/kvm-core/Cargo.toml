@@ -8,9 +8,13 @@ license.workspace = true
 [dependencies]
 kvm-proto.workspace = true
 kvm-hid.workspace = true
-kvm-vial.workspace = true
+kvm-map.workspace = true
 heapless.workspace = true
 defmt = { workspace = true, optional = true }
 
 [features]
-defmt = ["dep:defmt", "heapless/defmt", "kvm-proto/defmt", "kvm-hid/defmt", "kvm-vial/defmt"]
+defmt = ["dep:defmt", "heapless/defmt", "kvm-proto/defmt", "kvm-hid/defmt", "kvm-map/defmt"]
+
+[dev-dependencies]
+# The ESP32 module's Classic pad form, which the engine reads as the pad's own USB form.
+kvm-classic.workspace = true

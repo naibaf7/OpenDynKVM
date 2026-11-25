@@ -17,6 +17,7 @@ path = "src/bin/opendyn-kvm/main.rs"
 kvm-proto.workspace = true
 kvm-core.workspace = true
 kvm-hid.workspace = true
+kvm-map.workspace = true
 heapless.workspace = true
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1"
@@ -42,11 +43,17 @@ eframe = "0.37"
 nusb = "0.2"
 # The firmware file picker: the desktop's own dialog (XDG portal on Linux, no GTK; the system dialog on Windows).
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
+# The client and the window's worker are written once (software.md §9 "On the web"): blocking here, async in a
+# browser, whose WebHID and Web Bluetooth only answer once the page's event loop has run.
+maybe-async = { version = "0.2.10", features = ["is_sync"] }
 
 # The web build: eframe's web runner on a canvas (WebGL through glow, a fraction of wgpu's size there), the browser's
 # clock and storage.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "links"] }
+maybe-async = "0.2.10"
+async-trait = "0.1.89"
+js-sys = "0.3.79"
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 web-sys = { version = "0.3.106", features = ["console", "Document", "HtmlCanvasElement", "Location", "Storage", "Window"] }
@@ -58,6 +65,8 @@ web-time = "1.1"
 libc = "0.2"
 hidapi = { version = "2.6.7", default-features = false, features = ["linux-native-basic-udev"] }
 ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
+# The KVM's control service over Bluetooth LE (software.md §8.1 "Over Bluetooth"): BlueZ over D-Bus, in pure Rust.
+zbus = { version = "5.12", default-features = false, features = ["async-io", "blocking-api"] }
 
 [target.'cfg(windows)'.dependencies]
 hidapi = { version = "2.6.7", default-features = false, features = ["windows-native"] }
@@ -79,6 +88,9 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 # The tray icon: the notification area on Windows, the menu bar on macOS.
 tray-icon = "0.26"
+# The KVM's control service over Bluetooth LE (software.md §8.1 "Over Bluetooth"): WinRT's GATT client, CoreBluetooth.
+bluest = "0.6.9"
+futures-lite = "2.6"
 
 # macOS: IOHIDManager through hidapi's own C backend (built with the system's SDK on a Mac).
 [target.'cfg(not(any(windows, target_os = "linux", target_arch = "wasm32")))'.dependencies]

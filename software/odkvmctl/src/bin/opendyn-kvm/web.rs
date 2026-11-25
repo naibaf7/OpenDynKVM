@@ -1,5 +1,6 @@
-//! The window in a browser (the web build, wasm32: software.md §9 "On the web"): the simulator only, in a canvas
-//! with the id `opendyn-kvm`. The worker runs a round each frame ([`worker::Web`]); the settings are kept in the
+//! The window in a browser (the web build, wasm32: software.md §9 "On the web"), in a canvas with the id
+//! `opendyn-kvm`: the simulator, or a real KVM over WebHID or Web Bluetooth (`odkvmctl::webio`) in a Chromium-based
+//! browser. The worker is a task on the page's event loop ([`worker::spawn_web`]); the settings are kept in the
 //! browser's storage (`odkvmctl::local`); no tray, no second copy to look for, no monitors to switch. The page's
 //! address sets the simulator up as the environment does elsewhere: `?OPENDYN_SIM_BT=1&OPENDYN_SIM_HOP=1`, and
 //! `OPENDYN_LANG` picks the language (else the one chosen in Settings, else English).
@@ -13,15 +14,13 @@ use wasm_bindgen::JsCast;
 use crate::App;
 use crate::worker::{self, Shared, Wake};
 
-/// The window and the worker, as one app for eframe's web runner.
+/// The window, for eframe's web runner (the worker runs beside it on the page's event loop).
 struct WebApp {
     app: App,
-    worker: worker::Web,
 }
 
 impl eframe::App for WebApp {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.worker.step();
         self.app.logic(ctx, frame);
         // The simulated KVM moves on between frames (its mouse, its delays): keep them coming.
         ctx.request_repaint_after(odkvmctl::time::Duration::from_millis(50));
@@ -60,8 +59,8 @@ pub fn start() {
                 eframe::WebOptions::default(),
                 Box::new(move |cc| {
                     *slot.lock().unwrap() = Some(cc.egui_ctx.clone());
-                    let worker = worker::Web::new(shared.clone(), rx, wake.clone());
-                    Ok(Box::new(WebApp { app: App::new(shared, tx, tray_rx, wake), worker }))
+                    worker::spawn_web(shared.clone(), rx, wake.clone());
+                    Ok(Box::new(WebApp { app: App::new(shared, tx, tray_rx, wake) }))
                 }),
             )
             .await;

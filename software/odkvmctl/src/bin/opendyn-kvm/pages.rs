@@ -181,7 +181,8 @@ fn hid_usage(k: egui::Key) -> Option<u8> {
 
 /// Why a hotkey can't be learned now, if it can't.
 fn cant_learn(s: &Snapshot) -> Option<String> {
-    if s.status.asking.is_some_and(|pc| pc != s.status.active) {
+    // A wireless host reaching the KVM over its module can't: what is typed goes to the active target.
+    if s.status.asking_bt().is_some() || s.status.asking_pc().is_some_and(|pc| pc != s.status.active) {
         Some(fl!("cant-learn-not-active"))
     } else if !s.ports.iter().any(|p| p.state == PortState::Hosted && p.classes & class::KEYBOARD != 0) {
         Some(fl!("cant-learn-no-keyboard"))
@@ -249,7 +250,7 @@ impl App {
                     if active {
                         chip(ui, &fl!("chip-active"), color);
                     }
-                    if st.asking == Some(pc) {
+                    if st.asking_pc() == Some(pc) {
                         chip(ui, &fl!("chip-this-computer"), look::NEUTRAL);
                     }
                 });
@@ -409,6 +410,37 @@ impl App {
     /// What the old port cards said of a device, under its row (software.md §9): a front port's IDs and speed, the
     /// mode it runs in and why, its kinds, report rate and power, and over-current faults; a wireless device's battery
     /// and signal. Each line with how it looks.
+    /// An ESP32 board on `port` that the KVM left alone (it runs other firmware), on a KVM without a module: it may
+    /// become the module (`Request::AdoptModule`).
+    fn adoptable(s: &Snapshot, port: Port) -> bool {
+        let p = &s.ports[port.index()];
+        s.status.bt_module == kvm_proto::ctrl::diag::BtModule::Absent
+            && !matches!(p.state, PortState::Empty | PortState::Module)
+            && kvm_core::bt::dongle_ids(p.vid, p.pid)
+    }
+
+    /// Making the board on `port` the module: two presses, as it replaces the board's firmware.
+    fn adopt_row(&mut self, ui: &mut Ui, port: Port) {
+        let weak = look::palette(ui).weak;
+        ui.add(egui::Label::new(RichText::new(fl!("module-adopt-note")).color(weak)).wrap());
+        if self.adopt_armed != Some(port) {
+            if ui.button(fl!("module-adopt")).clicked() {
+                self.adopt_armed = Some(port);
+            }
+            return;
+        }
+        ui.label(RichText::new(fl!("module-adopt-really")).color(ink(ui, BAD)));
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new(RichText::new(fl!("module-adopt-confirm")).color(ink(ui, BAD)))).clicked() {
+                self.send(UiCmd::AdoptModule(port));
+                self.adopt_armed = None;
+            }
+            if ui.button(fl!("cancel")).clicked() {
+                self.adopt_armed = None;
+            }
+        });
+    }
+
     fn device_details(s: &Snapshot, d: Device) -> Vec<(String, Tone)> {
         let mut lines = Vec::new();
         match (d.port(), d.wireless()) {
@@ -623,6 +655,9 @@ impl App {
                                 Tone::Ink(c) => text.color(ink(ui, c)),
                             };
                             ui.add(egui::Label::new(text).wrap());
+                        }
+                        if let Some(port) = d.port().filter(|p| Self::adoptable(s, *p)) {
+                            self.adopt_row(ui, port);
                         }
                     });
                 }
@@ -959,11 +994,6 @@ impl App {
                             self.set(ConfigValue::Vial(mode));
                         }
                     });
-                    let mut km =
-                        config(s, |v| if let ConfigValue::Keymap(b) = v { Some(*b) } else { None }).unwrap_or(true);
-                    if ui.checkbox(&mut km, fl!("apply-keymap")).changed() {
-                        self.set(ConfigValue::Keymap(km));
-                    }
                 });
             }
         });
@@ -1240,7 +1270,13 @@ impl App {
             self.bt_module_card(ui, s);
             ui.add_space(8.0);
         }
-        self.install_cards(ui, s);
+        // Over the wireless module the KVM takes no firmware: the module that carries it is what an update replaces.
+        let link = self.shared.lock().unwrap().link;
+        if link == Some(odkvmctl::transport::Link::Bluetooth) {
+            card(ui, &fl!("page-firmware"), |ui| note(ui, fl!("fw-over-wireless")));
+        } else {
+            self.install_cards(ui, s);
+        }
         if s.is_some() {
             ui.add_space(8.0);
             if ui.button(fl!("identify")).clicked() {
@@ -1306,6 +1342,23 @@ impl App {
         });
     }
 
+    /// Over the wireless module, before the KVM's key let this computer control it (software.md §8.1 "Over
+    /// Bluetooth"): how to ask, and, once asked (`waiting`), that the KVM waits for its key.
+    pub(crate) fn not_allowed(&mut self, ui: &mut Ui, waiting: bool) {
+        card(ui, &fl!("not-allowed-title"), |ui| {
+            note(ui, fl!("not-allowed-note"));
+            if waiting {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let seconds = kvm_core::engine::UNLOCK_WAIT_MS / 1000;
+                    ui.label(RichText::new(fl!("cli-press-key-within", seconds = seconds)).strong());
+                });
+            } else if ui.button(fl!("not-allowed-ask")).clicked() {
+                self.send(crate::worker::UiCmd::AskControl);
+            }
+        });
+    }
+
     /// What the KVM pages show while no KVM answers; and where to go when one waits in its bootloader.
     /// The KVM's firmware speaks another protocol: nothing but its update, on the Firmware page.
     pub(crate) fn mismatch(&mut self, ui: &mut Ui) {
@@ -1351,6 +1404,51 @@ impl App {
 
     /// While the KVM is the simulator, at the top of every page: what is made up and what is real, and the way back to
     /// a real KVM (straight away once one is plugged in). Not in a browser, which has only the simulator.
+    /// In a browser: the simulator, or a KVM the page was given; how to connect one (WebHID, Web Bluetooth: Chromium-
+    /// based browsers), or go back to the simulator.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn web_banner(&mut self, ui: &mut Ui) {
+        use odkvmctl::transport::Link;
+        use odkvmctl::webio;
+        let link = self.shared.lock().unwrap().link;
+        let simulated = link.is_none_or(|l| l == Link::Simulated);
+        let c = if simulated { look::NEUTRAL } else { GOOD };
+        egui::Frame::new()
+            .fill(c.gamma_multiply(0.14))
+            .stroke(egui::Stroke::new(1.0, c))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                if !simulated {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(fl!("web-connected")).strong().color(ink(ui, c)));
+                        if ui.button(fl!("web-back-to-sim")).clicked() {
+                            self.send(UiCmd::WebSimulator);
+                        }
+                    });
+                    return;
+                }
+                ui.label(RichText::new(fl!("sim-banner-title")).strong().color(ink(ui, c)));
+                let (usb, wireless) = (webio::usb_supported(), webio::wireless_supported());
+                if !usb && !wireless {
+                    note(ui, fl!("web-no-api"));
+                    return;
+                }
+                ui.label(fl!("web-connect-note"));
+                ui.horizontal_wrapped(|ui| {
+                    // The browser's chooser needs the click: it opens while the click still counts.
+                    if usb && ui.button(fl!("web-connect-usb")).clicked() {
+                        self.send(UiCmd::WebConnect(Link::Usb));
+                    }
+                    if wireless && ui.button(fl!("web-connect-wireless")).clicked() {
+                        self.send(UiCmd::WebConnect(Link::Bluetooth));
+                    }
+                });
+            });
+        ui.add_space(8.0);
+    }
+
     pub(crate) fn sim_banner(&mut self, ui: &mut Ui) {
         if cfg!(target_arch = "wasm32") {
             return;

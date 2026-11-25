@@ -381,7 +381,8 @@ async fn run_device(index: usize, handle: &Handle, info: &EnumerationInfo) {
     let Some(parsed) = parse_config(&config) else { return };
     let mut ins: Vec<(u8, InPipe), 4> = Vec::new();
     let mut outs: Vec<(u8, OutPipe), 4> = Vec::new();
-    for iface in parsed.interfaces.iter().filter(|i| i.is_hid() || i.is_xinput()) {
+    // HID, wired XInput, and a wireless receiver's first pad (`ConfigInfo::polled`).
+    for iface in parsed.polled() {
         let ep_info = |e: &kvm_core::usbdesc::EndpointDesc, dir| EndpointInfo {
             addr: EndpointAddress::from_parts(e.number() as usize, dir),
             ep_type: EndpointType::Interrupt,
@@ -485,7 +486,7 @@ fn open_dongle(handle: &Handle, info: &EnumerationInfo, eps: kvm_core::bt::Dongl
         handle.alloc_pipe::<pipe::Interrupt, pipe::In>(addr, &data(eps.ep_in, Direction::In), info.split()).ok()?;
     let tx =
         handle.alloc_pipe::<pipe::Interrupt, pipe::Out>(addr, &data(eps.ep_out, Direction::Out), info.split()).ok()?;
-    Some(UsbLine::new(ctl, rx, tx, eps.comm))
+    Some(UsbLine::new(ctl, rx, tx, eps.comm, eps.kind))
 }
 
 // One per loop iteration on the stack; boxing isn't available and the size is harmless.
